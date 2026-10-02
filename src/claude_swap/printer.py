@@ -64,6 +64,31 @@ def _enable_windows_vt() -> bool:
         return False
 
 
+def print_line(text: str) -> None:
+    """``print(text, flush=True)`` that survives a reader going away.
+
+    ``cc-swap auto --once | head -1`` closes the pipe after one line; the next
+    print raised BrokenPipeError out of the engine's event callback and
+    aborted the tick, switch included. Here the error is swallowed and stdout
+    is pointed at the null device (what the Python docs recommend for
+    SIGPIPE), so the rest of the run completes silently."""
+    try:
+        print(text, flush=True)
+    except BrokenPipeError:
+        _stdout_to_devnull()
+
+
+def _stdout_to_devnull() -> None:
+    devnull = os.open(os.devnull, os.O_WRONLY)
+    try:
+        os.dup2(devnull, sys.stdout.fileno())
+    except (AttributeError, OSError, ValueError):
+        # Not a real file descriptor (a replaced stream): swap the object.
+        sys.stdout = open(os.devnull, "w", encoding="utf-8")  # noqa: SIM115
+    finally:
+        os.close(devnull)
+
+
 def force_utf8_output() -> None:
     """Make stdout/stderr encode UTF-8 so ● → ├ ─ └ don't crash on a legacy
     console (cp1252 on Windows, or an ASCII/C locale). errors="replace" keeps

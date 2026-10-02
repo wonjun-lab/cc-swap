@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import io
 import json
 import os
 import subprocess
@@ -1123,6 +1124,42 @@ class TestAutoCommand:
     def test_loop_mode_returns_loop_exit(self, temp_home):
         assert self._run([], temp_home) == 0
         assert self.FakeEngine.instances  # loop path constructed the engine
+
+    @pytest.mark.parametrize("jsonl", [False, True])
+    def test_a_closed_stdout_does_not_abort_the_tick(self, temp_home, monkeypatch, jsonl):
+        """`cc-swap auto --once | head -1`: the reader goes away after the first
+        line. The printer raised BrokenPipeError out of the engine's emit, so
+        the tick (and a due switch) stopped after one line."""
+        from claude_swap.autoswitch import NoSwitchEvent, PollEvent, TickOutcome
+
+        class ClosedPipe(io.StringIO):
+            def write(self, s):
+                raise BrokenPipeError(32, "Broken pipe")
+
+            def flush(self):
+                raise BrokenPipeError(32, "Broken pipe")
+
+        finished: list[bool] = []
+
+        class EmittingEngine(self.FakeEngine):
+            def tick(self):
+                self.on_event(PollEvent(
+                    active={"number": 1, "email": "a@example.com"},
+                    headroom={"1": 1.0}, threshold=90.0,
+                ))
+                self.on_event(NoSwitchEvent(reason="cooldown"))
+                finished.append(True)
+                return TickOutcome.SWITCHED
+
+        monkeypatch.setattr(sys, "stdout", ClosedPipe())
+        argv = ["--once"] + (["--json"] if jsonl else [])
+        with patch("claude_swap.autoswitch.AutoSwitchEngine", EmittingEngine), \
+             patch("os.geteuid", return_value=1000, create=True), \
+             patch.object(sys, "argv", ["claude-swap", "auto", *argv]):
+            with pytest.raises(SystemExit) as excinfo:
+                cli.main()
+        assert finished == [True]
+        assert excinfo.value.code == 0
 
     def test_flags_override_settings_json(self, temp_home):
         from claude_swap.paths import get_backup_root

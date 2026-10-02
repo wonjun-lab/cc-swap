@@ -752,7 +752,7 @@ Defaults live in settings.json in the backup root; flags override them.
     )
     from claude_swap.autoswitch import AutoSwitchEngine, AutoSwitchEvent
     from claude_swap.maximize.logrotate import LogRotator
-    from claude_swap.printer import accent, yellowed
+    from claude_swap.printer import accent, print_line, yellowed
     from claude_swap.settings import (
         MAXIMIZE_CLI_FLAGS,
         load_maximize_settings,
@@ -761,8 +761,10 @@ Defaults live in settings.json in the backup root; flags override them.
         merged_with_cli,
     )
 
+    # print_line: a closed pipe (`auto --once | head -1`) must not abort the
+    # tick from inside the engine's event callback.
     def jsonl_emit(event: AutoSwitchEvent) -> None:
-        print(json.dumps(event.to_json()), flush=True)
+        print_line(json.dumps(event.to_json()))
 
     def human_emit(event: AutoSwitchEvent) -> None:
         stamp = _time.strftime("%H:%M:%S")
@@ -773,7 +775,7 @@ Defaults live in settings.json in the backup root; flags override them.
             line = yellowed(line)
         elif event.kind in ("poll", "no-switch", "sleep"):
             line = dimmed(line)
-        print(f"{stamp}  {line}", flush=True)
+        print_line(f"{stamp}  {line}")
 
     lease = None
     try:
