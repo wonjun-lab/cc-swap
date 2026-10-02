@@ -53,6 +53,9 @@ def test_readme_strategy_row_mentions_maximize():
     "CLAUDE_CODE_OAUTH_TOKEN",
     "Terms of service",
     "cc-swap auto --once --dry-run",
+    "### Logins expire",
+    "refreshTokenExpiresAt",
+    "maximize.loginExpiryGuardMin",
 ])
 def test_readme_covers_install_migration_priming_and_the_service(snippet):
     assert snippet in README.read_text(encoding="utf-8")
