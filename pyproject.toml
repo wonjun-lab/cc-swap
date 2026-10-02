@@ -1,6 +1,6 @@
 [project]
 name = "cc-swap"
-version = "0.1.0"
+version = "0.1.1"
 description = "Multi-account switcher for Claude Code, with 5h/7d-aware auto-switching (fork of claude-swap)"
 readme = "README.md"
 requires-python = ">=3.12"
