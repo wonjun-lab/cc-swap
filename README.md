@@ -36,6 +36,8 @@ cc-swap reads and writes the same data as claude-swap: the backup directory (`~/
 4. `cc-swap config set autoswitch.strategy maximize`. The service runs plain `cc-swap auto`, which reads its strategy from the settings.
 5. `cc-swap service install`
 
+`cc-swap init` checks these steps for you, and `cc-swap doctor` explains anything left (see [Diagnostics](#diagnostics-doctor-init-why)).
+
 To go back, run `cc-swap service uninstall`, `uv tool uninstall cc-swap` and `uv tool install claude-swap`. Upstream warns about the unknown `maximize` strategy, falls back to `best`, and ignores the `maximize`/`prime` settings.
 
 cc-swap does not manage extra usage (pay-as-you-go beyond the plan). If you never want it, turn it off in your claude.ai account settings.
@@ -204,6 +206,54 @@ A Claude Code login has a fixed deadline. The token endpoint sets it at `/login`
 - **No landing on a dying login.** `maximize` never makes a soft or rebalance switch onto an account whose login expires within `maximize.loginExpiryGuardMin` minutes (default 120). An at-limit or hard fallback can still use it while it works, but never once its deadline has passed. Priming skips accounts past their deadline.
 - **Re-login.** Use Fleet's `r` (see above), or run `claude`, `/login` as that account, then `cc-swap add`. The Fleet guide stores the login only once the live refresh token has changed, so pressing `enter` before logging in stores nothing.
 - **Refresh audit.** Every refresh POST cc-swap makes logs one INFO line to the engine log (`refresh POST caller=… slot=… active=… source=live|backup|profile rt=<8 hex>-><8 hex> accessExp=… login=… result=… latency=…`). It holds fingerprint prefixes only, never tokens or emails, so it is safe to paste into an issue when you need to know which machine spent a token.
+
+## Diagnostics: `doctor`, `init`, `why`
+
+`cc-swap doctor` checks this machine and every stored login in one read-only pass and prints one fix line per problem. It never refreshes a token, writes nothing, and runs no `claude` other than `claude --version`. Accounts appear by slot number and logins by an 8-hex fingerprint prefix, never a token or an email, so the output is safe to paste into an issue. `--json` prints the same findings for scripts. The exit status is 0 when everything is fine, 1 with warnings and 2 with errors.
+
+| Check | What it looks at |
+|---|---|
+| `claude` | `prime.claudePath`, then PATH, then `~/.local/bin/claude`; whether `claude --version` answers |
+| `keychain` | macOS: whether the live login's Keychain item reads cleanly. `rc=36` (errSecInteractionNotAllowed): the login keychain is locked, the session cannot reach it (SSH, launchd before login), or a `/login` is still writing. `rc=51` (errSecAuthFailed): the item's access control refuses `/usr/bin/security`. `rc=44`: no item |
+| `plaintext` | `~/.claude/.credentials.json`: on macOS, a duplicate or a stale copy of the Keychain login (fingerprint prefixes compared); on Linux, readable by other users |
+| `live-login` | the live login (`~/.claude.json` and its token) belongs to a slot, and its token is not another slot's |
+| `upstream` | upstream `claude-swap` still installed (uv or pipx), running, or its menu bar LaunchAgent installed |
+| `service` | installed and running; its file written by cc-swap 0.2.0 or later (`CC_SWAP_SERVICE`); pinned to this `cc-swap` and version; its process started after the last install; the same `CLAUDE_CONFIG_DIR` as this shell |
+| `lease` | who holds the engine lease (the service, another engine, nobody) and whether a re-login paused switching |
+| `settings` | `settings.json` parses and every value is in range |
+| `priming` | while priming is on, a reminder to re-check its isolation after Claude Code upgrades |
+| per slot | stored login present and readable, login deadline (expired, or under 7 days), quarantine, two slots holding the same login |
+
+In Fleet, Account settings → `v` (*Verify logins*) runs the same checks in a modal; `r` runs them again.
+
+`cc-swap init` is the onboarding and migration checklist. It prints `ok`, `FIX` or `TODO` for each step: Claude Code installed → logged in → the live login saved in a slot → two or more accounts → upstream claude-swap gone → strategy `maximize` → service running on this build → priming off unless verified. It exits 1 until every step is ok, so re-run it after each one. Without `--apply` it writes nothing; `cc-swap init --apply` does the two idempotent steps (`cc-swap config set autoswitch.strategy maximize`, and `cc-swap service install` once the login, slot and upstream steps are ok).
+
+### Why didn't it switch?
+
+`cc-swap why` prints the decision the running engine last published to its state file, if it is fresh (the rule Fleet's `now` line uses) and about the account that is live now, and explains its reason code with the table below. Otherwise it runs `cc-swap auto --once --dry-run` to show what a tick would decide now (`--no-fallback` skips that, `--json` is for scripts). The same codes appear as `no switch: <code>` in `cc-swap auto` output and the engine log.
+
+| Code | Meaning | What to do |
+|---|---|---|
+| `below-threshold` | The active account is below autoswitch.threshold (strategies best and consume-first). | Nothing; lower autoswitch.threshold to switch earlier. |
+| `cooldown` | A proactive switch happened less than autoswitch.cooldownSeconds ago. | Wait, or lower autoswitch.cooldownSeconds. |
+| `no-candidates` | No other account can take you: every other one is disabled, excluded, quarantined or an API key. | cc-swap add another account, cc-swap enable one, or re-login a quarantined one (cc-swap doctor). |
+| `no-qualifying-candidate` | Other accounts exist, but none is far enough below the thresholds, or their usage is unreadable this tick. | Wait for a reset (cc-swap list shows when), or loosen the thresholds. |
+| `no-comparison` | No candidate's usage could be read this tick. | Check the network and cc-swap list; if it persists, cc-swap doctor. |
+| `no-viable-target` | Every candidate failed the last-moment check (dead token, another account's login, live session). | cc-swap doctor names the broken slots; re-login them. |
+| `reset-unknown` | consume-first: the active account's weekly reset time is unknown, so it cannot compare. | Nothing; it resumes once usage reports the reset. |
+| `already-consuming-soonest` | consume-first: no account with room resets sooner than the active one. | Nothing; this is the strategy working. |
+| `stale-usage` | consume-first: the target's usage could not be refreshed this tick (backoff or another poller). | Nothing; it retries next tick. |
+| `active-usage-unknown` | The active account's usage could not be read; failover follows after autoswitch.unhealthyTicks misses in a row. | Check the network and cc-swap list; if it persists, cc-swap doctor. |
+| `active-idle` | The active access token expired while Claude Code is idle; it refreshes on next use. | Nothing. |
+| `active-api-key` | The live login is a managed API key, which has no quota to watch. | cc-swap switch to a subscription account. |
+| `active-credential-unreadable` | The live login could not be read cleanly (Keychain rc=36/51, or only a stale plaintext copy), so switching would overwrite a login cc-swap cannot see. | cc-swap doctor; unlock the login keychain. Switching resumes by itself once a read succeeds. |
+| `unmanaged-active-account` | The live login belongs to no slot, or to a different account than the slot it claims. | cc-swap add (after checking which account you are logged in as). |
+| `new-login-not-backed-up` | A new /login on the active slot is not backed up yet; the engine waits until it is. | Wait a tick; if it persists, cc-swap add --slot N. |
+| `no-active-account` | Nobody is logged in to Claude Code. | Run claude and /login, then cc-swap add. |
+| `already-active` | The chosen target was already the live login when the switch ran. | Nothing. |
+| `maximize-paused` | A Fleet re-login paused switching (pausedUntil, at most 10 minutes). | Finish or cancel the re-login; the pause also ends by itself. |
+| `maximize-pending` | A soft mark is crossed; maximize waits for an idle moment (idleWindowMin) before switching. | Nothing; a hard ceiling switches at once. Lower maximize.idleWindowMin to switch sooner. |
+| `maximize-hold` | maximize sees no reason to move: below every soft mark and no better-scored account (or within rebalanceCooldownMin). | Nothing. |
 
 ---
 
