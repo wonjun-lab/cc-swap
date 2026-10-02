@@ -583,6 +583,50 @@ class TestResetWait:
                           samples=self.SLOW))
         assert got.code == "reset-wait"
 
+    # Review of rel/0.4.0: the pace was projected to 100% from the newest
+    # sample's time but compared with the minutes to the reset from now, and
+    # a sample still counts as fresh for idleWindowMin (10) minutes.
+
+    def test_the_projection_counts_from_now_not_from_the_newest_sample(self):
+        # 93 -> 96 over 10 min (0.3 pt/min), the newest reading 8 min old
+        # (a 429 backoff): 100% ~5 min from now, before the reset in 10.
+        stale = rows((18 * 60, 93, 40), (8 * 60, 96, 40))
+        got = decide(snap("1", resets(acct("1", 96, 40), m5=10), acct("2", 0, 10),
+                          samples=stale))
+        assert isinstance(got, Switch) and got.trigger == "hard" and got.target == "2"
+        # The same pace read just now: 100% in ~13 min, 3 past the reset.
+        fresh = rows((600, 93, 40), (0, 96, 40))
+        got = decide(snap("1", resets(acct("1", 96, 40), m5=10), acct("2", 0, 10),
+                          samples=fresh))
+        assert isinstance(got, Hold) and got.code == "reset-wait"
+
+    def test_an_old_sample_still_waits_when_the_reset_comes_first(self):
+        # 1 pt/min from 80% (soft), newest 8 min old: 100% in 12 min from
+        # now, exactly the reset in 10 plus the 2-minute margin.
+        old = rows((18 * 60, 70, 40), (8 * 60, 80, 40))
+        got = decide(snap("1", resets(acct("1", 80, 40), m5=10), acct("2", 0, 10),
+                          samples=old))
+        assert isinstance(got, Hold) and got.code == "reset-wait"
+        sooner = rows((18 * 60, 69, 40), (8 * 60, 80, 40))   # 1.1 pt/min: 10.2 min
+        got = decide(snap("1", resets(acct("1", 80, 40), m5=10), acct("2", 0, 10),
+                          samples=sooner))
+        assert getattr(got, "code", None) != "reset-wait"
+
+    def test_over_the_hard_cap_a_recent_429_never_waits(self):
+        from dataclasses import replace
+
+        # Waiting past the hard cap leans on polling every 60 s to catch a
+        # climb to 100%; a token that just 429'd cannot be polled like that.
+        over = snap("1", resets(acct("1", 96, 40), m5=8), acct("2", 10, 10), samples=self.SLOW)
+        assert decide(over).code == "reset-wait"
+        got = decide(replace(over, active_recent_429=True))
+        assert isinstance(got, Switch) and got.trigger == "hard" and got.target == "2"
+        # Under the hard cap (a soft trigger) 100% is still far off: it waits.
+        under = snap("1", resets(acct("1", 80, 40), m5=8), acct("2", 10, 10),
+                     samples=rows((600, 78, 40), (0, 80, 40)))
+        got = decide(replace(under, active_recent_429=True))
+        assert isinstance(got, Hold) and got.code == "reset-wait"
+
 
 # -- preempt and the idle pattern (maximize.preempt / learnIdlePattern) ------------------
 

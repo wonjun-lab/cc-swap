@@ -295,6 +295,27 @@ class TestResetWait:
         assert no_switch_reasons(h) == ["reset-wait"]
         assert self.next_poll(h) is None
 
+    def test_over_the_hard_cap_a_recent_429_switches_instead(self, temp_home):
+        # 1 pt / 3 min: without the 429 every tick waits (as above). At 95%
+        # (hard) a token that just 429'd cannot be polled every 60 s to
+        # catch a climb to 100%: the hard switch happens.
+        h = make(temp_home)
+        reset_at = h.clock.now + 13 * 60
+        for p5 in (93, 94):
+            assert h.tick_with_usage(self.usage(h, p5, reset_at)) is TickOutcome.NO_ACTION
+            h.clock.advance(180)
+        now = h.clock.now
+        usage = self.usage(h, 95, reset_at)
+        entries = {
+            "1": UsageEntry(last_good=usage["1"], fetched_at=now, age_s=0.0,
+                            last_429_at=now - 60),
+            "2": UsageEntry(last_good=usage["2"], fetched_at=now, age_s=0.0),
+            "3": UsageEntry(last_good=usage["3"], fetched_at=now, age_s=0.0),
+        }
+        assert h.tick_with_entries(entries) is TickOutcome.SWITCHED
+        assert no_switch_reasons(h) == ["reset-wait"] * 2
+        assert [e.trigger for e in of(h, SwitchEvent)] == ["hard"]
+
     def test_hot_reload_rejects_an_out_of_range_value(self, temp_home):
         h = make(temp_home, maximize={"resetWaitMin": 20})
         h.tick_with_usage({"1": win(10, 10), "2": win(0, 40), "3": win(0, 50)})

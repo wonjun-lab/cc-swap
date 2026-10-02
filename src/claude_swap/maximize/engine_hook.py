@@ -599,6 +599,17 @@ def _history_inputs(
         return None, {}
 
 
+def _recent_429(entry, now: float) -> bool:
+    """Whether the active account's usage entry 429'd recently enough to
+    keep the post-429 cadence (``_pull_active_poll`` skips it then): a
+    reset-aware wait past the hard cap cannot count on 60 s polls."""
+    check = getattr(entry, "recent_429", None)
+    try:
+        return bool(check(now)) if callable(check) else False
+    except Exception:
+        return False
+
+
 def _reset_samples(engine: aw.AutoSwitchEngine, number: str) -> None:
     record = {"account": number, "samples": [], CHANGED_KEY: engine.clock()}
     engine._mutate_state(lambda s: s.__setitem__(SAMPLES_KEY, record))
@@ -1037,6 +1048,7 @@ def run_maximize_tick(
         login_deadlines=deadlines,
         forecast=forecast,
         rates7=rates7,
+        active_recent_429=_recent_429(entries.get(current), now),
     )
     decision = policy.decide(snap)
     rt.last_snapshot, rt.last_decision = snap, decision

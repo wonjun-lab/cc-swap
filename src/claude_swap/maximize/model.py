@@ -83,6 +83,9 @@ class Snapshot:
     # each account's 7d burn rate (pct/hour while active; absent = unknown).
     forecast: Forecast | None = None
     rates7: Mapping[str, float] = field(default_factory=dict)
+    # The active account's usage token 429'd recently (``UsageEntry.recent_429``):
+    # it keeps the post-429 cadence, so it cannot be polled every 60 s.
+    active_recent_429: bool = False
 
     def view(self, number: str | None) -> AccountView | None:
         """The account with this slot number, or None."""

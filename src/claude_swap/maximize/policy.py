@@ -40,8 +40,10 @@ The destination is always the top of ``landing_candidates``. With none:
 
 Reset-aware wait (``resetWaitMin``, 0 = off): a hard or soft trigger whose
 window resets within ``resetWaitMin`` minutes, and whose recent pace reaches
-100% no sooner than ``RESET_WAIT_MARGIN_MIN`` after that reset (with no pace
-known: still under its hard cap), is waited out instead — the reset clears
+100% no sooner than ``RESET_WAIT_MARGIN_MIN`` after that reset, counted
+from now rather than from the newest sample (with no pace known: still
+under its hard cap; never past the hard cap while the active token had a
+recent 429), is waited out instead — the reset clears
 the reason to switch, and a switch costs a full context re-read on the new
 account. The other window's triggers still apply; with none left the
 decision is a ``Hold`` carrying ``reset_wait_until``, which the at-limit
@@ -331,8 +333,13 @@ def reset_wait_left(
 
     It may when the reset is at most ``reset_wait_min`` minutes away and
     the pace (``rate``, points per minute) reaches 100% no sooner than
-    ``RESET_WAIT_MARGIN_MIN`` after it. With no pace to project (unknown, or
-    not climbing), only a window still under its hard cap waits.
+    ``RESET_WAIT_MARGIN_MIN`` after it. The projection starts at the newest
+    sample, which may be minutes old (a sample counts as fresh for
+    ``idleWindowMin``), so its age comes off the minutes to 100%. With no
+    pace to project (unknown, or not climbing), only a window still under
+    its hard cap waits. A window at or over its hard cap never waits while
+    the active token had a recent 429: the wait leans on polling every 60 s
+    to catch a climb to 100%, and that token keeps the post-429 cadence.
     """
     s = snap.settings
     reset = _window_reset(a, window)
@@ -342,10 +349,13 @@ def reset_wait_left(
     if left > s.reset_wait_min:
         return None
     pct = _window_pct(a, window)
+    cap = s.hard_5h if window == "5h" else s.hard_7d
+    if pct >= cap and snap.active_recent_429:
+        return None
     if rate is None or rate <= 0:
-        cap = s.hard_5h if window == "5h" else s.hard_7d
         return left if pct < cap else None
-    to_limit = max(LIMIT_PCT - pct, 0.0) / rate
+    age = max(snap.now - snap.samples[-1].ts, 0.0) / 60.0 if snap.samples else 0.0
+    to_limit = max(LIMIT_PCT - pct, 0.0) / rate - age
     return left if to_limit >= left + RESET_WAIT_MARGIN_MIN else None
 
 
