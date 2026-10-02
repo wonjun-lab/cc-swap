@@ -57,6 +57,8 @@ class TestRegistry:
             "maximize.pendingPollS", "maximize.rebalanceCooldownMin",
             "maximize.tieEpsilon", "maximize.lastResort", "maximize.planOverride",
             "maximize.loginExpiryGuardMin", "maximize.resetWaitMin",
+            "maximize.preempt", "maximize.learnIdlePattern",
+            "maximize.preemptHorizonMaxH", "maximize.busyRebalanceGap",
             "prime.enabled", "prime.model", "prime.jitterS", "prime.maxAttempts",
             "prime.claudePath",
         } <= keys
@@ -81,6 +83,8 @@ class TestRegistry:
             "maximize.tieEpsilon": (0.0, 2.0),
             "maximize.loginExpiryGuardMin": (0, 1440),
             "maximize.resetWaitMin": (0, 60),
+            "maximize.preemptHorizonMaxH": (1, 48),
+            "maximize.busyRebalanceGap": (0.0, 5.0),
             "prime.maxAttempts": (1, 5),
         }
 
@@ -687,3 +691,42 @@ class TestResetWaitMin:
         assert load_maximize_settings(tmp_path).reset_wait_min == 0
         assert unset_setting(tmp_path, "maximize.resetWaitMin")
         assert load_maximize_settings(tmp_path).reset_wait_min == 15
+
+
+class TestPreemptAndPatternSettings:
+    def test_defaults(self):
+        s = MaximizeSettings()
+        assert (s.preempt, s.learn_idle_pattern, s.preempt_horizon_max_h, s.busy_rebalance_gap) == (
+            True, True, 12, 0.5)
+
+    def test_lenient_load_reports_each_repair(self, tmp_path: Path):
+        _write(tmp_path, {"maximize": {
+            "preempt": "false", "learnIdlePattern": "maybe",
+            "preemptHorizonMaxH": 100, "busyRebalanceGap": -1,
+        }})
+        problems: list[str] = []
+        s = load_maximize_settings(tmp_path, problems=problems)
+        assert (s.preempt, s.learn_idle_pattern, s.preempt_horizon_max_h, s.busy_rebalance_gap) == (
+            False, True, 48, 0.0)
+        assert problems == [
+            "maximize.preempt must be true or false (no quotes), got 'false'; read as false",
+            "maximize.learnIdlePattern must be true or false, got 'maybe'; using default true",
+            "maximize.preemptHorizonMaxH is 100, outside 1-48; clamped to 48",
+            "maximize.busyRebalanceGap is -1, outside 0-5; clamped to 0",
+        ]
+
+    def test_strict_set(self, tmp_path: Path):
+        assert set_setting(tmp_path, "maximize.preempt", "false") is False
+        assert set_setting(tmp_path, "maximize.learnIdlePattern", "no") is False
+        assert set_setting(tmp_path, "maximize.preemptHorizonMaxH", "6") == 6
+        assert set_setting(tmp_path, "maximize.busyRebalanceGap", "1.5") == 1.5
+        s = load_maximize_settings(tmp_path)
+        assert (s.preempt, s.learn_idle_pattern, s.preempt_horizon_max_h, s.busy_rebalance_gap) == (
+            False, False, 6, 1.5)
+        for key, bad in (
+            ("maximize.preempt", "sometimes"), ("maximize.preemptHorizonMaxH", "0"),
+            ("maximize.preemptHorizonMaxH", "49"), ("maximize.busyRebalanceGap", "5.1"),
+            ("maximize.busyRebalanceGap", "inf"),
+        ):
+            with pytest.raises(ConfigError):
+                set_setting(tmp_path, key, bad)

@@ -577,3 +577,189 @@ class TestResetWait:
                           samples=self.SLOW))
         assert isinstance(got, Hold) and got.reset_wait_until is not None
         assert "resets in 8m" in got.reason
+
+    def test_the_hold_carries_its_code(self):
+        got = decide(snap("1", resets(acct("1", 96, 40), m5=8), acct("2", 10, 10),
+                          samples=self.SLOW))
+        assert got.code == "reset-wait"
+
+
+# -- preempt and the idle pattern (maximize.preempt / learnIdlePattern) ------------------
+
+
+def quiet(start_h: float, end_h: float, label: str = "23:00", end_label: str = "07:00"):
+    from claude_swap.maximize.model import QuietWindow
+
+    return QuietWindow(NOW + start_h * H, NOW + end_h * H, label, end_label)
+
+
+def pattern(*, p_busy: float | None = 0.8, current=None, next=None, days: int = 9):
+    from claude_swap.maximize.model import Forecast
+
+    return Forecast(days=days, p_busy_now=p_busy, current=current, next=next)
+
+
+def with_history(s: Snapshot, *, forecast=None, **rates: float) -> Snapshot:
+    from dataclasses import replace
+
+    return replace(s, forecast=forecast, rates7={k.lstrip("_"): v for k, v in rates.items()})
+
+
+# Active #1: 5h 30% (under soft), 7d 84% climbing 2 pts/h -> soft 90 in 3 h.
+BUSY5 = rows((600, 27, 84), (300, 28.5, 84), (0, 30, 84))
+
+
+def preempt_snap(*, samples="idle", forecast="default", candidate=None, active=None, **settings):
+    a = active or acct("1", 30, 84)
+    s = snap("1", a, candidate or acct("2", 10, 10, reset7_d=6), samples=samples, **settings)
+    f = pattern(next=quiet(5, 13)) if forecast == "default" else forecast
+    return with_history(s, forecast=f, _1=2.0)
+
+
+class TestPreempt:
+    def test_crossing_before_the_quiet_window_switches_at_idle(self):
+        got = decide(preempt_snap())
+        assert isinstance(got, Switch) and got.trigger == "preempt" and got.target == "2"
+        assert got.reason == (
+            "#1 7d 84% would pass 90% in ~3h, before your usual quiet time (23:00) "
+            "— moving to #2 now while you're idle"
+        )
+
+    def test_not_idle_holds_with_the_preempt_code(self):
+        got = decide(preempt_snap(samples=BUSY5))
+        assert isinstance(got, Hold) and got.code == "preempt" and not got.pending
+        assert "will move to #2 at the next idle moment" in got.reason
+
+    def test_a_candidate_that_would_cross_too_is_no_target(self):
+        # #2 at 81% is landable but climbs at the active's pace: 90% in 4.5 h,
+        # inside the 5 h and before its 7d reset (6 h). A second account at
+        # 60% (15 h) is the target, though #2 ranks first by score.
+        crossing = acct("2", 10, 81, reset7_d=0.25)
+        s = preempt_snap(candidate=crossing)
+        got = decide(s)
+        assert not (isinstance(got, Switch) and got.trigger == "preempt")
+        assert getattr(got, "code", None) != "preempt"
+        from dataclasses import replace
+
+        both = replace(s, accounts=(*s.accounts, acct("3", 10, 60, reset7_d=6)))
+        assert [v.number for v in landing_candidates(both)] == ["2", "3"]
+        got = decide(both)
+        assert isinstance(got, Switch) and got.trigger == "preempt" and got.target == "3"
+
+    def test_preempt_off_is_the_old_decision(self):
+        old = decide(snap("1", acct("1", 30, 84), acct("2", 10, 10, reset7_d=6), samples="idle"))
+        got = decide(preempt_snap(preempt=False))
+        assert got == old and got.trigger == "rebalance"
+
+    def test_a_crossing_after_the_quiet_window_starts_waits_for_it(self):
+        got = decide(preempt_snap(forecast=pattern(next=quiet(1, 9))))
+        assert not (isinstance(got, Switch) and got.trigger == "preempt")
+
+    def test_no_pattern_looks_4_hours_ahead(self):
+        got = decide(preempt_snap(forecast=None))
+        assert got.trigger == "preempt" and "within the next 4h" in got.reason
+        slow = with_history(preempt_snap(forecast=None), _1=1.0)   # 6 h away
+        assert not (isinstance(decide(slow), Switch) and decide(slow).trigger == "preempt")
+
+    def test_the_horizon_is_capped(self):
+        far = pattern(next=quiet(20, 28))
+        got = decide(with_history(preempt_snap(forecast=far), forecast=far, _1=0.65))  # ~9 h
+        assert got.trigger == "preempt" and "within the next 12h" in got.reason
+        capped = with_history(preempt_snap(forecast=far, preempt_horizon_max_h=6),
+                              forecast=far, _1=0.65)
+        assert not (isinstance(decide(capped), Switch) and decide(capped).trigger == "preempt")
+
+    def test_unknown_or_flat_pace_never_preempts(self):
+        for rates in ({}, {"_1": 0.0}):
+            got = decide(with_history(preempt_snap(), forecast=pattern(next=quiet(5, 13)), **rates))
+            assert not (isinstance(got, Switch) and got.trigger == "preempt"), rates
+
+    def test_a_7d_reset_before_the_crossing_is_no_reason(self):
+        got = decide(preempt_snap(active=acct("1", 30, 84, reset7_d=2 / 24)))
+        assert not (isinstance(got, Switch) and got.trigger == "preempt")
+
+    def test_the_rebalance_cooldown_applies(self):
+        got = decide(preempt_snap(last_switch_min=10))
+        assert isinstance(got, Hold) and got.code == "preempt"
+        assert got.reason.startswith("preempt cooldown (20 min left): #1 7d 84%")
+
+    def test_never_onto_a_worse_tier(self):
+        got = decide(preempt_snap(candidate=acct("2", 10, 10, reset7_d=6, tier="last_resort")))
+        assert not (isinstance(got, Switch) and got.trigger == "preempt")
+
+    def test_a_smaller_plan_climbs_faster(self):
+        # 20x active -> 5x #2 at 70%: 4x the pct pace, 90% in 2.5 h: no target.
+        big = acct("1", 30, 84, weight=4)
+        got = decide(preempt_snap(active=big, candidate=acct("2", 10, 70, reset7_d=6)))
+        assert not (isinstance(got, Switch) and got.trigger == "preempt")
+        same = decide(preempt_snap(active=big, candidate=acct("2", 10, 70, reset7_d=6, weight=4)))
+        assert same.trigger == "preempt"
+
+    def test_a_candidates_own_faster_pace_counts(self):
+        s = with_history(preempt_snap(candidate=acct("2", 10, 75, reset7_d=6)),
+                         forecast=pattern(next=quiet(5, 13)), _1=2.0, _2=4.0)
+        assert not (isinstance(decide(s), Switch) and decide(s).trigger == "preempt")
+
+    @pytest.mark.parametrize("active, trigger", [
+        (acct("1", 100, 84), "at-limit"),
+        (acct("1", 96, 84), "hard"),
+        (acct("1", 60, 84), "soft"),
+    ])
+    def test_never_overrides_the_usual_triggers(self, active, trigger):
+        got = decide(preempt_snap(active=active))
+        assert isinstance(got, Switch) and got.trigger == trigger
+
+    def test_never_overrides_reset_wait(self):
+        got = decide(preempt_snap(active=resets(acct("1", 60, 84), m5=5)))
+        assert isinstance(got, Hold) and got.code == "reset-wait"
+
+
+# Rebalance with a small gain (#2 0.875 vs #1 0.70) and a big one (#3 2.33).
+SMALL = (acct("1", 10, 30, reset7_d=7), acct("2", 0, 25, reset7_d=6))
+BIG = (acct("1", 10, 30, reset7_d=7), acct("2", 0, 0, reset7_d=3))
+
+
+class TestRebalanceDeferral:
+    def decide(self, accounts=SMALL, **forecast_kw) -> object:
+        f = pattern(**forecast_kw) if forecast_kw else None
+        return decide(with_history(snap("1", *accounts, samples="idle"), forecast=f))
+
+    def test_a_small_gain_in_a_busy_time_waits_for_the_quiet_window(self):
+        got = self.decide(next=quiet(3, 11))
+        assert isinstance(got, Hold) and got.code == "rebalance-deferred"
+        assert got.reason.startswith("rebalance deferred to your quiet time (23:00): #2 score")
+
+    def test_a_big_gain_rebalances_now(self):
+        got = self.decide(BIG, next=quiet(3, 11))
+        assert isinstance(got, Switch) and got.trigger == "rebalance"
+
+    def test_the_gap_setting(self):
+        s = with_history(snap("1", *SMALL, samples="idle", busy_rebalance_gap=0.1),
+                         forecast=pattern(next=quiet(3, 11)))
+        assert decide(s).trigger == "rebalance"
+
+    @pytest.mark.parametrize("kw", [
+        {"p_busy": 0.1, "next": quiet(3, 11)},                    # usually quiet now
+        {"current": quiet(-1, 2), "next": quiet(20, 28)},         # inside a quiet window
+        {"p_busy": None, "next": quiet(3, 11)},                   # never observed
+        {"next": quiet(7, 15)},                                   # more than 6 h away
+        {"next": None},                                           # none ahead
+    ])
+    def test_otherwise_it_rebalances_as_before(self, kw):
+        got = self.decide(**kw)
+        assert isinstance(got, Switch) and got.trigger == "rebalance", kw
+
+    def test_no_pattern_rebalances_as_before(self):
+        got = self.decide()
+        assert isinstance(got, Switch) and got.trigger == "rebalance"
+
+    def test_a_tier_move_is_never_deferred(self):
+        accounts = (acct("1", 10, 30, reset7_d=7, tier="last_resort"), acct("2", 0, 25, reset7_d=6))
+        got = self.decide(accounts, next=quiet(3, 11))
+        assert isinstance(got, Switch) and got.trigger == "rebalance"
+
+    def test_cooldown_still_comes_first(self):
+        s = with_history(snap("1", *SMALL, samples="idle", last_switch_min=10),
+                         forecast=pattern(next=quiet(3, 11)))
+        got = decide(s)
+        assert isinstance(got, Hold) and got.code is None and "cooldown" in got.reason

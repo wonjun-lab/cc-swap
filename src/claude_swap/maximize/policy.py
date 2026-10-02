@@ -6,9 +6,22 @@ Triggers, first match wins:
 2. hard       a hard cap reached, or reached within
               ``force_eta_min`` at the recent burn rate  busy or not
 3. soft       a soft threshold reached                  waits for idle
-4. rebalance  (a) active is excluded/last_resort and a
+4. preempt    the active 7d is on pace to pass soft7d
+              before the next quiet window, and a
+              landable account is not                   idle + cooldown
+5. rebalance  (a) active is excluded/last_resort and a
               higher tier can land, or (b) the same
               tier's best beats the active by > eps     idle + cooldown
+
+Preempt and rebalance (b) read the usage history (``Snapshot.rates7``,
+``Snapshot.forecast``; maximize/history.py). Preempt projects at each
+account's 7d burn rate (pct/hour while active): a target's own, but never
+below the active's scaled to the target's plan, since your usage moves with
+you. Its horizon is the time to the next quiet window, capped at
+``preemptHorizonMaxH`` (``NO_PATTERN_HORIZON_H`` with no pattern). In a
+usually-busy slot (P(busy) >= ``history.QUIET_P``, not inside a quiet window)
+a rebalance (b) gaining less than ``busyRebalanceGap`` waits for a quiet
+window starting within ``DEFER_WITHIN_S``.
 
 The destination is always the top of ``landing_candidates``. With none:
 
@@ -42,6 +55,7 @@ from dataclasses import dataclass
 from typing import Literal
 
 from claude_swap.maximize import idle
+from claude_swap.maximize.history import QUIET_P
 from claude_swap.maximize.model import (
     TIER_ORDER,
     AccountView,
@@ -49,6 +63,7 @@ from claude_swap.maximize.model import (
     Exhausted,
     Hold,
     Indeterminate,
+    QuietWindow,
     Snapshot,
     Switch,
 )
@@ -60,6 +75,10 @@ LIMIT_PCT = 100.0
 # The reset-aware wait holds only while the recent pace reaches 100% at
 # least this many minutes after the window resets.
 RESET_WAIT_MARGIN_MIN = 2.0
+# Preempt's horizon while no idle pattern is learned (cold start, or off).
+NO_PATTERN_HORIZON_H = 4.0
+# A rebalance in a busy slot waits only for a quiet window this close.
+DEFER_WITHIN_S = 6 * 3600.0
 
 
 def _pct(value: float) -> str:
@@ -376,6 +395,7 @@ def _reset_wait(
         reset_wait_until=max(
             r for r in (_window_reset(a, w) for w in waits) if r is not None
         ),
+        code="reset-wait",
     )
 
 
@@ -441,6 +461,125 @@ def _soft(snap: Snapshot, landing: list[AccountView], why: str) -> Decision:
     )
 
 
+def _cooldown_left(snap: Snapshot) -> float | None:
+    """Seconds of the rebalance cooldown left, or None when it is over.
+
+    It runs from the later of the last engine switch and the last change of
+    active account: a manual switch restarts it too."""
+    since = max(
+        (t for t in (snap.last_switch_at, snap.active_changed_at) if t is not None),
+        default=None,
+    )
+    if since is None:
+        return None
+    remaining_s = snap.settings.rebalance_cooldown_min * 60.0 - (snap.now - since)
+    return remaining_s if remaining_s > 0 else None
+
+
+def _hours(hours: float) -> str:
+    return f"~{max(1, round(hours * 60))}m" if hours < 1 else f"~{hours:.0f}h"
+
+
+def soft7_eta_h(v: AccountView, rate: float, snap: Snapshot) -> float | None:
+    """Hours until ``v``'s 7d passes soft7d at ``rate`` pct/hour; None when
+    it never does: not climbing, or its 7d window resets first."""
+    if rate <= 0:
+        return None
+    hours = max(snap.settings.soft_7d - v.pct7, 0.0) / rate
+    if v.reset7 is not None and v.reset7 <= snap.now + hours * 3600.0:
+        return None
+    return hours
+
+
+def preempt_horizon(snap: Snapshot) -> tuple[float, str]:
+    """``(hours, phrase)``: how far ahead preempt looks, and how a reason
+    says so. To the next quiet window when there is one within
+    ``preemptHorizonMaxH``; else that cap; with no pattern,
+    ``NO_PATTERN_HORIZON_H`` (never past the cap)."""
+    s = snap.settings
+    cap = float(s.preempt_horizon_max_h)
+    f = snap.forecast
+    if f is None:
+        hours = min(NO_PATTERN_HORIZON_H, cap)
+        return hours, f"within the next {hours:g}h"
+    if f.next is not None and f.next.start - snap.now <= cap * 3600.0:
+        return (
+            (f.next.start - snap.now) / 3600.0,
+            f"before your usual quiet time ({f.next.start_label})",
+        )
+    return cap, f"within the next {cap:g}h"
+
+
+def _preempt(
+    snap: Snapshot, a: AccountView, landing: list[AccountView]
+) -> Decision | None:
+    """Move at an idle moment before the active 7d passes soft7d in a busy
+    stretch; None when there is no reason to (decide goes on to rebalance).
+
+    The active's 7d must reach soft7d within the horizon at its burn rate,
+    and a landable account of no worse a tier must not: projected at its
+    own rate, but never below the active's scaled by plan (a 20x -> 5x move
+    climbs four times faster in pct). The rebalance cooldown applies.
+    """
+    s = snap.settings
+    rate = snap.rates7.get(a.number)
+    if not s.preempt or rate is None or rate <= 0 or not landing:
+        return None
+    horizon, when = preempt_horizon(snap)
+    hours = soft7_eta_h(a, rate, snap)
+    if hours is None or hours > horizon:
+        return None
+    target = None
+    for v in landing:
+        if TIER_ORDER[v.tier] > TIER_ORDER[a.tier]:
+            continue
+        theirs = max(snap.rates7.get(v.number, 0.0), rate * max(1.0, a.plan_weight / v.plan_weight))
+        crosses = soft7_eta_h(v, theirs, snap)
+        if crosses is None or crosses > horizon:
+            target = v
+            break
+    if target is None:
+        return None
+    why = (
+        f"#{a.number} 7d {_pct(a.pct7)} would pass {_pct(s.soft_7d)} "
+        f"in {_hours(hours)}, {when}"
+    )
+    left = _cooldown_left(snap)
+    if left is not None:
+        return Hold(
+            f"preempt cooldown ({left / 60:.0f} min left): {why}",
+            pending=False,
+            code="preempt",
+        )
+    if not idle.is_idle(snap.samples, snap.now, s):
+        return Hold(
+            f"{why} — will move to #{target.number} at the next idle moment "
+            f"({idle_note(snap)})",
+            pending=False,
+            code="preempt",
+        )
+    return Switch(
+        target.number,
+        "preempt",
+        f"{why} — moving to #{target.number} now while you're idle",
+    )
+
+
+def _deferred_to(snap: Snapshot, gain: float) -> QuietWindow | None:
+    """The quiet window a rebalance gaining ``gain`` waits for, or None to
+    rebalance as usual: only in a usually-busy slot outside a quiet window,
+    for a gain under ``busyRebalanceGap``, and for a window starting within
+    ``DEFER_WITHIN_S``."""
+    f = snap.forecast
+    if f is None or f.current is not None or f.p_busy_now is None:
+        return None
+    if f.p_busy_now < QUIET_P or gain >= snap.settings.busy_rebalance_gap:
+        return None
+    if f.next is None or f.next.start - snap.now > DEFER_WITHIN_S:
+        return None
+    return f.next
+
+
 def _rebalance(
     snap: Snapshot, a: AccountView, landing: list[AccountView]
 ) -> Decision:
@@ -453,9 +592,11 @@ def _rebalance(
     top = landing[0]
     a_score = score(a, snap.now)
     t_score = score(top, snap.now)
+    gain: float | None = None
     if TIER_ORDER[top.tier] < TIER_ORDER[a.tier]:
         why = f"#{a.number} is {a.tier} and #{top.number} ({top.tier}) can land"
     elif top.tier == a.tier and t_score - a_score > s.tie_epsilon:
+        gain = t_score - a_score
         why = (
             f"#{top.number} score {t_score:.2f} beats #{a.number} "
             f"{a_score:.2f} by more than {s.tie_epsilon:g}"
@@ -466,19 +607,19 @@ def _rebalance(
             f"(score {a_score:.2f})",
             pending=False,
         )
-    # The cooldown runs from the later of the last engine switch and the
-    # last change of active account: a manual switch restarts it too.
-    since = max(
-        (t for t in (snap.last_switch_at, snap.active_changed_at) if t is not None),
-        default=None,
-    )
-    if since is not None:
-        remaining_s = s.rebalance_cooldown_min * 60.0 - (snap.now - since)
-        if remaining_s > 0:
-            return Hold(
-                f"rebalance cooldown ({remaining_s / 60:.0f} min left): {why}",
-                pending=False,
-            )
+    remaining_s = _cooldown_left(snap)
+    if remaining_s is not None:
+        return Hold(
+            f"rebalance cooldown ({remaining_s / 60:.0f} min left): {why}",
+            pending=False,
+        )
+    quiet = _deferred_to(snap, gain) if gain is not None else None
+    if quiet is not None:
+        return Hold(
+            f"rebalance deferred to your quiet time ({quiet.start_label}): {why}",
+            pending=False,
+            code="rebalance-deferred",
+        )
     if not idle.is_idle(snap.samples, snap.now, s):
         return Hold(
             f"rebalance waits for idle ({idle_note(snap)}): {why}",
@@ -507,4 +648,7 @@ def decide(snap: Snapshot) -> Decision:
         return _hard(snap, a, landing, force)
     if soft is not None:
         return _soft(snap, landing, soft)
+    pre = _preempt(snap, a, landing)
+    if pre is not None:
+        return pre
     return _rebalance(snap, a, landing)

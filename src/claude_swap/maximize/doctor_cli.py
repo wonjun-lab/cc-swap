@@ -477,6 +477,14 @@ REASONS: dict[str, tuple[str, str]] = {
         "A hard or soft mark is crossed, but that window resets within maximize.resetWaitMin minutes and the recent pace will not reach 100% before then, so maximize waits for the reset instead of switching (a switch makes Claude Code re-read the whole context on the new account).",
         "Nothing; it switches at once if the window hits 100%. Set maximize.resetWaitMin to 0 to switch without waiting.",
     ),
+    "preempt": (
+        "The active account's 7d is on pace to pass soft7d before your next quiet time, and another account would not; maximize moves at the next idle moment (after rebalanceCooldownMin).",
+        "Nothing; set maximize.preempt to false to wait for the soft mark instead.",
+    ),
+    "rebalance-deferred": (
+        "A better-scored account exists, but this is usually a busy time and the gain is under maximize.busyRebalanceGap, so the move waits for your next quiet window (at most 6 hours away).",
+        "Nothing; lower maximize.busyRebalanceGap, or set maximize.learnIdlePattern to false, to rebalance at any idle moment.",
+    ),
 }
 
 #: Switch triggers (the README's "When it switches" table plus upstream's).
@@ -484,6 +492,7 @@ TRIGGERS: dict[str, str] = {
     "at-limit": "the active 5h or 7d window is at 100%",
     "hard": "a hard ceiling is reached (or the recent pace reaches one within forceEtaMin)",
     "soft": "a soft mark is crossed and the account went idle",
+    "preempt": "the active 7d is on pace to pass soft7d before your next quiet time; moved while idle",
     "rebalance": "a better-scored account exists, or the active one is excluded / last resort",
     "failover": "the active account's usage could not be read several times in a row",
     "proactive": "the active account reached autoswitch.threshold",
@@ -558,6 +567,24 @@ def published_why(backup_root, *, now: float) -> dict | None:
             "wouldDecide": engine,
         }
     return engine
+
+
+def idle_pattern(backup_root, *, now: float) -> dict:
+    """The learned idle pattern (``history.summary``) for ``why``; reads
+    the usage history and settings, writes nothing."""
+    from claude_swap.maximize import history
+    from claude_swap.settings import load_maximize_settings
+
+    try:
+        enabled = load_maximize_settings(backup_root).learn_idle_pattern
+    except Exception:
+        enabled = True
+    return history.summary(history.read(backup_root, now).slots, now, enabled=enabled)
+
+
+def _pattern_line(pattern: dict) -> str:
+    text = str(pattern.get("text") or "").removeprefix("idle pattern: ")
+    return dimmed(f"  pattern  {text}")
 
 
 def _published_code(state: Mapping, published) -> str | None:
@@ -659,6 +686,9 @@ def _why_lines(why: dict) -> list[str]:
         if would.get("target") and would["decision"] in ("switch", "pending"):
             verdict += f" → #{would['target']}"
         lines.append(dimmed(f"  if on    the engine would {verdict}: {would['reason']}"))
+    pattern = why.get("idlePattern")
+    if pattern:
+        lines.append(_pattern_line(pattern))
     return lines
 
 
@@ -691,7 +721,10 @@ def why_command(argv: list[str], *, clock: Callable[[], float] = time.time) -> N
     )
     args = parser.parse_args(argv)
     root = paths.get_backup_root()
-    why = published_why(root, now=clock())
+    now = clock()
+    why = published_why(root, now=now)
+    if why is not None:
+        why["idlePattern"] = idle_pattern(root, now=now)
     if args.json:
         payload = {"schemaVersion": SCHEMA_VERSION, **(why or {"source": "none"})}
         if why is None:
@@ -706,6 +739,7 @@ def why_command(argv: list[str], *, clock: Callable[[], float] = time.time) -> N
         "No engine published a fresh decision (no engine running, the strategy "
         "is not maximize, or the login changed since)."
     )
+    print(_pattern_line(idle_pattern(root, now=now)))
     if args.no_fallback:
         print(dimmed("Run cc-swap auto --once --dry-run to see what one would decide now."))
         sys.exit(0)

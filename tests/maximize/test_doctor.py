@@ -481,6 +481,32 @@ def test_priming_paused_by_a_claude_update_is_a_warning_naming_prime_verify(worl
     assert steps["priming"].status == "FIX" and steps["priming"].fix == "cc-swap prime verify"
 
 
+def test_idle_pattern_is_reported_as_info(world):
+    from claude_swap.maximize import history as hist
+
+    world.healthy()
+    [f] = find(run(world), "idle-pattern", "info")
+    assert f.detail == "idle pattern: learning (0 of 3 days observed)"
+    slots = tuple(
+        hist.SlotObs(NOW - 4 * DAY + i * hist.SLOT_S, i % 96 >= 40)
+        for i in range(4 * 96)
+    )
+    hist._rewrite(hist.path_for(world.root), hist.History(slots=slots))
+    [f] = find(run(world), "idle-pattern", "info")
+    # 4 x 24 h of observations touch 4 or 5 local dates, by time zone.
+    assert f.detail.startswith(("idle pattern: 4 days learned, ", "idle pattern: 5 days learned, "))
+    assert "@" not in hist.path_for(world.root).read_text()
+
+
+def test_idle_pattern_off_or_another_strategy(world):
+    world.healthy()
+    world.settings(maximize={"learnIdlePattern": False})
+    [f] = find(run(world), "idle-pattern", "info")
+    assert f.detail == "idle pattern: off (maximize.learnIdlePattern)"
+    world.settings(autoswitch={"strategy": "best"})
+    assert find(run(world), "idle-pattern") == []
+
+
 def test_settings_not_json_is_an_error(world):
     world.healthy()
     (world.root / "settings.json").write_text("{nope")
