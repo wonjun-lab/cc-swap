@@ -757,6 +757,10 @@ class AutoSwitchEngine:
     is wall time (persisted cooldown timestamps must survive processes).
     """
 
+    #: Called before every tick of :meth:`run_loop` (the service's log
+    #: rotation); an exception it raises is swallowed.
+    housekeeping: Callable[[], None] | None = None
+
     def __init__(
         self,
         switcher: ClaudeAccountSwitcher,
@@ -2669,6 +2673,11 @@ class AutoSwitchEngine:
             self._wake.clear()
             if self._stop.is_set():
                 return self._exit_code or 0
+            if self.housekeeping is not None:
+                try:
+                    self.housekeeping()
+                except Exception:
+                    pass
             try:
                 outcome = self.tick()
             except Exception as e:  # pragma: no cover - tick() already guards

@@ -740,6 +740,7 @@ Defaults live in settings.json in the backup root; flags override them.
         claim_for_auto,
     )
     from claude_swap.autoswitch import AutoSwitchEngine, AutoSwitchEvent
+    from claude_swap.maximize.logrotate import LogRotator
     from claude_swap.printer import accent, yellowed
     from claude_swap.settings import (
         MAXIMIZE_CLI_FLAGS,
@@ -812,6 +813,13 @@ Defaults live in settings.json in the backup root; flags override them.
 
         # Loop mode: SIGTERM (systemd stop) exits the loop cleanly.
         signal.signal(signal.SIGTERM, lambda *_: engine.stop())
+        # As the launchd service, keep auto.log / auto.err.log bounded: rotate
+        # now and then at most hourly from the loop (maximize/logrotate.py).
+        if not args.dry_run:
+            rotator = LogRotator()
+            if rotator.active:
+                rotator.maybe_rotate()
+                engine.housekeeping = rotator.maybe_rotate
         if not args.json:
             if maximize is not None:
                 policy = (

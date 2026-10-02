@@ -50,6 +50,7 @@ from pathlib import Path
 
 from claude_swap import launch_agent, paths
 from claude_swap.exceptions import ClaudeSwitchError
+from claude_swap.maximize.logrotate import SERVICE_ENV
 from claude_swap.session import session_profile_containing
 from claude_swap.settings import load_prime_settings, set_setting
 
@@ -174,9 +175,10 @@ def service_env(
     env = {
         "PATH": service_path(program, claude_path, platform=platform, home=home),
         "PYTHONUNBUFFERED": "1",
-        # The engine exits non-zero (for a restart) on a stuck Keychain hold
-        # only when it knows it is the service.
-        "CC_SWAP_SERVICE": "1",
+        # Tells `cc-swap auto` it is the service: it rotates the launchd logs
+        # (maximize/logrotate.py) and exits non-zero for a restart on a stuck
+        # Keychain hold; a terminal run does neither.
+        SERVICE_ENV: "1",
     }
     if platform == "linux" and xdg_data_home:
         # The Linux backup root follows $XDG_DATA_HOME (paths.get_backup_root);
