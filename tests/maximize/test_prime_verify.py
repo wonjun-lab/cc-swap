@@ -184,6 +184,73 @@ class TestPrimerGate:
         primer.run_due(rig.snap())
         assert len(runner.calls) == 1
 
+    # -- item 4: re-check just before the launch ------------------------------------
+
+    def _during_precheck(self, rig, primer, action):
+        """Run ``action`` once the first launch's usage pre-check starts: after
+        the tick's version gate, before the launch."""
+        original = primer._fresh_reading
+        done = []
+
+        def wrapped(*a, **kw):
+            if not done:
+                done.append(1)
+                action()
+            return original(*a, **kw)
+
+        primer._fresh_reading = wrapped
+
+    def test_a_binary_swapped_after_the_gate_is_not_launched(self, rig):
+        runner = StubRunner(rig)
+        primer = rig.primer(runner=runner)
+        self._during_precheck(
+            rig, primer, lambda: rig.fake.path.write_text(rig.fake.path.read_text() + "\n# updated\n")
+        )
+        primer.run_due(rig.snap())
+        assert runner.calls == []
+        assert rig.primes() == {}  # nothing claimed: the next tick retries
+        primer.run_due(rig.snap())  # the next tick gates the new binary afresh
+        assert len(runner.calls) == 1
+
+    def test_manual_prime_reports_why_a_swapped_binary_was_held_back(self, rig):
+        runner = StubRunner(rig)
+        primer = rig.primer(runner=runner)
+        self._during_precheck(
+            rig, primer, lambda: rig.fake.path.write_text(rig.fake.path.read_text() + "\n# updated\n")
+        )
+        primer.prime_now(rig.snap(), sleep=rig.clock.advance)
+        assert runner.calls == []
+        assert any("changed" in why for why in primer.not_primed.values())
+
+    def test_no_prime_launches_while_claude_update_holds_its_lock(self, rig):
+        from claude_swap.locking import FileLock
+
+        runner = StubRunner(rig)
+        primer = rig.primer(runner=runner)
+        lock = FileLock(rig.switcher.backup_dir / ".claude_update.lock", timeout=0)
+        assert lock.acquire()
+        try:
+            primer.run_due(rig.snap())
+            assert runner.calls == []
+            assert rig.primes() == {}
+        finally:
+            lock.release()
+        primer.run_due(rig.snap())
+        assert len(runner.calls) == 1
+
+    def test_a_claude_update_that_starts_after_the_gate_blocks_the_launch(self, rig):
+        from claude_swap.locking import FileLock
+
+        runner = StubRunner(rig)
+        primer = rig.primer(runner=runner)
+        lock = FileLock(rig.switcher.backup_dir / ".claude_update.lock", timeout=0)
+        self._during_precheck(rig, primer, lambda: lock.acquire())
+        try:
+            primer.run_due(rig.snap())
+            assert runner.calls == []
+        finally:
+            lock.release()
+
     def test_verify_lifts_the_pause_without_a_restart(self, rig, monkeypatch):
         self._changed(rig, monkeypatch)
         runner = StubRunner(rig)

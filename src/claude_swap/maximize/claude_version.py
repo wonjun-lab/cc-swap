@@ -15,6 +15,10 @@ from __future__ import annotations
 
 import re
 
+#: ``cc-swap claude-update`` holds this lock (in the backup root) while
+#: ``claude update`` runs; the priming guard reads it to stay clear.
+UPDATE_LOCK_FILENAME = ".claude_update.lock"
+
 VERSION_RE = re.compile(
     r"(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z.-]+))?(?:\+([0-9A-Za-z.-]+))?"
 )

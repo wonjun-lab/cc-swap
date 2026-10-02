@@ -53,7 +53,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from claude_swap.maximize.claude_version import parse_version
+from claude_swap.maximize.claude_version import UPDATE_LOCK_FILENAME, parse_version
 
 VERIFY_FILENAME = "prime_verify.json"
 VERSION_TIMEOUT_S = 15.0
@@ -168,6 +168,22 @@ def identity(claude_path: str) -> list[Any] | None:
     except OSError:
         return None
     return [real, st.st_ino, st.st_mtime_ns, st.st_size]
+
+
+def update_in_progress(root: Path) -> bool:
+    """Whether ``cc-swap claude-update`` holds its lock (``claude update`` is
+    replacing the binary). A lock that cannot be checked counts as held:
+    this guards a launch, and holding one back is the safe error."""
+    from claude_swap.locking import FileLock
+
+    lock = FileLock(Path(root) / UPDATE_LOCK_FILENAME, timeout=0)
+    try:
+        if lock.acquire():
+            lock.release()
+            return False
+    except OSError:
+        pass
+    return True
 
 
 def current_version(

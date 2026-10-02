@@ -68,7 +68,12 @@ from claude_swap.autoswitch import STATE_FILENAME, STATE_SCHEMA_VERSION
 from claude_swap.exceptions import LockError
 from claude_swap.json_output import SCHEMA_VERSION
 from claude_swap.locking import FileLock
-from claude_swap.maximize.claude_version import VERSION_RE, parse_version, sort_key
+from claude_swap.maximize.claude_version import (
+    UPDATE_LOCK_FILENAME,
+    VERSION_RE,
+    parse_version,
+    sort_key,
+)
 from claude_swap.maximize.primer import resolve_claude_path
 from claude_swap.paths import get_backup_root, get_claude_config_home
 from claude_swap.printer import accent, dimmed, error
@@ -76,7 +81,7 @@ from claude_swap.settings import atomic_write_json, load_prime_settings
 
 PACKAGE = "@anthropic-ai/claude-code"
 DIST_TAGS_URL = f"https://registry.npmjs.org/-/package/{PACKAGE}/dist-tags"
-LOCK_FILENAME = ".claude_update.lock"
+LOCK_FILENAME = UPDATE_LOCK_FILENAME
 DEFAULT_UPDATE_TIMEOUT = 600.0
 VERSION_TIMEOUT = 30.0
 LOOKUP_TIMEOUT = 10.0

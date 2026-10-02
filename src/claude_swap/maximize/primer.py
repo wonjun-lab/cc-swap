@@ -753,6 +753,9 @@ class Primer:
         self._version_reader = version_reader
         self._gate_warned: tuple[str | None, str | None] | None = None
         self._gate_version: str | None = None
+        # `(binary identity,)` the version gate last passed under; None when
+        # the gate has not passed (or is off). Re-checked just before a launch.
+        self._gate_identity: tuple[list | None] | None = None
 
     @property
     def profile_dir(self) -> Path:
@@ -887,7 +890,11 @@ class Primer:
             return None
         from claude_swap.maximize import prime_verify
 
+        self._gate_identity = None
         try:
+            # Read before the gate: a binary swapped while it runs then
+            # differs from this when the launch re-checks.
+            identity = prime_verify.identity(claude)
             verdict = prime_verify.gate(
                 self.engine.switcher.backup_dir, claude,
                 reader=self._version_reader, clock=self._clock,
@@ -904,6 +911,7 @@ class Primer:
         self._gate_version = verdict.current
         if verdict.ok:
             self._gate_warned = None
+            self._gate_identity = (identity,)
             return None
         pair = (verdict.verified, verdict.current)
         events: list[AutoSwitchEvent] = []
@@ -1037,11 +1045,29 @@ class Primer:
             if self._is_active(num):
                 return self._skip_active(target, entry, self._clock()), False, None
             launch_at = self._clock()
+        # The version gate ran at the start of the tick; the checks above can
+        # take a while, and `claude update` may have run since.
+        stale = self._launch_blocked(claude)
+        if stale is not None:
+            return self._held_back(num, stale)
         attempts = attempts_used(entry, target.window_key, launch_at) + 1
         refused = self._claim(email, target.window_key, attempts, launch_at, entry)
         if refused is not None:
             return self._held_back(num, refused)
         return self._launch(target, claude, token, wait or self._sleep), True, None
+
+    def _launch_blocked(self, claude: str) -> str | None:
+        """Why a launch must wait, from a re-check just before it: the
+        ``claude`` binary is no longer the one the version gate passed, or a
+        ``cc-swap claude-update`` is replacing it right now."""
+        from claude_swap.maximize import prime_verify
+
+        if prime_verify.update_in_progress(self.engine.switcher.backup_dir):
+            return "a `claude update` is in progress"
+        if self._version_gate and self._gate_identity is not None:
+            if prime_verify.identity(claude) != self._gate_identity[0]:
+                return "claude changed since the version check; re-checked next tick"
+        return None
 
     @staticmethod
     def _held_back(num: str, why: str) -> tuple[list[PrimeEvent], bool, str]:
