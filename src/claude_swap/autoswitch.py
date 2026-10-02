@@ -2366,6 +2366,19 @@ class AutoSwitchEngine:
                     reason="active-credential-unreadable", detail=str(exc),
                 ))
                 return TickOutcome.NO_ACTION
+            if result and result.get("autoOff") and not result.get("switched"):
+                # `cc-swap auto off` landed after this tick read the state:
+                # the switch refused, which is not an already-active no-op.
+                from claude_swap.maximize.pause import auto_off, auto_off_detail
+
+                off = auto_off(self._read_state())
+                self._emit(
+                    NoSwitchEvent(
+                        reason="auto-off",
+                        detail=auto_off_detail(off) if off is not None else "",
+                    )
+                )
+                return TickOutcome.NO_ACTION
             if not result or not result.get("switched"):
                 self._emit(
                     NoSwitchEvent(

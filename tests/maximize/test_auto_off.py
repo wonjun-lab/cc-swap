@@ -137,6 +137,27 @@ class TestMaximizeEngine:
         assert h.tick_with_usage(HARD) is not TickOutcome.SWITCHED
         assert h.active_number() == 1
 
+    def test_the_refusal_at_switch_time_says_auto_off_not_already_active(self, temp_home):
+        h = make(temp_home)
+        real = h.engine._freshen_target
+
+        def freshen(number, email):
+            pause.set_auto_off(h.switcher.backup_dir, True, by="cli", now=NOW, host="mbp")
+            return real(number, email)
+
+        h.engine._freshen_target = freshen
+        assert h.tick_with_usage(HARD) is TickOutcome.NO_ACTION
+        reasons = [e.reason for e in of(h, NoSwitchEvent)]
+        assert "auto-off" in reasons and "already-active" not in reasons
+        [event] = auto_off_events(h)
+        assert "cc-swap auto on" in event.detail and "by cli" in event.detail
+        assert h.active_number() == 1
+
+    def test_the_documented_reasons_include_auto_off(self):
+        from claude_swap.maximize.doctor_cli import REASONS
+
+        assert "auto-off" in REASONS
+
 
 class TestUpstreamStrategies:
     USAGE = {

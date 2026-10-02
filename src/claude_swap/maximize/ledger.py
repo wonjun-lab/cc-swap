@@ -97,6 +97,10 @@ def tagged(fn: Callable[..., Any], **fields: Any) -> Callable[..., Any]:
     return run
 
 
+#: The ``reason`` of the result ``engine_switch`` returns when it refuses.
+AUTO_OFF_REFUSAL = "automatic switching was turned off"
+
+
 def engine_switch(engine, number: str, trigger: str):
     """``engine.switcher.switch_to(number)`` tagged as the engine's switch
     (``autoswitch._perform`` calls this instead of ``switch_to``, under the
@@ -109,7 +113,9 @@ def engine_switch(engine, number: str, trigger: str):
     except Exception:
         state = {}
     if auto_off(state) is not None:
-        return {"switched": False, "reason": "automatic switching was turned off"}
+        # `autoOff` marks the refusal so the caller reports `auto-off`, not a
+        # no-op switch onto the already-active account.
+        return {"switched": False, "reason": AUTO_OFF_REFUSAL, "autoOff": True}
     strategy = getattr(getattr(engine, "settings", None), "strategy", None)
     with switch_context(
         actor=ACTOR_ENGINE,
