@@ -291,48 +291,10 @@ def test_engine_status_identifies_the_service_by_pid():
 def test_engine_status_none_when_free():
     es = fleet.engine_status(held_elsewhere=False, holder_pid=4121, own=None, service=None)
     assert (es.holder, es.pid) == ("none", None)
-    text, tone = fleet.engine_line(es)
-    assert "nothing is switching" in text and tone == "warn"
     stopped = {"platform": "linux", "installed": True, "running": False, "pid": None,
                "state": "inactive", "linger": False}
     es = fleet.engine_status(held_elsewhere=False, holder_pid=None, own=None, service=stopped)
-    text, _ = fleet.engine_line(es)
-    assert "service stopped (systemd: inactive)" in text and "linger off" in text
-
-
-def test_status_lines_drop_suffixes_by_priority_when_narrow():
-    snap, mx, state = mockup()
-    rows = fleet.fleet_rows(snap, mx, PRIME, state, now=NOW)
-    msnap = fleet.fleet_snapshot(snap, mx, state, now=NOW)
-    dv = fleet.decision_view(state, msnap, now=NOW, poll_s=60)
-    es = fleet.engine_status(held_elsewhere=True, holder_pid=4121, own=None,
-                             service={"platform": "darwin", "running": True, "pid": 4121})
-    wide = fleet.status_lines(es, dv, rows, mx, PRIME, now=NOW, width=140)
-    assert [t.split()[0] for t, _ in wide] == ["engine", "now", "prime"]
-    assert "holds the lease — this TUI is a viewer" in wide[0][0]
-    assert "hard in ~1h50m" in wide[1][0] and "computed here" in wide[1][0]
-    assert "#2" in wide[2][0] and "#3 needs re-login" in wide[2][0]
-    narrow = fleet.status_lines(es, dv, rows, mx, PRIME, now=NOW, width=60)
-    assert all(len(t) <= 60 for t, _ in narrow)
-    assert narrow[1][0].startswith("now     HOLD — waiting for idle → #2")
-    assert "hard in" not in narrow[1][0]  # the lowest-priority part went first
-    head = fleet.header_line(mx, PRIME, rows, host="studio", ssh=True, now=NOW, width=112)
-    assert head.startswith("cc-swap @ studio (ssh) · maximize · 5h 50/95 · 7d 90/98")
-    assert "1 needs re-login" in head and len(head) == 112
-    short = fleet.header_line(mx, PRIME, rows, host="studio", ssh=True, now=NOW, width=50)
-    assert "1 needs re-login" in short and len(short) <= 50
-    off = fleet.status_lines(es, dv, rows, mx, replace(PRIME, enabled=False), now=NOW, width=140)
-    assert "priming off (s → Swap strategy)" in off[2][0]
-
-
-def test_attention_names_every_relogin_account():
-    snap, mx, state = mockup()
-    rows = fleet.fleet_rows(snap, mx, PRIME, state, now=NOW)
-    assert fleet.attention(rows) == (
-        "⚠ #3 old needs re-login (refresh token dead) — select it and press r"
-    )
-    healthy = [r for r in rows if r.login != "relogin"]
-    assert fleet.attention(healthy) is None
+    assert es.holder == "none" and es.service is stopped
 
 
 def test_login_expired_is_a_relogin_named_by_its_cause():
@@ -347,13 +309,6 @@ def test_login_expired_is_a_relogin_named_by_its_cause():
     assert rows["2"].login == "relogin" and rows["2"].login_expired is True
     assert rows["3"].login == "relogin" and rows["3"].login_expired is False
     assert fleet.relogin_count(list(rows.values())) == 2
-    assert fleet.attention([rows["2"]]) == (
-        "⚠ #2 lapsed needs re-login (login expired) — select it and press r"
-    )
-    assert fleet.attention([rows["2"], rows["3"]]) == (
-        "⚠ #2 lapsed (login expired), #3 dead (refresh token dead) need re-login"
-        " — select one and press r"
-    )
     steps = "\n".join(fleet.relogin_steps(rows["2"], ssh=False, host="h",
                                           claude_path=None, return_to=rows["1"]))
     assert "its login expired" in steps and "refresh token is dead" not in steps
@@ -361,60 +316,13 @@ def test_login_expired_is_a_relogin_named_by_its_cause():
     assert fleet.login_text(rows["3"]) == ("re-login needed (refresh token dead)", "crit")
 
 
-# -- layout -------------------------------------------------------------------------------
-
-
-@pytest.mark.parametrize(("width", "missing"), [
-    (140, set()),
-    (112, set()),
-    (100, {"rank", "7d in"}),
-    (80, {"rank", "7d in", "plan", "tier", "login"}),
-    (60, {"rank", "7d in", "plan", "tier", "login", "next prime"}),
-])
-def test_columns_for_widths(width, missing):
-    cols = fleet.columns_for(width)
-    assert set(fleet.ALL_COLUMNS) - set(cols) - {"5h win"} == missing | (
-        {"5h window"} if width < 64 else set()
-    )
-    assert ("5h win" in cols) == (width < 64)
-
-
-@pytest.mark.parametrize(("height", "detail", "menu", "prime_line", "keys"), [
-    (40, True, "full", True, "full"),
-    (32, True, "full", True, "full"),
-    (24, False, "full", True, "full"),
-    (18, False, "folded", True, "full"),
-    (12, False, "folded", False, "minimal"),
-])
-def test_fit_layout_keeps_attention_rows_and_status_first(height, detail, menu, prime_line, keys):
-    plan = fleet.fit_layout(height, 112, 6, attention=True)
-    assert (plan.detail, plan.menu, plan.prime_line, plan.keys) == (detail, menu, prime_line, keys)
-    assert plan.columns == fleet.columns_for(112)
-    # More accounts take their rows from the optional parts first.
-    assert fleet.fit_layout(height + 4, 112, 10, attention=True) == plan
-
-
-def test_row_cells_colour_against_maximize_thresholds():
-    snap, mx, state = mockup()
-    rows = {r.number: r for r in fleet.fleet_rows(snap, mx, PRIME, state, now=NOW)}
-    cols = fleet.columns_for(140)
-    cells = dict(zip(cols, fleet.row_cells(rows["1"], cols, now=NOW, mx=mx)))
-    assert cells["mark"] == ("*", "bold")
-    assert cells["5h"] == ("62%", "warn") and cells["7d"] == ("41%", "ok")
-    assert cells["5h window"][0] == f"running → {fleet.hhmm(NOW + 2 * H)}"
-    relogin = dict(zip(cols, fleet.row_cells(rows["3"], cols, now=NOW, mx=mx)))
-    assert relogin["5h"] == ("re-login", "crit") and relogin["land"] == ("re-login", "crit")
-    assert relogin["account"][1] == "crit"
-    narrow = fleet.columns_for(80)
-    team = dict(zip(narrow, fleet.row_cells(rows["6"], narrow, now=NOW, mx=mx)))
-    assert team["account"][0] == "team·LR"
-
-
 def _expiring(number, seconds_left, **kw):
     return replace(acc(number, **kw), login_expires_at=(NOW + seconds_left) * 1000)
 
 
-def test_login_cell_counts_down_amber_in_the_last_week_red_in_the_last_day():
+def test_login_deadline_tags_count_down_amber_in_the_last_week_red_in_the_last_day():
+    from claude_swap.maximize import home
+
     snap = accounts(
         acc(1, active=True),
         _expiring(2, DAY + 9 * H, alias="side"),
@@ -425,20 +333,14 @@ def test_login_cell_counts_down_amber_in_the_last_week_red_in_the_last_day():
     rows = {r.number: r for r in fleet.fleet_rows(snap, MX, PRIME, MaximizeState(), now=NOW)}
     assert rows["2"].login_deadline == NOW + DAY + 9 * H
     assert rows["1"].login_deadline is None
-    assert fleet.login_cell(rows["1"], NOW) == ("—", "dim")
-    assert fleet.login_cell(rows["2"], NOW) == ("1d 9h", "warn")
-    assert fleet.login_cell(rows["3"], NOW) == ("20h 0m", "crit")
-    assert fleet.login_cell(rows["4"], NOW) == ("expired", "crit")
-    assert fleet.login_cell(rows["5"], NOW) == ("20d", "dim")
-    cols = fleet.columns_for(140)
-    assert "login" in cols
-    cells = dict(zip(cols, fleet.row_cells(rows["2"], cols, now=NOW, mx=MX)))
-    assert cells["login"] == ("1d 9h", "warn")
-    assert (
-        f"login expires {local_clock(NOW + DAY + 9 * H)} (in 1d 9h)"
-        in fleet.detail_line(rows["2"], MX, now=NOW)
-    )
-    assert "login" not in fleet.detail_line(rows["1"], MX, now=NOW)
+
+    def tag(n):
+        return home.tag_for(rows[n], is_next=False, now=NOW, priming=False)
+
+    assert tag("2") == ("login 1d left", "warn")
+    assert tag("3") == ("login 20h left", "crit")
+    assert tag("4") == ("login expired", "crit")
+    assert not fleet.login_due(rows["5"], NOW) and not fleet.login_due(rows["1"], NOW)
 
 
 def test_land_note_names_the_login_guard():
@@ -447,32 +349,29 @@ def test_land_note_names_the_login_guard():
     rows = {r.number: r for r in fleet.fleet_rows(snap, MX, PRIME, MaximizeState(), now=NOW)}
     assert rows["2"].land == "login<2h" and rows["2"].landable is False
     assert rows["3"].land == "yes"
-    assert "login expires within the 120-min guard" in fleet.detail_line(rows["2"], MX, now=NOW)
 
 
 def test_attention_warns_of_logins_expiring_within_a_week():
+    from claude_swap.maximize import home
+
     snap = accounts(
         acc(1, active=True),
         _expiring(2, DAY + 9 * H, alias="side"),
         _expiring(5, 20 * DAY, alias="fine"),
     )
     rows = fleet.fleet_rows(snap, MX, PRIME, MaximizeState(), now=NOW)
-    side = f"login expires {local_clock(NOW + DAY + 9 * H)} (in 1d 9h)"
-    assert fleet.attention(rows, now=NOW) == (
-        f"⚠ #2 side {side} — re-login before then: select it and press r"
+    assert home.attention_parts(rows, now=NOW) == (
+        ["! #2 side login ends in 1d 9h — select it, press r"], "warn"
     )
-    assert fleet.attention_tone(rows, now=NOW) == "warn"
-    assert fleet.attention(rows) is None  # no clock: only dead logins
     soon = fleet.fleet_rows(
         accounts(acc(1, active=True), _expiring(3, 20 * H, alias="soon"),
                  _expiring(4, 2 * DAY, alias="next")),
         MX, PRIME, MaximizeState(), now=NOW,
     )
-    assert fleet.attention(soon, now=NOW) == (
-        "⚠ logins expire: #3 soon in 20h 0m, #4 next in 2d 0h — "
-        "re-login before then: select one and press r"
+    assert home.attention_parts(soon, now=NOW) == (
+        ["! #3 soon login ends in 20h 0m — select it, press r", "#4 next login ends in 2d 0h"],
+        "crit",
     )
-    assert fleet.attention_tone(soon, now=NOW) == "crit"
     assert fleet.login_due(soon[1], NOW) and not fleet.login_due(rows[2], NOW)
     # A dead login leads; an expiring one rides along.
     mixed = fleet.fleet_rows(
@@ -480,19 +379,13 @@ def test_attention_warns_of_logins_expiring_within_a_week():
                  acc(3, sentinel=USAGE_RELOGIN_REQUIRED, alias="old")),
         MX, PRIME, MaximizeState(), now=NOW,
     )
-    assert fleet.attention(mixed, now=NOW) == (
-        "⚠ #3 old needs re-login (refresh token dead) — select it and press r"
-        f" · #2 {side}"
+    assert home.attention_parts(mixed, now=NOW) == (
+        ["! #3 old needs re-login — select it, press r", "#2 side login ends in 1d 9h"],
+        "crit",
     )
-    assert fleet.attention_tone(mixed, now=NOW) == "crit"
-
-
-def test_detail_line_explains_rank_pace_and_landing():
-    snap, mx, state = mockup()
-    rows = {r.number: r for r in fleet.fleet_rows(snap, mx, PRIME, state, now=NOW)}
-    line = fleet.detail_line(rows["4"], mx)
-    assert line.startswith("rank 4 · 20x · pace 1.07 (78% left over 5.1d) · landable")
-    assert "primed" in line
+    steps = "\n".join(fleet.relogin_steps(rows[1], ssh=False, host="h", claude_path=None,
+                                          return_to=rows[0], now=NOW))
+    assert f"login expires {local_clock(NOW + DAY + 9 * H)} (in 1d 9h)" in steps
 
 
 # -- actions ------------------------------------------------------------------------------
