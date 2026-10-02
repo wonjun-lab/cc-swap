@@ -325,7 +325,9 @@ class TestSettings:
         assert runtime_for(h.engine).settings.soft_5h == 40.0
         write_settings(h, {"maximize": {"soft5h": 40, "pendingPollS": 5}})  # range 180-600
         h.tick_with_usage(usage)
-        assert "invalid maximize.pendingPollS" in of(h, ConfigWarningEvent)[-1].message
+        last = of(h, ConfigWarningEvent)[-1].message
+        assert "maximize.pendingPollS" in last
+        assert last.endswith("keeping the previous maximize settings")
         assert runtime_for(h.engine).settings.pending_poll_s == 180
         path = h.switcher.backup_dir / "settings.json"
         path.write_text("{not json")
@@ -339,7 +341,7 @@ class TestSettings:
         h = make(temp_home)
         usage = {"1": win(10, 10), "2": win(0, 10), "3": win(0, 50)}
         h.tick_with_usage(usage)
-        write_settings(h, {"maximize": {"idleWindowMin": 12.7}})
+        write_settings(h, {"maximize": {"idleWindowMin": 12.0}})  # integral float
         h.tick_with_usage(usage)
         assert runtime_for(h.engine).settings.idle_window_min == 12
         assert not of(h, ConfigWarningEvent)

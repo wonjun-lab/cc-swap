@@ -314,8 +314,8 @@ class TestProblemsReportEveryRepair:
 
     def test_an_integral_float_for_an_int_key_is_not_a_repair(self, tmp_path: Path):
         # Pure int truncation: 12.0 -> 12 changes nothing the user wrote.
-        loaded, problems = self._load(tmp_path, {"idleWindowMin": 12.0, "pendingPollS": 120.0})
-        assert (loaded.idle_window_min, loaded.pending_poll_s) == (12, 120)
+        loaded, problems = self._load(tmp_path, {"idleWindowMin": 12.0, "pendingPollS": 240.0})
+        assert (loaded.idle_window_min, loaded.pending_poll_s) == (12, 240)
         assert problems == []
 
     def test_an_int_for_a_float_key_is_not_a_repair(self, tmp_path: Path):
