@@ -387,6 +387,18 @@ def test_paused_engine_is_reported(world):
     assert "re-login #2" in f.detail and "5m" in f.detail
 
 
+def test_auto_off_is_reported(world):
+    world.healthy()
+    (world.root / "auto_off.json").write_text(json.dumps(
+        {"schemaVersion": 1, "autoOff": {"since": NOW - 3600, "by": "cli"}}
+    ))
+    findings = run(world)
+    [f] = [f for f in find(findings, "lease", "info") if "auto-switching is OFF" in f.detail]
+    assert "cc-swap auto on" in f.fix
+    # A standing user choice, not a problem: doctor's verdict is unchanged.
+    assert dr.exit_code(findings) == 0
+
+
 def test_default_lease_probe_creates_no_lock_file(tmp_path):
     held, pid = dr._lease_holder(tmp_path)
     assert (held, pid) == (False, None)

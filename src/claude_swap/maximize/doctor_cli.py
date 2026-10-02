@@ -490,10 +490,11 @@ def published_why(backup_root, *, now: float) -> dict | None:
     Fresh as Fleet's ``now`` line counts it (``fleet.fresh_s``), and for the
     account that is live now: a decision about another active account is
     history. A re-login pause wins over everything (it is what the engine is
-    honouring)."""
+    honouring), then ``cc-swap auto off`` (the engine still decides, but
+    never acts). A switch that just landed (published on the old account,
+    its target now live) still counts."""
     from claude_swap.maximize import pause
     from claude_swap.maximize import view as mxview
-    from claude_swap.maximize.fleet import fresh_s
 
     try:
         state = json.loads((backup_root / mxview.STATE_FILENAME).read_text(encoding="utf-8"))
@@ -514,6 +515,30 @@ def published_why(backup_root, *, now: float) -> dict | None:
             "action": action,
             "ageS": 0,
         }
+    engine = _engine_why(backup_root, now=now)
+    off = pause.effective_auto_off(backup_root, state)
+    if off is not None:
+        # The engine keeps deciding (and publishing "switch") while auto is
+        # off, but refuses to act on it: that refusal is the answer.
+        meaning, action = REASONS["auto-off"]
+        return {
+            "source": "auto-off",
+            "decision": "auto-off",
+            "code": "auto-off",
+            "reason": pause.auto_off_detail(off),
+            "meaning": meaning,
+            "action": action,
+            "ageS": 0,
+            "wouldDecide": engine,
+        }
+    return engine
+
+
+def _engine_why(backup_root, *, now: float) -> dict | None:
+    """The engine's fresh published decision about the live account, explained."""
+    from claude_swap.maximize import view as mxview
+    from claude_swap.maximize.fleet import fresh_s
+
     published = mxview.read_state(backup_root).decision
     if published is None:
         return None
@@ -525,12 +550,27 @@ def published_why(backup_root, *, now: float) -> dict | None:
         live = sequence.get("activeAccountNumber") if isinstance(sequence, dict) else None
     except (OSError, ValueError):
         live = None
-    if live is not None and published.active is not None and str(live) != published.active:
+    landed = (
+        published.decision == "switch"
+        and published.target is not None
+        and live is not None
+        and str(live) == published.target
+    )
+    if (
+        live is not None
+        and published.active is not None
+        and str(live) != published.active
+        and not landed
+    ):
         return None
     code = _decision_code(published.decision, published.pending)
     if published.decision == "switch":
         meaning = f"Switching: {TRIGGERS.get(published.trigger or '', published.trigger or 'switch')}."
-        action = "Nothing; the engine is switching (or just switched)."
+        action = (
+            f"Nothing; the engine switched (now on #{published.target})."
+            if landed
+            else "Nothing; the engine is switching (or just switched)."
+        )
     else:
         meaning, action = REASONS[code] if code in REASONS else ("", "")
     return {
@@ -552,6 +592,8 @@ def _why_lines(why: dict) -> list[str]:
     who = f"engine pid {why['pid']}" if why.get("pid") else "engine"
     if why["source"] == "paused":
         head = "PAUSED"
+    elif why["source"] == "auto-off":
+        head = "OFF — auto-switching is OFF"
     else:
         head = why["decision"].upper()
         if why.get("target"):
@@ -559,8 +601,11 @@ def _why_lines(why: dict) -> list[str]:
         if why.get("trigger"):
             head += f" ({why['trigger']})"
     active = f" on #{why['active']}" if why.get("active") else ""
-    when = "" if why["source"] == "paused" else f" · {dr.duration(why['ageS'])} ago"
-    lines = [f"{bolded(head)}{active}  " + dimmed(f"{who}{when}")]
+    when = "" if why["source"] in ("paused", "auto-off") else f" · {dr.duration(why['ageS'])} ago"
+    if why["source"] == "auto-off":
+        lines = [bolded(head)]
+    else:
+        lines = [f"{bolded(head)}{active}  " + dimmed(f"{who}{when}")]
     lines.append(f"  reason   {why['reason']}")
     if why.get("code"):
         lines.append(f"  code     {why['code']}")
@@ -568,6 +613,12 @@ def _why_lines(why: dict) -> list[str]:
         lines.append(f"  meaning  {why['meaning']}")
     if why.get("action"):
         lines.append(f"  do       {why['action']}")
+    would = why.get("wouldDecide")
+    if would:
+        verdict = would["decision"]
+        if would.get("target") and would["decision"] in ("switch", "pending"):
+            verdict += f" → #{would['target']}"
+        lines.append(dimmed(f"  if on    the engine would {verdict}: {would['reason']}"))
     return lines
 
 

@@ -989,7 +989,7 @@ def check_lease(ctx: Context) -> list[Finding]:
             if p.platform in ("darwin", "linux")
             else "run cc-swap auto in a terminal",
         ))
-    from claude_swap.maximize.pause import active_pause
+    from claude_swap.maximize.pause import active_pause, effective_auto_off
 
     paused = active_pause(ctx.state, p.now)
     if paused is not None:
@@ -998,6 +998,15 @@ def check_lease(ctx: Context) -> list[Finding]:
             "lease", "info",
             f"switching is paused for {duration(until - p.now)} more ({why})",
             "finish or cancel the Fleet re-login; the pause ends by itself",
+        ))
+    off = effective_auto_off(p.backup_root, ctx.state)
+    if off is not None:
+        since = f" since {_clock(off.since)}" if off.since is not None else ""
+        by = f" by {off.by}" if off.by else ""
+        out.append(Finding(
+            "lease", "info",
+            f"auto-switching is OFF{since}{by}: the engine decides but never switches or primes",
+            "cc-swap auto on (or Fleet Mode → o)",
         ))
     return out
 
