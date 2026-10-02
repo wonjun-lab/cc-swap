@@ -77,6 +77,7 @@ _SUBCOMMAND_FLAGS = {
 # commands (prime, service) register here; main() has a single hook for all.
 _FORK_COMMANDS: dict[str, str] = {
     "last-resort": "_last_resort_command",
+    "prime": "_prime_command",
 }
 
 
@@ -1128,6 +1129,14 @@ Examples:
         sys.exit(130)
 
 
+def _prime_command(argv: list[str]) -> None:
+    """Handle `cc-swap prime` (maximize/prime_cli.py). Imported lazily, so
+    other commands never load the primer."""
+    from claude_swap.maximize.prime_cli import prime_command
+
+    prime_command(argv)
+
+
 def _use_native_tls() -> None:
     """Route TLS trust decisions through the OS-native verifier.
 
@@ -1315,6 +1324,7 @@ cc-swap:
   %(prog)s auto --strategy maximize   per-window soft/hard auto-switching
   %(prog)s last-resort add|remove <a> use an account only as a last resort
   %(prog)s last-resort list           list last-resort accounts
+  %(prog)s prime [N ...] [--dry-run]  open idle accounts' 5h windows now
 
 Aliases: ls=list  rm=remove  update=upgrade""",
         formatter_class=argparse.RawDescriptionHelpFormatter,
