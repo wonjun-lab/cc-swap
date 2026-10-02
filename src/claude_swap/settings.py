@@ -14,6 +14,7 @@ from __future__ import annotations
 import dataclasses
 import json
 import logging
+import math
 import os
 import re
 import sys
@@ -285,13 +286,20 @@ def parse_model_names(value: str | None) -> tuple[str, ...]:
 
 
 def _clamped(settings, section: str = "autoswitch"):
-    """Clamp values into the SETTING_SPECS ranges; bad types → the default.
+    """Clamp values into the SETTING_SPECS ranges; bad types and non-finite
+    numbers (NaN, ±inf) → the default.
 
     ``section`` selects the registry rows; the result has ``settings``' type.
     """
 
     def num(value, default: float, lo: float, hi: float) -> float:
         if isinstance(value, bool) or not isinstance(value, (int, float)):
+            return default
+        # NaN and ±inf are not thresholds, they are a bad type like a string:
+        # `json.loads` accepts them, `int(nan)` raises, and NaN would slip
+        # through min/max unclamped. (An int never needs the check, and
+        # `isfinite` raises OverflowError on one too big for a float.)
+        if isinstance(value, float) and not math.isfinite(value):
             return default
         return float(min(max(value, lo), hi))
 
@@ -402,9 +410,10 @@ _BOOL_WORDS = {
 def parse_setting_value(spec: SettingSpec, raw_value: str):
     """Strictly parse a CLI-provided string for `cswap config set`.
 
-    Unlike the forgiving clamp on load, out-of-range or mistyped values raise
-    ConfigError so the user learns about the problem when setting the value,
-    not by silently degraded behavior at `cswap auto` time.
+    Unlike the forgiving clamp on load, out-of-range, mistyped or non-finite
+    (nan/inf) values raise ConfigError so the user learns about the problem
+    when setting the value, not by silently degraded behavior at `cswap auto`
+    time.
     """
     if spec.kind == "bool":
         # Never bool(str): bool("false") is True.
@@ -429,6 +438,12 @@ def parse_setting_value(spec: SettingSpec, raw_value: str):
                 f"'cswap config unset {spec.dotted}' to clear it"
             )
         return value
+    try:
+        finite = math.isfinite(float(raw_value))
+    except ValueError:
+        finite = True  # not a number at all: the parse below reports that
+    if not finite:
+        raise ConfigError(f"{spec.dotted} expects a finite number, got '{raw_value}'")
     try:
         value = int(raw_value) if spec.kind == "int" else float(raw_value)
     except ValueError:

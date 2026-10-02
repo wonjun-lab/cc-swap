@@ -37,6 +37,25 @@ def _settings_file(capsys) -> Path:
 
 
 class TestConfigList:
+    def test_list_survives_non_finite_values(self, temp_home, capsys):
+        # `json.loads` accepts NaN/Infinity; int(nan) used to crash the listing.
+        path = _settings_file(capsys)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            '{"maximize": {"idleWindowMin": NaN, "soft5h": Infinity},'
+            ' "autoswitch": {"unhealthyTicks": NaN}}'
+        )
+        code, out, err = _run([], capsys)
+        assert code == 0, err
+        assert "maximize.idleWindowMin" in out
+        assert "autoswitch.unhealthyTicks" in out
+
+    def test_set_rejects_non_finite(self, temp_home, capsys):
+        code, _, err = _run(["set", "maximize.idleWindowMin", "nan"], capsys)
+        assert code == 1
+        assert "finite" in err
+        assert not _settings_file(capsys).exists()
+
     def test_lists_all_keys_as_defaults(self, temp_home, capsys):
         code, out, _ = _run([], capsys)
         assert code == 0

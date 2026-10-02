@@ -84,6 +84,22 @@ class TestLoadSettings:
         assert loaded.threshold == AutoSwitchSettings().threshold
         assert loaded.include_api_key_accounts is True
 
+    @pytest.mark.parametrize("literal", ["NaN", "Infinity", "-Infinity", "1e400"])
+    @pytest.mark.parametrize("key, field", [
+        ("unhealthyTicks", "unhealthy_ticks"),  # int kind: int(nan) raised
+        ("threshold", "threshold"),  # float kind: NaN passed straight through
+        ("intervalSeconds", "interval_seconds"),
+        ("hysteresisPct", "hysteresis_pct"),
+    ])
+    def test_non_finite_numbers_fall_back_to_defaults(
+        self, tmp_path: Path, key, field, literal
+    ):
+        settings_path(tmp_path).write_text(
+            '{"autoswitch": {"%s": %s}}' % (key, literal)
+        )
+        loaded = load_settings(tmp_path)
+        assert getattr(loaded, field) == getattr(AutoSwitchSettings(), field)
+
     def test_unsupported_strategy_falls_back_to_best(self, tmp_path: Path):
         settings_path(tmp_path).write_text(
             json.dumps({"autoswitch": {"strategy": "chaos"}})

@@ -23,6 +23,7 @@ from claude_swap.settings import (
     load_settings,
     merge_maximize_cli,
     parse_jitter_range,
+    parse_setting_value,
     set_setting,
     settings_path,
     unset_setting,
@@ -163,6 +164,74 @@ class TestLoadMaximize:
         assert (loaded.soft_5h, loaded.hard_5h) == (50.0, 95.0)  # "high" -> default
         assert "maximize.soft7d (99) must not exceed maximize.hard7d (95)" in caplog.text
         assert load_settings(tmp_path).strategy == "best"
+
+
+NON_FINITE_LITERALS = ["NaN", "Infinity", "-Infinity", "1e400", "-1e400"]
+
+
+class TestNonFiniteNumbers:
+    """JSON allows NaN/Infinity (Python's parser accepts them), and a number
+    that is not finite is not a threshold: it reads as a bad type -> default,
+    like a string would. ``int(nan)`` used to raise out of the loader."""
+
+    @pytest.mark.parametrize("literal", NON_FINITE_LITERALS)
+    @pytest.mark.parametrize("key, field", [
+        ("idleWindowMin", "idle_window_min"),  # int kind: int(nan) raised
+        ("pendingPollS", "pending_poll_s"),
+        ("soft5h", "soft_5h"),  # float kind: NaN passed straight through
+        ("tieEpsilon", "tie_epsilon"),
+    ])
+    def test_maximize_key_falls_back_to_its_default(
+        self, tmp_path: Path, key, field, literal
+    ):
+        settings_path(tmp_path).write_text(
+            '{"maximize": {"%s": %s}}' % (key, literal)
+        )
+        loaded = load_maximize_settings(tmp_path)
+        assert getattr(loaded, field) == getattr(MaximizeSettings(), field)
+
+    @pytest.mark.parametrize("literal", NON_FINITE_LITERALS)
+    def test_prime_max_attempts_falls_back_to_its_default(self, tmp_path, literal):
+        settings_path(tmp_path).write_text('{"prime": {"maxAttempts": %s}}' % literal)
+        assert load_prime_settings(tmp_path).max_attempts == PrimeSettings().max_attempts
+
+    def test_other_keys_in_the_section_survive(self, tmp_path: Path):
+        settings_path(tmp_path).write_text(
+            '{"maximize": {"idleWindowMin": NaN, "forceEtaMin": 20}}'
+        )
+        loaded = load_maximize_settings(tmp_path)
+        assert loaded.idle_window_min == MaximizeSettings().idle_window_min
+        assert loaded.force_eta_min == 20
+
+    def test_an_int_too_large_for_a_float_is_clamped_not_a_crash(self, tmp_path: Path):
+        settings_path(tmp_path).write_text(
+            '{"maximize": {"idleWindowMin": %s}}' % ("9" * 400)
+        )
+        assert load_maximize_settings(tmp_path).idle_window_min == 60
+
+    def test_effective_settings_survives_non_finite_values(self, tmp_path: Path):
+        settings_path(tmp_path).write_text(
+            '{"maximize": {"idleWindowMin": NaN, "soft5h": Infinity}}'
+        )
+        rows = {spec.dotted: (value, is_set) for spec, value, is_set in effective_settings(tmp_path)}
+        assert rows["maximize.idleWindowMin"] == (10, True)
+        assert rows["maximize.soft5h"] == (50.0, True)
+
+    @pytest.mark.parametrize("raw_value", ["nan", "NaN", "inf", "-inf", "Infinity", "1e400"])
+    @pytest.mark.parametrize("dotted", [
+        "maximize.soft5h",  # float kind
+        "maximize.idleWindowMin",  # int kind
+        "prime.maxAttempts",
+    ])
+    def test_strict_parse_rejects_non_finite(self, dotted, raw_value):
+        with pytest.raises(ConfigError, match="finite"):
+            parse_setting_value(SETTING_SPECS[dotted], raw_value)
+
+    @pytest.mark.parametrize("raw_value", ["nan", "inf", "-inf"])
+    def test_config_set_rejects_non_finite_without_writing(self, tmp_path, raw_value):
+        with pytest.raises(ConfigError, match="finite"):
+            set_setting(tmp_path, "maximize.tieEpsilon", raw_value)
+        assert not settings_path(tmp_path).exists()
 
 
 class TestLoadPrime:
