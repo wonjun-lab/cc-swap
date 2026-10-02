@@ -388,6 +388,31 @@ def test_read_installed_reads_a_unit(tmp_path, on_linux):
     assert env["CLAUDE_CONFIG_DIR"] == "/a b/c"
 
 
+@pytest.mark.parametrize("value", [
+    "/tmp/x$$y",  # `$$` only collapses on Exec lines, not in Environment=
+    "/tmp/$HOME/x",
+    "/opt/50%/c",
+    'a"b',
+    "c:\\dir\\",
+    'tricky\\"mix$$%%',
+])
+def test_unit_environment_round_trips(tmp_path, on_linux, value):
+    """A refresh (`service install --reuse-installed-env`) re-installs what
+    read_installed returns, so the value must come back unchanged."""
+    program = ["/home/u/My $$tools/cc-swap"]
+    unit = service.unit_path(tmp_path)
+    unit.parent.mkdir(parents=True)
+    unit.write_text(
+        service.build_unit(
+            program, claude_path=None, home=tmp_path,
+            forward_env={"CLAUDE_CONFIG_DIR": value},
+        )
+    )
+    argv, env = service.read_installed(platform="linux", home=tmp_path)
+    assert env["CLAUDE_CONFIG_DIR"] == value
+    assert argv == program
+
+
 def test_read_installed_is_none_without_a_file(tmp_path, on_macos):
     assert service.read_installed(platform="darwin", home=tmp_path) is None
 

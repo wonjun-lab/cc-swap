@@ -337,13 +337,30 @@ def _plist_data(path: Path) -> dict | None:
     return data if isinstance(data, dict) else None
 
 
-def _unit_words(value: str) -> list[str]:
+_UNIT_ESCAPES = {"n": "\n", "t": "\t", "r": "\r", "s": " "}
+
+
+def _unit_unescape(word: str, *, exec_arg: bool) -> str:
+    """Undo :func:`_systemd_quote` in one pass, as systemd reads it:
+    backslash escapes, ``%%`` (every setting) and ``$$`` (Exec lines only;
+    ``Environment=`` values never expand ``$``)."""
+
+    def one(match: re.Match) -> str:
+        token = match.group(0)
+        if token == "%%":
+            return "%"
+        if token == "$$":
+            return "$" if exec_arg else "$$"
+        char = token[1]
+        return _UNIT_ESCAPES.get(char, char)
+
+    return re.sub(r"\\.|%%|\$\$", one, word, flags=re.DOTALL)
+
+
+def _unit_words(value: str, *, exec_arg: bool = False) -> list[str]:
     """The words of one unit-file value, undoing :func:`_systemd_quote`."""
     words = re.findall(r'"((?:[^"\\]|\\.)*)"|(\S+)', value)
-    return [
-        (quoted or bare).replace('\\"', '"').replace("\\\\", "\\").replace("$$", "$").replace("%%", "%")
-        for quoted, bare in words
-    ]
+    return [_unit_unescape(quoted or bare, exec_arg=exec_arg) for quoted, bare in words]
 
 
 def read_installed(
@@ -376,7 +393,7 @@ def read_installed(
         env: dict[str, str] = {}
         for line in text.splitlines():
             if line.startswith("ExecStart="):
-                argv = _unit_words(line.removeprefix("ExecStart="))
+                argv = _unit_words(line.removeprefix("ExecStart="), exec_arg=True)
             elif line.startswith("Environment="):
                 for word in _unit_words(line.removeprefix("Environment=")):
                     key, _, value = word.partition("=")
