@@ -1007,7 +1007,7 @@ def check_lease(ctx: Context) -> list[Finding]:
         out.append(Finding(
             "lease", "info",
             f"auto-switching is OFF{since}{by}: the engine decides but never switches or primes",
-            "cc-swap auto on (or Fleet Mode → o)",
+            "cc-swap auto on (or Fleet: m → o)",
         ))
     return out
 
@@ -1078,6 +1078,26 @@ def check_priming(ctx: Context) -> list[Finding]:
         f"priming is on; isolation verified for claude {verified} "
         "(it pauses after a Claude Code update until cc-swap prime verify passes)",
     )]
+
+
+def check_idle_pattern(ctx: Context) -> list[Finding]:
+    """What maximize has learned of your busy and quiet times (info only;
+    ``maximize`` strategy only). Reads the usage history, writes nothing."""
+    from claude_swap import settings as st
+    from claude_swap.maximize import history
+
+    if ctx.strategy != "maximize":
+        return []
+    raw = ctx.raw_settings or {}
+    try:
+        enabled = st._section_from_raw(
+            raw.get("maximize"), "maximize", st.MaximizeSettings
+        ).learn_idle_pattern
+    except TypeError:
+        enabled = True
+    p = ctx.probes
+    slots = history.read(p.backup_root, p.now).slots
+    return [Finding("idle-pattern", "info", history.describe(slots, p.now, enabled=enabled))]
 
 
 def priming_guard(backup_root: Path) -> tuple[str | None, str | None]:
@@ -1238,6 +1258,7 @@ ENV_CHECKS: tuple[Callable[[Context], list[Finding]], ...] = (
     check_lease,
     check_settings,
     check_priming,
+    check_idle_pattern,
 )
 
 

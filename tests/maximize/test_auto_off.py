@@ -324,15 +324,21 @@ class TestFleetReadModel:
         (tmp_path / "autoswitch_state.json").write_text(json.dumps({"autoOff": False}))
         assert not mxview.read_state(tmp_path).auto_off
 
-    def test_engine_and_prime_lines_say_auto_off(self):
-        es = fx.engine_status(held_elsewhere=False, holder_pid=None, own=None,
-                              service=None, auto_off=True)
-        parts, tone = fx.engine_parts(es)
-        assert ("AUTO OFF: watching only", 0) in parts and tone == "warn"
-        parts, tone = fx._prime_parts([], PrimeSettings(enabled=True), auto_off=True)
-        assert parts[0][0] == "stopped: automatic switching is off" and tone == "warn"
-        parts, _ = fx._prime_parts([], PrimeSettings(enabled=False), auto_off=True)
-        assert parts[0][0].startswith("priming off")
+    def test_the_home_sentence_says_auto_off_and_priming_stops(self):
+        from claude_swap.maximize import home
+        from claude_swap.settings import MaximizeSettings
+
+        es = fx.engine_status(held_elsewhere=True, holder_pid=4121, own=None,
+                              service={"running": True, "pid": 4121}, auto_off=True)
+        dv = fx.DecisionView("off", "1", None, None, "cli", at=NOW, would="hold")
+        sit = home.situation(es, dv, active="1", published_at=NOW, now=NOW, poll_s=60)
+        assert sit == "auto-off" and not home.switching_live(sit)
+        variants = home.status_variants(es, dv, [], MaximizeSettings(), sit, now=NOW)
+        assert "".join(t for t, _ in variants[0]).startswith("Auto OFF — nothing switches")
+        assert home.holder_variants(es, sit)[0] == "viewer · service pid 4121 is idle"
+        # A paused priming is not news while nothing primes anyway.
+        guard = "paused: claude 2.1.3 -> 2.1.4 (cc-swap prime verify)"
+        assert home.attention_parts([], now=NOW, prime_guard=guard, priming=False) is None
 
     def test_now_line_shows_what_it_would_do(self):
         dv = fx.DecisionView("off", "1", None, None, "fleet", at=NOW,
@@ -354,7 +360,7 @@ class TestFleetReadModel:
 
 @pytest.mark.asyncio
 class TestFleetScreen:
-    async def test_status_lines_menu_and_toggle(self, tmp_path):
+    async def test_status_sentence_menu_and_toggle(self, tmp_path):
         from tests.maximize.test_tui_fleet import _fleet, _open, _settings, _state
         from tests.test_tui import make_app, settle
 
@@ -363,10 +369,9 @@ class TestFleetScreen:
         app = make_app(_fleet(tmp_path))
         async with app.run_test(size=(140, 40)) as pilot:
             await _open(pilot)
-            engine = app.screen.query_one("#fx-engine", Static).render().plain
-            now_line = app.screen.query_one("#fx-now", Static).render().plain
-            assert "AUTO OFF" in engine and now_line.startswith("now     AUTO OFF")
-            await pilot.press("m")
+            status = app.screen.query_one("#fx-status", Static).render().plain
+            assert status.startswith("Auto OFF — nothing switches automatically")
+            await pilot.press("m")  # the menu; its o is automatic switching on/off
             await pilot.pause()
             await pilot.press("o")
             await settle(pilot)
@@ -375,6 +380,9 @@ class TestFleetScreen:
             await pilot.press("m")
             await pilot.pause()
             await pilot.press("o")
+            await settle(pilot)
+            assert pause.read_auto_off(tmp_path) is None  # turning it off asks first
+            await pilot.press("y")
             await settle(pilot)
             off = pause.read_auto_off(tmp_path)
             assert off is not None and off.by == "fleet"

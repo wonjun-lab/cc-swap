@@ -96,6 +96,19 @@ class MaximizeSettings:
     # A soft/rebalance switch never lands on an account whose login expires
     # within this many minutes (at-limit/hard fallbacks still may).
     login_expiry_guard_min: int = 120
+    # A hard or soft switch waits instead when the window that triggered it
+    # resets within this many minutes and the pace will not reach 100%
+    # before then (0 = off). At-limit and rebalance never wait.
+    reset_wait_min: int = 15
+    # Move at an idle moment when the active 7d is on pace to pass soft7d
+    # before the next quiet window (or within preempt_horizon_max_h).
+    preempt: bool = True
+    # Learn when you are usually busy/quiet from the usage history.
+    learn_idle_pattern: bool = True
+    preempt_horizon_max_h: int = 12
+    # In a usually-busy time, rebalance at once only for a score gain this
+    # large; smaller ones wait for the next quiet window.
+    busy_rebalance_gap: float = 0.5
 
 
 @dataclass(frozen=True)
@@ -220,6 +233,10 @@ SETTING_SPECS: dict[str, SettingSpec] = {
             "maximize", "forceEtaMin", "force_eta_min", "int", 0, 60,
             help="maximize: switch now when a hard cap is this many minutes away (0 = off)",
         ),
+        SettingSpec(
+            "maximize", "resetWaitMin", "reset_wait_min", "int", 0, 60,
+            help="maximize: skip a hard/soft switch when that window resets within this many minutes (0 = off)",
+        ),
         # Floor = poll_policy.MIN_INTERVAL_S: the per-account poll budget is
         # shared by every machine; the engine enforces it again regardless.
         SettingSpec(
@@ -237,6 +254,22 @@ SETTING_SPECS: dict[str, SettingSpec] = {
         SettingSpec(
             "maximize", "loginExpiryGuardMin", "login_expiry_guard_min", "int", 0, 1440,
             help="maximize: never soft/rebalance onto a login expiring within this many minutes",
+        ),
+        SettingSpec(
+            "maximize", "preempt", "preempt", "bool",
+            help="maximize: move at an idle moment when the 7d pace passes soft7d before your next quiet time",
+        ),
+        SettingSpec(
+            "maximize", "learnIdlePattern", "learn_idle_pattern", "bool",
+            help="maximize: learn your usual busy and quiet times from the usage history",
+        ),
+        SettingSpec(
+            "maximize", "preemptHorizonMaxH", "preempt_horizon_max_h", "int", 1, 48,
+            help="maximize: look at most this many hours ahead for a pre-emptive switch",
+        ),
+        SettingSpec(
+            "maximize", "busyRebalanceGap", "busy_rebalance_gap", "float", 0.0, 5.0,
+            help="maximize: in a usually-busy time, rebalance only for a score gain this large",
         ),
         SettingSpec(
             "maximize", "lastResort", "last_resort", "string",

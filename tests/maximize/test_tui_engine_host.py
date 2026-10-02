@@ -32,13 +32,15 @@ async def _open(pilot) -> None:
 
 
 def _engine_line(app) -> str:
-    return app.screen.query_one("#fx-engine", Static).render().plain
+    """Fleet's status line: the sentence and, on the right, who runs the engine."""
+    return app.screen.query_one("#fx-status", Static).render().plain
 
 
 async def _mode(pilot, *keys: str) -> None:
+    """Menu (m) → Mode (m), then ``keys`` in the Mode modal."""
     from claude_swap.tui.fleet_modals import ModeModal
 
-    await pilot.press("m")
+    await pilot.press("m", "m")
     await pilot.pause()
     assert isinstance(pilot.app.screen, ModeModal)
     for key in keys:
@@ -94,7 +96,8 @@ class TestEngineHost:
             assert isinstance(app.screen, FleetScreen)
             assert len(fake_engine.instances) == 1
             assert fake_engine.instances[0].dry_run is True
-            assert "● here · DRY-RUN" in _engine_line(app)
+            assert _engine_line(app).startswith("Dry run · ")
+            assert _engine_line(app).endswith("engine here · dry run")
             assert app._store_only is True  # the engine here fetches
             await _mode(pilot, "l")
             assert isinstance(app.screen, ConfirmModal)  # going live asks
@@ -104,7 +107,8 @@ class TestEngineHost:
             assert len(fake_engine.instances) == 2
             assert fake_engine.instances[0].stopped is True
             assert fake_engine.instances[1].dry_run is False
-            assert "● here · LIVE" in _engine_line(app)
+            assert _engine_line(app).startswith("Auto ON · ")
+            assert _engine_line(app).endswith("engine runs here · quitting stops it")
             await _mode(pilot, "d")
             assert len(fake_engine.instances) == 3 and fake_engine.instances[2].dry_run
 
@@ -193,7 +197,7 @@ class TestEngineHost:
             await _mode(pilot, "s")
             assert not app.engine_host.running
             assert await _eventually(lambda: not probe.held_elsewhere())
-            assert "nothing is switching" in _engine_line(app)
+            assert _engine_line(app).startswith("Not switching — no engine is running")
 
     async def test_classic_dashboard_keeps_the_engine_running(self, tmp_path, fake_engine):
         from claude_swap.tui.dashboard import DashboardScreen
@@ -211,7 +215,7 @@ class TestEngineHost:
             await pilot.press("ctrl+f")
             await settle(pilot)
             assert isinstance(app.screen, FleetScreen)
-            assert "● here · DRY-RUN" in _engine_line(app)
+            assert _engine_line(app).endswith("engine here · dry run")
 
     async def test_viewer_mode_offers_facts_only(self, tmp_path, fake_engine):
         from claude_swap.tui.fleet import FleetScreen

@@ -1,20 +1,32 @@
 """Fleet: the maximize home screen (cc-swap fork).
 
 Pushed over the untouched upstream ``DashboardScreen`` when
-``autoswitch.strategy == "maximize"`` (``c`` pops back to it, ``ctrl+f``
-returns). One screen answers "what is maximize doing, and why": a status
-block (engine holder, the engine's last decision, priming), every account
-as one table row in slot order with maximize's rank, plan, tier, landing
-verdict, 5h window and next prime, the highlighted account's card, and a
-first-letter menu (codex-swap's convention, ``tui/menus.py``).
+``autoswitch.strategy == "maximize"`` (the menu's *Classic dashboard* pops
+back to it, ``ctrl+f`` returns). One screen answers "what is automatic
+switching doing, and is anything wrong":
+
+* one plain-English sentence about the engine, with who runs it on the
+  right, and at most one attention line (``maximize/home.py``);
+* every account as a block in the upstream dashboard's look — active first,
+  then the engine's pick order — with one tag each and 5h/7d bars carrying
+  the soft and hard marks;
+* a footer of six keys; everything else is in the ``m`` menu popup.
+
+The layout follows the terminal size only (``home.home_layout``): two
+columns of blocks when wide, one when medium, and one line per account plus
+the selected account in full when narrow or short. The sentence, the
+attention line and the footer never scroll away.
 
 Viewer by default: the screen never takes the engine lease on its own. It
 probes the lease every few seconds (a free lease is taken and dropped at
 once; a service starting inside that microsecond window exits 4 and is
 restarted by launchd/systemd a minute later — acceptable) and reads what
-the engine publishes to its state file. Every computation lives in
-``maximize/fleet.py``; this module only lays the cells out. Blocking work
-(the lease probe, ``service.status()``) runs in thread workers.
+the engine publishes to its state file, plus its usage history (the idle
+pattern and burn rates a decision computed here uses, and ``?`` names).
+Every computation lives in
+``maximize/fleet.py`` and ``maximize/home.py``; ``tui/fleet_render.py``
+draws it. Blocking work (the lease probe, ``service.status()``) runs in
+thread workers.
 """
 
 from __future__ import annotations
@@ -29,10 +41,14 @@ from typing import TYPE_CHECKING
 from rich.text import Text
 from textual.app import ComposeResult
 from textual.binding import Binding
+from textual.containers import VerticalScroll
+from textual.geometry import Region
 from textual.screen import ModalScreen, Screen
-from textual.widgets import DataTable, ListItem, ListView, Static
+from textual.widgets import Static
 
 from claude_swap.maximize import fleet as fx
+from claude_swap.maximize import home
+from claude_swap.maximize import policy
 from claude_swap.maximize import view as mxview
 from claude_swap.maximize.primer import plan_text as mxprimer_plan_text
 from claude_swap.models import AccountsSnapshot
@@ -43,15 +59,15 @@ from claude_swap.settings import (
     load_prime_settings,
     load_settings,
 )
+from claude_swap.tui import fleet_render as render
 from claude_swap.tui import menus
 from claude_swap.tui.engine_host import EngineHost  # noqa: F401 (app.py imports it here)
+from claude_swap.tui.fleet_render import tone_style  # noqa: F401 (fleet_accounts imports it here)
 from claude_swap.tui.theme import Palette
-from claude_swap.tui.widgets import account_card_text
 
 if TYPE_CHECKING:
     from claude_swap.tui.app import CswapApp
 
-FLASH_S = 1.5             # a just-refreshed row stays highlighted this long
 LEASE_PROBE_S = 5.0
 SERVICE_PROBE_S = 30.0
 FETCH_ON_OPEN_ENV = "CC_SWAP_FETCH_ON_OPEN"
@@ -110,17 +126,6 @@ def history_text(root: Path, live: str | None) -> str:
         lines = [note, ""] + lines
     lines += ["", f"(newest first; all of it: cc-swap history -n 0 · {ledger.path_for(root)})"]
     return "\n".join(lines)
-
-
-def tone_style(tone: str, palette: Palette) -> str:
-    return {
-        "ok": palette.sev_ok,
-        "warn": palette.sev_warn,
-        "crit": palette.sev_crit,
-        "dim": palette.muted,
-        "accent": palette.accent,
-        "bold": f"bold {palette.foreground}",
-    }.get(tone, palette.foreground)
 
 
 def menu_text(title: str, key: str, palette: Palette, *, tone: str = "plain") -> Text:
@@ -271,61 +276,48 @@ def _relogin_done(app: "CswapApp", number: str, result) -> None:
     app.notify(f"#{number} login stored{tail}", title="Re-login")
 
 
-class FleetTable(DataTable):
-    """The account table; ↓ past the last row moves focus to the menu."""
-
-    def action_cursor_down(self) -> None:
-        if self.row_count and self.cursor_row >= self.row_count - 1:
-            screen = self.screen
-            if isinstance(screen, FleetScreen):
-                screen.focus_menu()
-                return
-        super().action_cursor_down()
 
 
-class FleetMenu(ListView):
-    """The vertical menu; ↑ on its first item returns to the table."""
+class FleetBody(Static):
+    """The account area. A click selects the account under the pointer."""
 
-    def action_cursor_up(self) -> None:
-        if (self.index or 0) <= 0:
-            screen = self.screen
-            if isinstance(screen, FleetScreen):
-                screen.focus_table()
-                return
-        super().action_cursor_up()
+    def __init__(self, **kw) -> None:
+        super().__init__("", markup=False, **kw)
+        self.layout_map: render.Body = render.Body()
 
-
-class FleetMenuItem(ListItem):
-    def __init__(self, entry: menus.MenuEntry) -> None:
-        super().__init__(Static(entry.title, markup=False))
-        self.action_id = entry.action
-        self.key = entry.key
-
-    def set_title(self, text: Text) -> None:
-        self.query_one(Static).update(text)
+    def on_click(self, event) -> None:
+        number = self.layout_map.number_at(event.x, event.y)
+        screen = self.screen
+        if number is not None and isinstance(screen, FleetScreen):
+            screen.select(number)
 
 
 class FleetScreen(Screen):
     CSS_PATH = "fleet.tcss"
     BINDINGS = [
-        Binding("s", "menu('strategy')", "Swap strategy", show=False),
-        Binding("m", "menu('mode')", "Mode", show=False),
-        Binding("p", "menu('prime')", "Prime now", show=False),
-        Binding("a", "menu('accounts')", "Account settings", show=False),
-        Binding("l", "last_resort", "Last resort", show=False),
-        Binding("x", "exclude", "Exclude", show=False),
+        # The footer: menus.HOME_KEYS.
+        Binding("enter", "switch_selected", "Switch", show=False),
         Binding("r", "relogin", "Re-login", show=False),
-        Binding("f", "fetch", "Fetch", show=False),
-        Binding("e,g", "app.open_auto", "Engine log", show=False),
-        Binding("v", "menu('history')", "Switch history", show=False),
-        Binding("u", "menu('update')", "Update Claude Code", show=False),
-        Binding("c", "classic", "Classic dashboard", show=False),
-        Binding("w", "app.open_watch", "Watch", show=False),
+        Binding("l", "last_resort", "Last resort", show=False),
+        Binding("m", "open_menu", "Menu", show=False),
         Binding("question_mark,h", "help", "Help", show=False),
         Binding("q", "quit", "Quit", show=False),
-        Binding("j", "cursor_down", show=False),
-        Binding("k", "cursor_up", show=False),
-        # The home screen: Esc never leaves it (c does).
+        Binding("down,j", "move('down')", show=False),
+        Binding("up,k", "move('up')", show=False),
+        Binding("right", "move('right')", show=False),
+        Binding("left", "move('left')", show=False),
+        # The menu's letters, straight from here (menus.SHORTCUT_KEYS).
+        Binding("s", "menu('strategy')", "Swap strategy", show=False),
+        Binding("p", "menu('prime')", "Prime now", show=False),
+        Binding("f", "menu('fetch')", "Fetch", show=False),
+        Binding("x", "menu('exclude')", "Exclude", show=False),
+        Binding("a", "menu('accounts')", "Account settings", show=False),
+        Binding("e,g", "menu('engine')", "Engine log", show=False),
+        Binding("v", "menu('history')", "Switch history", show=False),
+        Binding("u", "menu('update')", "Update Claude Code", show=False),
+        Binding("c", "menu('classic')", "Classic dashboard", show=False),
+        Binding("w", "app.open_watch", "Watch", show=False),
+        # The home screen: Esc never leaves it (the menu's c does).
         Binding("escape", "noop", show=False),
     ]
 
@@ -337,34 +329,32 @@ class FleetScreen(Screen):
         self._prime = PrimeSettings()
         self._poll_s = 60.0
         self._state = mxview.MaximizeState()
+        # The engine's usage history (view.read_history; None = unreadable):
+        # the idle pattern and burn rates Fleet's own decisions use.
+        self._history = None
         self._rows: list[fx.FleetRow] = []
         self._accounts: dict = {}
-        self._numbers: list[str] = []
-        self._columns: tuple[str, ...] = ()
+        self._order: list[str] = []
+        self._sel: str | None = None
+        self._scroll_to_sel = True
         self._held_elsewhere: bool | None = None
         self._holder_pid: int | None = None
         self._service: dict | None = None
-        self._fetched: dict[str, float | None] = {}
-        self._flash_until: dict[str, float] = {}
         self._fetched_on_open = False
-        self._layout: fx.LayoutPlan | None = None
+        self._layout: home.HomeLayout | None = None
+        self._situation: home.Situation | None = None
         self._hostname = host_name()
-        self._ssh = fx.over_ssh()
         self._fx_timers: list = []
         self._prime_guard: str | None = None
 
     # -- composition ------------------------------------------------------------------
 
     def compose(self) -> ComposeResult:
-        yield Static("", id="fx-head", markup=False)
-        yield Static("", id="fx-engine", markup=False)
-        yield Static("", id="fx-now", markup=False)
-        yield Static("", id="fx-prime", markup=False)
+        yield Static("", id="fx-status", markup=False)
         yield Static("", id="fx-attention", markup=False)
-        yield FleetTable(id="fx-table", cursor_type="row", zebra_stripes=False)
-        yield Static("", id="fx-detail", markup=False)
-        yield FleetMenu(*(FleetMenuItem(e) for e in menus.MAIN_MENU), id="fx-menu")
-        yield Static("", id="fx-menu-folded", markup=False)
+        with VerticalScroll(id="fx-scroll", can_focus=False):
+            yield FleetBody(id="fx-body")
+        yield Static("", id="fx-expanded", markup=False)
         yield Static("", id="fx-keys", markup=False)
 
     def on_mount(self) -> None:
@@ -379,7 +369,6 @@ class FleetScreen(Screen):
         self._probe_service()
         if self._host is not None:
             self._host.subscribe(self._on_host_event)
-        self.focus_table()
 
     def on_unmount(self) -> None:
         # The app is closing: an engine run here stops with it.
@@ -403,6 +392,7 @@ class FleetScreen(Screen):
             timer.pause()
 
     def on_resize(self) -> None:
+        self._scroll_to_sel = True
         self._render_all()
 
     # -- data -------------------------------------------------------------------------
@@ -423,20 +413,15 @@ class FleetScreen(Screen):
         if snap is None:
             return
         self._load_settings()
+        now = time.time()
         try:
             self._state = mxview.read_state(self._root)
         except Exception:
             self._state = mxview.MaximizeState()
+        self._history = mxview.read_history(self._root, now)  # never raises
         self._prime_guard = prime_guard(self._root)
-        now = time.time()
         self._rows = fx.fleet_rows(snap, self._mx, self._prime, self._state, now=now)
         self._accounts = {a.number: a for a in snap.accounts}
-        for row in self._rows:
-            before = self._fetched.get(row.number)
-            if before is not None and row.fetched_at is not None and row.fetched_at > before:
-                self._flash_until[row.number] = now + FLASH_S
-                self.set_timer(FLASH_S + 0.05, self._render_table)
-            self._fetched[row.number] = row.fetched_at
         self._maybe_fetch_on_open()
         self._render_all()
 
@@ -461,12 +446,20 @@ class FleetScreen(Screen):
             auto_off=self._state.auto_off,
         )
 
-    def _decision(self) -> fx.DecisionView:
+    def _msnap(self, now: float):
+        """The policy Snapshot Fleet decides on when no engine word is
+        fresh: the store, the state file and the usage history, so its own
+        decisions see the idle pattern and burn rates the engine sees."""
         snap = self.app.snapshot
-        now = time.time()
         if snap is None:
+            return None
+        return fx.fleet_snapshot(snap, self._mx, self._state, now=now, history=self._history)
+
+    def _decision(self, msnap=None, now: float | None = None) -> fx.DecisionView:
+        now = time.time() if now is None else now
+        msnap = msnap if msnap is not None else self._msnap(now)
+        if msnap is None:
             return fx.DecisionView("none", None, None, None, "")
-        msnap = fx.fleet_snapshot(snap, self._mx, self._state, now=now)
         host = self._host
         own = host.last_decision if host is not None and host.running else None
         return fx.decision_view(
@@ -480,15 +473,10 @@ class FleetScreen(Screen):
             self._apply_store_only()
             self._render_all()
         elif event.kind == "maximize" and self.is_attached:
-            self._render_status()
+            self._render_all()
 
     def current_row(self) -> fx.FleetRow | None:
-        table = self.query_one("#fx-table", FleetTable)
-        if not self._numbers or table.row_count == 0:
-            return None
-        index = min(max(table.cursor_row, 0), len(self._numbers) - 1)
-        number = self._numbers[index]
-        return next((r for r in self._rows if r.number == number), None)
+        return next((r for r in self._rows if r.number == self._sel), None)
 
     # -- lease and service probes (thread workers) ---------------------------------------
 
@@ -555,198 +543,207 @@ class FleetScreen(Screen):
         return Palette.from_theme(self.app.current_theme)
 
     def _width(self) -> int:
-        return max((self.size.width or 112) - 2, 20)
+        """The text width every line is laid out in (the screen minus one
+        column of padding each side and one for the accounts' scrollbar)."""
+        return max((self.size.width or 120) - 3, 20)
+
+    def _selected_bg(self, palette: Palette) -> str:
+        panel = getattr(self.app.current_theme, "panel", None)
+        return f"on {panel or palette.track}"
 
     def _render_all(self) -> None:
         if not self.is_attached:
             return
         size = self.size
-        self._layout = fx.fit_layout(
-            size.height or 32, size.width or 112, len(self._rows),
-            attention=fx.attention(self._rows, now=time.time()) is not None,
-        )
-        self._render_status()
-        self._render_table()
-        self._render_detail()
-        self._render_menu()
-        self._render_keys()
-        self._apply_layout()
-
-    def _apply_layout(self) -> None:
-        plan = self._layout
-        if plan is None:
-            return
-        self.query_one("#fx-prime").display = plan.prime_line
-        self.query_one("#fx-detail").display = plan.detail
-        self.query_one("#fx-menu").display = plan.menu == "full"
-        self.query_one("#fx-menu-folded").display = plan.menu == "folded"
-        self.query_one("#fx-attention").display = (
-            fx.attention(self._rows, now=time.time()) is not None
-        )
-        self.set_class(not plan.blanks, "-compact")
-        if plan.menu == "folded" and self.focused is self.query_one("#fx-menu"):
-            self.focus_table()
-
-    def _render_status(self) -> None:
+        layout = home.home_layout(size.width or 120, size.height or 36)
+        self._layout = layout
+        self.set_class(not layout.blanks, "-compact")
         palette = self._palette()
         width = self._width()
         now = time.time()
-        head = fx.header_line(
-            self._mx, self._prime, self._rows, host=self._hostname, ssh=self._ssh,
-            now=now, width=width,
+        es = self._engine_status()
+        msnap = self._msnap(now)
+        dv = self._decision(msnap, now)
+        picks = [v.number for v in policy.landing_candidates(msnap)] if msnap else []
+        snap = self.app.snapshot
+        published = self._state.decision
+        sit = home.situation(
+            es, dv, active=snap.active_number if snap else None,
+            published_at=published.at if published else None, now=now, poll_s=self._poll_s,
         )
-        self.query_one("#fx-head", Static).update(Text(head, style=f"bold {palette.foreground}"))
-        lines = fx.status_lines(
-            self._engine_status(), self._decision(), self._rows, self._mx, self._prime,
-            now=now, width=width, prime_guard=self._prime_guard,
+        self._situation = sit
+        self._render_top(es, dv, sit, now, width, palette)
+        ctx = render.Ctx(
+            palette=palette,
+            ticks=mxview.window_ticks(self._mx),
+            now=now,
+            next_no=home.next_number(dv, picks, sit),
+            priming=self._priming(es, sit),
         )
-        for widget_id, (text, tone) in zip(("#fx-engine", "#fx-now", "#fx-prime"), lines):
-            line = Text(text[:8], style=palette.muted)
-            line.append(text[8:], style=tone_style(tone, palette))
-            self.query_one(widget_id, Static).update(line)
-        warning = fx.attention(self._rows, now=now) or ""
-        tone = fx.attention_tone(self._rows, now=now)
-        color = palette.sev_crit if tone == "crit" else palette.sev_warn
-        self.query_one("#fx-attention", Static).update(
-            Text(warning, style=f"bold {color}")
+        rows = home.ordered_rows(self._rows, picks)
+        self._order = [r.number for r in rows]
+        if self._sel not in self._order:
+            self._sel = next((r.number for r in rows if r.active), None) or (
+                self._order[0] if self._order else None
+            )
+            self._scroll_to_sel = True
+        self._render_accounts(rows, ctx, layout, width, palette)
+        self.query_one("#fx-keys", Static).update(render.keys_text(width, palette))
+
+    def _priming(self, es: fx.EngineStatus, sit: home.Situation) -> bool:
+        """Whether priming runs now (the next prime time is worth showing)."""
+        return home.priming_runs(self._prime.enabled, es, sit, self._prime_guard)
+
+    def _render_top(
+        self, es: fx.EngineStatus, dv: fx.DecisionView, sit: home.Situation,
+        now: float, width: int, palette: Palette,
+    ) -> None:
+        published = self._state.decision
+        variants = home.status_variants(
+            es, dv, self._rows, self._mx, sit, now=now,
+            published_at=published.at if published else None,
         )
+        sentence, note = home.status_line(variants, home.holder_variants(es, sit), width)
+        self.query_one("#fx-status", Static).update(
+            render.status_text(sentence, note, width, palette)
+        )
+        service = es.service or {}
+        attention = home.attention_parts(
+            self._rows, now=now, prime_guard=self._prime_guard,
+            priming=self._prime.enabled and sit != "auto-off",
+            linger_off=service.get("linger") is False,
+        )
+        widget = self.query_one("#fx-attention", Static)
+        widget.display = attention is not None
+        if attention is not None:
+            parts, tone = attention
+            widget.update(render.attention_text(parts, tone, width, palette))
 
-    def _cells(self, row: fx.FleetRow, palette: Palette) -> list[Text]:
-        now = time.time()
-        flash = self._flash_until.get(row.number, 0.0) > now
-        out: list[Text] = []
-        name_width = fx.account_width(self._width())
-        cells = fx.row_cells(row, self._columns, now=now, mx=self._mx)
-        for col, (text, tone) in zip(self._columns, cells):
-            if col == "account":
-                text = fx.clip(text, name_width)
-            if row.login == "relogin" and text.strip():
-                tone = "crit"
-            style = tone_style(tone, palette)
-            if flash:
-                style += f" on {palette.track}"
-            out.append(Text(text, style=style, no_wrap=True))
-        return out
-
-    def _render_table(self) -> None:
-        if not self.is_attached or self._layout is None:
-            return
-        table = self.query_one("#fx-table", FleetTable)
-        palette = self._palette()
-        columns = self._layout.columns
-        numbers = [r.number for r in self._rows]
-        keep = self._numbers[table.cursor_row] if (
-            self._numbers and 0 <= table.cursor_row < len(self._numbers)
-        ) else None
-        if columns != self._columns or numbers != self._numbers:
-            self._columns = columns
-            table.clear(columns=True)
-            for col in columns:
-                table.add_column(fx.COLUMN_LABELS[col], key=col)
-            for row in self._rows:
-                table.add_row(*self._cells(row, palette), key=row.number)
-            self._numbers = numbers
-            if keep in numbers:
-                table.move_cursor(row=numbers.index(keep))
-            elif keep is None and self.app.snapshot is not None:
-                active = next((i for i, r in enumerate(self._rows) if r.active), 0)
-                table.move_cursor(row=active)
-            return
-        for row in self._rows:
-            for col, cell in zip(columns, self._cells(row, palette)):
-                table.update_cell(row.number, col, cell, update_width=True)
-
-    def _render_detail(self) -> None:
-        if self._layout is not None and not self._layout.detail:
-            return
-        row = self.current_row()
-        widget = self.query_one("#fx-detail", Static)
-        if row is None:
-            widget.update("")
-            return
-        palette = self._palette()
-        acc = self._accounts.get(row.number)
-        text = Text()
-        if acc is not None:
-            text.append(account_card_text(
-                acc, self._width() - 2, threshold=self.app.threshold_pct, now=time.time(),
-                palette=palette, window_ticks=getattr(self.app, "window_ticks", None),
+    def _render_accounts(
+        self, rows: list[fx.FleetRow], ctx: render.Ctx, layout: home.HomeLayout,
+        width: int, palette: Palette,
+    ) -> None:
+        body = self.query_one("#fx-body", FleetBody)
+        expanded = self.query_one("#fx-expanded", Static)
+        bg = self._selected_bg(palette)
+        if not rows:
+            body.layout_map = render.Body()
+            body.update(Text(
+                "loading…" if self.app.snapshot is None
+                else "No managed accounts yet: m → a (Account settings) adds one.",
+                style=palette.muted,
             ))
-        text.append("\n    ")
-        text.append(fx.detail_line(row, self._mx, now=time.time()), style=palette.muted)
-        widget.update(text)
+            expanded.display = False
+            return
+        expanded_lines = 0
+        if layout.mode == "narrow":
+            layout_map = render.render_list(rows, width, ctx, selected=self._sel, selected_bg=bg)
+            row = self.current_row()
+            detail = render.render_expanded(
+                row, self._accounts.get(row.number) if row else None, width, ctx,
+                max_bar=layout.max_bar,
+            )
+            expanded.update(detail)
+            expanded.display = True
+            expanded_lines = len(detail.plain.splitlines())
+        else:
+            layout_map = render.render_blocks(
+                rows, self._accounts, width, ctx, layout, selected=self._sel, selected_bg=bg,
+            )
+            expanded.display = False
+        body.layout_map = layout_map
+        body.update(layout_map.text)
+        self._fit_scroll(layout, expanded_lines)
+        if self._scroll_to_sel:
+            self._scroll_to_sel = False
+            self.call_after_refresh(self._scroll_selected_into_view)
 
-    def _menu_title(self, entry: menus.MenuEntry) -> tuple[str, str]:
-        es = self._engine_status()
-        relogin = fx.relogin_count(self._rows)
-        title = menus.menu_title(
-            entry.action,
-            mode_label=menus.mode_label(es.holder, es.pid),
-            relogin=relogin,
-            fetching=self.app._normal_refreshing,
-            auto_off=es.auto_off,
+    def _fit_scroll(self, layout: home.HomeLayout, expanded_lines: int) -> None:
+        """Cap the account area at the rows the fixed lines leave: the
+        status line, the attention line, the blank lines, the narrow
+        layout's expanded account and the footer always stay on screen.
+        When even that does not fit, the expanded account gives up rows
+        first (the list keeps two)."""
+        fixed = 1 + 1  # status line, footer
+        if self.query_one("#fx-attention").display:
+            fixed += 1
+        if layout.blanks:
+            fixed += 2  # above the status line and above the accounts
+        rest = (self.size.height or 36) - fixed
+        expanded = min(expanded_lines, max(rest - 2, 0))
+        detail = self.query_one("#fx-expanded")
+        detail.styles.max_height = expanded if expanded_lines else None
+        if expanded_lines and not expanded:
+            detail.display = False
+        self.query_one("#fx-scroll", VerticalScroll).styles.max_height = max(rest - expanded, 2)
+
+    def _scroll_selected_into_view(self) -> None:
+        if not self.is_attached:
+            return
+        span = self.query_one("#fx-body", FleetBody).layout_map.spans.get(self._sel or "")
+        if span is None:
+            return
+        first, count = span
+        self.query_one("#fx-scroll", VerticalScroll).scroll_to_region(
+            Region(0, first, 1, count), animate=False, immediate=True,
         )
-        tone = "plain"
-        if entry.action == "mode" and es.holder == "none":
-            tone = "warn"
-        if entry.action == "accounts" and relogin:
-            tone = "warn"
-        return title, tone
 
-    def _render_menu(self) -> None:
-        palette = self._palette()
-        for item in self.query(FleetMenuItem):
-            entry = menus.BY_ACTION[item.action_id]
-            title, tone = self._menu_title(entry)
-            item.set_title(menu_text(title, entry.key, palette, tone=tone))
+    # -- selection ----------------------------------------------------------------------
+
+    def select(self, number: str) -> None:
+        """Select account ``number`` (a click, or a test)."""
+        if number in self._order and number != self._sel:
+            self._sel = number
+            self._scroll_to_sel = True
+            self._render_all()
+
+    def action_move(self, direction: str) -> None:
+        layout = self._layout
+        columns = layout.columns if layout is not None and layout.mode != "narrow" else 1
+        target = home.step_selection(self._order, self._sel, direction, columns)
+        if target is not None and target != self._sel:
+            self._sel = target
+            self._scroll_to_sel = True
+            self._render_all()
+
+    # -- the menu ------------------------------------------------------------------------
+
+    def action_open_menu(self) -> None:
+        from claude_swap.tui.fleet_modals import MenuModal
+
+        self.app.push_screen(MenuModal(self._menu_rows()), self._on_menu)
+
+    def _menu_rows(self) -> list[menus.MenuRow]:
         es = self._engine_status()
-        folded = Text()
-        for i, line in enumerate(
-            menus.folded_menu(self._width(), mode_label=menus.mode_label(es.holder, es.pid))
-        ):
-            if i:
-                folded.append("\n")
-            for j, (title, key) in enumerate(line):
-                if j:
-                    folded.append(menus.SEP)
-                folded.append(menu_text(title, key, palette))
-        self.query_one("#fx-menu-folded", Static).update(folded)
+        row = self.current_row()
+        selected = (
+            menus.Selected(row.number, row.name, row.tier == "excluded")
+            if row is not None else None
+        )
+        mx = self._mx
+        return menus.menu_rows(
+            auto_off=es.auto_off,
+            holder=es.holder,
+            mode_label=menus.mode_label(es.holder, es.pid),
+            thresholds=f"5h {mx.soft_5h:g}/{mx.hard_5h:g} · 7d {mx.soft_7d:g}/{mx.hard_7d:g}",
+            relogin=fx.relogin_count(self._rows),
+            fetching=self.app._normal_refreshing,
+            selected=selected,
+        )
 
-    def _render_keys(self) -> None:
-        palette = self._palette()
-        minimal = self._layout is not None and self._layout.keys == "minimal"
-        hints = menus.key_hints(self._width() - 2, minimal=minimal)
-        self.query_one("#fx-keys", Static).update(Text(hints, style=palette.muted))
-
-    # -- focus ---------------------------------------------------------------------------
-
-    def focus_table(self) -> None:
-        self.query_one("#fx-table", FleetTable).focus()
-
-    def focus_menu(self) -> None:
-        if self._layout is not None and self._layout.menu == "folded":
-            return  # the folded menu is keys only
-        menu = self.query_one("#fx-menu", FleetMenu)
-        menu.index = 0
-        menu.focus()
-
-    def on_data_table_row_highlighted(self, event: DataTable.RowHighlighted) -> None:
-        self._render_detail()
-
-    # -- menu ----------------------------------------------------------------------------
-
-    def on_list_view_selected(self, event: ListView.Selected) -> None:
-        item = event.item
-        if isinstance(item, FleetMenuItem):
-            self.dispatch_menu(item.action_id)
+    def _on_menu(self, action: str | None) -> None:
+        if action is not None:
+            self.dispatch_menu(action)
 
     def dispatch_menu(self, action: str) -> None:
         handler = {
+            "auto": self.toggle_auto,
             "mode": self.open_mode,
             "strategy": self.open_strategy,
             "prime": self.open_prime,
-            "accounts": self.open_accounts,
             "fetch": self.action_fetch,
+            "exclude": self.action_exclude,
+            "accounts": self.open_accounts,
             "engine": self.app.action_open_auto,
             "history": self.open_history,
             "update": self.open_update,
@@ -761,6 +758,33 @@ class FleetScreen(Screen):
     def action_menu(self, action: str) -> None:
         self.dispatch_menu(action)
 
+    def toggle_auto(self) -> None:
+        """Menu → o: automatic switching off (after a confirmation), or
+        back on at once (``cc-swap auto``)."""
+        if self._state.auto_off:
+            self._set_auto(False)
+        else:
+            self.confirm_auto_off()
+
+    def confirm_auto_off(self) -> None:
+        """Ask before turning automatic switching OFF (``m`` then a stray
+        ``o`` must not stop switching on every engine until someone notices);
+        y or enter turns it off, n or esc leaves it on. Turning it back on
+        never asks."""
+        from claude_swap.tui.modals import ConfirmModal
+
+        self.app.push_screen(
+            ConfirmModal(
+                "Turn automatic switching OFF? Nothing switches or primes "
+                "automatically — on any engine, including the service — until "
+                "you turn it back on (m → o, or cc-swap auto on). Manual "
+                "switches still work.",
+                title="Automatic switching",
+                yes_label="Turn off",
+            ),
+            lambda confirmed: self._set_auto(True) if confirmed else None,
+        )
+
     def open_mode(self) -> None:
         from claude_swap.tui.fleet_modals import ModeModal
 
@@ -770,8 +794,11 @@ class FleetScreen(Screen):
         """Carry out a Mode choice. Going live always asks first (the auto
         screen's wording); Fleet never takes the lease without a choice."""
         host = self._host
-        if action in ("auto-off", "auto-on"):
-            self._set_auto(action == "auto-off")
+        if action == "auto-off":
+            self.confirm_auto_off()
+            return
+        if action == "auto-on":
+            self._set_auto(False)
             return
         if action is None or host is None:
             return
@@ -801,8 +828,8 @@ class FleetScreen(Screen):
         self._render_all()
 
     def _set_auto(self, off: bool) -> None:
-        """Mode → o: the persistent automatic-switching switch (``cc-swap
-        auto off|on``), honoured by whichever engine runs."""
+        """The persistent automatic-switching switch (``cc-swap auto
+        off|on``), honoured by whichever engine runs."""
         self.run_worker(
             partial(self._set_auto_blocking, off), thread=True,
             group="fleet-action", exit_on_error=False, name="fleet-auto-toggle",
@@ -873,7 +900,7 @@ class FleetScreen(Screen):
         self.app.push_screen(AccountsScreen())
 
     def open_prime(self) -> None:
-        """Pick accounts to prime now; the highlighted one is preselected."""
+        """Pick accounts to prime now; the selected one is preselected."""
         from claude_swap.maximize.primer import plan_rows
         from claude_swap.tui.fleet_modals import PrimeChoice, PrimeModal, prime_lines
 
@@ -896,15 +923,15 @@ class FleetScreen(Screen):
             PrimeModal(choices, preselect, partial(prime_lines, self.app.switcher))
         )
 
-    # -- row keys ------------------------------------------------------------------------
+    # -- account keys ----------------------------------------------------------------------
 
-    def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
-        """enter on a row: switch to it — asking first only when maximize
-        would not land there (switching is reversible)."""
-        number = str(event.row_key.value)
-        row = next((r for r in self._rows if r.number == number), None)
+    def action_switch_selected(self) -> None:
+        """enter: switch to the selected account — asking first only when
+        maximize would not land there (switching is reversible)."""
+        row = self.current_row()
         if row is None:
             return
+        number = row.number
         if row.active:
             self.notify(f"#{number} is already the active account", timeout=2)
             return
@@ -980,21 +1007,10 @@ class FleetScreen(Screen):
     def action_noop(self) -> None:
         pass
 
-    def action_cursor_down(self) -> None:
-        focused = self.focused
-        if isinstance(focused, (FleetTable, FleetMenu)):
-            focused.action_cursor_down()
-
-    def action_cursor_up(self) -> None:
-        focused = self.focused
-        if isinstance(focused, (FleetTable, FleetMenu)):
-            focused.action_cursor_up()
-
     def action_fetch(self) -> None:
         """One full fetch now — also as a viewer (store-only lane)."""
         self.app._start_normal_refresh(full=True)
         self.notify("Fetching latest usage…", timeout=2)
-        self._render_menu()
 
     def action_classic(self) -> None:
         # The upstream dashboard has no notion of a viewer lane: hand it the
@@ -1003,10 +1019,17 @@ class FleetScreen(Screen):
         self.app.set_store_only(False)
         self.app.pop_screen()
 
+    def idle_pattern(self) -> str:
+        """``idle pattern: 9 days learned · next quiet window 23:00–07:30``:
+        what the engine has learned of your busy and quiet times, for the
+        help screen (the home screen itself stays quiet about it)."""
+        now = time.time()
+        return mxview.idle_pattern_text(mxview.read_history(self._root, now), self._mx, now)
+
     def action_help(self) -> None:
         from claude_swap.tui.fleet_help import HelpScreen
 
-        self.app.push_screen(HelpScreen())
+        self.app.push_screen(HelpScreen(idle_pattern=self.idle_pattern()))
 
     def action_quit(self) -> None:
         request_quit(self.app)

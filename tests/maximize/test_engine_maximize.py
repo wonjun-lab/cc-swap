@@ -199,6 +199,134 @@ class TestSoftAndHard:
         assert entry.next_poll_at is None
 
 
+class TestResetWait:
+    """``maximize.resetWaitMin``: a window about to reset is waited out."""
+
+    @staticmethod
+    def usage(h: EngineHarness, p5: float, reset_at: float) -> dict:
+        # #1 has the best score, so only its own 5h can make it move; #2 is
+        # a ready landing target the whole time.
+        return {"1": win(p5, 10, r5=reset_at), "2": win(0, 40), "3": win(0, 50)}
+
+    @staticmethod
+    def next_poll(h: EngineHarness) -> float | None:
+        return h.switcher._usage_store.entries({"1": (EMAILS[1], "")})["1"].next_poll_at
+
+    def test_climbing_to_the_reset_never_switches(self, temp_home):
+        h = make(temp_home)
+        reset_at = h.clock.now + 13 * 60
+        for p5 in (93, 94, 95, 96):     # 1 pt / 3 min: 100% always well after the reset
+            assert h.tick_with_usage(self.usage(h, p5, reset_at)) is TickOutcome.NO_ACTION
+            assert self.next_poll(h) == pytest.approx(h.clock.now + 60)   # urgent poll
+            h.clock.advance(180)
+        h.clock.advance(300)            # past the reset: 5h restarts near zero
+        assert h.tick_with_usage(
+            self.usage(h, 1, h.clock.now + 5 * 3600)
+        ) is TickOutcome.NO_ACTION
+        assert no_switch_reasons(h) == ["reset-wait"] * 4 + ["maximize-hold"]
+        assert not of(h, SwitchEvent) and h.active_number() == 1
+        decisions = of(h, MaximizeDecisionEvent)
+        assert decisions[0].reason == (
+            "#1 5h 93% — resets in 13m, waiting it out (switches at once if it hits 100%)"
+        )
+        assert decisions[3].reason.startswith("#1 5h 96% — resets in 4m")
+
+    def test_the_wait_is_published_for_why(self, temp_home):
+        h = make(temp_home)
+        h.tick_with_usage(self.usage(h, 93, h.clock.now + 600))
+        record = h.state()[DECISION_KEY]
+        assert (record["decision"], record["pending"], record["code"]) == ("hold", False, "reset-wait")
+        assert record["target"] is None
+        h.clock.advance(900)            # reset over: an ordinary hold carries no code
+        h.tick_with_usage(self.usage(h, 1, h.clock.now + 5 * 3600))
+        assert "code" not in h.state()[DECISION_KEY]
+
+    def test_hitting_100_during_the_wait_switches_at_once(self, temp_home):
+        h = make(temp_home)
+        reset_at = h.clock.now + 10 * 60
+        assert h.tick_with_usage(self.usage(h, 93, reset_at)) is TickOutcome.NO_ACTION
+        h.clock.advance(60)
+        assert h.tick_with_usage(self.usage(h, 100, reset_at)) is TickOutcome.SWITCHED
+        assert [e.trigger for e in of(h, SwitchEvent)] == ["at-limit"]
+        assert h.active_number() == 2
+
+    def test_a_faster_pace_ends_the_wait(self, temp_home):
+        h = make(temp_home)
+        reset_at = h.clock.now + 10 * 60
+        assert h.tick_with_usage(self.usage(h, 93, reset_at)) is TickOutcome.NO_ACTION
+        h.clock.advance(180)            # +6 pts in 3 min: 100% in 30 s, before the reset
+        assert h.tick_with_usage(self.usage(h, 99, reset_at)) is TickOutcome.SWITCHED
+        assert [e.trigger for e in of(h, SwitchEvent)] == ["hard"]
+        assert no_switch_reasons(h) == ["reset-wait"]
+
+    def test_over_hard_with_no_pace_yet_switches(self, temp_home):
+        h = make(temp_home)
+        outcome = h.tick_with_usage(self.usage(h, 96, h.clock.now + 8 * 60))
+        assert outcome is TickOutcome.SWITCHED
+        assert [e.trigger for e in of(h, SwitchEvent)] == ["hard"]
+
+    def test_zero_turns_it_off(self, temp_home):
+        h = make(temp_home, maximize={"resetWaitMin": 0})
+        h.tick_with_usage(self.usage(h, 93, h.clock.now + 8 * 60))
+        assert no_switch_reasons(h) == ["maximize-pending"]
+        assert self.next_poll(h) == pytest.approx(h.clock.now + 180)
+
+    def test_urgent_polls_only_in_the_last_15_minutes(self, temp_home):
+        h = make(temp_home, maximize={"resetWaitMin": 60})
+        reset_at = h.clock.now + 40 * 60
+        h.tick_with_usage(self.usage(h, 93, reset_at))
+        assert no_switch_reasons(h) == ["reset-wait"]
+        assert self.next_poll(h) is None            # the planner's own cadence
+        h.clock.advance(26 * 60)
+        h.tick_with_usage(self.usage(h, 93, reset_at))
+        assert no_switch_reasons(h) == ["reset-wait"] * 2
+        assert self.next_poll(h) == pytest.approx(h.clock.now + 60)
+
+    def test_urgent_poll_respects_a_recent_429(self, temp_home):
+        h = make(temp_home)
+        now = h.clock.now
+        entries = {
+            "1": UsageEntry(last_good=win(93, 10, r5=now + 600), fetched_at=now, age_s=0.0,
+                            last_429_at=now - 60),
+            "2": UsageEntry(last_good=win(0, 40), fetched_at=now, age_s=0.0),
+            "3": UsageEntry(last_good=win(0, 50), fetched_at=now, age_s=0.0),
+        }
+        assert h.tick_with_entries(entries) is TickOutcome.NO_ACTION
+        assert no_switch_reasons(h) == ["reset-wait"]
+        assert self.next_poll(h) is None
+
+    def test_over_the_hard_cap_a_recent_429_switches_instead(self, temp_home):
+        # 1 pt / 3 min: without the 429 every tick waits (as above). At 95%
+        # (hard) a token that just 429'd cannot be polled every 60 s to
+        # catch a climb to 100%: the hard switch happens.
+        h = make(temp_home)
+        reset_at = h.clock.now + 13 * 60
+        for p5 in (93, 94):
+            assert h.tick_with_usage(self.usage(h, p5, reset_at)) is TickOutcome.NO_ACTION
+            h.clock.advance(180)
+        now = h.clock.now
+        usage = self.usage(h, 95, reset_at)
+        entries = {
+            "1": UsageEntry(last_good=usage["1"], fetched_at=now, age_s=0.0,
+                            last_429_at=now - 60),
+            "2": UsageEntry(last_good=usage["2"], fetched_at=now, age_s=0.0),
+            "3": UsageEntry(last_good=usage["3"], fetched_at=now, age_s=0.0),
+        }
+        assert h.tick_with_entries(entries) is TickOutcome.SWITCHED
+        assert no_switch_reasons(h) == ["reset-wait"] * 2
+        assert [e.trigger for e in of(h, SwitchEvent)] == ["hard"]
+
+    def test_hot_reload_rejects_an_out_of_range_value(self, temp_home):
+        h = make(temp_home, maximize={"resetWaitMin": 20})
+        h.tick_with_usage({"1": win(10, 10), "2": win(0, 40), "3": win(0, 50)})
+        write_settings(h, {"maximize": {"resetWaitMin": 90}})
+        h.tick_with_usage({"1": win(10, 10), "2": win(0, 40), "3": win(0, 50)})
+        [warning] = of(h, ConfigWarningEvent)
+        assert "maximize.resetWaitMin" in warning.message
+        assert warning.message.endswith("keeping the previous maximize settings")
+        assert runtime_for(h.engine).settings.reset_wait_min == 20
+
+
 class TestSamples:
     def test_samples_reset_when_active_changes_externally(self, temp_home):
         h = make(temp_home)

@@ -1,9 +1,11 @@
-"""The Fleet screen's read model: pure functions, no Textual, no I/O.
+"""The Fleet screens' read model: pure functions, no Textual, no I/O.
 
-Everything the maximize home screen shows is computed here from the TUI's
+The per-account rows, the engine's decision, who holds the engine and the
+Mode, Re-login and Swap strategy logic are computed here from the TUI's
 store snapshot, the engine's state file (:func:`view.read_state`), the
 settings and — when one runs in this process — the TUI's own engine events.
-Textual widgets only lay out the cells (codex-swap's ``render_lines``
+``maximize/home.py`` turns them into the home screen's sentence, tags and
+layout; Textual widgets only lay them out (codex-swap's ``render_lines``
 discipline applied to the Textual app). ``now`` is always passed in.
 
 Cells are ``(text, tone)`` pairs; a tone is one of ``ok``, ``warn``,
@@ -33,6 +35,7 @@ from claude_swap.json_output import (
 from claude_swap.maximize import idle, pause, policy
 from claude_swap.maximize import primer as mxprimer
 from claude_swap.maximize import view as mxview
+from claude_swap.maximize.history import History as UsageHistory
 from claude_swap.maximize.model import AccountView, Hold, Snapshot, Switch
 from claude_swap.maximize.plan import parse_plan_override
 from claude_swap.maximize.score import days_left, landable
@@ -63,16 +66,7 @@ _SENTINEL_LOGIN: dict[str, LoginState] = {
     USAGE_KEYCHAIN_UNAVAILABLE: "keychain",
     USAGE_API_KEY: "api",
 }
-# What a sentinel's 5h cell says (re-login is crit; the rest heal or are notes).
-_LOGIN_CELLS: dict[str, Cell] = {
-    "relogin": ("re-login", "crit"),
-    "expired": ("token exp.", "warn"),
-    "foreign": ("foreign", "warn"),
-    "keychain": ("keychain", "warn"),
-    "api": ("api", "dim"),
-}
 TIER_CELLS = {"normal": "normal", "last_resort": "last-r", "excluded": "excl"}
-TIER_SUFFIX = {"last_resort": "·LR", "excluded": "·X"}
 
 
 # -- time ---------------------------------------------------------------------------
@@ -253,11 +247,19 @@ class FleetRow:
 
 
 def fleet_snapshot(
-    snap: AccountsSnapshot, mx: MaximizeSettings, state: mxview.MaximizeState, *, now: float
+    snap: AccountsSnapshot,
+    mx: MaximizeSettings,
+    state: mxview.MaximizeState,
+    *,
+    now: float,
+    history: UsageHistory | None = None,
 ) -> Snapshot:
     """The policy Snapshot the TUI decides on: :func:`view.snapshot_from_accounts`
     with the published plans, and slots without a usable stored login set
-    aside like the engine does (``engine_hook._unavailable``)."""
+    aside like the engine does (``engine_hook._unavailable``). ``history``
+    (``view.read_history``) gives the decisions Fleet computes itself the
+    idle pattern and burn rates the engine's preempt and rebalance deferral
+    read; None decides as if there were no history."""
     unusable = {
         a.number
         for a in snap.accounts
@@ -265,7 +267,9 @@ def fleet_snapshot(
     }
     if unusable:
         state = replace(state, quarantined=state.quarantined | unusable)
-    return mxview.snapshot_from_accounts(snap, mx, state, now=now, plans=state.plans)
+    return mxview.snapshot_from_accounts(
+        snap, mx, state, now=now, plans=state.plans, history=history
+    )
 
 
 def _slot(number: str) -> tuple[int, str]:
@@ -359,9 +363,18 @@ class DecisionView:
     source: Literal["engine", "here", "computed"] = "computed"
     # kind "off" (`cc-swap auto off`): what the decision would have been.
     would: str | None = None
+    # A hold's own code (``model.Hold.code``: reset-wait, preempt,
+    # rebalance-deferred), from the engine or computed here; else None.
+    code: str | None = None
+    # reset-wait: ``(window, pct, reset epoch)`` for each window being waited
+    # out, read from the current snapshot so the minutes left stay live.
+    waits: tuple[tuple[str, float, float], ...] = ()
 
 
 _SLOT_RE = re.compile(r"#(\w+)")
+#: One waited-out window in a reset-wait reason (``policy._reset_wait``):
+#: ``5h 96% — resets in 8m``.
+_WAIT_RE = re.compile(r"\b(5h|7d) [\d.]+% — resets in \d+m")
 
 
 def _target_in(reason: str, active: str | None) -> str | None:
@@ -381,12 +394,31 @@ def _kind(decision: str, pending: bool) -> DecisionKind:
     return "none"
 
 
+def reset_waits(reason: str, msnap: Snapshot) -> tuple[tuple[str, float, float], ...]:
+    """The windows a reset-wait hold names (``5h 96% — resets in 8m``), with
+    the active account's current pct and reset from ``msnap``; a window that
+    has reset since (or reads no reset) is left out."""
+    a = msnap.view(msnap.active)
+    if a is None:
+        return ()
+    out: list[tuple[str, float, float]] = []
+    for window in dict.fromkeys(m.group(1) for m in _WAIT_RE.finditer(reason or "")):
+        pct, reset = (a.pct5, a.reset5) if window == "5h" else (a.pct7, a.reset7)
+        if pct is not None and reset is not None and reset > msnap.now:
+            out.append((window, pct, reset))
+    return tuple(out)
+
+
 def _enrich(dv: DecisionView, msnap: Snapshot) -> DecisionView:
-    """Growth and the hard-cap ETA, recomputed from the samples."""
+    """Growth and the hard-cap ETA, recomputed from the samples; for a
+    reset-wait hold, the windows it waits out. A reset-wait hold gets no
+    hard-cap ETA: it may already be past the hard cap (``hard in ~0m``), and
+    what ends it is the reset or 100%, not the cap."""
     waiting = mxview.pending(msnap) if dv.kind == "pending" else None
+    reset_wait = dv.kind == "hold" and dv.code == "reset-wait"
     eta = (
         idle.eta_to_hard_min(msnap.samples, msnap.settings)
-        if dv.kind in ("pending", "hold") and msnap.samples
+        if dv.kind in ("pending", "hold") and msnap.samples and not reset_wait
         else None
     )
     return replace(
@@ -395,11 +427,22 @@ def _enrich(dv: DecisionView, msnap: Snapshot) -> DecisionView:
         window=waiting.window if waiting else None,
         window_min=waiting.window_min if waiting else None,
         eta_hard_min=eta,
+        waits=reset_waits(dv.reason, msnap) if reset_wait else (),
     )
+
+
+def _hold_target(code: str | None, reason: str, active: str | None) -> str | None:
+    """Where a coded hold is headed: a preempt waiting for idle and a
+    deferred rebalance name their target in the reason; a reset-wait goes
+    nowhere."""
+    if code in ("preempt", "rebalance-deferred"):
+        return _target_in(reason, active)
+    return None
 
 
 def _computed(msnap: Snapshot, *, now: float) -> DecisionView:
     decision = policy.decide(msnap)
+    code: str | None = None
     if isinstance(decision, Switch):
         target, trigger = decision.target, decision.trigger
         kind: DecisionKind = "switch"
@@ -408,14 +451,17 @@ def _computed(msnap: Snapshot, *, now: float) -> DecisionView:
         target = None
         if isinstance(decision, Hold):
             kind = "pending" if decision.pending else "hold"
+            code = decision.code
             if decision.pending:
                 landing = policy.landing_candidates(msnap)
                 target = landing[0].number if landing else None
+            else:
+                target = _hold_target(code, decision.reason, msnap.active)
         else:
             kind = _kind(type(decision).__name__.lower(), False)
     return DecisionView(
         kind=kind, active=msnap.active, target=target, trigger=trigger,
-        reason=decision.reason, at=now, source="computed",
+        reason=decision.reason, at=now, source="computed", code=code,
     )
 
 
@@ -445,13 +491,13 @@ def decision_view(
     would = {
         "switch": f"switch ({dv.trigger}){target}",
         "pending": f"switch at the next idle moment{target}",
-        "hold": "hold",
+        "hold": f"hold ({dv.code})" if dv.code else "hold",
         "exhausted": "every account is at its limit",
         "indeterminate": "fail over (usage unreadable)",
     }.get(dv.kind)
     return replace(
         dv, kind="off", target=None, trigger=None, would=would,
-        at=state.auto_off_since, reason=state.auto_off_by or "",
+        at=state.auto_off_since, reason=state.auto_off_by or "", code=None, waits=(),
     )
 
 
@@ -474,6 +520,7 @@ def _decision_view(
             reason=why, at=until, source="engine",
         )
     if own is not None:
+        code = getattr(own, "code", None)
         dv = DecisionView(
             kind=_kind(own.decision, own.pending),
             active=own.active,
@@ -482,6 +529,7 @@ def _decision_view(
             reason=own.reason,
             at=own_at if own_at is not None else now,
             source="here",
+            code=code if own.decision == "hold" and code in mxview.HOLD_CODES else None,
         )
         return _enrich(dv, msnap)
     published = state.decision
@@ -498,6 +546,7 @@ def _decision_view(
             reason=published.reason,
             at=published.at,
             source="engine",
+            code=published.code,
         )
         return _enrich(dv, msnap)
     return _enrich(_computed(msnap, now=now), msnap)
@@ -603,63 +652,7 @@ def engine_status(
     return EngineStatus("none", None, service, auto_off)
 
 
-def _manager(service: Mapping | None) -> str:
-    return "systemd" if service and service.get("platform") == "linux" else "launchd"
-
-
-def engine_parts(es: EngineStatus) -> tuple[list[tuple[str, int]], Tone]:
-    service = es.service
-    if es.holder == "service":
-        parts = [
-            ("● service", 0),
-            (f"{_manager(service)} · pid {es.pid}", 2),
-            ("holds the lease — this TUI is a viewer", 1),
-        ]
-        tone = "plain"
-    elif es.holder == "other":
-        who = f"● pid {es.pid}" if es.pid else "● another process"
-        parts = [
-            (who, 0),
-            ("not the service: a terminal cc-swap auto or the menu bar", 2),
-            ("viewer", 1),
-        ]
-        tone = "plain"
-    elif es.holder == "here-dry":
-        parts = [("● here · DRY-RUN", 0), ("watching only, nothing switches", 1)]
-        tone = "warn"
-    elif es.holder == "here-live":
-        pid = f" (pid {es.pid})" if es.pid else ""
-        parts = [(f"● here · LIVE{pid}", 0), ("quitting stops it", 1)]
-        tone = "accent"
-    else:
-        if service is not None and service.get("installed"):
-            from claude_swap.maximize.service import state_text
-
-            why = f"service stopped ({_manager(service)}: {state_text(service)})"
-        elif service is not None:
-            why = "no service (cc-swap service install)"
-        else:
-            why = ""
-        parts = [("○ nothing is switching", 0)]
-        if why:
-            parts.append((why, 2))
-        parts.append(("m to run one here", 1))
-        tone = "warn"
-    if service is not None and service.get("linger") is False:
-        parts.append(("linger off: stops at logout", 3))
-        tone = "warn"
-    if es.auto_off:
-        parts.insert(1, ("AUTO OFF: watching only", 0))
-        tone = "warn"
-    return parts, tone
-
-
-def engine_line(es: EngineStatus, width: int = 1000) -> Cell:
-    parts, tone = engine_parts(es)
-    return _fit(parts, width), tone
-
-
-# -- lines --------------------------------------------------------------------------------
+# -- text and logins ----------------------------------------------------------------------
 
 
 def _fit(parts: Sequence[tuple[str, int]], width: int, *, prefix: str = "") -> str:
@@ -678,113 +671,12 @@ def _fit(parts: Sequence[tuple[str, int]], width: int, *, prefix: str = "") -> s
         kept.remove(worst)
 
 
-def _prime_parts(
-    rows: Sequence[FleetRow],
-    prime: PrimeSettings,
-    *,
-    auto_off: bool = False,
-    guard: str | None = None,
-) -> tuple[list[tuple[str, int]], Tone]:
-    if prime.enabled and (auto_off or guard):
-        # Priming is on but does not run: say why first.
-        parts = [("stopped: automatic switching is off", 0)] if auto_off else []
-        if guard:
-            parts.append((guard, 0))
-        return parts, "warn"
-    if not prime.enabled:
-        cold = sum(
-            1 for r in rows
-            if r.state5 == "cold" and not r.active and r.tier != "excluded" and r.login == "ok"
-        )
-        parts = [("priming off (s → Swap strategy)", 0)]
-        if cold:
-            parts.append((f"{cold} cold account{'s' if cold != 1 else ''} idle", 1))
-        return parts, "dim"
-    due = [r for r in rows if r.prime.kind == "due"]
-    windows = sorted(
-        (r for r in rows if r.prime.kind == "window"), key=lambda r: r.prime.lo or 0.0
-    )
-    blocked = [r for r in rows if r.prime.kind == "skip" and r.prime.note not in ("—", "")]
-    parts: list[tuple[str, int]] = []
-    if due:
-        by = max(r.prime.hi or 0.0 for r in due)
-        parts.append((" ".join(f"#{r.number}" for r in due) + f" due ≤{hhmm(by)}", 0))
-    for i, r in enumerate(windows):
-        parts.append((f"#{r.number} {prime_text(r.prime)}", 3 + i))
-    for r in blocked:
-        note = "needs re-login" if r.prime.note == "re-login" else r.prime.note
-        parts.append((f"#{r.number} {note}", 2))
-    if not parts:
-        parts.append(("nothing to prime", 0))
-    return parts, "plain"
-
-
-def status_lines(
-    es: EngineStatus,
-    dv: DecisionView,
-    rows: Sequence[FleetRow],
-    mx: MaximizeSettings,
-    prime: PrimeSettings,
-    *,
-    now: float,
-    width: int,
-    prime_guard: str | None = None,
-) -> list[Cell]:
-    """The three status lines under the header: engine, now, prime.
-    ``prime_guard`` is ``prime_verify.paused_note``: priming paused after a
-    Claude Code update."""
-    out: list[Cell] = []
-    for label, (parts, tone) in (
-        ("engine  ", engine_parts(es)),
-        ("now     ", decision_parts(dv, now=now)),
-        ("prime   ", _prime_parts(rows, prime, auto_off=es.auto_off, guard=prime_guard)),
-    ):
-        out.append((_fit(parts, width, prefix=label), tone))
-    return out
-
-
 def relogin_count(rows: Sequence[FleetRow]) -> int:
     return sum(1 for r in rows if r.login == "relogin")
 
 
-def header_line(
-    mx: MaximizeSettings,
-    prime: PrimeSettings,
-    rows: Sequence[FleetRow],
-    *,
-    host: str | None,
-    ssh: bool,
-    now: float,
-    width: int,
-) -> str:
-    """``cc-swap @ host (ssh) · maximize · 5h 50/95 · 7d 90/98 · margin 5 ·
-    priming on`` with the clock right-aligned; parts drop when narrow."""
-    head = "cc-swap"
-    if host:
-        head += f" @ {host}" + (" (ssh)" if ssh else "")
-    parts: list[tuple[str, int]] = [
-        (head, 0),
-        ("maximize", 3),
-        (f"5h {mx.soft_5h:g}/{mx.hard_5h:g}", 4),
-        (f"7d {mx.soft_7d:g}/{mx.hard_7d:g}", 5),
-        (f"margin {mx.landing_margin:g}", 7),
-        (f"priming {'on' if prime.enabled else 'off'}", 6),
-    ]
-    count = relogin_count(rows)
-    if count:
-        parts.append((f"{count} need{'s' if count == 1 else ''} re-login", 0))
-    clock = time.strftime("%a %H:%M", time.localtime(now))
-    room = width - len(clock) - 1
-    left = _fit(parts, room)
-    if not left.endswith("…") and len(left) <= room:
-        return left + " " * (width - len(left) - len(clock)) + clock
-    return _fit(parts, width)  # the clock goes before anything essential
-
-
-def _dead_cause(row: FleetRow, *, plural: bool = False) -> str:
-    if row.login_expired:
-        return "logins expired" if plural else "login expired"
-    return "refresh tokens dead" if plural else "refresh token dead"
+def _dead_cause(row: FleetRow) -> str:
+    return "login expired" if row.login_expired else "refresh token dead"
 
 
 def login_left(row: FleetRow, now: float) -> float | None:
@@ -803,78 +695,12 @@ def login_due(row: FleetRow, now: float) -> bool:
     )
 
 
-def login_cell(row: FleetRow, now: float) -> Cell:
-    """The ``login`` column: time left on the login — amber inside the last
-    week, red inside the last day and once past; dim otherwise."""
-    left = login_left(row, now)
-    if left is None:
-        return "—", "dim"
-    if left <= 0:
-        return "expired", "crit"
-    if left >= LOGIN_WARN_S:
-        return f"{int(left // 86400)}d", "dim"
-    return oauth.login_countdown(left), "crit" if left < LOGIN_URGENT_S else "warn"
-
-
 def _expiring_text(row: FleetRow, now: float) -> str:
     """``login expires Oct 9 20:04 (in 6d 2h)``: the deadline format doctor,
     list and the auto log use too (``oauth.login_expiry_note_ms``)."""
     if row.login_deadline is None:
         return "login expired"
     return oauth.login_expiry_note_ms(row.login_deadline * 1000.0, int(now * 1000)) or ""
-
-
-def _dead_line(dead: Sequence[FleetRow]) -> str:
-    if len(dead) == 1:
-        r = dead[0]
-        return (
-            f"⚠ #{r.number} {r.name} needs re-login ({_dead_cause(r)}) — "
-            "select it and press r"
-        )
-    if len({r.login_expired for r in dead}) == 1:
-        names = ", ".join(f"#{r.number} {r.name}" for r in dead)
-        cause = _dead_cause(dead[0], plural=True)
-        return f"⚠ {names} need re-login ({cause}) — select one and press r"
-    names = ", ".join(f"#{r.number} {r.name} ({_dead_cause(r)})" for r in dead)
-    return f"⚠ {names} need re-login — select one and press r"
-
-
-def attention(rows: Sequence[FleetRow], *, now: float | None = None) -> str | None:
-    """One line naming every account whose login only a re-login fixes, and
-    why (the login reached its deadline, or the refresh token died); with
-    ``now``, also the logins that expire within a week."""
-    dead = [r for r in rows if r.login == "relogin"]
-    due = [r for r in rows if now is not None and login_due(r, now)]
-    if dead:
-        line = _dead_line(dead)
-        for r in due:
-            line += f" · #{r.number} {_expiring_text(r, now)}"
-        return line
-    if not due or now is None:
-        return None
-    if len(due) == 1:
-        r = due[0]
-        return (
-            f"⚠ #{r.number} {r.name} {_expiring_text(r, now)} — "
-            "re-login before then: select it and press r"
-        )
-
-    def when(r: FleetRow) -> str:
-        left = login_left(r, now) or 0.0
-        return "expired" if left <= 0 else f"in {oauth.login_countdown(left)}"
-
-    parts = ", ".join(f"#{r.number} {r.name} {when(r)}" for r in due)
-    return f"⚠ logins expire: {parts} — re-login before then: select one and press r"
-
-
-def attention_tone(rows: Sequence[FleetRow], *, now: float) -> Tone:
-    """crit for a dead login or one inside its last day; warn otherwise."""
-    if any(r.login == "relogin" for r in rows):
-        return "crit"
-    urgent = any(
-        login_due(r, now) and (login_left(r, now) or 0.0) < LOGIN_URGENT_S for r in rows
-    )
-    return "crit" if urgent else "warn"
 
 
 def login_text(row: FleetRow) -> Cell:
@@ -893,193 +719,11 @@ _LOGIN_TEXT: dict[str, Cell] = {
 }
 
 
-# -- table ----------------------------------------------------------------------------------
-
-
-ALL_COLUMNS: tuple[str, ...] = (
-    "mark", "#", "account", "plan", "tier", "rank",
-    "5h", "7d", "7d in", "pace", "land", "login",
-    "5h window", "next prime",
-)
-COLUMN_LABELS = {
-    "mark": "", "#": "#", "account": "account", "plan": "plan", "tier": "tier",
-    "rank": "rank", "5h": "5h", "7d": "7d", "7d in": "7d in", "pace": "pace",
-    "land": "land", "login": "login", "5h window": "5h window", "5h win": "5h", "next prime": "next prime",
-}
-
-
-def columns_for(width: int) -> tuple[str, ...]:
-    """The table's columns at ``width``: always mark, #, account, 5h, 7d,
-    land and the 5h window; then pace, next prime, tier, plan, 7d in and
-    rank, dropped in reverse order as the screen narrows."""
-    drop: set[str] = set()
-    if width < 112:
-        drop |= {"rank", "7d in"}
-    if width < 100:
-        drop |= {"plan", "tier", "login"}
-    if width < 64:
-        drop |= {"next prime"}
-    cols = [c for c in ALL_COLUMNS if c not in drop]
-    if width < 64:
-        cols = ["5h win" if c == "5h window" else c for c in cols]
-    return tuple(cols)
-
-
-def account_width(width: int) -> int:
-    """The account column's width (min 8): aliases fit, long emails clip."""
-    if width >= 130:
-        return 20
-    if width >= 100:
-        return 14
-    if width >= 64:
-        return 10
-    return 8
+# -- actions --------------------------------------------------------------------------------
 
 
 def clip(text: str, width: int) -> str:
     return text if len(text) <= width else text[: max(width - 1, 0)] + "…"
-
-
-def _pct_cell(pct: float | None, soft: float, hard: float, stale: bool) -> Cell:
-    if pct is None:
-        return "?", "dim"
-    text = f"{'~' if stale else ''}{pct:.0f}%"
-    if stale:
-        return text, "dim"
-    if pct >= hard:
-        return text, "crit"
-    if pct >= soft:
-        return text, "warn"
-    return text, "ok"
-
-
-def _window_cell(row: FleetRow, *, short: bool) -> Cell:
-    if row.login == "relogin":
-        return "?", "crit"
-    if row.state5 == "cold" or row.reset5 is None:
-        return "cold", "dim"
-    clock = hhmm(row.reset5)
-    if short:
-        return (f"prim {clock}" if row.state5 == "primed" else f"run {clock}"), (
-            "accent" if row.state5 == "primed" else "plain"
-        )
-    if row.state5 == "primed":
-        return f"primed → {clock}", "accent"
-    return f"running → {clock}", "plain"
-
-
-def row_cells(
-    row: FleetRow, columns: Sequence[str], *, now: float, mx: MaximizeSettings
-) -> tuple[Cell, ...]:
-    """The table cells of one row, in ``columns`` order."""
-    dead = row.login == "relogin"
-    dim_tier = row.tier != "normal"
-    name = row.name
-    if "tier" not in columns and row.tier in TIER_SUFFIX:
-        name += TIER_SUFFIX[row.tier]
-    cells: list[Cell] = []
-    for col in columns:
-        if col == "mark":
-            cell: Cell = ("*", "bold") if row.active else (" ", "plain")
-        elif col == "#":
-            cell = (row.number, "crit" if dead else ("bold" if row.active else "plain"))
-        elif col == "account":
-            cell = (name, "crit" if dead else ("bold" if row.active else "plain"))
-        elif col == "plan":
-            cell = (row.plan, "dim" if row.plan in ("?", "api") else "plain")
-        elif col == "tier":
-            cell = (TIER_CELLS.get(row.tier, row.tier), "dim" if dim_tier else "plain")
-        elif col == "rank":
-            if row.tier == "excluded":
-                cell = ("—", "dim")
-            else:
-                cell = (str(row.rank) if row.rank is not None else "?", "plain")
-        elif col == "5h":
-            if row.login != "ok":
-                cell = _LOGIN_CELLS[row.login]
-            else:
-                cell = _pct_cell(row.pct5, mx.soft_5h, mx.hard_5h, row.stale)
-        elif col == "7d":
-            if row.login != "ok" and row.pct7 is None:
-                cell = ("—", "crit" if dead else "dim")
-            else:
-                cell = _pct_cell(row.pct7, mx.soft_7d, mx.hard_7d, row.stale)
-        elif col == "7d in":
-            cell = (f"{row.days7:.1f}d", "plain") if row.days7 is not None else ("—", "dim")
-        elif col == "pace":
-            cell = (f"{row.score:.2f}", "plain") if row.score is not None else ("—", "dim")
-        elif col == "land":
-            if dead:
-                cell = ("re-login", "crit")
-            elif row.land == "yes":
-                cell = ("yes", "ok")
-            elif row.land == "active":
-                cell = ("active", "bold")
-            else:
-                cell = (row.land, "dim")
-        elif col == "login":
-            cell = ("re-login", "crit") if dead else login_cell(row, now)
-        elif col in ("5h window", "5h win"):
-            cell = _window_cell(row, short=col == "5h win")
-        elif col == "next prime":
-            text = prime_text(row.prime)
-            if row.prime.kind == "due":
-                tone = "accent"
-            elif text == "re-login":
-                tone = "crit"
-            else:
-                tone = "plain" if row.prime.kind == "window" else "dim"
-            cell = (text, tone)
-        else:
-            cell = ("", "plain")
-        cells.append(cell)
-    return tuple(cells)
-
-
-def detail_line(row: FleetRow, mx: MaximizeSettings, *, now: float | None = None) -> str:
-    """The fork line under the detail card: rank, plan, pace explained, the
-    landing verdict in words, the 5h window and (with ``now``) the time left
-    on the login."""
-    parts: list[str] = []
-    if row.tier == "excluded":
-        parts.append("excluded from rotation")
-    else:
-        parts.append(f"rank {row.rank}" if row.rank is not None else "rank ?")
-    parts.append(row.plan if row.plan != "?" else "plan ?")
-    if row.score is not None and row.pct7 is not None and row.days7 is not None:
-        parts.append(
-            f"pace {row.score:.2f} ({100 - row.pct7:.0f}% left over {row.days7:.1f}d)"
-        )
-    land = {
-        "yes": "landable",
-        "active": "active",
-        "re-login": "needs re-login (press r)",
-        "excluded": "excluded (x includes it)",
-        "quarant.": "quarantined (no usable stored login)",
-        "usage ?": "usage unknown",
-        "api key": "API key (no quota)",
-    }.get(row.land)
-    if land is None and row.land.startswith("login<"):
-        land = (
-            f"not landable (login expires within the {mx.login_expiry_guard_min}-min "
-            "guard; at-limit fallback only)"
-        )
-    if land is None:
-        land = f"not landable ({row.land}: under both soft marks minus {mx.landing_margin:g})"
-    parts.append(land)
-    if row.tier == "last_resort":
-        parts.append("last resort (l toggles)")
-    if row.state5 == "primed" and row.reset5 is not None:
-        parts.append(f"5h primed → {hhmm(row.reset5)}")
-    elif row.state5 == "running" and row.reset5 is not None:
-        parts.append(f"5h running → {hhmm(row.reset5)}")
-    else:
-        parts.append("5h cold")
-    left = login_left(row, now) if now is not None else None
-    if left is not None and now is not None and row.login != "relogin":
-        hint = " (r re-logs in)" if left < LOGIN_WARN_S else ""
-        parts.append(_expiring_text(row, now) + hint)
-    return " · ".join(parts)
 
 
 def switch_warning(row: FleetRow, mx: MaximizeSettings) -> str | None:
@@ -1167,36 +811,6 @@ def relogin_steps(
         "don't copy one login between machines.",
     ]
     return lines
-
-
-# -- layout -----------------------------------------------------------------------------------
-
-
-@dataclass(frozen=True)
-class LayoutPlan:
-    detail: bool
-    prime_line: bool
-    menu: Literal["full", "folded"]
-    keys: Literal["full", "minimal"]
-    blanks: bool
-    columns: tuple[str, ...]
-
-
-def fit_layout(height: int, width: int, n_rows: int, *, attention: bool) -> LayoutPlan:
-    """What fits on a ``height``×``width`` terminal. Depends only on the
-    size and the account count, never on the cursor. Kept in order: the
-    attention line, the engine/now lines and every row; the menu (vertical,
-    then folded); the key hints; the prime line; the detail card; blank
-    lines. The thresholds are for 6 accounts; each extra row costs a line."""
-    h = height - max(0, n_rows - 6)
-    return LayoutPlan(
-        detail=h >= 29,
-        prime_line=h >= 18,
-        menu="full" if h >= 24 else "folded",
-        keys="full" if h >= 18 else "minimal",
-        blanks=h >= 18,
-        columns=columns_for(width),
-    )
 
 
 # -- Mode -----------------------------------------------------------------------------------

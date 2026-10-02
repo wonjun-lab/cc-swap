@@ -29,7 +29,7 @@ def _table_rows() -> dict[str, list[str]]:
 
 
 def test_every_fork_key_is_registered():
-    assert len(FORK_KEYS) == 19  # 14 maximize.* + 5 prime.*
+    assert len(FORK_KEYS) == 24  # 19 maximize.* + 5 prime.*
 
 
 @pytest.mark.parametrize("key", FORK_KEYS)
@@ -82,9 +82,95 @@ def test_readme_describes_the_service_takeover_as_a_retry_not_a_wait_for_termina
     "it refuses a login that belongs to another slot",
     "`pausedUntil`",
     "CC_SWAP_FETCH_ON_OPEN=0",
+    "assets/fleet-wide.png",
+    "assets/fleet-narrow.png",
+    "nothing below is live",
 ])
 def test_readme_documents_the_fleet_screen_and_relogin(snippet):
     assert snippet in README.read_text(encoding="utf-8")
+
+
+def test_readme_fleet_screenshots_exist():
+    root = README.parent
+    text = _readme_text()
+    for name in ("fleet-wide.png", "fleet-narrow.png", "fleet-reset-wait.png"):
+        assert (root / "assets" / name).stat().st_size > 10_000, name
+        assert f"assets/{name}" in text, name
+
+
+def _section(heading: str, end: str = "\n## ") -> str:
+    text = _readme_text()
+    start = text.index(heading)
+    return text[start:text.index(end, start + len(heading))]
+
+
+def test_readme_trigger_table_lists_every_policy_trigger():
+    """``model.Trigger`` (what ``policy.decide`` can switch for) against the
+    "When it switches" table; failover is the engine's own."""
+    from typing import get_args
+
+    from claude_swap.maximize.model import Trigger
+
+    table = _section("**When it switches**", "\n\n*Idle*")
+    rows = [line.split("|")[1].strip().strip("`") for line in table.splitlines()
+            if line.startswith("| `")]
+    assert set(get_args(Trigger)) <= set(rows)
+    # First match wins: the table lists them in the policy's order.
+    assert [r for r in rows if r in get_args(Trigger)] == list(get_args(Trigger))
+
+
+@pytest.mark.parametrize("snippet", [
+    # The home sentence for each hold code and a preempt switch (maximize/home.py).
+    "5h 96% — resets in 8m, waiting it out (switches at once if it hits 100%)",
+    "7d 84% would pass 90% in ~3h, before your usual quiet time (23:00) — will move to "
+    "#2 side when you pause",
+    "rebalance deferred to your quiet time (23:00)",
+    "switching #1 main → #2 side now while you're idle",
+    # The learned idle pattern: in help (?) and Swap strategy, not on the home screen.
+    "idle pattern: 9 days learned · next quiet window 23:00–07:30",
+])
+def test_readme_fleet_section_words_the_engine_reasons(snippet):
+    assert snippet in _section("## Fleet: the TUI home for maximize")
+
+
+def test_readme_fleet_section_names_every_new_swap_strategy_setting():
+    section = _section("## Fleet: the TUI home for maximize")
+    for key in ("resetWaitMin", "learnIdlePattern", "preempt", "preemptHorizonMaxH",
+                "busyRebalanceGap"):
+        assert f"`{key}`" in section, key
+
+
+def test_readme_home_sentences_are_the_ones_fleet_prints():
+    """The README quotes the sentence; this builds it from the policy's own
+    reason so a rewording on either side shows up here."""
+    from dataclasses import replace
+
+    from claude_swap.maximize import fleet as fx
+    from claude_swap.maximize import home
+    from claude_swap.maximize.model import Sample
+    from claude_swap.maximize.view import MaximizeState
+    from tests.maximize.test_fleet import MX, NOW, PRIME, acc, accounts, usage
+
+    snap = accounts(acc(1, usage(96, 40, reset5=NOW + 8 * 60 + 20), active=True, alias="main"),
+                    acc(2, usage(10, 20), alias="side"))
+    state = MaximizeState(samples_account="1", samples=(
+        Sample(NOW - 660, 95.5, 40.0), Sample(NOW - 60, 96.0, 40.0)))
+    msnap = fx.fleet_snapshot(snap, MX, state, now=NOW)
+    dv = replace(fx.preview_decision(msnap, MX), source="engine")
+    rows = fx.fleet_rows(snap, MX, PRIME, state, now=NOW)
+    es = fx.EngineStatus("service", 4121, {"running": True, "pid": 4121})
+    first = "".join(t for t, _ in home.status_variants(es, dv, rows, MX, "live", now=NOW)[0])
+    assert f"`{first}`" in _readme_text()
+
+
+def test_readme_names_every_fleet_footer_key():
+    from claude_swap.maximize import home
+
+    text = _readme_text()
+    start = text.index("## Fleet: the TUI home for maximize")
+    section = text[start:text.index("### Logins expire", start)]
+    for key, what in home.KEY_HINTS:
+        assert f"`{key}` {what}" in section, key
 
 
 # --- README <-> code contracts ----------------------------------------------
@@ -169,7 +255,11 @@ def test_every_fleet_key_the_readme_names_is_bound():
 
     bound = {"?" if k == "question_mark" else k for b in FleetScreen.BINDINGS for k in b.key.split(",")}
     bound |= {k for b in CswapApp.BINDINGS for k in b.key.split(",")}
-    # Sub-screens the section documents: Account settings and the Mode modal.
+    # Sub-screens the section documents: the menu, Account settings and the
+    # Mode modal.
+    from claude_swap.tui import menus
+
+    bound |= set(menus.MAIN_KEYS)
     bound |= {k for b in AccountsScreen.BINDINGS for k in b.key.split(",")}
     bound |= {
         a.key

@@ -10,7 +10,7 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 
 from claude_swap.maximize.idle import trim_samples
-from claude_swap.maximize.model import AccountView, Sample, Snapshot
+from claude_swap.maximize.model import AccountView, Forecast, Sample, Snapshot
 from claude_swap.maximize.plan import plan_weight
 from claude_swap.maximize.tiers import parse_account_list, tier_for
 from claude_swap.poll_policy import parse_reset_ts
@@ -72,6 +72,9 @@ def build_snapshot(
     settings: MaximizeSettings,
     active_changed_at: float | None = None,
     login_deadlines: Mapping[str, float] | None = None,
+    forecast: Forecast | None = None,
+    rates7: Mapping[str, float] | None = None,
+    active_recent_429: bool = False,
 ) -> Snapshot:
     """One view per ``records`` entry, in ``records`` order (sequence order)."""
     last_resort = parse_account_list(settings.last_resort)
@@ -105,4 +108,7 @@ def build_snapshot(
         last_switch_at=last_switch_at,
         settings=settings,
         active_changed_at=active_changed_at,
+        forecast=forecast,
+        rates7=dict(rates7 or {}),
+        active_recent_429=active_recent_429,
     )

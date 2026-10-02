@@ -14,9 +14,11 @@ the ``auto`` parser; ``prime verify`` is a ``prime`` subcommand; ``upgrade
 --check`` extends upstream's ``upgrade``) are not in ``_FORK_COMMANDS`` and
 are listed in ``EXTRA_FORK_ACTIONS`` so they are held to the same rule.
 
-A route is the key path from the Fleet home screen: ``"u"`` is a main-menu
-or row key; ``"a i"`` is ``a`` (Account settings) then ``i`` on that
-screen; ``"m o"`` is ``m`` (Mode) then the Mode modal's ``o``.
+A route is the key path from the Fleet home screen. Since 0.4.0 the home
+screen has six keys (its footer) and everything else lives in the ``m``
+menu: ``"l"`` is a home key; ``"m p"`` is ``m`` (the menu) then ``p``;
+``"m a i"`` is the menu, ``a`` (Account settings), then ``i`` on that
+screen; ``"m m"`` is the menu's Mode modal.
 """
 
 from __future__ import annotations
@@ -40,14 +42,15 @@ EXTRA_FORK_ACTIONS: tuple[str, ...] = (
 
 #: CLI action -> the Fleet key path that performs the same thing.
 FLEET_ROUTES: dict[str, str] = {
-    "last-resort": "l",  # row key: toggle last resort on the highlighted account
-    "prime": "p",  # menu: Prime now…
-    "history": "v",  # menu: View switch history (the ledger, newest first)
-    "claude-update": "u",  # menu: Update Claude Code (check, confirm, run)
-    "doctor": "a i",  # Account settings → Inspect all logins (doctor)
-    "auto off": "m o",  # Mode → o: automatic switching off (persistent)
-    "auto on": "m o",  # Mode → o: automatic switching back on
-    "auto status": "m",  # Mode: its facts say AUTO OFF, by whom and since when
+    "last-resort": "l",  # home key: toggle last resort on the selected account
+    "prime": "m p",  # menu → Prime now…
+    "history": "m v",  # menu → View switch history (the ledger, newest first)
+    "claude-update": "m u",  # menu → Update Claude Code (check, confirm, run)
+    "doctor": "m a i",  # menu → Account settings → Inspect all logins (doctor)
+    "auto off": "m o",  # menu → o: automatic switching off (persistent)
+    "auto on": "m o",  # menu → o: automatic switching back on
+    # The home sentence says Auto OFF; menu → Mode's facts say by whom and since when.
+    "auto status": "m m",
 }
 
 #: CLI action -> why Fleet deliberately has no twin.
@@ -67,13 +70,15 @@ KNOWN_ASYMMETRY: dict[str, str] = {
         "before Fleet is the home screen"
     ),
     "why": (
-        "Fleet's now line already shows the engine's last decision and its reason "
-        "live; why is that same explanation for a shell"
+        "Fleet's status sentence already says what the engine decided, live, and "
+        "when it stopped reporting — a reset-wait, preempt or deferred rebalance in "
+        "plain words — and ? shows the learned idle pattern; why is that same "
+        "explanation for a shell"
     ),
     "prime verify": (
         "spawns claude in a throwaway profile (and with --live spends a real prime) "
-        "to re-check isolation; Fleet's prime line says when it is needed and names "
-        "the command"
+        "to re-check isolation; Fleet's attention line says when it is needed and "
+        "names the command"
     ),
 }
 
@@ -114,15 +119,27 @@ def _screen_keys(screen_cls) -> set[str]:
     return {k for b in screen_cls.BINDINGS for k in b.key.split(",")}
 
 
-def _sub_keys(first: str) -> set[str]:
-    """Keys the sub-screen that ``first`` opens answers to."""
-    if first == "a":
+def _menu_keys() -> set[str]:
+    """Keys the ``m`` menu answers to (every item's letter, plus closing)."""
+    from claude_swap.tui.fleet_modals import MenuModal
+
+    rows = menus.menu_rows(auto_off=False, holder="service", mode_label="service · viewing")
+    modal = MenuModal(rows)
+    assert set(modal._by_key) == set(menus.MAIN_KEYS), "a menu item has no key"
+    return set(modal._by_key) | _screen_keys(MenuModal)
+
+
+def _sub_keys(path: tuple[str, ...]) -> set[str]:
+    """Keys the screen or modal that the key path ``path`` opens answers to."""
+    if path == ("m",):
+        return _menu_keys()
+    if path == ("m", "a"):
         from claude_swap.tui.fleet_accounts import AccountsScreen
 
         keys = _screen_keys(AccountsScreen)
         assert keys >= {k for k, _t, _a in menus.ACCOUNT_ITEMS}, "an Account item is unbound"
         return keys
-    if first == "m":
+    if path == ("m", "m"):
         from claude_swap.maximize import fleet as fx
 
         return {
@@ -131,20 +148,32 @@ def _sub_keys(first: str) -> set[str]:
             for off in (False, True)
             for a in fx.mode_transitions(holder, auto_off=off)
         }
-    raise AssertionError(f"no sub-screen behind `{first}` is known to this test")
+    raise AssertionError(f"no screen behind `{' '.join(path)}` is known to this test")
 
 
 @pytest.mark.parametrize("action,route", sorted(FLEET_ROUTES.items()))
-def test_a_routed_fleet_key_is_bound_and_in_the_menu_or_row_keys(action, route):
+def test_a_routed_fleet_key_path_is_bound_at_every_step(action, route):
     first, *rest = route.split()
     assert first in _fleet_keys(), f"Fleet binds no `{first}` for `cc-swap {action}`"
-    assert first in menus.MAIN_KEYS + menus.ROW_KEYS, (
-        f"`{first}` (for `cc-swap {action}`) is neither a Fleet menu key nor a row key"
+    assert first in menus.HOME_KEYS, (
+        f"`{first}` (for `cc-swap {action}`) is not one of the home screen's keys"
     )
+    path = (first,)
     for key in rest:
-        assert key in _sub_keys(first), (
-            f"`{route}` (for `cc-swap {action}`): `{key}` is not bound behind `{first}`"
+        assert key in _sub_keys(path), (
+            f"`{route}` (for `cc-swap {action}`): `{key}` is not bound behind "
+            f"`{' '.join(path)}`"
         )
+        path += (key,)
+
+
+def test_menu_routes_name_the_menu_item_that_does_it():
+    assert menus.BY_ACTION["prime"].key == "p"
+    assert menus.BY_ACTION["history"].key == "v"
+    assert menus.BY_ACTION["update"].key == "u"
+    assert menus.BY_ACTION["accounts"].key == "a"
+    assert menus.BY_ACTION["auto"].key == "o"
+    assert menus.BY_ACTION["mode"].key == "m"
 
 
 @pytest.mark.parametrize("action", [a for a in EXTRA_FORK_ACTIONS if " " in a])
@@ -162,14 +191,96 @@ def test_an_asymmetry_gives_a_real_reason(action, reason):
     assert len(reason.split()) >= 8, f"say why `cc-swap {action}` has no Fleet twin"
 
 
-def test_every_fleet_menu_and_row_key_is_bound():
-    unbound = [k for k in (*menus.MAIN_KEYS, *menus.ROW_KEYS) if k not in _fleet_keys()]
-    # `enter` is the DataTable's own selection, not a screen binding.
-    assert [k for k in unbound if k != "enter"] == []
+def test_every_home_key_and_shortcut_is_bound():
+    keys = (*menus.HOME_KEYS, *menus.ROW_KEYS, *menus.SHORTCUT_KEYS)
+    assert [k for k in keys if k not in _fleet_keys()] == []
+    # One stray key on the home screen never turns automatic switching off.
+    assert "o" not in _fleet_keys()
 
 
 def test_ctrl_f_is_bound_app_wide():
     assert any("ctrl+f" in b.key for b in CswapApp.BINDINGS)
+
+
+# -- settings: `cc-swap config set` vs Fleet's Swap strategy (m → s) ---------------------------
+#
+# The same rule for settings: every ``maximize.*``/``prime.*`` key `config
+# set` accepts is a Swap strategy field, or is listed here with the reason it
+# is not. A key registered later fails until it is one or the other.
+
+#: Fork settings the Swap strategy screen does not edit, and why.
+STRATEGY_ASYMMETRY: dict[str, str] = {
+    "maximize.pendingPollS": (
+        "the poll interval while waiting for idle spends the per-account usage budget "
+        "every machine shares; change it deliberately with cc-swap config set"
+    ),
+    "maximize.lastResort": (
+        "a comma-separated list of emails or aliases; Fleet's l toggles last resort on "
+        "the selected account and edits this same list"
+    ),
+    "maximize.planOverride": (
+        "a per-email text map that only breaks ties; the plan normally comes from each "
+        "account's stored credentials"
+    ),
+    "maximize.loginExpiryGuardMin": (
+        "a landing guard near a login's fixed deadline; Fleet answers that deadline "
+        "with login tags, the attention line and r to renew the login"
+    ),
+    "prime.claudePath": (
+        "detected from your shell and saved by cc-swap service install; a path typed "
+        "into a TUI field is easy to get wrong and launchd runs without your PATH"
+    ),
+}
+
+
+def _fork_settings() -> set[str]:
+    from claude_swap.settings import SETTING_SPECS
+
+    return {k for k, s in SETTING_SPECS.items() if s.section in ("maximize", "prime")}
+
+
+@pytest.mark.parametrize("key", sorted(_fork_settings()))
+def test_every_fork_setting_is_in_swap_strategy_or_says_why_not(key):
+    edited = {f.key for f in menus.STRATEGY_FIELDS}
+    assert (key in edited) != (key in STRATEGY_ASYMMETRY), (
+        f"{key}: add it to tui/menus.py STRATEGY_FIELDS (Swap strategy, m → s) or to "
+        "STRATEGY_ASYMMETRY here with the reason Fleet does not edit it"
+    )
+
+
+def test_the_strategy_asymmetry_names_real_settings_with_real_reasons():
+    assert set(STRATEGY_ASYMMETRY) <= _fork_settings()
+    assert {f.key for f in menus.STRATEGY_FIELDS} <= _fork_settings()
+    for key, reason in STRATEGY_ASYMMETRY.items():
+        assert len(reason.split()) >= 8, f"say why Swap strategy does not edit {key}"
+
+
+def test_every_hold_code_why_explains_fleet_words_too():
+    """`cc-swap why` explains a hold's own code (doctor_cli.REASONS); Fleet's
+    sentence must word the same codes, not fall back to a generic hold."""
+    from claude_swap.maximize import doctor_cli
+    from claude_swap.maximize import fleet as fx
+    from claude_swap.maximize import home
+    from claude_swap.maximize.view import HOLD_CODES
+    from claude_swap.settings import MaximizeSettings
+
+    assert HOLD_CODES <= set(doctor_cli.REASONS)
+    row = fx.FleetRow(
+        number="1", name="main", email="m@x", org="personal", active=True, rank=1,
+        plan="20x", tier="normal", pct5=96.0, pct7=40.0, days7=3.0, score=1.0,
+        landable=False, land="active", state5="running", reset5=None,
+        prime=fx.PrimeCell("active", None, None, "—"), login="ok", stale=False,
+    )
+    es = fx.EngineStatus("service", 4121, {"running": True, "pid": 4121})
+
+    def said(code):
+        dv = fx.DecisionView("hold", "1", None, None, "#1 x", at=0.0, source="engine",
+                             code=code)
+        return home.status_variants(es, dv, [row], MaximizeSettings(), "live", now=0.0)
+
+    generic = said(None)
+    for code in sorted(HOLD_CODES):
+        assert said(code) != generic, code
 
 
 @pytest.mark.parametrize("command", sorted(cli._FORK_COMMANDS))

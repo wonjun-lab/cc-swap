@@ -33,6 +33,25 @@ _BAR_EMPTY = "─"
 _BAR_TICK = "┃"
 
 
+def bar_color(
+    pct: float | None,
+    *,
+    threshold: float | None = None,
+    hard: float | None = None,
+    palette: Palette = Palette.DARK,
+) -> str:
+    """A usage value's color. With both of maximize's marks (``threshold``
+    = soft, ``hard``) it follows them: green under soft, amber from soft,
+    red from hard. Otherwise upstream's fixed ramp (``Palette.severity``)."""
+    if pct is None or threshold is None or hard is None:
+        return palette.severity(pct)
+    if pct >= hard:
+        return palette.sev_crit
+    if pct >= threshold:
+        return palette.sev_warn
+    return palette.sev_ok
+
+
 def bar_cells(
     pct: float | None,
     width: int,
@@ -46,7 +65,8 @@ def bar_cells(
 
     ``threshold`` is the warn-colored tick (the auto-switch line; maximize's
     soft threshold). ``hard`` adds a crit-colored tick for maximize's hard
-    ceiling; when both land on one cell the hard tick wins.
+    ceiling; when both land on one cell the hard tick wins. With both, the
+    fill is colored by them (:func:`bar_color`).
     """
     text = Text()
     if pct is None:
@@ -62,7 +82,7 @@ def bar_cells(
     hard_at: int | None = None
     if hard is not None:
         hard_at = min(width - 1, max(0, round(hard / 100.0 * width)))
-    color = palette.severity(pct)
+    color = bar_color(pct, threshold=threshold, hard=hard, palette=palette)
     fill_style = f"{color} dim" if stale else color
     for i in range(width):
         if hard_at is not None and i == hard_at:
@@ -98,7 +118,7 @@ def usage_bar(
     if pct is None:
         text.append("  usage unknown", style=palette.muted)
     else:
-        color = palette.severity(pct)
+        color = bar_color(pct, threshold=threshold, hard=hard, palette=palette)
         text.append(f" {pct:3.0f}%", style=f"{color} dim" if stale else color)
     if suffix:
         text.append(f"  {suffix}", style=palette.muted)
@@ -278,14 +298,19 @@ def account_card_text(
 
 
 def mini_account_text(
-    acc: AccountSnapshot, now: float, *, palette: Palette = Palette.DARK
+    acc: AccountSnapshot,
+    now: float,
+    *,
+    palette: Palette = Palette.DARK,
+    window_ticks: Mapping[str, tuple[float, float]] | None = None,
 ) -> Text:
     """One minimized line for an inactive account.
 
     ``2  work@acme.dev [personal]   5h 92% · 7d 63%`` — pcts only, severity
-    colored; a window at/over 100% brings its reset countdown along, and a
-    maxed per-model window shows as ``Fable (!)``. Sentinel states show
-    their label instead.
+    colored (by maximize's soft/hard marks when ``window_ticks`` names the
+    window, as the bars are); a window at/over 100% brings its reset
+    countdown along, and a maxed per-model window shows as ``Fable (!)``.
+    Sentinel states show their label instead.
     """
     text = Text(no_wrap=True, overflow="ellipsis")
     text.append(f"{acc.number:>2}  ", style=f"bold {palette.muted}")
@@ -316,7 +341,8 @@ def mini_account_text(
         pct = float(window["pct"])
         if parts:
             text.append(" · ", style=palette.track)
-        color = palette.severity(pct)
+        soft, hard = (window_ticks or {}).get(label, (None, None))
+        color = bar_color(pct, threshold=soft, hard=hard, palette=palette)
         text.append(f"{label} ", style=palette.muted)
         text.append(f"{pct:.0f}%", style=f"{color} dim" if stale else color)
         if pct >= 100:
@@ -382,7 +408,12 @@ class AccountsPanel(Static):
                     )
                 )
             elif self._show_minis:
-                blocks.append(mini_account_text(acc, now, palette=palette))
+                blocks.append(
+                    mini_account_text(
+                        acc, now, palette=palette,
+                        window_ticks=getattr(app, "window_ticks", None),
+                    )
+                )
         if not blocks:
             return Text("no active managed login", style=palette.muted)
         text = Text()

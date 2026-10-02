@@ -7,12 +7,17 @@ module's status/resolve_program.
 
 from __future__ import annotations
 
+import http.client
 import json
 import sys
+import time
+import urllib.error
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
 
+import claude_swap.update_check as uc
 from claude_swap import cli
 from claude_swap.maximize import service
 from claude_swap.update_check import (
@@ -32,6 +37,9 @@ def _isolation(tmp_path, monkeypatch):
         raise OSError("network disabled in tests")
 
     monkeypatch.setattr("claude_swap.update_check.urllib.request.urlopen", _offline)
+    # The installed build: older than the cc-v0.4.0 release the tests mock,
+    # whatever pyproject's version is (tests that need another one set it).
+    monkeypatch.setattr("claude_swap.update_check.__version__", "0.3.2", raising=False)
     monkeypatch.setattr("claude_swap.update_check.CACHE_PATH", tmp_path / "cache.json")
     monkeypatch.setattr("claude_swap.update_check._has_menubar_extra", lambda: False)
     monkeypatch.setattr(service, "status", lambda **kw: {"installed": False})
@@ -39,6 +47,14 @@ def _isolation(tmp_path, monkeypatch):
         "claude_swap.update_check.subprocess.run",
         lambda *a, **k: pytest.fail(f"subprocess.run called: {a}"),
     )
+    # The lookup authenticates from $GITHUB_TOKEN / $GH_TOKEN or `gh auth
+    # token`; none of that may leak in from the machine running the suite.
+    monkeypatch.delenv("GITHUB_TOKEN", raising=False)
+    monkeypatch.delenv("GH_TOKEN", raising=False)
+    monkeypatch.setattr(uc, "shutil", SimpleNamespace(which=lambda *a, **k: None))
+    uc._gh_cli_token.cache_clear()
+    yield
+    uc._gh_cli_token.cache_clear()
 
 
 def _json_response(payload) -> MagicMock:
@@ -119,10 +135,12 @@ class TestUpgradeCheck:
 
         assert run_upgrade_check() == 0
 
-    def test_offline_without_a_cache_exits_1_and_says_so(self, v020, capsys):
-        assert run_upgrade_check() == 1
+    def test_offline_without_a_cache_exits_2_and_says_so(self, v020, capsys):
+        assert run_upgrade_check() == 2
 
-        assert "could not" in capsys.readouterr().err.lower()
+        err = capsys.readouterr().err
+        assert "could not reach GitHub" in err
+        assert "cannot confirm the latest release" in err
 
     def test_offline_falls_back_to_the_cached_tag_with_a_warning(self, v020, capsys):
         import claude_swap.update_check as uc
@@ -237,6 +255,246 @@ class TestUpgradeCheck:
         assert f"pip install --upgrade {FORK}@cc-v0.3.1" in out
         assert "pip install -e" in out and "git pull" in out
         assert "cc-swap upgrade" not in out
+
+
+def _http_error(code: int, **headers: str) -> urllib.error.HTTPError:
+    """An HTTPError with response headers; ``X_RateLimit_Reset`` -> ``X-RateLimit-Reset``."""
+    message = http.client.HTTPMessage()
+    for name, value in headers.items():
+        message[name.replace("_", "-")] = value
+    return urllib.error.HTTPError(RELEASES_URL, code, "error", message, None)
+
+
+def _rate_limited(monkeypatch) -> tuple[list, str]:
+    """Every request fails like GitHub does once the quota is spent. Returns
+    the requests seen and the ``HH:MM`` the quota comes back at."""
+    reset = int(time.time()) + 1800
+    error = _http_error(
+        403, X_RateLimit_Remaining="0", X_RateLimit_Reset=str(reset)
+    )
+    seen: list = []
+
+    def _urlopen(req, timeout=None):
+        seen.append(req)
+        raise error
+
+    monkeypatch.setattr("claude_swap.update_check.urllib.request.urlopen", _urlopen)
+    return seen, time.strftime("%H:%M", time.localtime(reset))
+
+
+def _cache_tag(tag: str | None, age: float) -> None:
+    """Leave ``tag`` in the update-check cache, written ``age`` seconds ago."""
+    uc.CACHE_PATH.write_text(json.dumps({"timestamp": time.time() - age, "data": tag}))
+
+
+def _stub_install(monkeypatch, returncode: int = 0) -> list[list[str]]:
+    calls: list[list[str]] = []
+    monkeypatch.setattr(
+        "claude_swap.update_check.subprocess.run",
+        lambda cmd, **kw: calls.append(cmd) or MagicMock(returncode=returncode),
+    )
+    return calls
+
+
+TWO_HOURS = 2 * 3600 + 5
+
+
+class TestUpgradeWhenGitHubCannotBeAsked:
+    """The live lookup failed (rate limit, network, ...). Say so, and never
+    tell the user they are current on the strength of a cached answer: that
+    is how `upgrade` once printed "already on cc-v0.3.1; nothing to do" while
+    cc-v0.3.2 existed."""
+
+    def test_the_exit_code_is_2(self):
+        assert uc.EXIT_LOOKUP_FAILED == 2
+
+    def test_a_cached_tag_that_matches_the_install_is_not_called_current(
+        self, v031, monkeypatch, capsys
+    ):
+        _, until = _rate_limited(monkeypatch)
+        _cache_tag("cc-v0.3.1", TWO_HOURS)
+
+        assert run_self_upgrade() == 2
+
+        captured = capsys.readouterr()
+        assert (
+            f"could not reach GitHub (rate limited until {until}); "
+            "using cached cc-v0.3.1 from 2h ago — it may be out of date"
+        ) in captured.err
+        assert "cannot confirm the latest release" in captured.err
+        everything = captured.out + captured.err
+        assert "already on" not in everything and "nothing to do" not in everything
+
+    def test_a_cached_tag_older_than_the_install_is_not_called_current_either(
+        self, v031, monkeypatch, capsys
+    ):
+        _rate_limited(monkeypatch)
+        _cache_tag("cc-v0.3.0", TWO_HOURS)
+
+        assert run_self_upgrade() == 2
+
+        captured = capsys.readouterr()
+        assert "cannot confirm the latest release" in captured.err
+        assert "newer than the latest release" not in captured.out + captured.err
+
+    def test_a_network_failure_is_named_as_such(self, v031, capsys):
+        # The autouse fixture makes urlopen raise OSError.
+        _cache_tag("cc-v0.3.1", TWO_HOURS)
+
+        assert run_self_upgrade() == 2
+
+        assert "could not reach GitHub (network error" in capsys.readouterr().err
+
+    def test_force_still_reinstalls_the_cached_tag(self, v031, monkeypatch, capsys):
+        _rate_limited(monkeypatch)
+        _cache_tag("cc-v0.3.1", TWO_HOURS)
+        calls = _stub_install(monkeypatch)
+
+        assert run_self_upgrade(force=True) == 0
+
+        assert calls == [["uv", "tool", "install", "--force", f"{FORK}@cc-v0.3.1"]]
+        assert "using cached cc-v0.3.1 from 2h ago" in capsys.readouterr().err
+
+    def test_a_cached_tag_newer_than_the_install_is_installed_with_the_warning(
+        self, v031, monkeypatch, capsys
+    ):
+        _rate_limited(monkeypatch)
+        _cache_tag("cc-v0.3.2", TWO_HOURS)
+        calls = _stub_install(monkeypatch)
+
+        assert run_self_upgrade() == 0
+
+        assert calls == [["uv", "tool", "install", "--force", f"{FORK}@cc-v0.3.2"]]
+        err = capsys.readouterr().err
+        assert "could not reach GitHub (rate limited until" in err
+        assert "using cached cc-v0.3.2 from 2h ago" in err
+        assert "it may be out of date" in err
+
+    def test_with_no_cache_it_says_why_before_installing_the_default_branch(
+        self, v031, monkeypatch, capsys
+    ):
+        _rate_limited(monkeypatch)
+        calls = _stub_install(monkeypatch)
+
+        assert run_self_upgrade() == 0
+
+        assert calls == [["uv", "tool", "install", "--force", FORK]]
+        captured = capsys.readouterr()
+        assert "could not reach GitHub (rate limited until" in captured.err
+        assert "default branch" in captured.out
+
+    def test_an_unauthenticated_rate_limit_suggests_a_token(self, v031, monkeypatch, capsys):
+        _rate_limited(monkeypatch)
+        _cache_tag("cc-v0.3.1", TWO_HOURS)
+
+        run_self_upgrade()
+
+        err = capsys.readouterr().err
+        assert "GITHUB_TOKEN" in err and "gh auth login" in err
+
+    def test_an_authenticated_rate_limit_does_not(self, v031, monkeypatch, capsys):
+        monkeypatch.setenv("GITHUB_TOKEN", "ghp_envtoken")
+        _rate_limited(monkeypatch)
+        _cache_tag("cc-v0.3.1", TWO_HOURS)
+
+        run_self_upgrade()
+
+        err = capsys.readouterr().err
+        assert "GITHUB_TOKEN" not in err and "ghp_envtoken" not in err
+
+    def test_no_published_release_is_not_a_failure_and_ignores_the_cache(
+        self, v031, monkeypatch, capsys
+    ):
+        # GitHub answered: there is no fork release. A cached tag is stale news.
+        _github(monkeypatch, {RELEASES_URL: []})
+        _cache_tag("cc-v0.3.2", TWO_HOURS)
+        calls = _stub_install(monkeypatch)
+
+        assert run_self_upgrade() == 0
+
+        assert calls == [["uv", "tool", "install", "--force", FORK]]
+        assert capsys.readouterr().err == ""
+
+    def test_a_live_answer_is_silent_on_stderr(self, v031, monkeypatch, capsys):
+        _github(monkeypatch, {RELEASES_URL: [_release("cc-v0.3.1")]})
+
+        assert run_self_upgrade() == 0
+
+        captured = capsys.readouterr()
+        assert "already on cc-v0.3.1" in captured.out
+        assert captured.err == ""
+
+
+class TestCheckWhenGitHubCannotBeAsked:
+    """`upgrade --check` follows the same rule as `upgrade`."""
+
+    def test_a_cached_tag_that_matches_the_install_is_not_called_up_to_date(
+        self, v031, monkeypatch, capsys
+    ):
+        _, until = _rate_limited(monkeypatch)
+        _cache_tag("cc-v0.3.1", TWO_HOURS)
+
+        assert run_upgrade_check() == 2
+
+        captured = capsys.readouterr()
+        assert (
+            f"could not reach GitHub (rate limited until {until}); "
+            "using cached cc-v0.3.1 from 2h ago — it may be out of date"
+        ) in captured.err
+        assert "cannot confirm the latest release" in captured.err
+        assert "up to date" not in captured.out + captured.err
+
+    def test_a_cached_tag_older_than_the_install_is_not_called_up_to_date_either(
+        self, v031, monkeypatch, capsys
+    ):
+        _rate_limited(monkeypatch)
+        _cache_tag("cc-v0.3.0", TWO_HOURS)
+
+        assert run_upgrade_check() == 2
+
+        assert "up to date" not in capsys.readouterr().out
+
+    def test_a_cached_tag_newer_than_the_install_is_still_an_update(
+        self, v031, monkeypatch, capsys
+    ):
+        seen, _ = _rate_limited(monkeypatch)
+        _cache_tag("cc-v0.3.2", TWO_HOURS)
+
+        assert run_upgrade_check() == 10
+
+        captured = capsys.readouterr()
+        assert "Latest:    0.3.2" in captured.out
+        assert "cached" in captured.out
+        assert "using cached cc-v0.3.2 from 2h ago" in captured.err
+        # GitHub just failed; don't ask again for the notes and commit list.
+        assert len(seen) == 1
+
+    def test_with_no_cache_it_exits_2(self, v031, monkeypatch, capsys):
+        _rate_limited(monkeypatch)
+
+        assert run_upgrade_check() == 2
+
+        err = capsys.readouterr().err
+        assert "could not reach GitHub (rate limited until" in err
+        assert "cannot confirm the latest release" in err
+
+    def test_no_published_release_is_not_a_lookup_failure(self, v031, monkeypatch, capsys):
+        _github(monkeypatch, {RELEASES_URL: []})
+
+        assert run_upgrade_check() == 1
+
+        err = capsys.readouterr().err
+        assert "could not reach GitHub" not in err
+        assert "no published" in err.lower()
+
+    def test_a_live_answer_is_silent_on_stderr(self, v031, monkeypatch, capsys):
+        _github(monkeypatch, {RELEASES_URL: [_release("cc-v0.3.1")]})
+
+        assert run_upgrade_check() == 0
+
+        captured = capsys.readouterr()
+        assert "up to date" in captured.out
+        assert captured.err == ""
 
 
 class TestCheckFlag:

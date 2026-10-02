@@ -33,7 +33,7 @@ async def test_fleet_i_opens_inspect_all_logins_with_the_findings(tmp_path, monk
     app = make_app(_fleet(tmp_path))
     async with app.run_test(size=(140, 40)) as pilot:
         await _open(pilot)
-        await pilot.press("a")
+        await pilot.press("m", "a")  # the menu, then Account settings
         await _open(pilot)
         assert isinstance(app.screen, AccountsScreen)
         keys = app.screen.query_one("#fx-ac-keys").render().plain

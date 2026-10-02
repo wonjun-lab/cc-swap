@@ -273,6 +273,225 @@ def test_preview_decision_uses_edited_thresholds():
     assert (dv.kind, dv.trigger, dv.target) == ("switch", "hard", "2")
 
 
+# -- hold codes, the reset-aware wait and the usage history (feat/reset-wait hooks) ----------------
+
+
+#: #1 at 5h 96% (past hard 95), the window resetting in 8 minutes, at a pace
+#: that needs 80 minutes to reach 100%: the policy waits the reset out.
+def _reset_wait_fleet():
+    snap = accounts(
+        acc(1, usage(96, 40, reset5=NOW + 8 * 60 + 20), active=True, alias="main"),
+        acc(2, usage(10, 20), alias="side"),
+    )
+    state = MaximizeState(samples_account="1", samples=(
+        Sample(NOW - 660, 95.5, 40.0), Sample(NOW - 60, 96.0, 40.0),
+    ))
+    return snap, state
+
+
+RESET_WAIT_REASON = (
+    "#1 5h 96% — resets in 8m, waiting it out (switches at once if it hits 100%)"
+)
+
+
+def test_a_published_code_is_read_for_a_hold_only():
+    from claude_swap.maximize.view import _published
+
+    base = {"at": NOW, "pid": 1, "active": "1", "decision": "hold", "trigger": None,
+            "target": None, "reason": RESET_WAIT_REASON, "pending": False}
+    assert _published({**base, "code": "reset-wait"})[0].code == "reset-wait"
+    assert _published({**base, "code": "rebalance-deferred"})[0].code == "rebalance-deferred"
+    assert _published(base)[0].code is None
+    assert _published({**base, "code": "from-a-newer-engine"})[0].code is None
+    assert _published({**base, "code": ["reset-wait"]})[0].code is None
+    switch = {**base, "decision": "switch", "trigger": "hard", "code": "reset-wait"}
+    assert _published(switch)[0].code is None
+
+
+def test_a_reset_wait_hold_names_its_window_and_has_no_hard_eta():
+    snap, state = _reset_wait_fleet()
+    msnap = fleet.fleet_snapshot(snap, MX, state, now=NOW)
+    dv = fleet.decision_view(state, msnap, now=NOW, poll_s=60)
+    assert (dv.kind, dv.code, dv.source) == ("hold", "reset-wait", "computed")
+    assert dv.reason == RESET_WAIT_REASON
+    assert dv.waits == (("5h", 96.0, pytest.approx(NOW + 8 * 60 + 20)),)
+    # Past the hard cap the ETA to it is 0: "hard in ~0m" said nothing true.
+    assert dv.eta_hard_min is None
+    assert "hard in" not in fleet.now_line(dv, now=NOW)
+    # The same hold, published by the engine.
+    published = PublishedDecision(
+        at=NOW - 30, pid=4121, active="1", decision="hold", trigger=None, target=None,
+        reason=RESET_WAIT_REASON, pending=False, code="reset-wait",
+    )
+    dv = fleet.decision_view(replace(state, decision=published), msnap, now=NOW, poll_s=60)
+    assert (dv.kind, dv.code, dv.source, dv.target) == ("hold", "reset-wait", "engine", None)
+    assert dv.eta_hard_min is None and dv.waits[0][0] == "5h"
+    # A plain hold over the hard cap keeps its ETA (it is not waiting a reset out).
+    plain = fleet.decision_view(
+        replace(state, decision=replace(published, code=None)), msnap, now=NOW, poll_s=60
+    )
+    assert plain.code is None and plain.eta_hard_min == 0.0
+
+
+def test_a_tui_hosted_engine_carries_the_code_too():
+    snap, state = _reset_wait_fleet()
+    msnap = fleet.fleet_snapshot(snap, MX, state, now=NOW)
+    own = MaximizeDecisionEvent(active="1", decision="hold", trigger=None,
+                                reason=RESET_WAIT_REASON, code="reset-wait")
+    dv = fleet.decision_view(state, msnap, now=NOW, poll_s=60, own=own, own_at=NOW - 5)
+    assert (dv.kind, dv.code, dv.source) == ("hold", "reset-wait", "here")
+    assert dv.eta_hard_min is None
+    # A code on anything but a hold, or one this build does not know, is ignored.
+    odd = MaximizeDecisionEvent(active="1", decision="hold", trigger=None,
+                                reason=RESET_WAIT_REASON, code="from-a-newer-engine")
+    assert fleet.decision_view(state, msnap, now=NOW, poll_s=60, own=odd).code is None
+
+
+def test_the_engine_event_carries_the_hold_code():
+    from claude_swap.maximize import engine_hook
+    from claude_swap.maximize.model import Hold, Switch
+
+    snap, state = _reset_wait_fleet()
+    msnap = fleet.fleet_snapshot(snap, MX, state, now=NOW)
+    held = engine_hook._decision_event(
+        msnap, Hold(RESET_WAIT_REASON, pending=False, code="reset-wait"), False
+    )
+    assert held.code == "reset-wait" and held._fields()["code"] == "reset-wait"
+    moved = engine_hook._decision_event(msnap, Switch("2", "preempt", "why"), False)
+    assert moved.code is None and "code" not in moved._fields()
+
+
+def test_auto_off_says_which_hold_it_would_be():
+    snap, state = _reset_wait_fleet()
+    msnap = fleet.fleet_snapshot(snap, MX, state, now=NOW)
+    dv = fleet.decision_view(replace(state, auto_off=True), msnap, now=NOW, poll_s=60)
+    assert (dv.kind, dv.would, dv.code) == ("off", "hold (reset-wait)", None)
+
+
+def _hourly_points(number: str, pct7_now: float, per_hour: float, hours: int):
+    from claude_swap.maximize.history import UsagePoint
+
+    return [
+        UsagePoint(NOW - k * H, number, 20.0, pct7_now - k * per_hour, True)
+        for k in range(hours, -1, -1)
+    ]
+
+
+def _preempt_fleet():
+    """#1 at 7d 84%, climbing 1.5 points an hour while active; #2 has room.
+    The 5h rose 3 points in the last 10 minutes: not idle."""
+    snap = accounts(
+        acc(1, usage(30, 84, days7=3), active=True, alias="main"),
+        acc(2, usage(10, 20, days7=3), alias="side"),
+    )
+    state = MaximizeState(samples_account="1", samples=(
+        Sample(NOW - 660, 27.0, 84.0), Sample(NOW - 60, 30.0, 84.0),
+    ))
+    return snap, state
+
+
+def test_fleet_decisions_use_the_usage_history():
+    from claude_swap.maximize import history
+
+    snap, state = _preempt_fleet()
+    h = history.History(points=tuple(_hourly_points("1", 84.0, 1.5, 6)))
+    with_history = fleet.fleet_snapshot(snap, MX, state, now=NOW, history=h)
+    assert with_history.rates7 == history.burn_rates(h.points, NOW)
+    assert with_history.rates7["1"] == pytest.approx(1.5)
+    assert with_history.forecast is None  # fewer than 3 days of slots: no pattern
+    dv = fleet.decision_view(state, with_history, now=NOW, poll_s=60)
+    assert (dv.kind, dv.code, dv.target, dv.source) == ("hold", "preempt", "2", "computed")
+    assert "would pass 90% in ~4h, within the next 4h" in dv.reason
+    # Without history (none, unreadable, or learning off) it decides as the
+    # engine does on a cold start.
+    bare = fleet.fleet_snapshot(snap, MX, state, now=NOW)
+    assert bare.rates7 == {} and bare.forecast is None
+    assert fleet.decision_view(state, bare, now=NOW, poll_s=60).code is None
+    off = replace(MX, preempt=False, learn_idle_pattern=False)
+    assert fleet.fleet_snapshot(snap, off, state, now=NOW, history=h).rates7 == {}
+
+
+def test_history_inputs_follow_the_settings_like_the_engine():
+    from claude_swap.maximize import history
+    from claude_swap.maximize import view as mxview
+
+    slots = tuple(
+        history.SlotObs(NOW - k * history.SLOT_S - (NOW % history.SLOT_S), k % 8 != 0)
+        for k in range(1, 4 * 96)
+    )
+    h = history.History(points=tuple(_hourly_points("1", 84.0, 1.5, 6)), slots=slots)
+    forecast, rates = mxview.history_inputs(h, MX, NOW)
+    assert forecast == history.forecast(h.slots, NOW) and forecast is not None
+    assert rates == history.burn_rates(h.points, NOW)
+    assert mxview.history_inputs(h, replace(MX, learn_idle_pattern=False), NOW)[0] is None
+    assert mxview.history_inputs(h, replace(MX, preempt=False), NOW)[1] == {}
+    assert mxview.history_inputs(None, MX, NOW) == (None, {})
+
+
+def test_a_history_error_falls_back_to_no_history(tmp_path, monkeypatch):
+    from claude_swap.maximize import history
+    from claude_swap.maximize import view as mxview
+
+    assert mxview.read_history(tmp_path, NOW) == history.History()  # no file yet
+    (tmp_path / history.HISTORY_FILENAME).mkdir()  # a directory: unreadable as a file
+    assert mxview.read_history(tmp_path, NOW) in (None, history.History())
+
+    def boom(*_a, **_k):
+        raise RuntimeError("corrupt")
+
+    monkeypatch.setattr(history, "forecast", boom)
+    h = history.History(points=tuple(_hourly_points("1", 84.0, 1.5, 6)))
+    assert mxview.history_inputs(h, MX, NOW) == (None, {})
+    snap, state = _preempt_fleet()
+    assert fleet.fleet_snapshot(snap, MX, state, now=NOW, history=h).rates7 == {}
+    monkeypatch.setattr(history, "read", boom)
+    (tmp_path / history.HISTORY_FILENAME).rmdir()
+    (tmp_path / history.HISTORY_FILENAME).write_text("{}\n")
+    assert mxview.read_history(tmp_path, NOW) is None
+
+
+def test_read_history_parses_once_while_the_file_is_unchanged(tmp_path, monkeypatch):
+    import os
+
+    from claude_swap.maximize import history
+    from claude_swap.maximize import view as mxview
+
+    path = tmp_path / history.HISTORY_FILENAME
+    path.write_text('{"k":"u","t":%r,"n":"1","p5":1,"p7":2,"a":1}\n' % (NOW - 60))
+    calls: list[int] = []
+    real = history.read
+    monkeypatch.setattr(history, "read", lambda root, now=None: calls.append(1) or real(root))
+    first = mxview.read_history(tmp_path, NOW)
+    assert len(first.points) == 1 and calls == [1]
+    assert mxview.read_history(tmp_path, NOW) == first and calls == [1]
+    with open(path, "a") as f:
+        f.write('{"k":"u","t":%r,"n":"2","p5":1,"p7":2,"a":0}\n' % (NOW - 30))
+    os.utime(path, ns=(path.stat().st_atime_ns, path.stat().st_mtime_ns + 1_000_000))
+    assert len(mxview.read_history(tmp_path, NOW).points) == 2 and calls == [1, 1]
+
+
+def test_the_idle_pattern_line_for_help_and_swap_strategy():
+    from claude_swap.maximize import history
+    from claude_swap.maximize import view as mxview
+
+    assert mxview.idle_pattern_text(history.History(), MX, NOW) == (
+        "idle pattern: learning (0 of 3 days observed)"
+    )
+    assert mxview.idle_pattern_text(None, MX, NOW) == "idle pattern: usage history unreadable"
+    assert mxview.idle_pattern_text(None, replace(MX, learn_idle_pattern=False), NOW) == (
+        "idle pattern: off (maximize.learnIdlePattern)"
+    )
+    slots = tuple(
+        history.SlotObs(NOW - k * history.SLOT_S - (NOW % history.SLOT_S), False)
+        for k in range(1, 10 * 96)
+    )
+    days = history.learned_days(slots, NOW)
+    text = mxview.idle_pattern_text(history.History(slots=slots), MX, NOW)
+    assert text.startswith(f"idle pattern: {days} days learned · quiet now until ")
+    assert ", " not in text  # Fleet's separator; doctor and why keep the comma
+    assert history.describe(slots, NOW).startswith(f"idle pattern: {days} days learned, ")
+
+
 # -- engine status and status lines ---------------------------------------------------------------
 
 
@@ -291,48 +510,10 @@ def test_engine_status_identifies_the_service_by_pid():
 def test_engine_status_none_when_free():
     es = fleet.engine_status(held_elsewhere=False, holder_pid=4121, own=None, service=None)
     assert (es.holder, es.pid) == ("none", None)
-    text, tone = fleet.engine_line(es)
-    assert "nothing is switching" in text and tone == "warn"
     stopped = {"platform": "linux", "installed": True, "running": False, "pid": None,
                "state": "inactive", "linger": False}
     es = fleet.engine_status(held_elsewhere=False, holder_pid=None, own=None, service=stopped)
-    text, _ = fleet.engine_line(es)
-    assert "service stopped (systemd: inactive)" in text and "linger off" in text
-
-
-def test_status_lines_drop_suffixes_by_priority_when_narrow():
-    snap, mx, state = mockup()
-    rows = fleet.fleet_rows(snap, mx, PRIME, state, now=NOW)
-    msnap = fleet.fleet_snapshot(snap, mx, state, now=NOW)
-    dv = fleet.decision_view(state, msnap, now=NOW, poll_s=60)
-    es = fleet.engine_status(held_elsewhere=True, holder_pid=4121, own=None,
-                             service={"platform": "darwin", "running": True, "pid": 4121})
-    wide = fleet.status_lines(es, dv, rows, mx, PRIME, now=NOW, width=140)
-    assert [t.split()[0] for t, _ in wide] == ["engine", "now", "prime"]
-    assert "holds the lease — this TUI is a viewer" in wide[0][0]
-    assert "hard in ~1h50m" in wide[1][0] and "computed here" in wide[1][0]
-    assert "#2" in wide[2][0] and "#3 needs re-login" in wide[2][0]
-    narrow = fleet.status_lines(es, dv, rows, mx, PRIME, now=NOW, width=60)
-    assert all(len(t) <= 60 for t, _ in narrow)
-    assert narrow[1][0].startswith("now     HOLD — waiting for idle → #2")
-    assert "hard in" not in narrow[1][0]  # the lowest-priority part went first
-    head = fleet.header_line(mx, PRIME, rows, host="studio", ssh=True, now=NOW, width=112)
-    assert head.startswith("cc-swap @ studio (ssh) · maximize · 5h 50/95 · 7d 90/98")
-    assert "1 needs re-login" in head and len(head) == 112
-    short = fleet.header_line(mx, PRIME, rows, host="studio", ssh=True, now=NOW, width=50)
-    assert "1 needs re-login" in short and len(short) <= 50
-    off = fleet.status_lines(es, dv, rows, mx, replace(PRIME, enabled=False), now=NOW, width=140)
-    assert "priming off (s → Swap strategy)" in off[2][0]
-
-
-def test_attention_names_every_relogin_account():
-    snap, mx, state = mockup()
-    rows = fleet.fleet_rows(snap, mx, PRIME, state, now=NOW)
-    assert fleet.attention(rows) == (
-        "⚠ #3 old needs re-login (refresh token dead) — select it and press r"
-    )
-    healthy = [r for r in rows if r.login != "relogin"]
-    assert fleet.attention(healthy) is None
+    assert es.holder == "none" and es.service is stopped
 
 
 def test_login_expired_is_a_relogin_named_by_its_cause():
@@ -347,13 +528,6 @@ def test_login_expired_is_a_relogin_named_by_its_cause():
     assert rows["2"].login == "relogin" and rows["2"].login_expired is True
     assert rows["3"].login == "relogin" and rows["3"].login_expired is False
     assert fleet.relogin_count(list(rows.values())) == 2
-    assert fleet.attention([rows["2"]]) == (
-        "⚠ #2 lapsed needs re-login (login expired) — select it and press r"
-    )
-    assert fleet.attention([rows["2"], rows["3"]]) == (
-        "⚠ #2 lapsed (login expired), #3 dead (refresh token dead) need re-login"
-        " — select one and press r"
-    )
     steps = "\n".join(fleet.relogin_steps(rows["2"], ssh=False, host="h",
                                           claude_path=None, return_to=rows["1"]))
     assert "its login expired" in steps and "refresh token is dead" not in steps
@@ -361,60 +535,13 @@ def test_login_expired_is_a_relogin_named_by_its_cause():
     assert fleet.login_text(rows["3"]) == ("re-login needed (refresh token dead)", "crit")
 
 
-# -- layout -------------------------------------------------------------------------------
-
-
-@pytest.mark.parametrize(("width", "missing"), [
-    (140, set()),
-    (112, set()),
-    (100, {"rank", "7d in"}),
-    (80, {"rank", "7d in", "plan", "tier", "login"}),
-    (60, {"rank", "7d in", "plan", "tier", "login", "next prime"}),
-])
-def test_columns_for_widths(width, missing):
-    cols = fleet.columns_for(width)
-    assert set(fleet.ALL_COLUMNS) - set(cols) - {"5h win"} == missing | (
-        {"5h window"} if width < 64 else set()
-    )
-    assert ("5h win" in cols) == (width < 64)
-
-
-@pytest.mark.parametrize(("height", "detail", "menu", "prime_line", "keys"), [
-    (40, True, "full", True, "full"),
-    (32, True, "full", True, "full"),
-    (24, False, "full", True, "full"),
-    (18, False, "folded", True, "full"),
-    (12, False, "folded", False, "minimal"),
-])
-def test_fit_layout_keeps_attention_rows_and_status_first(height, detail, menu, prime_line, keys):
-    plan = fleet.fit_layout(height, 112, 6, attention=True)
-    assert (plan.detail, plan.menu, plan.prime_line, plan.keys) == (detail, menu, prime_line, keys)
-    assert plan.columns == fleet.columns_for(112)
-    # More accounts take their rows from the optional parts first.
-    assert fleet.fit_layout(height + 4, 112, 10, attention=True) == plan
-
-
-def test_row_cells_colour_against_maximize_thresholds():
-    snap, mx, state = mockup()
-    rows = {r.number: r for r in fleet.fleet_rows(snap, mx, PRIME, state, now=NOW)}
-    cols = fleet.columns_for(140)
-    cells = dict(zip(cols, fleet.row_cells(rows["1"], cols, now=NOW, mx=mx)))
-    assert cells["mark"] == ("*", "bold")
-    assert cells["5h"] == ("62%", "warn") and cells["7d"] == ("41%", "ok")
-    assert cells["5h window"][0] == f"running → {fleet.hhmm(NOW + 2 * H)}"
-    relogin = dict(zip(cols, fleet.row_cells(rows["3"], cols, now=NOW, mx=mx)))
-    assert relogin["5h"] == ("re-login", "crit") and relogin["land"] == ("re-login", "crit")
-    assert relogin["account"][1] == "crit"
-    narrow = fleet.columns_for(80)
-    team = dict(zip(narrow, fleet.row_cells(rows["6"], narrow, now=NOW, mx=mx)))
-    assert team["account"][0] == "team·LR"
-
-
 def _expiring(number, seconds_left, **kw):
     return replace(acc(number, **kw), login_expires_at=(NOW + seconds_left) * 1000)
 
 
-def test_login_cell_counts_down_amber_in_the_last_week_red_in_the_last_day():
+def test_login_deadline_tags_count_down_amber_in_the_last_week_red_in_the_last_day():
+    from claude_swap.maximize import home
+
     snap = accounts(
         acc(1, active=True),
         _expiring(2, DAY + 9 * H, alias="side"),
@@ -425,20 +552,14 @@ def test_login_cell_counts_down_amber_in_the_last_week_red_in_the_last_day():
     rows = {r.number: r for r in fleet.fleet_rows(snap, MX, PRIME, MaximizeState(), now=NOW)}
     assert rows["2"].login_deadline == NOW + DAY + 9 * H
     assert rows["1"].login_deadline is None
-    assert fleet.login_cell(rows["1"], NOW) == ("—", "dim")
-    assert fleet.login_cell(rows["2"], NOW) == ("1d 9h", "warn")
-    assert fleet.login_cell(rows["3"], NOW) == ("20h 0m", "crit")
-    assert fleet.login_cell(rows["4"], NOW) == ("expired", "crit")
-    assert fleet.login_cell(rows["5"], NOW) == ("20d", "dim")
-    cols = fleet.columns_for(140)
-    assert "login" in cols
-    cells = dict(zip(cols, fleet.row_cells(rows["2"], cols, now=NOW, mx=MX)))
-    assert cells["login"] == ("1d 9h", "warn")
-    assert (
-        f"login expires {local_clock(NOW + DAY + 9 * H)} (in 1d 9h)"
-        in fleet.detail_line(rows["2"], MX, now=NOW)
-    )
-    assert "login" not in fleet.detail_line(rows["1"], MX, now=NOW)
+
+    def tag(n):
+        return home.tag_for(rows[n], is_next=False, now=NOW, priming=False)
+
+    assert tag("2") == ("login 1d left", "warn")
+    assert tag("3") == ("login 20h left", "crit")
+    assert tag("4") == ("login expired", "crit")
+    assert not fleet.login_due(rows["5"], NOW) and not fleet.login_due(rows["1"], NOW)
 
 
 def test_land_note_names_the_login_guard():
@@ -447,32 +568,29 @@ def test_land_note_names_the_login_guard():
     rows = {r.number: r for r in fleet.fleet_rows(snap, MX, PRIME, MaximizeState(), now=NOW)}
     assert rows["2"].land == "login<2h" and rows["2"].landable is False
     assert rows["3"].land == "yes"
-    assert "login expires within the 120-min guard" in fleet.detail_line(rows["2"], MX, now=NOW)
 
 
 def test_attention_warns_of_logins_expiring_within_a_week():
+    from claude_swap.maximize import home
+
     snap = accounts(
         acc(1, active=True),
         _expiring(2, DAY + 9 * H, alias="side"),
         _expiring(5, 20 * DAY, alias="fine"),
     )
     rows = fleet.fleet_rows(snap, MX, PRIME, MaximizeState(), now=NOW)
-    side = f"login expires {local_clock(NOW + DAY + 9 * H)} (in 1d 9h)"
-    assert fleet.attention(rows, now=NOW) == (
-        f"⚠ #2 side {side} — re-login before then: select it and press r"
+    assert home.attention_parts(rows, now=NOW) == (
+        ["! #2 side login ends in 1d 9h — select it, press r"], "warn"
     )
-    assert fleet.attention_tone(rows, now=NOW) == "warn"
-    assert fleet.attention(rows) is None  # no clock: only dead logins
     soon = fleet.fleet_rows(
         accounts(acc(1, active=True), _expiring(3, 20 * H, alias="soon"),
                  _expiring(4, 2 * DAY, alias="next")),
         MX, PRIME, MaximizeState(), now=NOW,
     )
-    assert fleet.attention(soon, now=NOW) == (
-        "⚠ logins expire: #3 soon in 20h 0m, #4 next in 2d 0h — "
-        "re-login before then: select one and press r"
+    assert home.attention_parts(soon, now=NOW) == (
+        ["! #3 soon login ends in 20h 0m — select it, press r", "#4 next login ends in 2d 0h"],
+        "crit",
     )
-    assert fleet.attention_tone(soon, now=NOW) == "crit"
     assert fleet.login_due(soon[1], NOW) and not fleet.login_due(rows[2], NOW)
     # A dead login leads; an expiring one rides along.
     mixed = fleet.fleet_rows(
@@ -480,19 +598,13 @@ def test_attention_warns_of_logins_expiring_within_a_week():
                  acc(3, sentinel=USAGE_RELOGIN_REQUIRED, alias="old")),
         MX, PRIME, MaximizeState(), now=NOW,
     )
-    assert fleet.attention(mixed, now=NOW) == (
-        "⚠ #3 old needs re-login (refresh token dead) — select it and press r"
-        f" · #2 {side}"
+    assert home.attention_parts(mixed, now=NOW) == (
+        ["! #3 old needs re-login — select it, press r", "#2 side login ends in 1d 9h"],
+        "crit",
     )
-    assert fleet.attention_tone(mixed, now=NOW) == "crit"
-
-
-def test_detail_line_explains_rank_pace_and_landing():
-    snap, mx, state = mockup()
-    rows = {r.number: r for r in fleet.fleet_rows(snap, mx, PRIME, state, now=NOW)}
-    line = fleet.detail_line(rows["4"], mx)
-    assert line.startswith("rank 4 · 20x · pace 1.07 (78% left over 5.1d) · landable")
-    assert "primed" in line
+    steps = "\n".join(fleet.relogin_steps(rows[1], ssh=False, host="h", claude_path=None,
+                                          return_to=rows[0], now=NOW))
+    assert f"login expires {local_clock(NOW + DAY + 9 * H)} (in 1d 9h)" in steps
 
 
 # -- actions ------------------------------------------------------------------------------
