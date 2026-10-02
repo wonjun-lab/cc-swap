@@ -21,7 +21,9 @@ from claude_swap.autoswitch import (
     SwitchEvent,
     TickOutcome,
 )
+from claude_swap.maximize import pause
 from claude_swap.maximize.engine_hook import (
+    DECISION_KEY,
     SAMPLES_KEY,
     _primer_class,
     apply_maximize_settings,
@@ -520,6 +522,87 @@ class TestPrimerHook:
         name = "claude_swap.maximize.primer"
         monkeypatch.setitem(sys.modules, name, types.ModuleType(name))
         assert _primer_class() is None
+
+
+class TestPublishDecision:
+    """The engine writes its decision to the state file for TUI viewers."""
+
+    def test_live_tick_publishes_decision_slot_numbers_only(self, temp_home):
+        h = make(temp_home)
+        h.switcher._write_account_credentials("3", EMAILS[3], json.dumps({
+            "claudeAiOauth": {"accessToken": "sk-3", "refreshToken": "rt-3",
+                              "rateLimitTier": "default_claude_max_20x"},
+        }))
+        h.tick_with_usage({"1": win(62, 40), "2": win(0, 10), "3": win(0, 50)})
+        record = h.state()[DECISION_KEY]
+        assert record == {
+            "at": h.clock.now, "pid": os.getpid(), "active": "1",
+            "decision": "hold", "trigger": None, "target": "2",
+            "reason": record["reason"], "pending": True,
+            "plans": {"1": None, "2": None, "3": "20x"},
+        }
+        assert record["reason"].startswith("#1 5h 62% >= soft 50")
+        text = json.dumps(h.state()[DECISION_KEY])
+        assert "@" not in text and "sk-" not in text
+
+    def test_switch_is_published_with_its_trigger_and_target(self, temp_home):
+        h = make(temp_home)
+        assert h.tick_with_usage(
+            {"1": win(96, 40), "2": win(0, 10), "3": win(0, 50)}
+        ) is TickOutcome.SWITCHED
+        record = h.state()[DECISION_KEY]
+        assert (record["decision"], record["trigger"], record["target"]) == ("switch", "hard", "2")
+
+    def test_dry_run_tick_does_not_publish(self, temp_home):
+        h = make(temp_home)
+        h.engine = h._make_engine(dry_run=True)
+        h.tick_with_usage({"1": win(62, 40), "2": win(0, 10), "3": win(0, 50)})
+        assert DECISION_KEY not in h.state()
+
+    def test_publish_skips_unchanged_decision_within_300s(self, temp_home):
+        h = make(temp_home)
+        usage = {"1": win(10, 10), "2": win(0, 10), "3": win(0, 10)}
+        h.tick_with_usage(usage)
+        first = h.state()[DECISION_KEY]["at"]
+        h.clock.advance(200)
+        h.tick_with_usage(usage)
+        assert h.state()[DECISION_KEY]["at"] == first
+        h.clock.advance(150)
+        h.tick_with_usage(usage)
+        assert h.state()[DECISION_KEY]["at"] == h.clock.now
+        h.clock.advance(10)
+        h.tick_with_usage({**usage, "1": win(62, 10)})  # a new decision: written at once
+        assert h.state()[DECISION_KEY]["at"] == h.clock.now
+
+
+class TestPause:
+    """A re-login in the TUI pauses the engine (pausedUntil in the state file)."""
+
+    def test_paused_tick_neither_switches_nor_primes(self, temp_home):
+        h = make(temp_home)
+        rt = runtime_for(h.engine)
+        primer = FakePrimer()
+        rt.primer, rt.prime_settings = primer, PrimeSettings(enabled=True)
+        pause.pause(h.switcher.backup_dir, "relogin", now=h.clock.now)
+        usage = {"1": win(100, 40), "2": win(0, 10), "3": win(0, 50)}
+        assert h.tick_with_usage(usage) is TickOutcome.NO_ACTION
+        assert h.active_number() == 1 and primer.calls == []
+        assert no_switch_reasons(h) == ["maximize-paused"]
+        assert "relogin" in of(h, NoSwitchEvent)[0].detail
+        assert not of(h, MaximizeDecisionEvent)
+        # It expires on its own after 10 minutes.
+        h.clock.advance(pause.MAX_PAUSE_S + 1)
+        assert h.tick_with_usage(usage) is TickOutcome.SWITCHED
+        assert primer.calls == ["2"]
+
+    def test_resume_lifts_the_pause_at_once(self, temp_home):
+        h = make(temp_home)
+        root = h.switcher.backup_dir
+        pause.pause(root, "relogin", now=h.clock.now)
+        pause.resume(root)
+        assert "pausedUntil" not in h.state()
+        usage = {"1": win(100, 40), "2": win(0, 10), "3": win(0, 50)}
+        assert h.tick_with_usage(usage) is TickOutcome.SWITCHED
 
 
 def test_combined_soft_idle_last_resort_excluded_and_priming(temp_home):

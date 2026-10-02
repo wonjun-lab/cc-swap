@@ -25,6 +25,7 @@ from __future__ import annotations
 import json
 import logging
 import math
+import os
 from collections.abc import Mapping
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
@@ -33,7 +34,7 @@ from typing import Any, Protocol
 from claude_swap import autoswitch as aw
 from claude_swap import poll_policy
 from claude_swap.exceptions import ConfigError
-from claude_swap.maximize import idle, policy
+from claude_swap.maximize import idle, pause, policy
 from claude_swap.maximize.model import (
     AccountView,
     Decision,
@@ -44,7 +45,7 @@ from claude_swap.maximize.model import (
     Snapshot,
     Switch,
 )
-from claude_swap.maximize.plan import rate_limit_tier_from_credentials
+from claude_swap.maximize.plan import plan_label, rate_limit_tier_from_credentials
 from claude_swap.maximize.report import decision_rows
 from claude_swap.maximize.score import score
 from claude_swap.maximize.snapshot import build_snapshot, usage_windows
@@ -66,6 +67,11 @@ CHANGED_KEY = "activeChangedAt"
 # rateLimitTier only changes with a plan change; re-read the stored
 # credential (a Keychain read on macOS) at most hourly per slot.
 TIER_CACHE_TTL_S = 3600.0
+# The decision this engine last made, for TUI viewers (``_publish_decision``).
+DECISION_KEY = "maximizeDecision"
+# An unchanged decision is rewritten this often, so a reader can tell a
+# steady engine from a stopped one by the record's age.
+PUBLISH_REFRESH_S = 300.0
 
 # Numeric ``maximize`` keys. The settings loader is lenient per key (wrong
 # type → default, out of range → clamped) and reports only pair repairs in
@@ -476,6 +482,64 @@ def _decision_event(
     )
 
 
+def _decision_fields(decision: Decision) -> tuple[str, str | None, bool]:
+    if isinstance(decision, Switch):
+        return "switch", decision.trigger, False
+    if isinstance(decision, Hold):
+        return "hold", None, decision.pending
+    if isinstance(decision, Exhausted):
+        return "exhausted", None, False
+    return "indeterminate", None, False
+
+
+def _publish_decision(
+    engine: aw.AutoSwitchEngine,
+    snap: Snapshot,
+    decision: Decision,
+    state: Mapping,
+    tiers: Mapping[str, str | None],
+) -> None:
+    """Write this tick's decision to the state file for TUI viewers.
+
+    Slot numbers and the policy's own reason only — no emails, no raw
+    ``rateLimitTier`` strings. Rewritten when the decision changes, or when
+    the stored one is :data:`PUBLISH_REFRESH_S` old (the TUI's freshness
+    clock); never on dry runs, which write nothing."""
+    if engine.dry_run:
+        return
+    name, trigger, pending = _decision_fields(decision)
+    target: str | None = decision.target if isinstance(decision, Switch) else None
+    if pending:
+        landing = policy.landing_candidates(snap)
+        target = landing[0].number if landing else None
+    record = {
+        "at": snap.now,
+        "pid": os.getpid(),
+        "active": snap.active,
+        "decision": name,
+        "trigger": trigger,
+        "target": target,
+        "reason": decision.reason,
+        "pending": pending,
+        "plans": {num: plan_label(tier) for num, tier in tiers.items()},
+    }
+    previous = state.get(DECISION_KEY)
+    if isinstance(previous, Mapping):
+        at = previous.get("at")
+        same = all(previous.get(k) == record[k] for k in record if k not in ("at", "pid"))
+        if (
+            same
+            and isinstance(at, (int, float))
+            and not isinstance(at, bool)
+            and 0 <= snap.now - at < PUBLISH_REFRESH_S
+        ):
+            return
+    try:
+        engine._mutate_state(lambda s: s.__setitem__(DECISION_KEY, record))
+    except Exception as e:  # a display aid must never break a tick
+        _logger.debug("could not publish the maximize decision: %s", type(e).__name__)
+
+
 def _without(snap: Snapshot, failed: set[str]) -> Snapshot:
     return replace(
         snap,
@@ -708,11 +772,22 @@ def run_maximize_tick(
     rt = runtime_for(engine)
     reload_if_changed(engine, rt)
     now = engine.clock()
+    paused = pause.active_pause(state, now)
+    if paused is not None:
+        # A TUI re-login owns the live login for now: no switch, no prime,
+        # and no samples (the login it shows is not a manual switch).
+        until, why = paused
+        engine._emit(aw.NoSwitchEvent(
+            reason="maximize-paused",
+            detail=f"switching paused ({why}) for {until - now:.0f}s more",
+        ))
+        return aw.TickOutcome.NO_ACTION
     records = _records(engine, current)
     samples, active_changed_at = _update_samples(
         engine, rt, state, current, entries.get(current), usage.get(current), now
     )
     last = state.get("lastSwitchAt")
+    tiers = _rate_limit_tiers(engine, rt, records, now)
     snap = build_snapshot(
         now=now,
         active=current,
@@ -720,7 +795,7 @@ def run_maximize_tick(
         records=records,
         quarantined=set(quarantined) | _unavailable(engine, records, current),
         api_key_accounts={n for n, r in records.items() if r.get("kind") == "api_key"},
-        rate_limit_tiers=_rate_limit_tiers(engine, rt, records, now),
+        rate_limit_tiers=tiers,
         samples=samples,
         last_switch_at=(
             float(last)
@@ -733,6 +808,7 @@ def run_maximize_tick(
     decision = policy.decide(snap)
     rt.last_snapshot, rt.last_decision = snap, decision
     engine._emit(_decision_event(snap, decision, engine.dry_run))
+    _publish_decision(engine, snap, decision, state, tiers)
     if isinstance(decision, Indeterminate):
         _run_primer(engine, rt, snap)
         return None

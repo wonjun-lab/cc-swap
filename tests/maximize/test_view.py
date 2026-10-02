@@ -219,10 +219,54 @@ def test_read_state_parses_the_engine_keys(tmp_path):
     assert state.last_switch_at == NOW - 120
 
 
+def test_read_state_parses_published_decision_and_plans(tmp_path):
+    (tmp_path / "autoswitch_state.json").write_text(json.dumps({
+        "maximizeDecision": {
+            "at": NOW - 30, "pid": 4121, "active": "1", "decision": "hold",
+            "trigger": None, "target": "2", "reason": "#1 5h 62% >= soft 50; waiting",
+            "pending": True, "plans": {"1": "20x", "2": "5x", "3": None, "4": 7},
+        },
+        "pausedUntil": NOW + 300, "pausedReason": "relogin",
+    }))
+    state = view.read_state(tmp_path)
+    assert state.decision == view.PublishedDecision(
+        at=NOW - 30, pid=4121, active="1", decision="hold", trigger=None,
+        target="2", reason="#1 5h 62% >= soft 50; waiting", pending=True,
+    )
+    assert state.plans == {"1": "20x", "2": "5x", "3": None}
+    assert (state.paused_until, state.paused_reason) == (NOW + 300, "relogin")
+
+
+@pytest.mark.parametrize("record", [
+    "hold",
+    {"decision": "hold", "reason": "x"},                   # no timestamp
+    {"at": "soon", "decision": "hold", "reason": "x"},
+    {"at": NOW, "decision": "dance", "reason": "x"},       # unknown kind
+    {"at": NOW, "decision": "switch", "reason": 3},
+])
+def test_read_state_ignores_malformed_published_decision(tmp_path, record):
+    (tmp_path / "autoswitch_state.json").write_text(json.dumps({
+        "maximizeDecision": record, "lastSwitchAt": NOW, "pausedUntil": "later",
+    }))
+    state = view.read_state(tmp_path)
+    assert state.decision is None and state.plans == {}
+    assert state.paused_until is None
+    assert state.last_switch_at == NOW  # the rest still reads
+
+
+def test_snapshot_from_accounts_weighs_published_plans():
+    s = view.snapshot_from_accounts(
+        _accounts(), MaximizeSettings(), view.MaximizeState(), now=NOW, plans={"1": "20x"},
+    )
+    assert [v.plan_weight for v in s.accounts] == [4, 1, 1]
+
+
 def test_state_filename_matches_the_engine():
     from claude_swap.autoswitch import STATE_FILENAME
+    from claude_swap.maximize.engine_hook import DECISION_KEY
 
     assert view.STATE_FILENAME == STATE_FILENAME
+    assert view.DECISION_KEY == DECISION_KEY
 
 
 # -- from the TUI's AccountsSnapshot ----------------------------------------------------------

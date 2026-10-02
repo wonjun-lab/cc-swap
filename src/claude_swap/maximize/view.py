@@ -48,6 +48,25 @@ _PAIRS = (("soft_5h", "hard_5h"), ("soft_7d", "hard_7d"))
 TIER_LABELS = {"normal": "normal", "last_resort": "last resort", "excluded": "excluded"}
 
 
+#: ``engine_hook.DECISION_KEY`` (pinned by a test, like STATE_FILENAME).
+DECISION_KEY = "maximizeDecision"
+DECISION_KINDS = frozenset({"switch", "hold", "indeterminate", "exhausted"})
+
+
+@dataclass(frozen=True)
+class PublishedDecision:
+    """The decision a live engine last wrote (``engine_hook._publish_decision``)."""
+
+    at: float
+    pid: int | None
+    active: str | None
+    decision: str  # one of DECISION_KINDS
+    trigger: str | None
+    target: str | None
+    reason: str
+    pending: bool
+
+
 @dataclass(frozen=True)
 class MaximizeState:
     """The engine state-file keys the maximize panel reads."""
@@ -57,6 +76,11 @@ class MaximizeState:
     primes: Mapping[str, Mapping] = field(default_factory=dict)
     quarantined: frozenset[str] = frozenset()
     last_switch_at: float | None = None
+    decision: PublishedDecision | None = None
+    plans: Mapping[str, str | None] = field(default_factory=dict)
+    # A TUI re-login's pause marker (maximize/pause.py), as written.
+    paused_until: float | None = None
+    paused_reason: str | None = None
 
 
 @dataclass(frozen=True)
@@ -86,6 +110,40 @@ def _num(value) -> float | None:
     return value if math.isfinite(value) else None
 
 
+def _text(value) -> str | None:
+    return str(value) if isinstance(value, (str, int)) and not isinstance(value, bool) else None
+
+
+def _published(raw: object) -> tuple[PublishedDecision | None, dict[str, str | None]]:
+    """The ``maximizeDecision`` record, leniently: anything malformed is None."""
+    if not isinstance(raw, dict):
+        return None, {}
+    at = _num(raw.get("at"))
+    kind = raw.get("decision")
+    reason = raw.get("reason")
+    if at is None or kind not in DECISION_KINDS or not isinstance(reason, str):
+        return None, {}
+    pid = raw.get("pid")
+    trigger = raw.get("trigger")
+    decision = PublishedDecision(
+        at=at,
+        pid=pid if isinstance(pid, int) and not isinstance(pid, bool) else None,
+        active=_text(raw.get("active")),
+        decision=kind,
+        trigger=trigger if isinstance(trigger, str) else None,
+        target=_text(raw.get("target")),
+        reason=reason,
+        pending=raw.get("pending") is True,
+    )
+    plans_raw = raw.get("plans")
+    plans: dict[str, str | None] = {}
+    if isinstance(plans_raw, dict):
+        for num, label in plans_raw.items():
+            if label is None or isinstance(label, str):
+                plans[str(num)] = label
+    return decision, plans
+
+
 def read_state(backup_root: Path) -> MaximizeState:
     """The maximize keys of ``autoswitch_state.json``; empty when unreadable.
 
@@ -113,6 +171,8 @@ def read_state(backup_root: Path) -> MaximizeState:
     found.sort(key=lambda s: s.ts)
     primes = raw.get("primes")
     quarantine = raw.get("quarantine")
+    decision, plans = _published(raw.get(DECISION_KEY))
+    reason = raw.get("pausedReason")
     return MaximizeState(
         samples_account=account,
         samples=tuple(found),
@@ -123,6 +183,10 @@ def read_state(backup_root: Path) -> MaximizeState:
             else frozenset()
         ),
         last_switch_at=_num(raw.get("lastSwitchAt")),
+        decision=decision,
+        plans=plans,
+        paused_until=_num(raw.get("pausedUntil")),
+        paused_reason=reason if isinstance(reason, str) else None,
     )
 
 
@@ -132,12 +196,13 @@ def snapshot_from_accounts(
     state: MaximizeState,
     *,
     now: float,
+    plans: Mapping[str, str | None] | None = None,
 ) -> Snapshot:
     """The policy Snapshot for the TUI's store snapshot.
 
-    Plan tiers are unknown here (reading ``rateLimitTier`` costs a Keychain
-    read per account), so only ``maximize.planOverride`` weighs in. That
-    affects tie-breaks only.
+    Plan tiers are not read here (reading ``rateLimitTier`` costs a Keychain
+    read per account): ``plans`` — the labels a live engine published — and
+    ``maximize.planOverride`` weigh in. That affects tie-breaks only.
     """
     accounts = snap.accounts
     return build_snapshot(
@@ -150,7 +215,7 @@ def snapshot_from_accounts(
         },
         quarantined=set(state.quarantined),
         api_key_accounts={a.number for a in accounts if a.kind == "api_key"},
-        rate_limit_tiers={a.number: None for a in accounts},
+        rate_limit_tiers={a.number: (plans or {}).get(a.number) for a in accounts},
         samples=state.samples if state.samples_account == snap.active_number else (),
         last_switch_at=state.last_switch_at,
         settings=settings,
