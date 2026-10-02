@@ -381,5 +381,8 @@ class TestFleetScreen:
             await pilot.pause()
             await pilot.press("o")
             await settle(pilot)
+            assert pause.read_auto_off(tmp_path) is None  # turning it off asks first
+            await pilot.press("y")
+            await settle(pilot)
             off = pause.read_auto_off(tmp_path)
             assert off is not None and off.by == "fleet"

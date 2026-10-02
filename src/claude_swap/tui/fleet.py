@@ -759,8 +759,31 @@ class FleetScreen(Screen):
         self.dispatch_menu(action)
 
     def toggle_auto(self) -> None:
-        """Menu → o: automatic switching off, or back on (``cc-swap auto``)."""
-        self._set_auto(not self._state.auto_off)
+        """Menu → o: automatic switching off (after a confirmation), or
+        back on at once (``cc-swap auto``)."""
+        if self._state.auto_off:
+            self._set_auto(False)
+        else:
+            self.confirm_auto_off()
+
+    def confirm_auto_off(self) -> None:
+        """Ask before turning automatic switching OFF (``m`` then a stray
+        ``o`` must not stop switching on every engine until someone notices);
+        y or enter turns it off, n or esc leaves it on. Turning it back on
+        never asks."""
+        from claude_swap.tui.modals import ConfirmModal
+
+        self.app.push_screen(
+            ConfirmModal(
+                "Turn automatic switching OFF? Nothing switches or primes "
+                "automatically — on any engine, including the service — until "
+                "you turn it back on (m → o, or cc-swap auto on). Manual "
+                "switches still work.",
+                title="Automatic switching",
+                yes_label="Turn off",
+            ),
+            lambda confirmed: self._set_auto(True) if confirmed else None,
+        )
 
     def open_mode(self) -> None:
         from claude_swap.tui.fleet_modals import ModeModal
@@ -771,8 +794,11 @@ class FleetScreen(Screen):
         """Carry out a Mode choice. Going live always asks first (the auto
         screen's wording); Fleet never takes the lease without a choice."""
         host = self._host
-        if action in ("auto-off", "auto-on"):
-            self._set_auto(action == "auto-off")
+        if action == "auto-off":
+            self.confirm_auto_off()
+            return
+        if action == "auto-on":
+            self._set_auto(False)
             return
         if action is None or host is None:
             return

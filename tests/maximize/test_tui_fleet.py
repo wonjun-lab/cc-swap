@@ -706,6 +706,9 @@ class TestKeys:
             assert isinstance(app.screen, FleetScreen) and len(seen) == len(menus.MAIN_MENU) + 1
 
     async def test_menu_o_turns_automatic_switching_off_and_on(self, tmp_path):
+        from claude_swap.tui.fleet import FleetScreen
+        from claude_swap.tui.modals import ConfirmModal
+
         _settings(tmp_path)
         app = make_app(_fleet(tmp_path))
         async with app.run_test(size=(140, 40)) as pilot:
@@ -713,12 +716,51 @@ class TestKeys:
             await pilot.press("o")  # not a home key: one stray key never turns it off
             await _open(pilot)
             assert pause.read_auto_off(tmp_path) is None
+            # Turning it OFF asks first (review of rel/0.4.0): m then a stray
+            # o must not stop switching. esc cancels ...
             await pilot.press("m", "o")
+            await _open(pilot)
+            assert isinstance(app.screen, ConfirmModal)
+            assert pause.read_auto_off(tmp_path) is None
+            await pilot.press("escape")
+            await _open(pilot)
+            assert isinstance(app.screen, FleetScreen)
+            assert pause.read_auto_off(tmp_path) is None
+            assert not _status(app).startswith("Auto OFF")
+            # ... y confirms.
+            await pilot.press("m", "o", "y")
             await _open(pilot)
             off = pause.read_auto_off(tmp_path)
             assert off is not None and off.by == "fleet"
             assert _status(app).startswith("Auto OFF")
+            # Turning it back ON is immediate.
             await pilot.press("m", "o")
+            await _open(pilot)
+            assert isinstance(app.screen, FleetScreen)
+            assert pause.read_auto_off(tmp_path) is None
+            # enter confirms too.
+            await pilot.press("m", "o")
+            await _open(pilot)
+            assert isinstance(app.screen, ConfirmModal)
+            await pilot.press("enter")
+            await _open(pilot)
+            assert pause.read_auto_off(tmp_path) is not None
+
+    async def test_mode_o_asks_before_turning_automatic_switching_off(self, tmp_path):
+        from claude_swap.tui.fleet_modals import ModeModal
+        from claude_swap.tui.modals import ConfirmModal
+
+        _settings(tmp_path)
+        app = make_app(_fleet(tmp_path))
+        async with app.run_test(size=(140, 40)) as pilot:
+            await _open(pilot)
+            await pilot.press("m", "m")
+            await _open(pilot)
+            assert isinstance(app.screen, ModeModal)
+            await pilot.press("o")
+            await _open(pilot)
+            assert isinstance(app.screen, ConfirmModal)
+            await pilot.press("n")
             await _open(pilot)
             assert pause.read_auto_off(tmp_path) is None
 
