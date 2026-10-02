@@ -539,6 +539,18 @@ def _menubar_install_command() -> str:
     return f"pip install {spec}"
 
 
+def autoswitch_item_title(engine_elsewhere: bool) -> str:
+    """Settings-menu label for the auto-switch toggle.
+
+    While another engine holds the engine lease (the cc-swap service, a
+    terminal ``cc-swap auto``, a TUI auto screen) the menu bar runs none of
+    its own and only displays; the label says so instead of looking broken.
+    """
+    if engine_elsewhere:
+        return "Auto-switch accounts (running in another cc-swap engine)"
+    return "Auto-switch accounts"
+
+
 def run(switcher) -> int:
     """Entry point for ``cswap --menubar``. Blocks until the user quits."""
     ensure_notification_identity()
@@ -571,6 +583,7 @@ def run(switcher) -> int:
     )
 
     from claude_swap.autoswitch import AutoSwitchEngine
+    from claude_swap.maximize.lease import EngineLease, LeaseKeeper
     from claude_swap.settings import load_settings, set_setting
     from claude_swap.snapshot_source import SnapshotSource
 
@@ -600,6 +613,10 @@ def run(switcher) -> int:
             self._engine = None
             self._engine_events: list = []
             self._event_lock = threading.Lock()
+            # Engine lease: while another engine holds it, the menu bar only
+            # displays (store-only reads) and never starts its own.
+            self._lease_keeper = LeaseKeeper(EngineLease(switcher.backup_dir))
+            self._engine_elsewhere = False
             self.rebuild_menu()
             # Background display refresh on the user's interval, plus a fast
             # UI-sync tick that applies snapshots + engine events on the main thread.
@@ -626,7 +643,8 @@ def run(switcher) -> int:
             try:
                 try:
                     raw = self._snapshot_source.take(
-                        full=full, store_only=self._engine is not None
+                        full=full,
+                        store_only=self._engine is not None or self._engine_elsewhere,
                     )
                 except Exception:
                     # Keep the last good snapshot rather than blanking the menu.
@@ -690,9 +708,15 @@ def run(switcher) -> int:
 
         # ---- auto-switch engine ----------------------------------------------
         def _start_engine(self):
-            """Run the core AutoSwitchEngine (live) in a background thread."""
+            """Run the core AutoSwitchEngine (live) in a background thread —
+            unless another process holds the engine lease, in which case the
+            menu bar only displays what that engine does."""
             if self._engine is not None:
                 return
+            if not self._lease_keeper.claim():
+                self._engine_elsewhere = True
+                return
+            self._engine_elsewhere = False
             try:
                 engine = AutoSwitchEngine(
                     self.switcher,
@@ -701,10 +725,12 @@ def run(switcher) -> int:
                     dry_run=False,
                 )
             except Exception as e:  # never let a bad start crash the menu bar
+                self._lease_keeper.close()
                 self.switcher._logger.warning("auto-switch engine failed to start: %s", e)
                 rumps.notification("claude-swap", "Auto-switch failed to start", str(e))
                 return
             self._engine = engine
+            self._lease_keeper.engine_started()
             threading.Thread(target=self._run_engine, args=(engine,), daemon=True).start()
 
         def _run_engine(self, engine):
@@ -712,11 +738,16 @@ def run(switcher) -> int:
                 engine.run_loop()
             except Exception:
                 self.switcher._logger.debug("auto-switch engine crashed", exc_info=True)
+            finally:
+                # The lease outlives the engine's last tick, not just stop().
+                self._lease_keeper.engine_exited()
 
         def _stop_engine(self):
             if self._engine is not None:
                 self._engine.stop()
                 self._engine = None
+            self._lease_keeper.close()
+            self._engine_elsewhere = False
 
         def _restart_engine(self):
             """Apply changed core settings by restarting the running engine."""
@@ -891,7 +922,10 @@ def run(switcher) -> int:
                 interval.add(choice)
             menu.add(interval)
 
-            auto_item = rumps.MenuItem("Auto-switch accounts", callback=self.on_toggle_autoswitch)
+            auto_item = rumps.MenuItem(
+                autoswitch_item_title(self._engine_elsewhere),
+                callback=self.on_toggle_autoswitch,
+            )
             auto_item.state = 1 if self.settings.auto_switch_enabled else 0
             menu.add(auto_item)
 
@@ -1060,6 +1094,13 @@ def run(switcher) -> int:
             self.settings.save(settings_path)
             if self.settings.auto_switch_enabled:
                 self._start_engine()
+                if self._engine_elsewhere:
+                    rumps.notification(
+                        "claude-swap",
+                        "Auto-switch is already running elsewhere",
+                        "Another cc-swap engine (service, terminal or TUI) owns "
+                        "auto-switching; the menu bar will only display it.",
+                    )
             else:
                 self._stop_engine()
             self.rebuild_menu()

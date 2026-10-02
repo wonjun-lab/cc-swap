@@ -104,6 +104,11 @@ MenuItem Static.menu-item-muted { color: $secondary; }
     color: $background;
 }
 
+#mode-badge.viewer {
+    background: $panel;
+    color: $secondary;
+}
+
 #auto-summary {
     width: 1fr;
     color: $secondary;

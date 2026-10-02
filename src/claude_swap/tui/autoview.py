@@ -3,8 +3,10 @@
 Runs :class:`AutoSwitchEngine` in a thread worker and renders its typed
 events. Opens in **dry-run** — opening a view must never start switching
 accounts on its own; going live is an explicit, confirmed action. The
-engine's own state file semantics (shared cooldown, quarantine list, state
-lock) make it safe to run alongside an external ``cswap auto``.
+engine runs only while the app holds the machine's engine lease
+(``maximize/lease.py``); when another process holds it — the cc-swap
+service, a terminal ``cc-swap auto`` — the screen is a read-only VIEWER:
+no engine, store-only snapshots, no go-live.
 
 The active account's full card sits on top (same widget as the dashboard's
 panel, with the threshold tick); this screen adds the engine badge, the
@@ -15,6 +17,7 @@ snapshot poller runs store-only: the engine is the only fetcher.
 from __future__ import annotations
 
 from dataclasses import replace
+from functools import partial
 from typing import TYPE_CHECKING
 
 from rich.text import Text
@@ -38,6 +41,7 @@ from claude_swap.tui.theme import Palette
 from claude_swap.tui.widgets import AccountsPanel
 
 if TYPE_CHECKING:
+    from claude_swap.maximize.lease import LeaseKeeper
     from claude_swap.tui.app import CswapApp
 
 _EVENT_ROLES = {
@@ -60,6 +64,15 @@ def event_text(event: AutoSwitchEvent, *, palette: Palette = Palette.DARK) -> Te
     text.append(f"{data.clock_stamp()}  ", style=palette.muted)
     text.append(event.human(), style=style)
     return text
+
+
+def _run_engine_holding(engine: AutoSwitchEngine, keeper: "LeaseKeeper") -> int:
+    """Engine worker body: count this thread against the lease until its last
+    tick returns (``stop()`` only asks the loop to end)."""
+    try:
+        return engine.run_loop()
+    finally:
+        keeper.engine_exited()
 
 
 class AutoScreen(Screen):
@@ -86,6 +99,8 @@ class AutoScreen(Screen):
         self._adjusting = False
         self._configured_threshold: float | None = None
         self._entry_threshold: float | None = None
+        # Another process holds the engine lease: show, never run, an engine.
+        self._viewer = False
 
     def compose(self) -> ComposeResult:
         yield AccountsPanel(show_minis=False, id="auto-active-panel")
@@ -111,11 +126,16 @@ class AutoScreen(Screen):
         self._update_summary()
         self.watch(self.app, "snapshot", self._on_snapshot)
         self.watch(self.app, "theme", self._on_theme_change)
-        self._start_engine(dry_run=True)
+        if self.app.engine_keeper.claim():
+            self._start_engine(dry_run=True)
+        else:
+            self._enter_viewer()
 
     def on_unmount(self) -> None:
         if self._engine is not None:
             self._engine.stop()
+        # Released now, or by the engine thread that finishes its tick last.
+        self.app.engine_keeper.close()
         # A session threshold must not outlive the engine it steered: unpin
         # the poll planner and put the bar tick back on the file value.
         self.app.switcher.clear_poll_policy_inputs()
@@ -141,6 +161,10 @@ class AutoScreen(Screen):
     def check_action(self, action: str, parameters: tuple) -> bool | None:
         if action in ("threshold_step", "adjust_done") and not self._adjusting:
             return False  # hidden and inert until adjust mode is armed
+        if self._viewer and action == "toggle_live":
+            return False  # no engine here to take live
+        if self._viewer and action == "adjust_threshold":
+            return False  # a session threshold would steer no engine
         return True
 
     def action_adjust_threshold(self) -> None:
@@ -214,8 +238,10 @@ class AutoScreen(Screen):
             dry_run=dry_run,
         )
         self._engine = engine
+        keeper = self.app.engine_keeper
+        keeper.engine_started()
         self.run_worker(
-            engine.run_loop,
+            partial(_run_engine_holding, engine, keeper),
             thread=True,
             group="engine",
             exit_on_error=False,
@@ -238,6 +264,22 @@ class AutoScreen(Screen):
         except Exception:
             # App/screen tearing down mid-tick; the event has nowhere to go.
             pass
+
+    def _enter_viewer(self) -> None:
+        """Another process owns auto-switching: watch it, never run one."""
+        self._viewer = True
+        self._update_badge()
+        self.refresh_bindings()
+        pid = self.app.engine_keeper.lease.holder_pid()
+        who = f" (pid {pid})" if pid else ""
+        self.query_one("#event-log", RichLog).write(
+            Text(
+                f"— another cc-swap engine is running{who}: this screen only "
+                "watches. Stop that engine and reopen this screen to run one "
+                "here —",
+                style=Palette.from_theme(self.app.current_theme).muted,
+            )
+        )
 
     def _on_engine_event(self, event: AutoSwitchEvent) -> None:
         if not self.is_attached:
@@ -275,7 +317,10 @@ class AutoScreen(Screen):
 
     def _update_badge(self) -> None:
         badge = self.query_one("#mode-badge", Static)
-        if self._engine is not None and not self._engine.dry_run:
+        if self._viewer:
+            badge.update(" VIEWER ")
+            badge.set_classes("viewer")
+        elif self._engine is not None and not self._engine.dry_run:
             badge.update(" LIVE ")
             badge.set_classes("live")
         else:
