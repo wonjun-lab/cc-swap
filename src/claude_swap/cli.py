@@ -610,6 +610,8 @@ Examples:
   cswap auto --json                # one JSON event per line (for scripts)
   cswap auto --once; echo $?       # single tick, outcome in exit code
   cswap auto --dry-run             # log decisions, never actually switch
+  cc-swap auto --strategy maximize # per-window soft/hard marks (cc-swap)
+  cc-swap auto --strategy maximize --soft5h 40 --hard5h 90
 
 Defaults live in settings.json in the backup root; flags override them.
         """,
@@ -666,14 +668,32 @@ Defaults live in settings.json in the backup root; flags override them.
     )
     parser.add_argument(
         "--strategy",
-        choices=("best", "consume-first"),
+        choices=("best", "consume-first", "maximize"),
         default=None,
         help=(
-            "Target selection: 'best' (most quota left; default) or "
+            "Target selection: 'best' (most quota left; default), "
             "'consume-first' (proactively use the account whose weekly window "
-            "resets soonest)"
+            "resets soonest), or 'maximize' (cc-swap: separate 5h/7d soft and "
+            "hard marks, spend the weekly quota that would expire first)"
         ),
     )
+    for flag, window, kind, default in (
+        ("--soft5h", "5h", "soft", 50),
+        ("--hard5h", "5h", "hard", 95),
+        ("--soft7d", "7d", "soft", 90),
+        ("--hard7d", "7d", "hard", 98),
+    ):
+        when = "at the next idle moment" if kind == "soft" else "immediately"
+        parser.add_argument(
+            flag,
+            type=float,
+            metavar="PCT",
+            help=(
+                f"maximize only: {window} {kind} mark, switch {when} once the "
+                f"active account's {window} window reaches it "
+                f"(1-99.9; default {default}; soft <= hard)"
+            ),
+        )
     parser.add_argument(
         "--dry-run",
         action="store_true",
@@ -688,7 +708,13 @@ Defaults live in settings.json in the backup root; flags override them.
 
     from claude_swap.autoswitch import AutoSwitchEngine, AutoSwitchEvent
     from claude_swap.printer import accent, yellowed
-    from claude_swap.settings import load_settings, merged_with_cli
+    from claude_swap.settings import (
+        MAXIMIZE_CLI_FLAGS,
+        load_maximize_settings,
+        load_settings,
+        merge_maximize_cli,
+        merged_with_cli,
+    )
 
     def jsonl_emit(event: AutoSwitchEvent) -> None:
         print(json.dumps(event.to_json()), flush=True)
@@ -712,11 +738,34 @@ Defaults live in settings.json in the backup root; flags override them.
                 sys.exit(1)
 
         settings = merged_with_cli(load_settings(switcher.backup_dir), args)
+        # cc-swap: --soft5h/--hard5h/--soft7d/--hard7d only mean something to
+        # the maximize strategy (flag or settings.json); reject, don't ignore.
+        given = [
+            f"--{attr}"
+            for attr, _ in MAXIMIZE_CLI_FLAGS
+            if getattr(args, attr) is not None
+        ]
+        if given and settings.strategy != "maximize":
+            parser.error(
+                f"{', '.join(given)} only apply to the maximize strategy "
+                "(--strategy maximize or autoswitch.strategy maximize)"
+            )
+        maximize = None
+        engine_kwargs = {}
+        if settings.strategy == "maximize":
+            # Raises ConfigError (exit 1 below) when the flags put a soft mark
+            # above its hard cap. The engine gets the flags themselves, not the
+            # merged values, so it can re-apply them over every hot reload.
+            maximize = merge_maximize_cli(
+                load_maximize_settings(switcher.backup_dir), args
+            )
+            engine_kwargs["maximize_cli"] = args
         engine = AutoSwitchEngine(
             switcher,
             settings,
             jsonl_emit if args.json else human_emit,
             dry_run=args.dry_run,
+            **engine_kwargs,
         )
 
         if args.once:
@@ -725,9 +774,17 @@ Defaults live in settings.json in the backup root; flags override them.
         # Loop mode: SIGTERM (systemd stop) exits the loop cleanly.
         signal.signal(signal.SIGTERM, lambda *_: engine.stop())
         if not args.json:
+            if maximize is not None:
+                policy = (
+                    f"strategy maximize, 5h soft {maximize.soft_5h:g}% / hard "
+                    f"{maximize.hard_5h:g}%, 7d soft {maximize.soft_7d:g}% / hard "
+                    f"{maximize.hard_7d:g}%"
+                )
+            else:
+                policy = f"threshold {settings.threshold:.0f}%"
             print(
                 dimmed(
-                    f"Auto-switch running: threshold {settings.threshold:.0f}%, "
+                    f"Auto-switch running: {policy}, "
                     f"every {settings.interval_seconds:.0f}s"
                     f"{' (dry-run)' if args.dry_run else ''} — Ctrl-C to stop"
                 )
