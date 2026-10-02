@@ -21,18 +21,29 @@ building, output classification. ``Primer`` (Task 11) is the engine half.
 
 from __future__ import annotations
 
+import json
+import logging
 import math
 import os
 import random
 import re
-from collections.abc import Mapping
+import signal
+import subprocess
+import time
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
+from claude_swap import oauth
+from claude_swap.autoswitch import AutoSwitchEvent, ConfigWarningEvent, PrimeEvent
 from claude_swap.maximize.model import AccountView, Snapshot
-from claude_swap.session import AUTH_OVERRIDE_ENV_VARS
-from claude_swap.settings import PrimeSettings, parse_jitter_range
+from claude_swap.maximize.snapshot import build_snapshot
+from claude_swap.poll_policy import parse_reset_ts
+from claude_swap.session import AUTH_OVERRIDE_ENV_VARS, delete_macos_keychain_entry
+from claude_swap.settings import PrimeSettings, load_maximize_settings, parse_jitter_range
+
+_logger = logging.getLogger("claude-swap")
 
 WINDOW_S = 5 * 3600.0          # a 5h window's length
 BUCKET_S = 600.0               # resets land on 10-minute boundaries (spec §3.1)
@@ -384,3 +395,69 @@ def classify_failure(result: PrimeRunResult) -> str:
     if _MODEL_RE.search(text):
         return "model-not-found"
     return "other"
+
+
+# ---------------------------------------------------------------------------
+# I/O half (Task 11): run the child, talk to the engine, keep state.
+# ---------------------------------------------------------------------------
+
+def _parse_is_error(stdout: str) -> bool | None:
+    try:
+        data = json.loads(stdout)
+    except (TypeError, ValueError):
+        return None
+    if isinstance(data, dict) and isinstance(data.get("is_error"), bool):
+        return data["is_error"]
+    return None
+
+
+def _kill_tree(proc: subprocess.Popen) -> None:
+    try:
+        if os.name == "posix":
+            os.killpg(proc.pid, signal.SIGKILL)
+        else:
+            proc.kill()
+    except OSError:
+        pass  # already gone
+
+
+def run_prime(
+    argv: Sequence[str],
+    env: Mapping[str, str],
+    cwd: Path,
+    timeout_s: float = PRIME_TIMEOUT_S,
+) -> PrimeRunResult:
+    """Run the priming child once: no shell, stdin closed, bounded.
+
+    POSIX children get their own session so a timeout kills the whole tree
+    (node may fork helpers that would otherwise hold the pipes open).
+    """
+    secret = env.get("CLAUDE_CODE_OAUTH_TOKEN")
+    extra: dict = {"start_new_session": True} if os.name == "posix" else {}
+    try:
+        proc = subprocess.Popen(
+            list(argv),
+            env=dict(env),
+            cwd=str(cwd),
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            encoding="utf-8",
+            errors="replace",
+            **extra,
+        )
+    except OSError as exc:
+        return PrimeRunResult(None, False, mask_secrets(f"{type(exc).__name__}: {exc}", secret))
+    try:
+        out, err = proc.communicate(timeout=timeout_s)
+    except subprocess.TimeoutExpired:
+        _kill_tree(proc)
+        out, err = proc.communicate()
+        return PrimeRunResult(None, True, mask_secrets(err, secret), mask_secrets(out, secret))
+    return PrimeRunResult(
+        proc.returncode,
+        False,
+        mask_secrets(err, secret),
+        mask_secrets(out, secret),
+        _parse_is_error(out),
+    )
