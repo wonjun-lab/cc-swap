@@ -66,8 +66,11 @@ def _cache_path() -> Path:
 
 
 def _make_release_response(version: str) -> MagicMock:
-    """A GitHub ``releases/latest`` payload for tag ``v<version>``."""
-    data = json.dumps({"tag_name": f"v{version}", "prerelease": False}).encode()
+    """A GitHub releases-list payload holding one release, tagged
+    ``cc-v<version>`` (the fork's release tag scheme)."""
+    data = json.dumps(
+        [{"tag_name": f"cc-v{version}", "draft": False, "prerelease": False}]
+    ).encode()
     mock_resp = MagicMock()
     mock_resp.read.return_value = data
     mock_resp.__enter__ = lambda s: s
@@ -76,9 +79,9 @@ def _make_release_response(version: str) -> MagicMock:
 
 
 def _make_tag_response(tag: str) -> MagicMock:
-    """A ``releases/latest`` payload whose tag_name is exactly ``tag``."""
+    """A releases-list payload whose only release has tag_name exactly ``tag``."""
     resp = _make_release_response("0.0.0")
-    resp.read.return_value = json.dumps({"tag_name": tag}).encode()
+    resp.read.return_value = json.dumps([{"tag_name": tag}]).encode()
     return resp
 
 
@@ -137,7 +140,7 @@ class TestCheckForUpdate:
 
     def test_fresh_cache_no_network(self, tmp_path, monkeypatch):
         cache_path = tmp_path / "cache.json"
-        _write_cache(cache_path, "0.5.0")
+        _write_cache(cache_path, "cc-v0.5.0")
         monkeypatch.setattr("claude_swap.update_check.CACHE_PATH", cache_path)
 
         with patch("claude_swap.update_check.urllib.request.urlopen") as mock_urlopen:
@@ -165,7 +168,9 @@ class TestGitHubReleaseSource:
     """cc-swap polls its own GitHub Releases, never upstream's PyPI project."""
 
     @patch("claude_swap.update_check.urllib.request.urlopen")
-    def test_requests_the_fork_latest_release(self, mock_urlopen, tmp_path, monkeypatch):
+    def test_requests_the_fork_releases_list_not_releases_latest(
+        self, mock_urlopen, tmp_path, monkeypatch
+    ):
         monkeypatch.setattr("claude_swap.update_check.CACHE_PATH", tmp_path / "cache.json")
         mock_urlopen.return_value = _make_release_response("0.4.0")
 
@@ -173,9 +178,11 @@ class TestGitHubReleaseSource:
 
         req = mock_urlopen.call_args[0][0]
         assert req.full_url == RELEASES_URL
-        assert RELEASES_URL == (
-            "https://api.github.com/repos/wonjun-lab/cc-swap/releases/latest"
+        # /releases/latest can point at a tag outside the cc-v scheme.
+        assert RELEASES_URL.startswith(
+            "https://api.github.com/repos/wonjun-lab/cc-swap/releases?"
         )
+        assert "/latest" not in RELEASES_URL
         assert req.get_header("Accept") == "application/vnd.github+json"
         assert req.get_header("User-agent")  # GitHub rejects requests without one
 
@@ -192,17 +199,16 @@ class TestGitHubReleaseSource:
         assert check_for_update("0.1.0") is None
         assert json.loads(cache_path.read_text())["data"] is None
 
+    @pytest.mark.parametrize("tag", ["0.4.0", "v0.4.0", "v0.26.0", "V0.4.0"])
     @patch("claude_swap.update_check.urllib.request.urlopen")
-    def test_tag_without_v_prefix_is_accepted(self, mock_urlopen, tmp_path, monkeypatch):
+    def test_tag_outside_the_cc_v_scheme_is_ignored(
+        self, mock_urlopen, tmp_path, monkeypatch, tag
+    ):
+        # v0.4.0 .. v0.26.0 are upstream's tags, inherited by the fork.
         monkeypatch.setattr("claude_swap.update_check.CACHE_PATH", tmp_path / "cache.json")
-        resp = _make_release_response("0.0.0")
-        resp.read.return_value = json.dumps({"tag_name": "0.4.0"}).encode()
-        mock_urlopen.return_value = resp
+        mock_urlopen.return_value = _make_tag_response(tag)
 
-        result = check_for_update("0.3.2")
-
-        assert result is not None
-        assert "(0.4.0)" in result
+        assert check_for_update("0.3.1") is None
 
     @patch("claude_swap.update_check.urllib.request.urlopen")
     def test_payload_without_tag_is_silent(self, mock_urlopen, tmp_path, monkeypatch):
@@ -394,7 +400,7 @@ class TestCheckForUpdateMessage:
 
 
 FORK = "git+https://github.com/wonjun-lab/cc-swap"
-PINNED = f"{FORK}@v0.4.0"
+PINNED = f"{FORK}@cc-v0.4.0"
 
 
 @patch("claude_swap.update_check.sys.platform", "linux")
@@ -434,18 +440,17 @@ class TestRunSelfUpgrade:
     @patch("claude_swap.update_check.subprocess.run")
     @patch("claude_swap.update_check.urllib.request.urlopen")
     @patch("claude_swap.update_check._detect_install_method", return_value="uv")
-    def test_tag_keeps_its_published_spelling(
+    def test_upstream_style_tag_is_never_installed(
         self, mock_detect, mock_urlopen, mock_run
     ):
-        # The git ref must be the tag as published; a tag without the "v"
-        # prefix is not rewritten to carry one.
-        mock_urlopen.return_value = _make_tag_response("0.4.0")
+        # upstream's inherited v0.26.0 must not be picked up, however high.
+        mock_urlopen.return_value = _make_tag_response("v0.26.0")
         mock_run.return_value = MagicMock(returncode=0)
 
         run_self_upgrade()
 
         mock_run.assert_called_once_with(
-            ["uv", "tool", "install", "--force", f"{FORK}@0.4.0"], check=False
+            ["uv", "tool", "install", "--force", INSTALL_URL], check=False
         )
 
     @patch("claude_swap.update_check.subprocess.run")
@@ -459,7 +464,7 @@ class TestRunSelfUpgrade:
 
         run_self_upgrade()
 
-        assert "v0.4.0" in capsys.readouterr().out
+        assert "cc-v0.4.0" in capsys.readouterr().out
 
     @patch("claude_swap.update_check.subprocess.run")
     @patch("claude_swap.update_check.urllib.request.urlopen")
@@ -528,7 +533,7 @@ class TestRunSelfUpgrade:
         )
         assert "default branch" in capsys.readouterr().out
 
-    @pytest.mark.parametrize("tag", ["v1.0 beta", "v1.0#frag", "v1.0@evil", "-v1", "v1/../x"])
+    @pytest.mark.parametrize("tag", ["cc-v1.0 beta", "cc-v1.0#frag", "cc-v1.0@evil", "-v1", "cc-v1/../x"])
     @patch("claude_swap.update_check.subprocess.run")
     @patch("claude_swap.update_check.urllib.request.urlopen")
     @patch("claude_swap.update_check._detect_install_method", return_value="uv")
@@ -603,7 +608,7 @@ class TestUpgradeIgnoresTheCache:
     ):
         # v0.1.1 is out, but the fresh cache still says v0.1.0.
         monkeypatch.setattr("claude_swap.update_check.__version__", "0.1.0", raising=False)
-        _write_cache(_cache_path(), "v0.1.0")
+        _write_cache(_cache_path(), "cc-v0.1.0")
         mock_urlopen.return_value = _make_release_response("0.1.1")
         mock_run.return_value = MagicMock(returncode=0)
 
@@ -611,25 +616,25 @@ class TestUpgradeIgnoresTheCache:
 
         mock_urlopen.assert_called_once()
         mock_run.assert_called_once_with(
-            ["uv", "tool", "install", "--force", f"{FORK}@v0.1.1"], check=False
+            ["uv", "tool", "install", "--force", f"{FORK}@cc-v0.1.1"], check=False
         )
-        assert json.loads(_cache_path().read_text())["data"] == "v0.1.1"
+        assert json.loads(_cache_path().read_text())["data"] == "cc-v0.1.1"
 
     def test_live_failure_falls_back_to_cached_tag_with_warning(
         self, mock_run, mock_detect, monkeypatch, capsys
     ):
         monkeypatch.setattr("claude_swap.update_check.__version__", "0.0.1", raising=False)
         # Even an expired cache entry beats guessing the default branch.
-        _write_cache(_cache_path(), "v0.1.0", timestamp=time.time() - 10 * CACHE_TTL)
+        _write_cache(_cache_path(), "cc-v0.1.0", timestamp=time.time() - 10 * CACHE_TTL)
         mock_run.return_value = MagicMock(returncode=0)
 
         assert run_self_upgrade() == 0
 
         mock_run.assert_called_once_with(
-            ["uv", "tool", "install", "--force", f"{FORK}@v0.1.0"], check=False
+            ["uv", "tool", "install", "--force", f"{FORK}@cc-v0.1.0"], check=False
         )
         out = capsys.readouterr().out
-        assert "v0.1.0" in out
+        assert "cc-v0.1.0" in out
         assert "cached" in out.lower()
 
     def test_live_failure_and_no_cache_uses_default_branch(
@@ -661,7 +666,7 @@ class TestUpgradeIgnoresTheCache:
     def test_unsafe_cached_tag_is_not_used(
         self, mock_urlopen, mock_run, mock_detect
     ):
-        _write_cache(_cache_path(), "v1.0@evil")
+        _write_cache(_cache_path(), "cc-v1.0@evil")
         mock_run.return_value = MagicMock(returncode=0)
 
         run_self_upgrade()
@@ -685,7 +690,7 @@ class TestUpgradeAlreadyCurrent:
         assert run_self_upgrade() == 0
 
         mock_run.assert_not_called()
-        assert "already on v0.1.1" in capsys.readouterr().out
+        assert "already on cc-v0.1.1" in capsys.readouterr().out
 
     def test_force_reinstalls_anyway(
         self, mock_urlopen, mock_run, mock_detect, monkeypatch
@@ -697,7 +702,7 @@ class TestUpgradeAlreadyCurrent:
         assert run_self_upgrade(force=True) == 0
 
         mock_run.assert_called_once_with(
-            ["uv", "tool", "install", "--force", f"{FORK}@v0.1.1"], check=False
+            ["uv", "tool", "install", "--force", f"{FORK}@cc-v0.1.1"], check=False
         )
 
     def test_older_release_than_installed_still_skips_nothing_weird(
@@ -795,7 +800,7 @@ class TestNoticeAnnouncesTheTagItInstalls:
 
         check_for_update("0.3.2")
 
-        assert json.loads(cache_path.read_text())["data"] == "v0.4.0"
+        assert json.loads(cache_path.read_text())["data"] == "cc-v0.4.0"
 
     @patch("claude_swap.update_check.sys.platform", "win32")
     @patch("claude_swap.update_check.urllib.request.urlopen")
@@ -815,7 +820,7 @@ class TestNoticeAnnouncesTheTagItInstalls:
     @patch("claude_swap.update_check.sys.platform", "win32")
     def test_windows_hint_from_cache_is_pinned_too(self, tmp_path, monkeypatch):
         cache_path = tmp_path / "cache.json"
-        _write_cache(cache_path, "v0.5.0")
+        _write_cache(cache_path, "cc-v0.5.0")
         monkeypatch.setattr("claude_swap.update_check.CACHE_PATH", cache_path)
         monkeypatch.setattr("claude_swap.update_check._detect_install_method", lambda: "pipx")
 
@@ -823,7 +828,7 @@ class TestNoticeAnnouncesTheTagItInstalls:
 
         assert result is not None
         assert "(0.5.0)" in result
-        assert f"pipx install --force {FORK}@v0.5.0" in result
+        assert f"pipx install --force {FORK}@cc-v0.5.0" in result
 
 
 class TestInstallHintsNameTheFork:
