@@ -53,9 +53,19 @@ class PrimeReport:
     events: list[AutoSwitchEvent] = field(default_factory=list)
     pending: list[str] = field(default_factory=list)
     not_primed: dict[str, str] = field(default_factory=dict)
+    # Dry run only: what the real run would be stopped by (Primer.preflight),
+    # and notes that change nothing about it (auto-off).
+    blocked: str | None = None
+    blocked_all: bool = False
+    notes: list[str] = field(default_factory=list)
 
     @property
     def failed(self) -> bool:
+        if self.dry_run:
+            # Exactly when the real run would fail on the same blocker.
+            return self.blocked is not None and (
+                self.blocked_all or any(would for _n, _t, would in self.plan)
+            )
         return any(getattr(e, "outcome", None) in _FAILED for e in self.events) or bool(
             self.not_primed
         )
@@ -75,7 +85,15 @@ class PrimeReport:
         """The whole report as plain text: the plan's skip lines (all of the
         plan on a dry run), the events, then :meth:`tail_lines`."""
         if self.dry_run:
-            return [f"#{num}  {text}" for num, text, _ in self.plan] or ["No accounts."]
+            head = [f"Priming is paused: {self.blocked}"] if self.blocked_all else []
+            held = "priming is paused, see above" if self.blocked_all else self.blocked
+            rows = [
+                f"#{num}  not primed ({held})"
+                if would and self.blocked is not None
+                else f"#{num}  {text}"
+                for num, text, would in self.plan
+            ] or ["No accounts."]
+            return head + rows + list(self.notes)
         out = [f"#{num}  {text}" for num, text, would in self.plan if not would]
         out += [event.human() for event in self.events]
         return out + self.tail_lines()
@@ -85,6 +103,21 @@ def _print_skips(plan: list[tuple[str, str, bool]]) -> None:
     for num, text, would_prime in plan:
         if not would_prime:
             print(dimmed(f"#{num}  {text}"))
+
+
+def _auto_off_notes(backup_root) -> list[str]:
+    from claude_swap.maximize.pause import read_auto_off
+
+    try:
+        off = read_auto_off(backup_root)
+    except Exception:
+        return []
+    if off is None:
+        return []
+    return [
+        "Note: auto-switching is OFF, so the engine does not prime; "
+        "a manual cc-swap prime still does (cc-swap auto on turns it back on)."
+    ]
 
 
 def manual_prime(
@@ -121,7 +154,12 @@ def manual_prime(
     snap = prime_snapshot(engine, usage, clock())
     plan = primer.plan(snap, numbers)
     if dry_run:
-        return PrimeReport(True, plan)
+        # Same blockers as the real run below, so the two never disagree.
+        blocked, blocked_all = primer.preflight()
+        return PrimeReport(
+            True, plan, blocked=blocked, blocked_all=blocked_all,
+            notes=_auto_off_notes(switcher.backup_dir),
+        )
     if on_plan is not None:
         on_plan(plan)
     events = primer.prime_now(snap, numbers, sleep=sleep)
@@ -195,6 +233,8 @@ def prime_command(argv: list[str]) -> None:
         if args.dry_run:
             for line in report.lines():
                 print(line)
+            if report.failed:
+                sys.exit(1)
             return
         for event in report.events:
             _print_event(event)

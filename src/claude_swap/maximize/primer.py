@@ -853,6 +853,39 @@ class Primer:
             for row in self.plan_rows(snap, numbers)
         ]
 
+    def preflight(self) -> tuple[str | None, bool]:
+        """What would stop :meth:`prime_now` before any launch, read without
+        launching or recording anything (``cc-swap prime --dry-run``):
+        ``(reason, whole_run)``. ``whole_run`` is True when the run itself is
+        refused (no ``claude``, the version guard) and False when each
+        target would be held back (a ``claude update`` running, a re-login
+        pause). ``(None, False)`` when nothing stands in the way."""
+        from claude_swap.maximize import prime_verify
+
+        claude = resolve_claude_path(self.settings.claude_path)
+        if claude is None:
+            return "no `claude` executable at prime.claudePath or ~/.local/bin/claude", True
+        if self._version_gate:
+            try:
+                verdict = prime_verify.gate(
+                    self.engine.switcher.backup_dir, claude,
+                    reader=self._version_reader, clock=self._clock,
+                )
+            except Exception as e:
+                return (
+                    f"could not read claude version ({type(e).__name__}); "
+                    f"{prime_verify.PAUSED_UNTIL}",
+                    True,
+                )
+            if not verdict.ok:
+                return verdict.reason, True
+        if prime_verify.update_in_progress(self.engine.switcher.backup_dir):
+            return "a `claude update` is in progress", False
+        paused = active_pause(self.engine._read_state(), self._clock())
+        if paused is not None:
+            return f"switching paused ({paused[1]})", False
+        return None, False
+
     def pending_accounts(self, snap: Snapshot) -> list[str]:
         state = self._prime_state()
         return [
