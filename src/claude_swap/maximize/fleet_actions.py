@@ -15,6 +15,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 from pathlib import Path
 
+from claude_swap import oauth
 from claude_swap.maximize.tiers import (
     last_resort_matches,
     parse_account_list,
@@ -30,9 +31,31 @@ def _who(switcher, live: tuple[str, str, str]) -> str:
     return f"#{slot}" if slot else "an account cc-swap does not manage"
 
 
-def relogin_store(switcher, number: str, *, return_to: str | None) -> dict:
+NO_NEW_LOGIN = (
+    "no new login yet — run claude, /login as this account, then press enter"
+)
+
+
+def live_login_fingerprint(switcher) -> str | None:
+    """``oauth.credential_fingerprint`` of the live login (a hash of its
+    refresh token — never the token), or None when nothing is readable."""
+    read = getattr(switcher, "_read_credentials", None)
+    if read is None:
+        return None
+    try:
+        creds = read()
+    except Exception:
+        return None
+    return oauth.credential_fingerprint(creds) if creds else None
+
+
+def relogin_store(
+    switcher, number: str, *, return_to: str | None, before: str | None = None
+) -> dict:
     """Store the live login into slot ``number`` if — and only if — it is
-    that slot's account; then switch back to ``return_to``.
+    that slot's account AND a new login (``before`` is the live login's
+    fingerprint when the re-login started; None = unknown, not checked);
+    then switch back to ``return_to``.
 
     Returns ``{"stored": bool, "number", "reason"?, "returned_to"?}``.
     Raises nothing for a wrong login: that is a refusal, not an error.
@@ -49,6 +72,10 @@ def relogin_store(switcher, number: str, *, return_to: str | None) -> dict:
             "number": number,
             "reason": "no live Claude Code login found — run claude and /login first",
         }
+    # The slot may already hold this very login (its own, now dead): storing
+    # it again would "succeed" and change nothing.
+    if before is not None and live_login_fingerprint(switcher) == before:
+        return {"stored": False, "number": number, "reason": NO_NEW_LOGIN}
     email, org, account_uuid = live
     want_email = str(record.get("email") or "")
     want_org = str(record.get("organizationUuid") or "")

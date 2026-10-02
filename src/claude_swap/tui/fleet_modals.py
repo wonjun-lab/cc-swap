@@ -6,6 +6,7 @@ the results. Results name accounts by slot number.
 
 from __future__ import annotations
 
+import threading
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -22,6 +23,7 @@ from textual.widgets.selection_list import Selection
 
 from claude_swap.maximize import fleet as fx
 from claude_swap.maximize import pause
+from claude_swap.maximize.fleet_actions import NO_NEW_LOGIN
 from claude_swap.maximize.prime_cli import manual_prime
 from claude_swap.tui.data import ActionResult
 from claude_swap.tui.theme import Palette
@@ -154,12 +156,19 @@ class ReloginModal(ModalScreen["ActionResult | None"]):
         lines: list[str],
         *,
         backup_root: Path,
-        store: Callable[[], ActionResult],
+        store: Callable[[str | None], ActionResult],
+        fingerprint: Callable[[], str | None] | None = None,
     ) -> None:
+        """``store(before)`` stores the live login; ``before`` is the live
+        login's fingerprint when this opened (None = unknown). ``fingerprint``
+        reads that fingerprint (a hash, never a token)."""
         super().__init__()
         self._lines = lines
         self._root = backup_root
         self._store = store
+        self._fingerprint = fingerprint
+        self._baseline: str | None = None
+        self._baseline_ready = threading.Event()
         self._busy = False
         self._lifted = False  # the pause was lifted (cancel, store, unmount)
 
@@ -178,6 +187,10 @@ class ReloginModal(ModalScreen["ActionResult | None"]):
         # Renew while the modal stays open: the marker never outlives the
         # last renewal by more than MAX_PAUSE_S, so a crash still lifts it.
         self._renew_timer = self.set_interval(RENEW_S, self._renew)
+        self.run_worker(
+            self._baseline_blocking, thread=True, group="fleet-relogin-baseline",
+            exit_on_error=False, name="fleet-relogin-baseline",
+        )
 
     def _run_pause_op(self, work: Callable[[], None], name: str) -> None:
         """Pause, renewal and resume share one exclusive group on the app
@@ -246,15 +259,41 @@ class ReloginModal(ModalScreen["ActionResult | None"]):
             exit_on_error=False, name="fleet-relogin",
         )
 
-    def _store_blocking(self) -> None:
+    def _baseline_blocking(self) -> None:
+        """The live login's fingerprint as the modal opens: enter must find
+        a different one (a new ``/login``), not the login already there."""
         try:
-            result = self._store()
+            self._baseline = self._fingerprint() if self._fingerprint else None
+        except Exception:
+            self._baseline = None
+        finally:
+            self._baseline_ready.set()
+
+    def _store_blocking(self) -> None:
+        self._baseline_ready.wait(timeout=10.0)
+        before = self._baseline if self._baseline_ready.is_set() else None
+        if before is not None and self._fingerprint is not None:
+            try:
+                unchanged = self._fingerprint() == before
+            except Exception:
+                unchanged = False
+            if unchanged:
+                self.app.call_from_thread(self._not_yet)
+                return
+        try:
+            result = self._store(before)
         except Exception as e:
             result = ActionResult(False, f"Error: {type(e).__name__}: {e}")
         finally:
             self._lifted = True  # no renewal from here on
             _resume(self._root)
         self.app.call_from_thread(self._stored, result)
+
+    def _not_yet(self) -> None:
+        """Same login as when this opened: stay open (still paused)."""
+        self._busy = False
+        self.app.busy = False
+        self._status(NO_NEW_LOGIN)
 
     def _stored(self, result: ActionResult) -> None:
         self.app.busy = False

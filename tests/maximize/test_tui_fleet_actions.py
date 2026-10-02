@@ -22,9 +22,15 @@ class IdentitySwitcher(FakeSwitcher):
     """FakeSwitcher plus the identity surface ``relogin_store`` reads: the
     slot records and the live ``.claude.json`` identity."""
 
-    def __init__(self, accounts, backup_dir, *, live=None):
+    def __init__(self, accounts, backup_dir, *, live=None, live_rt=None):
         super().__init__(accounts, backup_dir)
         self.live = live  # (email, org_uuid, account_uuid) or None
+        self.live_rt = live_rt  # the live login's refresh token, or None
+
+    def _read_credentials(self):
+        if self.live_rt is None:
+            return None
+        return json.dumps({"claudeAiOauth": {"accessToken": "at", "refreshToken": self.live_rt}})
 
     def _get_sequence_data(self):
         return {"accounts": {
@@ -381,6 +387,37 @@ class TestRelogin:
             modal._pause_blocking()  # a renewal that was already running
             assert "pausedUntil" not in json.loads(state.read_text())
 
+    async def test_relogin_modal_refuses_until_a_new_login_lands(self, tmp_path):
+        from claude_swap.tui.fleet import FleetScreen
+        from claude_swap.tui.fleet_modals import ReloginModal
+
+        _settings(tmp_path)
+        state = tmp_path / "autoswitch_state.json"
+        fake = _fleet(tmp_path, live=("user4@example.com", "", "uuid-4"), live_rt="rt-old")
+        app = make_app(fake)
+        async with app.run_test(size=(140, 40)) as pilot:
+            await _open(pilot)
+            toasts = _toasts(app)
+            await _to_row(pilot, "4")
+            await pilot.press("r")
+            await _open(pilot)
+            modal = app.screen
+            assert isinstance(modal, ReloginModal)
+            await pilot.press("enter")  # nothing changed since the modal opened
+            await _open(pilot)
+            assert app.screen is modal  # stays open, still paused
+            status = modal.query_one("#fx-relogin-status", Static).render().plain
+            assert status.startswith("no new login yet")
+            assert "rt-old" not in status
+            assert ("add", None, True) not in fake.calls
+            assert "pausedUntil" in json.loads(state.read_text())
+            fake.live_rt = "rt-new"  # the user ran /login
+            await pilot.press("enter")
+            await _open(pilot)
+            assert isinstance(app.screen, FleetScreen)
+            assert ("add", None, True) in fake.calls
+            assert ("#4 login stored; back on #1", "information") in toasts
+
     async def test_relogin_modal_stores_the_right_login_and_switches_back(self, tmp_path):
         from claude_swap.tui.fleet import FleetScreen
 
@@ -401,6 +438,23 @@ class TestRelogin:
             assert ("#4 login stored; back on #1", "information") in toasts
             state = json.loads((tmp_path / "autoswitch_state.json").read_text())
             assert "pausedUntil" not in state
+
+
+def test_relogin_store_requires_a_new_login(tmp_path):
+    from claude_swap.maximize.fleet_actions import live_login_fingerprint
+
+    fake = _fleet(tmp_path, live=("user4@example.com", "", "uuid-4"), live_rt="rt-old")
+    before = live_login_fingerprint(fake)
+    assert before and "rt-old" not in before
+    result = relogin_store(fake, "4", return_to="1", before=before)
+    assert result["stored"] is False
+    assert result["reason"].startswith("no new login yet")
+    assert fake.calls == []
+    fake.live_rt = "rt-new"  # the user ran /login
+    assert relogin_store(fake, "4", return_to="1", before=before)["stored"] is True
+    # Unknown baseline (nothing readable when the modal opened): not refused.
+    fake.calls.clear()
+    assert relogin_store(fake, "4", return_to="1", before=None)["stored"] is True
 
 
 def test_relogin_store_refuses_when_live_login_is_another_slot(tmp_path):
