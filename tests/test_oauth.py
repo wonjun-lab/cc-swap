@@ -1570,6 +1570,28 @@ class TestLoginExpiry:
         assert after.startswith("login expired ")
         assert " in " not in after
 
+    @pytest.mark.parametrize("stored_days, kept", [(5, True), (40, False)])
+    def test_refresh_never_extends_a_known_deadline(self, stored_days, kept):
+        """Whether ``refresh_token_expires_in`` is the REMAINING lifetime of
+        the login or a fresh full lifetime is undocumented: never let a
+        refresh push a known deadline later; keep the earliest."""
+        now_ms = int(time.time() * 1000)
+        stored = now_ms + stored_days * self.DAY_MS
+        mock_response = MagicMock()
+        mock_response.read.return_value = json.dumps({
+            "access_token": "new-access", "refresh_token": "new-refresh",
+            "expires_in": 3600, "refresh_token_expires_in": 30 * 24 * 3600,
+        }).encode()
+        mock_response.__enter__ = lambda s: s
+        mock_response.__exit__ = MagicMock(return_value=False)
+        with patch("claude_swap.oauth.urllib.request.urlopen", return_value=mock_response):
+            outcome = oauth.try_refresh_oauth_credentials(self._creds(stored))
+        got = oauth.extract_oauth_data(outcome.credentials)["refreshTokenExpiresAt"]
+        if kept:
+            assert got == stored
+        else:
+            assert abs(got - (now_ms + 30 * self.DAY_MS)) < 60_000
+
     def test_refresh_persists_the_deadline_the_endpoint_states(self):
         mock_response = MagicMock()
         mock_response.read.return_value = json.dumps({

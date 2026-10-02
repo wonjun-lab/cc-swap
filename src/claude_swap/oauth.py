@@ -344,7 +344,20 @@ def try_refresh_oauth_credentials(
             and isinstance(rt_expires_in, (int, float))
             and rt_expires_in > 0
         ):
-            oauth["refreshTokenExpiresAt"] = now_ms + int(rt_expires_in * 1000)
+            stated = now_ms + int(rt_expires_in * 1000)
+            known = oauth.get("refreshTokenExpiresAt")
+            # Whether the stated value is the login's REMAINING lifetime or
+            # a fresh full one is undocumented, so a refresh never pushes a
+            # known future deadline later: keep the earliest. A known
+            # deadline already in the past is evidently wrong (this refresh
+            # just succeeded) and gives way to the stated one.
+            if (
+                not isinstance(known, bool)
+                and isinstance(known, (int, float))
+                and now_ms < known < stated
+            ):
+                stated = int(known)
+            oauth["refreshTokenExpiresAt"] = stated
 
         data["claudeAiOauth"] = oauth
         return RefreshOutcome(
