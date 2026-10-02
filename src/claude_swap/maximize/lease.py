@@ -24,6 +24,7 @@ the locked byte is unreadable to other processes, so
 
 from __future__ import annotations
 
+import errno
 import logging
 import os
 import sys
@@ -68,13 +69,20 @@ class EngineLease:
 
         True when this object holds it afterwards (already holding counts),
         False when another holder has it. Failing to create or open the lock
-        file raises ``OSError``; the caller decides whether that is fatal
+        file, or a lock call that fails for any reason other than another
+        holder (``ENOLCK`` on a filesystem without lock support, say), raises
+        ``OSError``; the caller decides whether that is fatal
         (:func:`claim_for_auto`) or degradable (:func:`should_run_engine`).
         """
         if self._fd is not None:
             return True
         fd = self._open()
-        if not _try_lock(fd):
+        try:
+            locked = _try_lock(fd)
+        except BaseException:
+            os.close(fd)
+            raise
+        if not locked:
             os.close(fd)
             return False
         self._fd = fd
@@ -93,7 +101,8 @@ class EngineLease:
         """Whether another holder has the lease right now.
 
         A momentary probe: a free lease is taken and dropped at once, so it
-        never steals. False while this object is the holder.
+        never steals. False while this object is the holder. Raises
+        ``OSError`` exactly where :meth:`acquire` does.
         """
         if self._fd is not None:
             return False
@@ -124,15 +133,37 @@ class EngineLease:
         return os.open(self.path, os.O_RDWR | os.O_CREAT, 0o600)
 
 
+def _is_held_elsewhere(error: OSError) -> bool:
+    """Whether a failed non-blocking lock call means "another holder has it".
+
+    Only that: ``BlockingIOError`` (``EWOULDBLOCK``/``EAGAIN``) from ``flock``,
+    and on Windows the lock violation ``msvcrt.locking`` reports for a byte
+    another process has locked (``PermissionError``/``EACCES``, or
+    ``EDEADLK``). Anything else (``ENOLCK``, ``EBADF``, ``EINVAL``...) is a
+    lock that cannot be taken at all and must not read as a free-or-busy
+    answer, or a broken lock would look like a permanently busy engine.
+    """
+    if sys.platform == "win32":
+        return isinstance(error, PermissionError) or error.errno in (
+            errno.EACCES,
+            errno.EDEADLK,
+        )
+    return isinstance(error, BlockingIOError)
+
+
 def _try_lock(fd: int) -> bool:
+    """True when the lock is taken, False when another holder has it; any
+    other failure raises ``OSError``."""
     try:
         if sys.platform == "win32":
             os.lseek(fd, 0, os.SEEK_SET)
             msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
         else:
             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except OSError:  # BlockingIOError (POSIX) / PermissionError (Windows): held
-        return False
+    except OSError as e:
+        if _is_held_elsewhere(e):
+            return False
+        raise
     return True
 
 
@@ -176,8 +207,9 @@ def should_run_engine(lease: EngineLease) -> bool:
     release it once its engine has stopped. False means another process owns
     auto-switching: show its results read-only (store-only snapshots, the
     state file) and never start an engine. A lock file that cannot be created
-    degrades to True — upstream behaviour without a lease — rather than
-    leaving the host unable to auto-switch at all.
+    or locked (``OSError`` other than another holder) degrades to True —
+    upstream behaviour without a lease — rather than leaving the host unable
+    to auto-switch at all.
     """
     try:
         return lease.acquire()
@@ -234,7 +266,7 @@ def claim_for_auto(
     state write) and needs none, so it keeps working while the service runs.
     Every other run is an engine. Raises :class:`EngineBusyError` when
     another engine holds the lease, ``ClaudeSwitchError`` when the lock file
-    cannot be created.
+    cannot be created or locked.
     """
     if once and dry_run:
         return None
@@ -243,7 +275,7 @@ def claim_for_auto(
         acquired = lease.acquire()
     except OSError as e:
         raise ClaudeSwitchError(
-            f"cannot create the engine lease {lease.path}: {e}"
+            f"cannot take the engine lease {lease.path}: {e}"
         ) from e
     if not acquired:
         raise EngineBusyError(busy_message(lease.holder_pid()))

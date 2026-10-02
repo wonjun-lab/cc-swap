@@ -3,17 +3,21 @@ death, and the decision helpers the UI hosts and `cc-swap auto` build on it."""
 
 from __future__ import annotations
 
+import errno
+import logging
 import os
 import subprocess
 import sys
 import textwrap
 import time
+import types
 from pathlib import Path
 
 import pytest
 
 import claude_swap
 from claude_swap.exceptions import ClaudeSwitchError
+from claude_swap.maximize import lease as lease_mod
 from claude_swap.maximize.lease import (
     EXIT_ENGINE_BUSY,
     EngineBusyError,
@@ -142,6 +146,112 @@ def test_holder_pid_survives_a_refused_acquire_and_a_probe(tmp_path):
         assert other.holder_pid() == os.getpid()
     finally:
         holder.release()
+
+
+# -- contention vs a lock that cannot be taken at all ----------------------------------
+
+
+def _flock_raises(monkeypatch, code: int) -> None:
+    def flock(fd, operation):
+        raise OSError(code, os.strerror(code))
+
+    monkeypatch.setattr(lease_mod.fcntl, "flock", flock)
+
+
+@posix_only
+@pytest.mark.parametrize("code", [errno.EWOULDBLOCK, errno.EAGAIN])
+def test_a_would_block_lock_error_means_held_elsewhere(tmp_path, monkeypatch, code):
+    _flock_raises(monkeypatch, code)
+    lease = EngineLease(tmp_path)
+    assert lease.held_elsewhere() is True
+    assert lease.acquire() is False
+    assert not lease.held
+
+
+@posix_only
+def test_a_lock_error_that_is_not_contention_propagates_and_leaks_no_descriptor(
+    tmp_path, monkeypatch
+):
+    _flock_raises(monkeypatch, errno.ENOLCK)
+    opened: list[int] = []
+    real_open = EngineLease._open
+
+    def spying_open(self):
+        fd = real_open(self)
+        opened.append(fd)
+        return fd
+
+    monkeypatch.setattr(EngineLease, "_open", spying_open)
+    lease = EngineLease(tmp_path)
+    with pytest.raises(OSError) as excinfo:
+        lease.acquire()
+    assert excinfo.value.errno == errno.ENOLCK
+    with pytest.raises(OSError) as excinfo:
+        lease.held_elsewhere()
+    assert excinfo.value.errno == errno.ENOLCK
+    assert not lease.held
+    assert len(opened) == 2
+    for fd in opened:
+        with pytest.raises(OSError):  # EBADF: both attempts closed theirs
+            os.fstat(fd)
+
+
+@posix_only
+def test_should_run_engine_degrades_to_running_when_locking_is_unavailable(
+    tmp_path, monkeypatch, caplog
+):
+    _flock_raises(monkeypatch, errno.ENOLCK)
+    lease = EngineLease(tmp_path)
+    with caplog.at_level(logging.WARNING, logger="claude-swap"):
+        assert should_run_engine(lease) is True
+    assert not lease.held
+    assert "engine lease unavailable" in caplog.text
+
+
+@posix_only
+def test_claim_for_auto_reports_a_lock_failure_as_an_error_not_as_busy(tmp_path, monkeypatch):
+    _flock_raises(monkeypatch, errno.ENOLCK)
+    with pytest.raises(ClaudeSwitchError, match="cannot take the engine lease") as excinfo:
+        claim_for_auto(tmp_path, once=False, dry_run=False)
+    assert not isinstance(excinfo.value, EngineBusyError)
+    assert os.strerror(errno.ENOLCK) in str(excinfo.value)
+
+
+def _fake_msvcrt(monkeypatch, error: OSError | None):
+    def locking(fd, mode, nbytes):
+        if error is not None and mode == 2:  # LK_NBLCK
+            raise error
+
+    fake = types.SimpleNamespace(LK_NBLCK=2, LK_UNLCK=0, locking=locking)
+    monkeypatch.setattr(lease_mod, "msvcrt", fake, raising=False)
+    monkeypatch.setattr(lease_mod.sys, "platform", "win32")
+
+
+@pytest.mark.parametrize("error", [
+    PermissionError(errno.EACCES, "Permission denied"),
+    OSError(errno.EACCES, "Permission denied"),
+    OSError(errno.EDEADLK, "Resource deadlock avoided"),
+])
+def test_windows_lock_violations_mean_held_elsewhere(tmp_path, monkeypatch, error):
+    fd = os.open(tmp_path / "lock", os.O_RDWR | os.O_CREAT)
+    try:
+        _fake_msvcrt(monkeypatch, error)
+        assert lease_mod._try_lock(fd) is False
+    finally:
+        os.close(fd)
+
+
+def test_other_windows_lock_errors_propagate(tmp_path, monkeypatch):
+    fd = os.open(tmp_path / "lock", os.O_RDWR | os.O_CREAT)
+    try:
+        _fake_msvcrt(monkeypatch, OSError(errno.EINVAL, "Invalid argument"))
+        with pytest.raises(OSError) as excinfo:
+            lease_mod._try_lock(fd)
+        assert excinfo.value.errno == errno.EINVAL
+        _fake_msvcrt(monkeypatch, None)
+        assert lease_mod._try_lock(fd) is True
+    finally:
+        os.close(fd)
 
 
 # -- two processes --------------------------------------------------------------
@@ -286,7 +396,7 @@ def test_claim_for_auto_raises_busy_naming_the_holder(tmp_path):
 
 def test_claim_for_auto_turns_an_unwritable_root_into_a_clean_error(tmp_path, monkeypatch):
     monkeypatch.setattr(EngineLease, "_open", _refuse_open)
-    with pytest.raises(ClaudeSwitchError, match="cannot create the engine lease") as excinfo:
+    with pytest.raises(ClaudeSwitchError, match="cannot take the engine lease") as excinfo:
         claim_for_auto(tmp_path, once=False, dry_run=False)
     assert not isinstance(excinfo.value, EngineBusyError)
 

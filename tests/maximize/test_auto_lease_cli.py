@@ -130,3 +130,20 @@ def test_busy_message_names_the_holder_pid(temp_home, capsys):
     finally:
         other.release()
     assert f"(pid {os.getpid()})" in capsys.readouterr().err
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="patches fcntl.flock")
+def test_a_lock_that_cannot_be_taken_exits_1_not_4(temp_home, capsys, monkeypatch):
+    import errno
+
+    from claude_swap.maximize import lease as lease_mod
+
+    def flock(fd, operation):
+        raise OSError(errno.ENOLCK, os.strerror(errno.ENOLCK))
+
+    monkeypatch.setattr(lease_mod.fcntl, "flock", flock)
+    assert _run([]) == 1
+    assert FakeEngine.instances == []
+    err = capsys.readouterr().err
+    assert "cannot take the engine lease" in err
+    assert "already running" not in err
