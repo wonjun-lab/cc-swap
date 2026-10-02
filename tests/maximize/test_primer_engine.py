@@ -54,6 +54,21 @@ class TestPrimer:
         profile = rig.switcher.backup_dir / "prime-profile"
         assert scrubbed == [profile, profile]
 
+    @pytest.mark.parametrize("interrupt", [KeyboardInterrupt, SystemExit])
+    def test_interrupted_run_still_scrubs_the_profile(self, rig, monkeypatch, interrupt):
+        scrubbed: list[Path] = []
+        monkeypatch.setattr(primer_mod, "delete_macos_keychain_entry", scrubbed.append)
+        profile = rig.switcher.backup_dir / "prime-profile"
+
+        def runner(argv, env, cwd, timeout_s=90.0):
+            (profile / ".credentials.json").write_text("{}")  # the child saved a login
+            raise interrupt()
+
+        with pytest.raises(interrupt):
+            rig.primer(runner=runner).run_due(rig.snap(nums=("1", "2")))
+        assert scrubbed == [profile, profile]
+        assert not (profile / ".credentials.json").exists()
+
     def test_verification_success(self, rig):
         runner = StubRunner(rig)
         primer = rig.primer(runner=runner)

@@ -50,6 +50,7 @@ BUCKET_S = 600.0               # resets land on 10-minute boundaries (spec §3.1
 VERIFY_DELAY_S = 30.0          # read usage no sooner than this after a prime
 VERIFY_TOLERANCE_S = 120.0     # spec §6.2 step 5: ± 2 minutes
 PRIME_TIMEOUT_S = 90.0
+KILL_GRACE_S = 5.0             # after a kill: how long to drain the pipes before closing them
 LIVE_RECHECK_S = 600.0         # re-check a live-session skip after 10 minutes
 RATE_LIMIT_FALLBACK_S = 3600.0 # 429 with no known 7d reset: wait an hour
 DEFAULT_JITTER: tuple[int, int] = (45, 300)  # used if prime.jitterS is unparseable
@@ -421,16 +422,51 @@ def _kill_tree(proc: subprocess.Popen) -> None:
         pass  # already gone
 
 
+def _decoded(data: str | bytes | None) -> str:
+    if isinstance(data, bytes):  # TimeoutExpired carries raw bytes
+        return data.decode("utf-8", "replace")
+    return data or ""
+
+
+def _close_and_reap(proc: subprocess.Popen) -> None:
+    """Close our pipe ends and collect the (killed) child's exit status."""
+    for pipe in (proc.stdout, proc.stderr):
+        if pipe is not None:
+            try:
+                pipe.close()
+            except OSError:
+                pass
+    try:
+        proc.wait(timeout=KILL_GRACE_S)
+    except subprocess.TimeoutExpired:
+        pass
+
+
+def _drain_killed(proc: subprocess.Popen) -> tuple[str, str]:
+    """What a killed child wrote, read for at most ``KILL_GRACE_S``. A helper
+    that left the process group survives the kill and may hold the pipes
+    open; past the grace we stop waiting for EOF and close them."""
+    try:
+        return proc.communicate(timeout=KILL_GRACE_S)
+    except subprocess.TimeoutExpired as exc:
+        _close_and_reap(proc)
+        return _decoded(exc.stdout), _decoded(exc.stderr)
+
+
 def run_prime(
     argv: Sequence[str],
     env: Mapping[str, str],
     cwd: Path,
     timeout_s: float = PRIME_TIMEOUT_S,
 ) -> PrimeRunResult:
-    """Run the priming child once: no shell, stdin closed, bounded.
+    """Run the priming child once: no shell, stdin closed, bounded — returns
+    within ``timeout_s + KILL_GRACE_S`` whatever the child's helpers do.
 
     POSIX children get their own session so a timeout kills the whole tree
-    (node may fork helpers that would otherwise hold the pipes open).
+    (node may fork helpers that would otherwise hold the pipes open). That
+    also keeps a terminal Ctrl-C from reaching the child, so any exception
+    while waiting (KeyboardInterrupt, SystemExit, a raising signal handler)
+    kills the tree before it propagates: the child holds an access token.
     """
     secret = env.get("CLAUDE_CODE_OAUTH_TOKEN")
     extra: dict = {"start_new_session": True} if os.name == "posix" else {}
@@ -452,8 +488,12 @@ def run_prime(
         out, err = proc.communicate(timeout=timeout_s)
     except subprocess.TimeoutExpired:
         _kill_tree(proc)
-        out, err = proc.communicate()
+        out, err = _drain_killed(proc)
         return PrimeRunResult(None, True, mask_secrets(err, secret), mask_secrets(out, secret))
+    except BaseException:
+        _kill_tree(proc)
+        _close_and_reap(proc)
+        raise
     return PrimeRunResult(
         proc.returncode,
         False,
@@ -778,30 +818,33 @@ class Primer:
         self, target: PrimeTarget, claude: str, token: str, sleep: Sleep
     ) -> list[PrimeEvent]:
         profile = self._prepare_profile()
-        env = build_prime_env(os.environ, profile, token)
-        result = self._runner(
-            build_prime_argv(claude, self.settings.model), env, profile, PRIME_TIMEOUT_S
-        )
-        if (
-            not result.timed_out
-            and result.returncode not in (0, None)
-            and classify_failure(result) == "model-not-found"
-            and self.settings.model != FALLBACK_MODEL
-        ):
-            _logger.warning(
-                "prime: model %s not found; retrying account %s with %s",
-                self.settings.model, target.number, FALLBACK_MODEL,
-            )
-            # Same attempt (already claimed), new launch instant: guard it and
-            # make it the prime time verification measures against.
-            pause = guard_wait(self._clock())
-            if pause:
-                sleep(pause)
-            self._record(target.email, lastAttemptAt=self._clock())
+        try:
+            env = build_prime_env(os.environ, profile, token)
             result = self._runner(
-                build_prime_argv(claude, FALLBACK_MODEL), env, profile, PRIME_TIMEOUT_S
+                build_prime_argv(claude, self.settings.model), env, profile, PRIME_TIMEOUT_S
             )
-        self._scrub_profile(profile)
+            if (
+                not result.timed_out
+                and result.returncode not in (0, None)
+                and classify_failure(result) == "model-not-found"
+                and self.settings.model != FALLBACK_MODEL
+            ):
+                _logger.warning(
+                    "prime: model %s not found; retrying account %s with %s",
+                    self.settings.model, target.number, FALLBACK_MODEL,
+                )
+                # Same attempt (already claimed), new launch instant: guard it
+                # and make it the prime time verification measures against.
+                pause = guard_wait(self._clock())
+                if pause:
+                    sleep(pause)
+                self._record(target.email, lastAttemptAt=self._clock())
+                result = self._runner(
+                    build_prime_argv(claude, FALLBACK_MODEL), env, profile, PRIME_TIMEOUT_S
+                )
+        finally:
+            # Also on Ctrl-C / SystemExit: never leave a login in the profile.
+            self._scrub_profile(profile)
         return self._settle(target, result)
 
     def _settle(self, target: PrimeTarget, result: PrimeRunResult) -> list[PrimeEvent]:
