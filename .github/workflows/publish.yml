@@ -6,6 +6,9 @@ on:
 
 jobs:
   publish:
+    # cc-swap ships from GitHub Releases + `uv tool install git+...`, never
+    # PyPI; the guard keeps a fork release from attempting an upstream publish.
+    if: github.repository == 'realiti4/claude-swap'
     runs-on: ubuntu-latest
     permissions:
       id-token: write

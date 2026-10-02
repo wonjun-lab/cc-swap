@@ -21,6 +21,7 @@ import os
 import platform
 import plistlib
 import re
+import shlex
 import sys
 import threading
 import time
@@ -493,15 +494,14 @@ def framework_build_warning(
 
         install_method = _detect_install_method()
 
+    spec = _menubar_install_spec()
     if install_method == "uv":
-        remedy = (
-            "  uv tool install --managed-python --force 'claude-swap[menubar]'"
-        )
+        remedy = f"  uv tool install --managed-python --force {spec}"
     elif install_method == "pipx":
         remedy = (
             "  Reinstall against a non-framework interpreter, e.g. one from "
             "`uv python install 3.13`:\n"
-            "  pipx install --force --python <that python> 'claude-swap[menubar]'"
+            f"  pipx install --force --python <that python> {spec}"
         )
     else:
         remedy = (
@@ -514,6 +514,29 @@ def framework_build_warning(
         "observed not to draw the menu bar icon: the process runs and logs "
         "nothing, but no status item appears.\n" + remedy
     )
+
+
+def _menubar_install_spec() -> str:
+    """The shell-quoted requirement that installs the fork with the menu bar
+    extra. Never upstream's PyPI ``claude-swap``: installing that would
+    replace the fork with upstream."""
+    from claude_swap.update_check import _install_spec
+
+    return shlex.quote(_install_spec(menubar=True))
+
+
+def _menubar_install_command() -> str:
+    """How to add the menu bar extra, through the tool that owns this install
+    (pip cannot add it to a uv/pipx tool environment)."""
+    from claude_swap.update_check import _detect_install_method
+
+    spec = _menubar_install_spec()
+    method = _detect_install_method()
+    if method == "uv":
+        return f"uv tool install --force {spec}"
+    if method == "pipx":
+        return f"pipx install --force {spec}"
+    return f"pip install {spec}"
 
 
 def run(switcher) -> int:
@@ -536,7 +559,7 @@ def run(switcher) -> int:
         # error type the CLI already renders cleanly instead of a traceback.
         raise ClaudeSwitchError(
             "Menu bar mode requires 'rumps'. "
-            "Install with: pip install 'claude-swap[menubar]'"
+            f"Install with: {_menubar_install_command()}"
         ) from e
 
     # rumps never sets an activation policy, so under a framework Python the

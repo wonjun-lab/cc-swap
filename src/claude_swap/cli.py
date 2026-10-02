@@ -70,6 +70,15 @@ _SUBCOMMAND_FLAGS = {
     "menubar": "--menubar",
 }
 
+# cc-swap fork subcommands, pre-dispatched like `alias`/`map` (a positional
+# verb can't live in the main parser's mutually-exclusive flag group). Values
+# are function NAMES, resolved at call time, so tests can patch the module
+# attribute (``patch("claude_swap.cli._last_resort_command")``). New fork
+# commands (prime, service) register here; main() has a single hook for all.
+_FORK_COMMANDS: dict[str, str] = {
+    "last-resort": "_last_resort_command",
+}
+
 
 def _translate_subcommand(argv: list[str]) -> list[str]:
     """Rewrite a leading memorable subcommand into the equivalent flag argv.
@@ -575,6 +584,19 @@ Examples:
         sys.exit(130)
 
 
+def _finite_float(value: str) -> float:
+    """argparse ``type=`` for a flag that takes a number: nan and inf parse as
+    floats, but they are not thresholds, so reject them here instead of
+    letting them reach the settings merge."""
+    try:
+        number = float(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"invalid number: {value!r}") from None
+    if not math.isfinite(number):
+        raise argparse.ArgumentTypeError(f"expected a finite number, got {value!r}")
+    return number
+
+
 def _auto_command(argv: list[str]) -> None:
     """Handle `cswap auto [--once] [--json] [...]`.
 
@@ -610,6 +632,8 @@ Examples:
   cswap auto --json                # one JSON event per line (for scripts)
   cswap auto --once; echo $?       # single tick, outcome in exit code
   cswap auto --dry-run             # log decisions, never actually switch
+  cc-swap auto --strategy maximize # per-window soft/hard marks (cc-swap)
+  cc-swap auto --strategy maximize --soft5h 40 --hard5h 90
 
 Defaults live in settings.json in the backup root; flags override them.
         """,
@@ -666,14 +690,32 @@ Defaults live in settings.json in the backup root; flags override them.
     )
     parser.add_argument(
         "--strategy",
-        choices=("best", "consume-first"),
+        choices=("best", "consume-first", "maximize"),
         default=None,
         help=(
-            "Target selection: 'best' (most quota left; default) or "
+            "Target selection: 'best' (most quota left; default), "
             "'consume-first' (proactively use the account whose weekly window "
-            "resets soonest)"
+            "resets soonest), or 'maximize' (cc-swap: separate 5h/7d soft and "
+            "hard marks, spend the weekly quota that would expire first)"
         ),
     )
+    for flag, window, kind, default in (
+        ("--soft5h", "5h", "soft", 50),
+        ("--hard5h", "5h", "hard", 95),
+        ("--soft7d", "7d", "soft", 90),
+        ("--hard7d", "7d", "hard", 98),
+    ):
+        when = "at the next idle moment" if kind == "soft" else "immediately"
+        parser.add_argument(
+            flag,
+            type=_finite_float,
+            metavar="PCT",
+            help=(
+                f"maximize only: {window} {kind} mark, switch {when} once the "
+                f"active account's {window} window reaches it "
+                f"(1-99.9; default {default}; soft <= hard)"
+            ),
+        )
     parser.add_argument(
         "--dry-run",
         action="store_true",
@@ -688,7 +730,13 @@ Defaults live in settings.json in the backup root; flags override them.
 
     from claude_swap.autoswitch import AutoSwitchEngine, AutoSwitchEvent
     from claude_swap.printer import accent, yellowed
-    from claude_swap.settings import load_settings, merged_with_cli
+    from claude_swap.settings import (
+        MAXIMIZE_CLI_FLAGS,
+        load_maximize_settings,
+        load_settings,
+        merge_maximize_cli,
+        merged_with_cli,
+    )
 
     def jsonl_emit(event: AutoSwitchEvent) -> None:
         print(json.dumps(event.to_json()), flush=True)
@@ -712,11 +760,34 @@ Defaults live in settings.json in the backup root; flags override them.
                 sys.exit(1)
 
         settings = merged_with_cli(load_settings(switcher.backup_dir), args)
+        # cc-swap: --soft5h/--hard5h/--soft7d/--hard7d only mean something to
+        # the maximize strategy (flag or settings.json); reject, don't ignore.
+        given = [
+            f"--{attr}"
+            for attr, _ in MAXIMIZE_CLI_FLAGS
+            if getattr(args, attr) is not None
+        ]
+        if given and settings.strategy != "maximize":
+            parser.error(
+                f"{', '.join(given)} only apply to the maximize strategy "
+                "(--strategy maximize or autoswitch.strategy maximize)"
+            )
+        maximize = None
+        engine_kwargs = {}
+        if settings.strategy == "maximize":
+            # Raises ConfigError (exit 1 below) when the flags put a soft mark
+            # above its hard cap. The engine gets the flags themselves, not the
+            # merged values, so it can re-apply them over every hot reload.
+            maximize = merge_maximize_cli(
+                load_maximize_settings(switcher.backup_dir), args
+            )
+            engine_kwargs["maximize_cli"] = args
         engine = AutoSwitchEngine(
             switcher,
             settings,
             jsonl_emit if args.json else human_emit,
             dry_run=args.dry_run,
+            **engine_kwargs,
         )
 
         if args.once:
@@ -725,9 +796,17 @@ Defaults live in settings.json in the backup root; flags override them.
         # Loop mode: SIGTERM (systemd stop) exits the loop cleanly.
         signal.signal(signal.SIGTERM, lambda *_: engine.stop())
         if not args.json:
+            if maximize is not None:
+                policy = (
+                    f"strategy maximize, 5h soft {maximize.soft_5h:g}% / hard "
+                    f"{maximize.hard_5h:g}%, 7d soft {maximize.soft_7d:g}% / hard "
+                    f"{maximize.hard_7d:g}%"
+                )
+            else:
+                policy = f"threshold {settings.threshold:.0f}%"
             print(
                 dimmed(
-                    f"Auto-switch running: threshold {settings.threshold:.0f}%, "
+                    f"Auto-switch running: {policy}, "
                     f"every {settings.interval_seconds:.0f}s"
                     f"{' (dry-run)' if args.dry_run else ''} — Ctrl-C to stop"
                 )
@@ -892,6 +971,163 @@ Examples:
         sys.exit(130)
 
 
+def _last_resort_entry(accounts: dict, num: str, email: str) -> str:
+    """The ``maximize.lastResort`` entry that names exactly Account-``num``.
+
+    The email (slot numbers move under swap/move, spec §5.1) — unless another
+    managed account shares it (a personal and a Team login), where the email
+    would mark both; then the account's alias, which is unique.
+    """
+    shared = sorted(
+        (
+            n for n, rec in accounts.items()
+            if n != num and (rec.get("email") or "").lower() == email.lower()
+        ),
+        key=int,
+    )
+    if not shared:
+        return email
+    alias = accounts.get(num, {}).get("alias")
+    if alias:
+        return alias
+    from claude_swap.exceptions import ConfigError
+
+    raise ConfigError(
+        f"{email} is shared by Account-{num} and Account-{', Account-'.join(shared)}; "
+        f"give Account-{num} an alias first (cc-swap alias {num} NAME) so "
+        "last-resort names only that account"
+    )
+
+
+def _last_resort_matches(accounts: dict, entry: str) -> list[str]:
+    """Slot numbers an entry marks: email or alias, case-insensitive (the
+    same rule the maximize tiering applies)."""
+    needle = entry.lower()
+    return sorted(
+        (
+            n for n, rec in accounts.items()
+            if needle in {
+                (rec.get("email") or "").lower(),
+                (rec.get("alias") or "").lower(),
+            }
+        ),
+        key=int,
+    )
+
+
+def _last_resort_command(argv: list[str]) -> None:
+    """Handle `cc-swap last-resort add|remove|list [NUM|EMAIL|ALIAS]`.
+
+    Convenience wrapper over the ``maximize.lastResort`` setting (spec §5.1,
+    §8): those accounts are switched to only when no normal account can take
+    the switch. Writes go through `set_setting`/`unset_setting`, so the file
+    keeps its other keys and the 0600 mode.
+    """
+    from claude_swap.settings import (
+        load_maximize_settings,
+        load_settings,
+        parse_model_names,
+        set_setting,
+        unset_setting,
+    )
+
+    parser = argparse.ArgumentParser(
+        prog=f"{_prog_name()} last-resort",
+        description=(
+            "Mark accounts the maximize strategy uses only when no other "
+            "account can take the switch (edits maximize.lastResort)."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  cc-swap last-resort add 3
+  cc-swap last-resort add team@example.com
+  cc-swap last-resort remove dev
+  cc-swap last-resort list
+        """,
+    )
+    parser.add_argument("--debug", action="store_true", help="Enable debug logging")
+    sub = parser.add_subparsers(dest="action", metavar="{add,remove,list}")
+    for name, text in (
+        ("add", "Use an account only as a last resort"),
+        ("remove", "Return an account to normal ranking"),
+    ):
+        p = sub.add_parser(name, help=text)
+        p.add_argument("account", metavar="NUM|EMAIL|ALIAS")
+    sub.add_parser("list", help="Show last-resort accounts (the default)")
+    args = parser.parse_args(argv)
+    action = args.action or "list"
+
+    try:
+        switcher = ClaudeAccountSwitcher(debug=args.debug)
+        _guard_root(switcher)
+        root = switcher.backup_dir
+        # parse_model_names is a generic comma-list splitter: trimmed,
+        # case-insensitively deduped, first spelling kept.
+        entries = list(parse_model_names(load_maximize_settings(root).last_resort))
+
+        if action == "list":
+            accounts = (switcher._get_sequence_data() or {}).get("accounts", {})
+            if not entries:
+                print(dimmed("No last-resort accounts"))
+                return
+            print(bolded("Last-resort accounts:"))
+            for entry in entries:
+                nums = _last_resort_matches(accounts, entry)
+                where = (
+                    ", ".join(f"Account-{n}" for n in nums)
+                    if nums else muted("(no matching account)")
+                )
+                print(f"  {entry} → {where}")
+            return
+
+        num, email, _ = switcher.resolve_account(args.account)
+        accounts = (switcher._get_sequence_data() or {}).get("accounts", {})
+
+        if action == "add":
+            if num in {n for e in entries for n in _last_resort_matches(accounts, e)}:
+                print(dimmed(f"Account-{num} ({email}) is already last-resort."))
+                return
+            entries.append(_last_resort_entry(accounts, num, email))
+            set_setting(root, "maximize.lastResort", ",".join(entries))
+            print(f"{accent('Marked')} Account-{num} ({email}) last-resort")
+            strategy = load_settings(root).strategy
+            if strategy != "maximize":
+                print(dimmed(
+                    f"  Takes effect with the maximize strategy (now {strategy}): "
+                    "cc-swap config set autoswitch.strategy maximize"
+                ))
+            return
+
+        # remove: drop every entry that marks this account, so it is
+        # guaranteed normal afterwards.
+        dropped = [e for e in entries if num in _last_resort_matches(accounts, e)]
+        if not dropped:
+            print(dimmed(f"Account-{num} ({email}) is not last-resort."))
+            return
+        kept = [e for e in entries if e not in dropped]
+        if kept:
+            set_setting(root, "maximize.lastResort", ",".join(kept))
+        else:
+            unset_setting(root, "maximize.lastResort")
+        print(f"{accent('Removed')} Account-{num} ({email}) from last-resort")
+        also = sorted(
+            {n for e in dropped for n in _last_resort_matches(accounts, e)} - {num},
+            key=int,
+        )
+        if also:
+            warning(
+                f"  Also returned {', '.join(f'Account-{n}' for n in also)} "
+                "(the removed entry named them too); re-add by alias if needed."
+            )
+    except ClaudeSwitchError as e:
+        error(f"Error: {e}")
+        sys.exit(1)
+    except KeyboardInterrupt:
+        print(f"\n{dimmed('Operation cancelled')}")
+        sys.exit(130)
+
+
 def _use_native_tls() -> None:
     """Route TLS trust decisions through the OS-native verifier.
 
@@ -1019,6 +1255,11 @@ def main() -> None:
     if argv and argv[0] == "move":
         _move_command(argv[1:])
         return
+    # cc-swap: the one hook for every fork subcommand (see _FORK_COMMANDS).
+    fork_command = _FORK_COMMANDS.get(argv[0]) if argv else None
+    if fork_command is not None:
+        globals()[fork_command](argv[1:])
+        return
 
     # Bare `cswap` in an interactive terminal opens the TUI dashboard (like
     # lazygit/k9s). TTY-gated on both ends so scripts and pipes keep getting
@@ -1069,6 +1310,11 @@ Commands:
   %(prog)s menubar --install-service  keep the menu bar running via launchd
   %(prog)s upgrade                    self-upgrade to latest
   %(prog)s purge                      remove all claude-swap data
+
+cc-swap:
+  %(prog)s auto --strategy maximize   per-window soft/hard auto-switching
+  %(prog)s last-resort add|remove <a> use an account only as a last resort
+  %(prog)s last-resort list           list last-resort accounts
 
 Aliases: ls=list  rm=remove  update=upgrade""",
         formatter_class=argparse.RawDescriptionHelpFormatter,

@@ -647,9 +647,14 @@ class AutoSwitchEngine:
         dry_run: bool = False,
         state_path: Path | None = None,
         clock: Callable[[], float] = time.time,
+        maximize_cli: object | None = None,
     ):
         self.switcher = switcher
         self.settings = settings
+        # cc-swap: the `auto --soft5h/--hard5h/--soft7d/--hard7d` namespace
+        # (None = no flags). The maximize hook re-applies it with
+        # settings.merge_maximize_cli over every load_maximize_settings().
+        self.maximize_cli = maximize_cli
         # Model(s) whose per-model weekly limit also binds the switch decision
         # (empty = account-wide 5h/7d only). ``settings.model`` is a comma-
         # separated list ("Fable", "Opus,Sonnet", "all"); parse once here and

@@ -10,6 +10,7 @@ from unittest.mock import patch
 import pytest
 
 from claude_swap import cli
+from claude_swap.settings import SETTING_SPECS
 
 
 def _run(argv: list[str], capsys) -> tuple[int, str, str]:
@@ -36,6 +37,25 @@ def _settings_file(capsys) -> Path:
 
 
 class TestConfigList:
+    def test_list_survives_non_finite_values(self, temp_home, capsys):
+        # `json.loads` accepts NaN/Infinity; int(nan) used to crash the listing.
+        path = _settings_file(capsys)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            '{"maximize": {"idleWindowMin": NaN, "soft5h": Infinity},'
+            ' "autoswitch": {"unhealthyTicks": NaN}}'
+        )
+        code, out, err = _run([], capsys)
+        assert code == 0, err
+        assert "maximize.idleWindowMin" in out
+        assert "autoswitch.unhealthyTicks" in out
+
+    def test_set_rejects_non_finite(self, temp_home, capsys):
+        code, _, err = _run(["set", "maximize.idleWindowMin", "nan"], capsys)
+        assert code == 1
+        assert "finite" in err
+        assert not _settings_file(capsys).exists()
+
     def test_lists_all_keys_as_defaults(self, temp_home, capsys):
         code, out, _ = _run([], capsys)
         assert code == 0
@@ -51,7 +71,7 @@ class TestConfigList:
             "ui.theme",
         ):
             assert key in out
-        assert out.count("(default)") == 9
+        assert out.count("(default)") == len(SETTING_SPECS)
 
     def test_set_key_not_marked_default(self, temp_home, capsys):
         _run(["set", "autoswitch.cooldownSeconds", "600"], capsys)
@@ -78,7 +98,7 @@ class TestConfigList:
         assert payload["schemaVersion"] == 1
         assert payload["path"].endswith("settings.json")
         by_key = {entry["key"]: entry for entry in payload["settings"]}
-        assert len(by_key) == 9
+        assert len(by_key) == len(SETTING_SPECS)
         assert by_key["autoswitch.threshold"]["value"] == 90.0
         assert by_key["autoswitch.threshold"]["isSet"] is False
         assert by_key["autoswitch.includeApiKeyAccounts"]["value"] is False
