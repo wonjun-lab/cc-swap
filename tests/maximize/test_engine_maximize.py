@@ -640,6 +640,36 @@ def login_warnings(h: EngineHarness) -> list[str]:
     return [e.message for e in of(h, ConfigWarningEvent) if " login expire" in e.message]
 
 
+class TestDeadLoginTargets:
+    """A target switch_to refuses as login-dead is set aside and the policy
+    decides again, like a target that failed to freshen."""
+
+    def test_a_login_dead_refusal_re_decides_without_that_target(self, temp_home):
+        h = make(temp_home)
+        real = h.switcher.switch_to
+
+        def refuse_2(number, **kw):
+            if str(number) == "2":
+                return {"switched": False, "reason": "login-dead", "loginProblem": "x"}
+            return real(number, **kw)
+
+        with patch.object(h.switcher, "switch_to", side_effect=refuse_2), \
+             patch.object(h.switcher, "list_accounts"):
+            outcome = h.tick_with_usage({"1": win(100, 30), "2": win(10, 10), "3": win(50, 50)})
+        assert outcome is TickOutcome.SWITCHED
+        assert h.state()["lastSwitchTo"] == "3"
+
+    def test_a_freshen_login_dead_is_set_aside(self, temp_home):
+        h = make(temp_home)
+        with patch.object(
+            type(h.engine), "_freshen_target",
+            lambda self, n, e: "login-dead" if n == "2" else "ok",
+        ), patch.object(h.switcher, "list_accounts"):
+            outcome = h.tick_with_usage({"1": win(100, 30), "2": win(10, 10), "3": win(50, 50)})
+        assert outcome is TickOutcome.SWITCHED
+        assert h.state()["lastSwitchTo"] == "3"
+
+
 class TestPollLineMarks:
     """Under maximize the per-tick line said "switch at 90%" (the legacy
     autoswitch.threshold) on the first tick and "switch at 95%" later;

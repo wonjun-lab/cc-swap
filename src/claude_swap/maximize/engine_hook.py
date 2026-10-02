@@ -680,12 +680,18 @@ def _switch(
             return engine._perform(number, email, pick.trigger, left), None
         status = engine._freshen_target(number, email)
         if status == "ok":
-            with ledger.switch_context(reason=pick.reason):
-                outcome = engine._perform(number, email, pick.trigger, left)
-            if outcome is aw.TickOutcome.SWITCHED:
-                _reset_samples(engine, number)
-                return outcome, number
-            return outcome, None
+            try:
+                with ledger.switch_context(reason=pick.reason):
+                    outcome = engine._perform(number, email, pick.trigger, left)
+            except aw.TargetLoginDead:
+                # switch_to refused the target (its login is dead): set it
+                # aside and decide again, as for a target that failed to freshen.
+                status = "login-dead"
+            else:
+                if outcome is aw.TickOutcome.SWITCHED:
+                    _reset_samples(engine, number)
+                    return outcome, number
+                return outcome, None
         if status in ("identity-conflict", "invalid_grant"):
             engine._quarantine(number, email, status)
         elif status == "transient":

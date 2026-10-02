@@ -284,6 +284,11 @@ def _now_iso() -> str:
     )
 
 
+class TargetLoginDead(Exception):
+    """``_perform``: ``switch_to`` refused the target because its stored login
+    is dead. Nothing was written; the caller tries its next candidate."""
+
+
 def local_time_label(iso: str) -> str:
     """An event's ISO timestamp for a human line: local time with the date
     and how far off it is (``oauth.deadline_text``), never the raw ISO with
@@ -937,7 +942,9 @@ class AutoSwitchEngine:
         Returns ``"ok"``, ``"invalid_grant"`` (dead lineage — quarantine),
         ``"identity-conflict"`` (alive but authenticates as a different
         account — quarantine, do not activate), ``"transient"`` (network
-        trouble — try again next tick) or ``"skip-live-session"``. Only ever
+        trouble — try again next tick), ``"login-dead"`` (the login's deadline
+        passed, or the slot is otherwise dead — skip it) or
+        ``"skip-live-session"``. Only ever
         touches the slot's *backup* store; the active credential belongs to
         Claude Code.
         """
@@ -957,13 +964,19 @@ class AutoSwitchEngine:
         data = oauth.extract_oauth_data(creds)
         if not data:
             return "invalid_grant"
-        expires_at = data.get("expiresAt")
         now_ms = self.clock() * 1000
+        expires_at = data.get("expiresAt")
         near_expiry = (
             isinstance(expires_at, (int, float))
             and now_ms + FRESHEN_BUFFER_MS >= expires_at
         )
         if not near_expiry:
+            if oauth.is_login_expired(creds, now_ms=int(now_ms)) or self._login_dead(number):
+                # The login itself is over, but its access token is still
+                # valid: nothing to refresh (a refresh would get the
+                # invalid_grant that quarantines it), and `switch_to` would
+                # refuse it as login-dead. Not a target; try the next one.
+                return "login-dead"
             return "ok"
         # The consume gate serializes every backup-rt POST (the recovery
         # branch in `_fetch_active_usage` is a second call site, under the
@@ -996,6 +1009,17 @@ class AutoSwitchEngine:
             # send the user to check a connection that is fine.
             return outcome.error
         return "transient"
+
+    def _login_dead(self, number: str) -> bool:
+        """``switcher.dead_login_reason`` (the check ``switch_to`` refuses
+        on); False when the switcher has none or it cannot tell."""
+        check = getattr(self.switcher, "dead_login_reason", None)
+        if check is None:
+            return False
+        try:
+            return check(number) is not None
+        except Exception:
+            return False
 
     def _note_token_identity(
         self, number: str, token_account: dict | None
@@ -1606,9 +1630,12 @@ class AutoSwitchEngine:
                 ) < _SYSTEMIC_STATUSES.index(systemic):
                     systemic = status
                 continue
-            if status == "skip-live-session":
+            if status in ("skip-live-session", "login-dead"):
                 continue
-            return self._perform(num, email, trigger, left_snapshot)
+            try:
+                return self._perform(num, email, trigger, left_snapshot)
+            except TargetLoginDead:
+                continue  # switch_to's last-moment refusal: next candidate
 
         if systemic or transient_failure:
             self._emit(
@@ -2417,13 +2444,10 @@ class AutoSwitchEngine:
             if result and result.get("reason") == "login-dead" and not result.get("switched"):
                 # switch_to's last-moment check: the target's stored login
                 # is dead (expired / quarantined), so it was not activated.
-                self._emit(
-                    NoSwitchEvent(
-                        reason="no-viable-target",
-                        detail=str(result.get("loginProblem") or result.get("message") or ""),
-                    )
+                # Nothing changed; the caller moves on to its next candidate.
+                raise TargetLoginDead(
+                    str(result.get("loginProblem") or result.get("message") or "")
                 )
-                return TickOutcome.NO_ACTION
             if not result or not result.get("switched"):
                 self._emit(
                     NoSwitchEvent(
