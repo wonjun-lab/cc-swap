@@ -107,13 +107,16 @@ class TestRunPrime:
         env = build_prime_env({}, tmp_path, "sk-ant-oat01-abcdefgh")
         started = time.monotonic()
         try:
-            result = run_prime(build_prime_argv(str(fake.path), "m"), env, tmp_path, timeout_s=1.0)
+            # 3 s, not 1 s: under xdist load the fake's own Python start-up
+            # (plus spawning the helper) can exceed 1 s, and a child killed
+            # before it records its call leaves calls() empty.
+            result = run_prime(build_prime_argv(str(fake.path), "m"), env, tmp_path, timeout_s=3.0)
             took = time.monotonic() - started
         finally:
             fake.kill_orphans()
         assert result.timed_out is True
         assert result.returncode is None
-        assert took < 1.0 + 1.0 + 3.0  # timeout + drain grace + slack
+        assert took < 3.0 + 1.0 + 4.0  # timeout + drain grace + slack
         [call] = fake.calls()
         assert not pid_alive(call["pid"])  # killed and reaped
 
