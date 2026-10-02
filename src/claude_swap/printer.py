@@ -72,10 +72,24 @@ def print_line(text: str) -> None:
     aborted the tick, switch included. Here the error is swallowed and stdout
     is pointed at the null device (what the Python docs recommend for
     SIGPIPE), so the rest of the run completes silently."""
+    global _gone_stdout
     try:
         print(text, flush=True)
     except BrokenPipeError:
         _stdout_to_devnull()
+        _gone_stdout = sys.stdout
+
+
+# The stdout object print_line redirected to the null device (by identity, so
+# a stream swapped in later — a test's capture — does not inherit the flag).
+_gone_stdout: object | None = None
+
+
+def stdout_gone() -> bool:
+    """Whether :func:`print_line` found stdout's reader gone (and pointed
+    stdout at the null device). A long-running caller stops on it: nobody
+    sees what it does any more."""
+    return _gone_stdout is not None and sys.stdout is _gone_stdout
 
 
 def _stdout_to_devnull() -> None:

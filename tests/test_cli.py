@@ -1161,6 +1161,62 @@ class TestAutoCommand:
         assert finished == [True]
         assert excinfo.value.code == 0
 
+    @pytest.mark.parametrize("jsonl", [False, True])
+    def test_loop_mode_stops_after_the_tick_once_stdout_is_gone(
+        self, temp_home, monkeypatch, jsonl
+    ):
+        """Loop mode must not go on switching unseen for days after its reader
+        left: it finishes the current tick, then exits 0 with the lease
+        released."""
+        from claude_swap.autoswitch import NoSwitchEvent
+        from claude_swap.maximize.lease import claim_for_auto
+        from claude_swap.paths import get_backup_root
+
+        class ClosedPipe(io.StringIO):
+            """`| head -1`: the first line gets through, then the reader is gone."""
+
+            closed_now = False
+
+            def write(self, s):
+                if self.closed_now:
+                    raise BrokenPipeError(32, "Broken pipe")
+                return super().write(s)
+
+            def flush(self):
+                if self.closed_now:
+                    raise BrokenPipeError(32, "Broken pipe")
+                type(self).closed_now = True
+
+        ticks: list[int] = []
+
+        class LoopEngine(self.FakeEngine):
+            stopped = False
+
+            def run_loop(self):
+                for n in range(5):
+                    if self.stopped:
+                        return 0
+                    self.on_event(NoSwitchEvent(reason="cooldown"))
+                    self.on_event(NoSwitchEvent(reason="cooldown"))  # rest of the tick
+                    ticks.append(n)
+                return 0
+
+            def stop(self):
+                self.stopped = True
+
+        monkeypatch.setattr(sys, "stdout", ClosedPipe())
+        argv = ["--json"] if jsonl else []
+        with patch("claude_swap.autoswitch.AutoSwitchEngine", LoopEngine), \
+             patch("os.geteuid", return_value=1000, create=True), \
+             patch.object(sys, "argv", ["claude-swap", "auto", *argv]):
+            with pytest.raises(SystemExit) as excinfo:
+                cli.main()
+        assert excinfo.value.code == 0
+        assert ticks == [0]  # finished the tick it was in, started no other
+        lease = claim_for_auto(get_backup_root(), once=False, dry_run=False)
+        assert lease is not None
+        lease.release()
+
     def test_flags_override_settings_json(self, temp_home):
         from claude_swap.paths import get_backup_root
 

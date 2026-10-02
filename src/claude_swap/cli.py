@@ -752,7 +752,7 @@ Defaults live in settings.json in the backup root; flags override them.
     )
     from claude_swap.autoswitch import AutoSwitchEngine, AutoSwitchEvent
     from claude_swap.maximize.logrotate import LogRotator
-    from claude_swap.printer import accent, print_line, yellowed
+    from claude_swap.printer import accent, print_line, stdout_gone, yellowed
     from claude_swap.settings import (
         MAXIMIZE_CLI_FLAGS,
         load_maximize_settings,
@@ -762,9 +762,18 @@ Defaults live in settings.json in the backup root; flags override them.
     )
 
     # print_line: a closed pipe (`auto --once | head -1`) must not abort the
-    # tick from inside the engine's event callback.
+    # tick from inside the engine's event callback. `--once` then finishes
+    # its tick silently; the loop stops after the tick it is in (nobody would
+    # see it switch any more), exiting 0 with the lease released.
+    running: list = []  # the loop-mode engine, once built
+
+    def emit_line(text: str) -> None:
+        print_line(text)
+        if stdout_gone() and running:
+            running[0].stop()
+
     def jsonl_emit(event: AutoSwitchEvent) -> None:
-        print_line(json.dumps(event.to_json()))
+        emit_line(json.dumps(event.to_json()))
 
     def human_emit(event: AutoSwitchEvent) -> None:
         stamp = _time.strftime("%H:%M:%S")
@@ -775,7 +784,7 @@ Defaults live in settings.json in the backup root; flags override them.
             line = yellowed(line)
         elif event.kind in ("poll", "no-switch", "sleep"):
             line = dimmed(line)
-        print_line(f"{stamp}  {line}")
+        emit_line(f"{stamp}  {line}")
 
     lease = None
     try:
@@ -824,6 +833,7 @@ Defaults live in settings.json in the backup root; flags override them.
         if args.once:
             sys.exit(engine.tick().value)
 
+        running.append(engine)
         # Loop mode: SIGTERM (systemd stop) exits the loop cleanly.
         signal.signal(signal.SIGTERM, lambda *_: engine.stop())
         # As the launchd service, keep auto.log / auto.err.log bounded: rotate
@@ -842,7 +852,7 @@ Defaults live in settings.json in the backup root; flags override them.
                 )
             else:
                 policy = f"threshold {settings.threshold:.0f}%"
-            print(
+            emit_line(
                 dimmed(
                     f"Auto-switch running: {policy}, "
                     f"every {settings.interval_seconds:.0f}s"
