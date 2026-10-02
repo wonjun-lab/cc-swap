@@ -459,13 +459,38 @@ class TestUpstreamPaths:
         assert [e.number for e in of(h, QuarantineEvent)] == ["2"]
         assert h.active_number() == 3
 
-    def test_transient_freshen_everywhere_is_an_error(self, temp_home):
+    def test_transient_freshen_everywhere_at_limit_is_an_error(self, temp_home):
+        # Re-deciding without the failed targets ends in Exhausted, not a
+        # Hold: upstream's transient handling stands.
         h = make(temp_home)
         with patch.object(h.engine, "_freshen_target", return_value="transient"):
-            outcome = h.tick_with_usage({"1": win(96, 40), "2": win(0, 10), "3": win(0, 50)})
+            outcome = h.tick_with_usage({"1": win(100, 40), "2": win(0, 10), "3": win(0, 50)})
         assert outcome is TickOutcome.ERROR
         assert "network" in of(h, ErrorEvent)[0].message
         assert h.active_number() == 1
+
+    @pytest.mark.parametrize("status", ["skip-live-session", "transient"])
+    def test_failed_preparation_then_hold_is_a_normal_hold(self, temp_home, status):
+        # Hard on 1; 2 is the only target (3 is over the hard cap). With 2
+        # set aside, the policy holds on 1: that is a hold, not a failure.
+        h = make(temp_home)
+        with patch.object(h.engine, "_freshen_target", return_value=status):
+            outcome = h.tick_with_usage({"1": win(96, 40), "2": win(0, 10), "3": win(97, 10)})
+        assert outcome is TickOutcome.NO_ACTION
+        assert not of(h, ErrorEvent)
+        [event] = of(h, NoSwitchEvent)
+        assert event.reason == "maximize-hold"
+        assert "no account under the hard caps has more 5h room than #1" in event.detail
+        assert f"set aside #2 ({status})" in event.detail
+        assert h.active_number() == 1
+
+    def test_failed_preparation_then_hold_keeps_systemic_errors(self, temp_home):
+        h = make(temp_home)
+        with patch.object(h.engine, "_freshen_target", return_value="store-unmirrored"):
+            outcome = h.tick_with_usage({"1": win(96, 40), "2": win(0, 10), "3": win(97, 10)})
+        assert outcome is TickOutcome.ERROR
+        assert "CLAUDE_SECURESTORAGE_CONFIG_DIR" in of(h, ErrorEvent)[0].message
+        assert not of(h, NoSwitchEvent)
 
 
 class TestPrimerHook:

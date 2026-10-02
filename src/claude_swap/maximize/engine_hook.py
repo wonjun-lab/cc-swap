@@ -7,6 +7,8 @@ and maps the decision back onto those upstream paths:
 
 * ``Switch``        → ``_freshen_target`` + ``_perform``; a target whose
                       freshen fails is set aside and the policy re-decides
+                      (a ``Hold`` then takes the hold path below unless the
+                      failure was systemic)
 * ``Hold``          → ``NoSwitchEvent``; a pending hold also pulls the active
                       account's next poll to ``pending_poll_s``
 * ``Indeterminate`` → ``None``: ``_tick_inner`` continues into its own
@@ -486,18 +488,26 @@ def _without(snap: Snapshot, failed: set[str]) -> Snapshot:
 
 def _switch(
     engine: aw.AutoSwitchEngine,
+    rt: MaximizeRuntime,
     snap: Snapshot,
     decision: Switch,
     usage: Mapping[str, dict | str | None],
     headroom: Mapping[str, float | None],
     current: str,
+    entry,
 ) -> tuple[aw.TickOutcome, str | None]:
-    """Freshen + perform, re-deciding without each target that fails."""
+    """Freshen + perform, re-deciding without each target that fails.
+
+    A re-decision that holds (nothing else worth moving to) is an ordinary
+    hold — the policy is content to stay — unless the failure was systemic,
+    which keeps upstream's error so its cause gets named.
+    """
     left = (
         headroom.get(current),
         aw._binding_recovery_ts(usage.get(current), engine._models, snap.now),
     )
     failed: set[str] = set()
+    set_aside: list[str] = []
     transient = False
     systemic = ""
     pick: Decision = decision
@@ -525,7 +535,11 @@ def _switch(
                 systemic = status
         # "skip-live-session" and every failure: set aside, decide again.
         failed.add(number)
+        set_aside.append(f"#{number} ({status})")
         pick = policy.decide(_without(snap, failed))
+    if isinstance(pick, Hold) and not systemic:
+        held = replace(pick, reason=f"{pick.reason}; set aside {', '.join(set_aside)}")
+        return _hold(engine, rt, held, current, entry, snap.now), None
     if systemic or transient:
         engine._emit(aw.ErrorEvent(
             message=(
@@ -728,7 +742,9 @@ def run_maximize_tick(
     engine._idle_hold_since = None
     landed: str | None = None
     if isinstance(decision, Switch):
-        outcome, landed = _switch(engine, snap, decision, usage, headroom, current)
+        outcome, landed = _switch(
+            engine, rt, snap, decision, usage, headroom, current, entries.get(current)
+        )
     elif isinstance(decision, Hold):
         outcome = _hold(engine, rt, decision, current, entries.get(current), now)
     else:
