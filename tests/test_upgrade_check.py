@@ -22,7 +22,7 @@ from claude_swap.update_check import (
 )
 
 FORK = "git+https://github.com/wonjun-lab/cc-swap"
-PINNED = f"{FORK}@v0.4.0"
+PINNED = f"{FORK}@cc-v0.4.0"
 API = "https://api.github.com/repos/wonjun-lab/cc-swap"
 
 
@@ -79,21 +79,29 @@ def v020(monkeypatch):
     monkeypatch.setattr("claude_swap.update_check.sys.platform", "linux")
 
 
+@pytest.fixture
+def v031(monkeypatch):
+    """Installed 0.3.1, the first release tagged cc-v."""
+    monkeypatch.setattr("claude_swap.update_check.__version__", "0.3.1", raising=False)
+    monkeypatch.setattr("claude_swap.update_check._detect_install_method", lambda: "uv")
+    monkeypatch.setattr("claude_swap.update_check.sys.platform", "linux")
+
+
 class TestUpgradeCheck:
     def test_update_available_exits_10_and_names_both_versions(
         self, v020, monkeypatch, capsys
     ):
-        _github(monkeypatch, {RELEASES_URL: _release("v0.3.0")})
+        _github(monkeypatch, {RELEASES_URL: [_release("cc-v0.3.1")]})
 
         assert run_upgrade_check() == 10
 
         out = capsys.readouterr().out
         assert "Installed: 0.2.0" in out
-        assert "Latest:    0.3.0" in out
+        assert "Latest:    0.3.1" in out
         assert "cc-swap upgrade" in out
 
     def test_up_to_date_exits_0(self, v020, monkeypatch, capsys):
-        _github(monkeypatch, {RELEASES_URL: _release("v0.2.0")})
+        _github(monkeypatch, {RELEASES_URL: [_release("cc-v0.2.0")]})
 
         assert run_upgrade_check() == 0
 
@@ -102,12 +110,12 @@ class TestUpgradeCheck:
         assert "cc-swap upgrade" not in out
 
     def test_running_ahead_of_the_latest_release_is_up_to_date(self, v020, monkeypatch):
-        _github(monkeypatch, {RELEASES_URL: _release("v0.1.9")})
+        _github(monkeypatch, {RELEASES_URL: [_release("cc-v0.1.9")]})
 
         assert run_upgrade_check() == 0
 
     def test_a_prerelease_is_not_pushed_onto_a_final_install(self, v020, monkeypatch):
-        _github(monkeypatch, {RELEASES_URL: _release("v0.3.0b1")})
+        _github(monkeypatch, {RELEASES_URL: [_release("cc-v0.3.0b1")]})
 
         assert run_upgrade_check() == 0
 
@@ -119,31 +127,32 @@ class TestUpgradeCheck:
     def test_offline_falls_back_to_the_cached_tag_with_a_warning(self, v020, capsys):
         import claude_swap.update_check as uc
 
-        uc.write_cache(uc.CACHE_PATH, "v0.3.0")
+        uc.write_cache(uc.CACHE_PATH, "cc-v0.3.1")
 
         assert run_upgrade_check() == 10
 
         captured = capsys.readouterr()
         assert "cached" in captured.err
-        assert "Latest:    0.3.0" in captured.out
+        assert "Latest:    0.3.1" in captured.out
 
     def test_check_never_installs_anything(self, v020, monkeypatch):
         # subprocess.run fails the test (see _isolation).
-        _github(monkeypatch, {RELEASES_URL: _release("v0.3.0")})
+        _github(monkeypatch, {RELEASES_URL: [_release("cc-v0.3.1")]})
 
         assert run_upgrade_check() == 10
 
-    def test_lists_the_release_notes_between_the_versions(self, v020, monkeypatch, capsys):
+    def test_lists_the_release_notes_between_the_versions(self, v031, monkeypatch, capsys):
         _github(
             monkeypatch,
             {
-                RELEASES_URL: _release("v0.4.0", "four"),
-                f"{API}/releases?per_page=30": [
-                    _release("v0.4.0", "Fourth: auto on|off"),
-                    _release("v0.3.0", "Third: doctor"),
-                    _release("v0.2.0", "Second: already installed"),
-                    _release("v0.3.1b1", "beta, not for finals", prerelease=True),
-                    _release("v0.3.5", "unfinished notes", draft=True),
+                RELEASES_URL: [
+                    _release("cc-v0.4.0", "Fourth: auto on|off"),
+                    _release("cc-v0.3.2", "Third: doctor"),
+                    _release("cc-v0.3.1", "Second: already installed"),
+                    _release("cc-v0.3.3b1", "beta, not for finals", prerelease=True),
+                    _release("cc-v0.3.5", "unfinished notes", draft=True),
+                    _release("v0.26.0", "upstream notes"),
+                    _release("v0.3.0", "legacy notes"),
                 ],
             },
         )
@@ -151,9 +160,11 @@ class TestUpgradeCheck:
         assert run_upgrade_check() == 10
 
         out = capsys.readouterr().out
-        assert "v0.4.0" in out and "Fourth: auto on|off" in out
-        assert "v0.3.0" in out and "Third: doctor" in out
+        assert "cc-v0.4.0" in out and "Fourth: auto on|off" in out
+        assert "cc-v0.3.2" in out and "Third: doctor" in out
         assert "already installed" not in out
+        assert "upstream notes" not in out
+        assert "legacy notes" not in out
         assert "beta, not for finals" not in out
         assert "unfinished notes" not in out
         assert out.index("Fourth") < out.index("Third")
@@ -162,8 +173,8 @@ class TestUpgradeCheck:
         seen = _github(
             monkeypatch,
             {
-                RELEASES_URL: _release("v0.3.0"),
-                f"{API}/compare/v0.2.0...v0.3.0": {
+                RELEASES_URL: [_release("cc-v0.3.1")],
+                f"{API}/compare/v0.2.0...cc-v0.3.1": {
                     "commits": [
                         _commit("Add doctor", "long body that must not be printed"),
                         _commit("Add init"),
@@ -177,14 +188,14 @@ class TestUpgradeCheck:
         out = capsys.readouterr().out
         assert "Add doctor" in out and "Add init" in out
         assert "long body" not in out
-        assert f"{API}/compare/v0.2.0...v0.3.0" in seen
+        assert f"{API}/compare/v0.2.0...cc-v0.3.1" in seen
 
     def test_a_long_commit_list_is_capped(self, v020, monkeypatch, capsys):
         _github(
             monkeypatch,
             {
-                RELEASES_URL: _release("v0.3.0"),
-                f"{API}/compare/v0.2.0...v0.3.0": {
+                RELEASES_URL: [_release("cc-v0.3.1")],
+                f"{API}/compare/v0.2.0...cc-v0.3.1": {
                     "commits": [_commit(f"change {i}") for i in range(80)]
                 },
             },
@@ -198,32 +209,32 @@ class TestUpgradeCheck:
         assert "more" in out
 
     def test_missing_change_lists_do_not_change_the_verdict(self, v020, monkeypatch, capsys):
-        _github(monkeypatch, {RELEASES_URL: _release("v0.3.0")})
+        _github(monkeypatch, {RELEASES_URL: [_release("cc-v0.3.1")]})
 
         assert run_upgrade_check() == 10
 
-        assert "Latest:    0.3.0" in capsys.readouterr().out
+        assert "Latest:    0.3.1" in capsys.readouterr().out
 
     def test_windows_prints_the_command_instead_of_the_upgrade_verb(
         self, v020, monkeypatch, capsys
     ):
         monkeypatch.setattr("claude_swap.update_check.sys.platform", "win32")
-        _github(monkeypatch, {RELEASES_URL: _release("v0.3.0")})
+        _github(monkeypatch, {RELEASES_URL: [_release("cc-v0.3.1")]})
 
         assert run_upgrade_check() == 10
 
-        assert f"uv tool install --force {FORK}@v0.3.0" in capsys.readouterr().out
+        assert f"uv tool install --force {FORK}@cc-v0.3.1" in capsys.readouterr().out
 
     def test_unknown_install_method_prints_manual_and_editable_hints(
         self, v020, monkeypatch, capsys
     ):
         monkeypatch.setattr("claude_swap.update_check._detect_install_method", lambda: None)
-        _github(monkeypatch, {RELEASES_URL: _release("v0.3.0")})
+        _github(monkeypatch, {RELEASES_URL: [_release("cc-v0.3.1")]})
 
         assert run_upgrade_check() == 10
 
         out = capsys.readouterr().out
-        assert f"pip install --upgrade {FORK}@v0.3.0" in out
+        assert f"pip install --upgrade {FORK}@cc-v0.3.1" in out
         assert "pip install -e" in out and "git pull" in out
         assert "cc-swap upgrade" not in out
 
@@ -276,7 +287,7 @@ class TestUpgradeRefreshesTheService:
         monkeypatch.setattr("claude_swap.update_check.subprocess.run", _run)
         monkeypatch.setattr(
             "claude_swap.update_check.urllib.request.urlopen",
-            lambda *a, **k: _json_response(_release("v0.4.0")),
+            lambda *a, **k: _json_response([_release("cc-v0.4.0")]),
         )
         return calls
 

@@ -3,6 +3,11 @@
 cc-swap is installed from git (``uv tool install git+...``), never from PyPI:
 the PyPI ``claude-swap`` project is upstream, and following it would offer to
 replace the fork with upstream.
+
+Release tags are ``cc-vX.Y.Z``. The fork inherited upstream's ``v0.3.0`` ...
+``v0.26.0`` tags, so a fork release named ``v0.4.0`` would sit on upstream's
+old commit; only ``cc-v`` releases are considered (plus the four pre-``cc-v``
+fork tags in :data:`LEGACY_TAGS`, and only while no ``cc-v`` release exists).
 """
 
 from __future__ import annotations
@@ -27,8 +32,14 @@ from claude_swap.cache import CACHE_DIR, MISSING, read_cache, write_cache
 CACHE_PATH = CACHE_DIR / "cc_swap_update_check.json"
 CACHE_TTL = 24 * 3600  # 24 hours
 _API_URL = "https://api.github.com/repos/wonjun-lab/cc-swap"
-RELEASES_URL = f"{_API_URL}/releases/latest"
-RELEASES_LIST_URL = f"{_API_URL}/releases?per_page=30"
+# The releases list, not ``/releases/latest``: "latest" is whatever GitHub
+# flags (by default the newest by tag date) and can be a tag outside the
+# ``cc-v`` scheme. Listed newest first, so 100 is far more than needed.
+RELEASES_URL = f"{_API_URL}/releases?per_page=100"
+RELEASE_TAG_PREFIX = "cc-v"
+# The fork's releases before the ``cc-v`` scheme. An explicit allowlist, never
+# a ``v*`` pattern: every other ``v*`` tag is upstream's.
+LEGACY_TAGS = ("v0.1.0", "v0.1.1", "v0.2.0", "v0.3.0")
 INSTALL_URL = "git+https://github.com/wonjun-lab/cc-swap"
 # Seconds `cc-swap upgrade` waits for GitHub to name the latest release; the
 # passive update notice keeps its 2s so that it never slows a command down.
@@ -51,6 +62,8 @@ _VERSION_RE = re.compile(
 )
 # Tag names we are willing to splice into an install URL.
 _TAG_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._+-]*")
+# What follows ``cc-v``: a final release, or one with a PEP 440 a/b/rc suffix.
+_RELEASE_VERSION_RE = re.compile(r"\d+\.\d+\.\d+(?:(?:a|b|rc)\d+)?")
 _PRE_RANKS = {"alpha": 0, "a": 0, "beta": 1, "b": 1, "preview": 2, "pre": 2, "rc": 2, "c": 2}
 _FINAL_RANK = 3
 
@@ -63,6 +76,37 @@ class _Version(NamedTuple):
     release: tuple[int, ...]
     pre_rank: int  # _FINAL_RANK when this is not a pre-release.
     pre_number: int
+
+
+def release_tag(version: str) -> str:
+    """The git tag the release of ``version`` is published under.
+
+    ``0.3.1`` -> ``cc-v0.3.1``. Raises ValueError for anything that is not a
+    bare ``X.Y.Z`` (optionally ``aN``/``bN``/``rcN``) version, so a typo such
+    as ``v0.3.1`` cannot produce a tag the update check would then ignore.
+    """
+    if not _RELEASE_VERSION_RE.fullmatch(version):
+        raise ValueError(f"not a release version (expected X.Y.Z, e.g. 0.3.1): {version!r}")
+    return f"{RELEASE_TAG_PREFIX}{version}"
+
+
+def _is_prefixed_tag(tag: str) -> bool:
+    return tag.startswith(RELEASE_TAG_PREFIX) and bool(
+        _RELEASE_VERSION_RE.fullmatch(tag[len(RELEASE_TAG_PREFIX):])
+    )
+
+
+def is_fork_tag(tag: str) -> bool:
+    """Whether ``tag`` names one of the fork's own releases: ``cc-vX.Y.Z`` or
+    one of the :data:`LEGACY_TAGS`. Upstream's inherited ``v*`` tags are not."""
+    return _is_prefixed_tag(tag) or tag in LEGACY_TAGS
+
+
+def _tag_for_version(version: str) -> str:
+    """The tag an already-released ``version`` of the fork lives at: the legacy
+    ``v`` tag for 0.1.0 - 0.3.0, ``cc-v`` for everything after."""
+    legacy = f"v{version}"
+    return legacy if legacy in LEGACY_TAGS else f"{RELEASE_TAG_PREFIX}{version}"
 
 
 def _parse_version(v: str) -> _Version:
@@ -179,26 +223,57 @@ def _get_json(url: str, timeout: float) -> object | None:
         return None
 
 
-def _fetch_latest_tag(timeout: float = 2) -> str | None:
-    """The fork's latest published release tag, as published (``v0.4.0``).
+def _fork_releases(data: object) -> list[tuple[_Version, str, dict]]:
+    """``(version, tag, release)`` for every published fork release in a
+    releases-list payload, highest version first.
 
-    None on any failure. That includes HTTP 404, which is what GitHub answers
-    while the fork has no published (non-draft, non-prerelease) release yet:
-    a normal state, not one to report. A 403 rate limit or a 5xx is just as
-    unactionable for a passive check. A tag that could not be a git ref
-    suffix is treated as no tag: it comes off the network and ends up in a
-    URL handed to the package manager.
+    Drafts and pre-releases are out, and so is any tag that is not the fork's
+    (see :func:`is_fork_tag`). The legacy tags only count while no ``cc-v``
+    release is published. The tag comes off the network and ends up in a URL
+    handed to the package manager, hence the strict shape check.
     """
-    data = _get_json(RELEASES_URL, timeout)
-    tag = data.get("tag_name") if isinstance(data, dict) else None
-    if not isinstance(tag, str):
-        return None
-    tag = tag.strip()
-    return tag if _TAG_RE.fullmatch(tag) else None
+    if not isinstance(data, list):
+        return []
+    prefixed: list[tuple[_Version, str, dict]] = []
+    legacy: list[tuple[_Version, str, dict]] = []
+    for item in data:
+        if not isinstance(item, dict) or item.get("draft") or item.get("prerelease"):
+            continue
+        tag = item.get("tag_name")
+        if not isinstance(tag, str) or not _TAG_RE.fullmatch(tag) or not is_fork_tag(tag):
+            continue
+        try:
+            version = _parse_version(_tag_version(tag))
+        except ValueError:
+            continue
+        (prefixed if _is_prefixed_tag(tag) else legacy).append((version, tag, item))
+    chosen = prefixed or legacy
+    chosen.sort(key=lambda entry: entry[0], reverse=True)
+    return chosen
+
+
+def _pick_latest_tag(data: object) -> str | None:
+    """The tag of the highest published fork release in ``data``, or None."""
+    releases = _fork_releases(data)
+    return releases[0][1] if releases else None
+
+
+def _fetch_latest_tag(timeout: float = 2) -> str | None:
+    """The fork's latest published release tag, as published (``cc-v0.4.0``).
+
+    None on any failure. That includes HTTP 404 and an empty list, which is
+    what GitHub answers while the fork has no published (non-draft,
+    non-prerelease) release yet: a normal state, not one to report. A 403 rate
+    limit or a 5xx is just as unactionable for a passive check.
+    """
+    return _pick_latest_tag(_get_json(RELEASES_URL, timeout))
 
 
 def _tag_version(tag: str) -> str:
-    """The version a release tag names: ``v0.4.0`` -> ``0.4.0``."""
+    """The version a release tag names: ``cc-v0.4.0`` -> ``0.4.0`` (and the
+    legacy ``v0.3.0`` -> ``0.3.0``)."""
+    if tag.startswith(RELEASE_TAG_PREFIX):
+        return tag[len(RELEASE_TAG_PREFIX):]
     return tag[1:] if tag[:1] in ("v", "V") else tag
 
 
@@ -210,7 +285,7 @@ def _cached_tag() -> str | None:
     something we trust to hold a safe ref.
     """
     cached = read_cache(CACHE_PATH, float("inf"))
-    if isinstance(cached, str) and _TAG_RE.fullmatch(cached):
+    if isinstance(cached, str) and _TAG_RE.fullmatch(cached) and is_fork_tag(cached):
         return cached
     return None
 
@@ -256,6 +331,10 @@ def check_for_update(current_version: str) -> str | None:
             # published, not as a bare version: the Windows hint below has to
             # name the exact git ref the release lives at.
             write_cache(CACHE_PATH, latest_tag)
+
+        # The cache file is not something we trust to hold one of our tags.
+        if not (isinstance(latest_tag, str) and is_fork_tag(latest_tag)):
+            latest_tag = None
 
         latest_version = _tag_version(latest_tag) if latest_tag else None
         if latest_version and _is_newer(latest_version, current_version):
@@ -382,36 +461,26 @@ def _refresh_service() -> None:
 def _release_notes_between(installed: str, latest: str) -> list[tuple[str, str]]:
     """``(tag, notes)`` of each published release after ``installed`` up to
     ``latest``, newest first. Empty on any failure (best effort)."""
-    data = _get_json(RELEASES_LIST_URL, UPGRADE_LOOKUP_TIMEOUT)
+    data = _get_json(RELEASES_URL, UPGRADE_LOOKUP_TIMEOUT)
     if not isinstance(data, list):
         return []
     try:
         low, high = _parse_version(installed), _parse_version(latest)
     except ValueError:
         return []
-    found: list[tuple[_Version, str, str]] = []
-    for item in data:
-        if not isinstance(item, dict) or item.get("draft") or item.get("prerelease"):
-            continue
-        tag = item.get("tag_name")
-        if not isinstance(tag, str) or not _TAG_RE.fullmatch(tag):
-            continue
-        try:
-            version = _parse_version(_tag_version(tag))
-        except ValueError:
-            continue
+    found: list[tuple[str, str]] = []
+    for version, tag, item in _fork_releases(data):
         if not low < version <= high:
             continue
         body = item.get("body")
-        found.append((version, tag, body.strip() if isinstance(body, str) else ""))
-    found.sort(key=lambda entry: entry[0], reverse=True)
-    return [(tag, body) for _, tag, body in found]
+        found.append((tag, body.strip() if isinstance(body, str) else ""))
+    return found
 
 
 def _commit_subjects_between(installed: str, tag: str) -> list[str]:
     """First lines of the commits between the installed release and ``tag``
     (GitHub compare API), oldest first. Empty on any failure."""
-    base = f"v{installed}"
+    base = _tag_for_version(installed)
     if not (_TAG_RE.fullmatch(base) and _TAG_RE.fullmatch(tag)):
         return []
     data = _get_json(f"{_API_URL}/compare/{base}...{tag}", UPGRADE_LOOKUP_TIMEOUT)
