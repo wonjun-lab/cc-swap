@@ -30,7 +30,11 @@ from claude_swap.autoswitch import (
     _recovery_is_useful,
     pct_label,
 )
-from claude_swap.json_output import USAGE_FOREIGN_CREDENTIAL, USAGE_TOKEN_EXPIRED
+from claude_swap.json_output import (
+    USAGE_FOREIGN_CREDENTIAL,
+    USAGE_KEYCHAIN_UNAVAILABLE,
+    USAGE_TOKEN_EXPIRED,
+)
 from claude_swap.usage_store import FetchRecord, UsageEntry
 from claude_swap.models import Platform
 from claude_swap.settings import AutoSwitchSettings
@@ -673,6 +677,76 @@ class TestIdleHold:
         switch = next(e for e in harness.events if isinstance(e, SwitchEvent))
         assert switch.trigger == "failover"
         assert harness.engine._idle_hold_since is None
+
+
+def tick_with_active_read(h: EngineHarness, usage: dict, verdict) -> TickOutcome:
+    """One tick whose collection pass read the live credential with
+    ``verdict`` (``credentials.ActiveCredentials``) — how the real
+    ``_build_accounts_info`` records an rc=36 Keychain read."""
+    entries = {num: _entry_for(value, h.clock.now) for num, value in usage.items()}
+
+    def collect(*_a, **_kw):
+        h.switcher._record_active_verdict(verdict)
+        return entries
+
+    with patch.object(h.switcher, "usage_entries_by_account", side_effect=collect):
+        return h.engine.tick()
+
+
+class TestActiveCredentialUnreadable:
+    """2026-10-03 incident: right after a /login the Keychain answered
+    rc=36 (errSecInteractionNotAllowed) for ~3 minutes; three "usage
+    unknown" ticks later the engine failed over and wrote another slot over
+    the fresh, never-backed-up login. An unreadable or degraded live read
+    must hold — no counting, no switch, no state write."""
+
+    # Keychain denied, nothing else readable (keychain_unavailable).
+    DENIED = ("", True, True)
+    # Keychain denied, a plaintext fallback served instead (degraded).
+    FALLBACK = (json.dumps({"claudeAiOauth": {"accessToken": "sk-stale",
+                                              "refreshToken": "rt-stale"}}),
+                False, True)
+    # The plaintext file itself could not be read.
+    FILE_ERROR = (None, False, False)
+
+    @pytest.mark.parametrize("raw", [DENIED, FALLBACK, FILE_ERROR],
+                             ids=["denied", "plaintext-fallback", "file-error"])
+    @pytest.mark.parametrize("active_usage", [USAGE_KEYCHAIN_UNAVAILABLE, None])
+    def test_unreadable_active_never_fails_over(self, harness, raw, active_usage):
+        from claude_swap.autoswitch import ConfigWarningEvent
+        from claude_swap.credentials import ActiveCredentials
+
+        verdict = ActiveCredentials(*raw)
+        usage = {"1": active_usage, "2": _usage(10), "3": _usage(20)}
+        state_path = harness.switcher.backup_dir / "autoswitch_state.json"
+        before = state_path.read_bytes() if state_path.exists() else None
+        for _ in range(6):  # twice unhealthy_ticks (3)
+            assert tick_with_active_read(harness, usage, verdict) is TickOutcome.NO_ACTION
+            harness.clock.advance(60)
+        assert harness.active_number() == 1
+        assert not any(isinstance(e, SwitchEvent) for e in harness.events)
+        assert harness.engine._unhealthy_ticks == 0
+        after = state_path.read_bytes() if state_path.exists() else None
+        assert after == before  # no state change
+        warnings = [e for e in harness.events if isinstance(e, ConfigWarningEvent)]
+        assert len(warnings) == 1 and "Keychain unreadable; holding" in warnings[0].message
+        reasons = {e.reason for e in harness.events if isinstance(e, NoSwitchEvent)}
+        assert reasons == {"active-credential-unreadable"}
+
+    def test_holds_even_at_limit_and_resumes_after_a_clean_read(self, harness):
+        from claude_swap.autoswitch import ConfigWarningEvent
+        from claude_swap.credentials import ActiveCredentials
+
+        degraded = ActiveCredentials(*self.FALLBACK)
+        at_limit = {"1": _usage(100), "2": _usage(10), "3": _usage(20)}
+        assert tick_with_active_read(harness, at_limit, degraded) is TickOutcome.NO_ACTION
+        assert harness.active_number() == 1
+        clean = ActiveCredentials(self.FALLBACK[0], False, False)
+        assert tick_with_active_read(harness, at_limit, clean) is TickOutcome.SWITCHED
+        # A later episode warns again.
+        assert tick_with_active_read(harness, at_limit, degraded) is TickOutcome.NO_ACTION
+        warnings = [e for e in harness.events if isinstance(e, ConfigWarningEvent)]
+        assert len(warnings) == 2
 
 
 class TestAdaptiveScheduler:

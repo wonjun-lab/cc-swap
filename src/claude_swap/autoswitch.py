@@ -765,6 +765,9 @@ class AutoSwitchEngine:
         # ``_idle_hold_slow`` is per-tick like ``_blocked_wait_long``.
         self._idle_hold_since: float | None = None
         self._idle_hold_slow = False
+        # One warning per episode of an unreadable live credential (the
+        # tick holds while it lasts; see `_active_read_unhealthy`).
+        self._read_hold_warned = False
         # One-shot typo guard for ``autoswitch.model``: resolved (and possibly
         # warned) on the first tick where every relevant account has readable
         # usage — adaptive polling legitimately leaves gaps before that.
@@ -1064,6 +1067,29 @@ class AutoSwitchEngine:
                 },
             )
         )
+
+        if self._active_read_unhealthy():
+            # The live credential could not be read cleanly this pass
+            # (Keychain rc 36/51/…, a plaintext-only fallback, or an
+            # unreadable file). Whatever usage says, a switch now would
+            # overwrite a login cswap cannot see — possibly a fresh /login
+            # that was never backed up (2026-10-03). Hold, count nothing,
+            # write nothing, until a read succeeds.
+            if not self._read_hold_warned:
+                self._read_hold_warned = True
+                self._emit(ConfigWarningEvent(
+                    message=(
+                        f"Keychain unreadable; holding — Account-{current}'s "
+                        "live credential could not be read cleanly, so no "
+                        "switch until a read succeeds"
+                    )
+                ))
+            self._emit(NoSwitchEvent(
+                reason="active-credential-unreadable",
+                detail="live credential read failed or degraded; holding",
+            ))
+            return TickOutcome.NO_ACTION
+        self._read_hold_warned = False
 
         if not self._model_check_done:
             self._check_model_names(quarantined, usage)
@@ -2298,6 +2324,21 @@ class AutoSwitchEngine:
         return TickOutcome.SWITCHED
 
     # -- helpers --------------------------------------------------------------
+
+    def _active_read_unhealthy(self) -> bool:
+        """Whether this pass's read of the live credential failed or was
+        degraded (``credentials.ActiveCredentials``: Keychain unreadable,
+        served from the plaintext fallback, or the file unreadable)."""
+        verdict_of = getattr(self.switcher, "_active_verdict", None)
+        if verdict_of is None:
+            return False
+        try:
+            verdict = verdict_of()
+        except Exception:
+            return False
+        return bool(
+            verdict.value is None or verdict.keychain_unavailable or verdict.degraded
+        )
 
     def _in_cooldown(self, state: dict) -> bool:
         last = state.get("lastSwitchAt")

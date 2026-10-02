@@ -170,6 +170,8 @@ cc-swap service uninstall   # stop it and remove it
 
 `install` forwards `CLAUDE_CONFIG_DIR` and `CLAUDE_SECURESTORAGE_CONFIG_DIR` from the shell you run it in to the service, and prints which ones it forwarded, so a custom profile is read by the service too. It refuses to install while `CLAUDE_CONFIG_DIR` points at a `cswap run` session profile; run it from a terminal outside the session.
 
+**An unreadable login holds the engine.** If the live credential cannot be read cleanly (for example, the macOS Keychain answers `rc=36` for a few minutes after a `/login`, or only the plaintext fallback is readable), the engine logs `Keychain unreadable; holding` once and makes no switch for any trigger until a read succeeds. These ticks do not count toward failover. Switching then would overwrite a login cc-swap cannot see, possibly one that has not been backed up yet.
+
 **One engine per machine.** Whatever runs the engine (the service, a terminal `cc-swap auto`, the TUI's auto screen, or the menu bar's auto-switch) holds a lock, `<backup root>/.engine.lock`, for as long as it runs. The OS frees the lock when the process exits, even after a crash. While another process holds it, `cc-swap auto` refuses to start and exits with code `4`, and the TUI's auto screen (badge **VIEWER**) and the menu bar only show what the running engine is doing. `cc-swap auto --once --dry-run` needs no lock and always works. If another engine held the lease when the service started, the service retries every minute and takes over once that engine stops. To run an engine in a terminal instead, run `cc-swap service uninstall` first.
 
 ## Fleet: the TUI home for maximize

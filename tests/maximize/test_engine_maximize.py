@@ -670,6 +670,30 @@ class TestLoginExpiryWarning:
         assert line.startswith("Account-1 login expired ")
 
 
+class TestActiveCredentialUnreadableMaximize:
+    def test_rc36_on_the_active_read_holds_maximize_without_writes(self, temp_home):
+        from claude_swap.credentials import ActiveCredentials
+        from tests.test_autoswitch import tick_with_active_read
+
+        h = make(temp_home)
+        denied = ActiveCredentials("", True, True)
+        state_path = h.switcher.backup_dir / "autoswitch_state.json"
+        before = state_path.read_bytes() if state_path.exists() else None
+        for usage in (
+            {"1": None, "2": win(0, 10), "3": win(0, 50)},          # usage unknown
+            {"1": win(100, 40), "2": win(0, 10), "3": win(0, 50)},  # even at limit
+        ):
+            for _ in range(5):
+                assert tick_with_active_read(h, usage, denied) is TickOutcome.NO_ACTION
+                h.clock.advance(60)
+        assert h.active_number() == 1 and not of(h, SwitchEvent)
+        assert not of(h, MaximizeDecisionEvent)
+        assert h.engine._unhealthy_ticks == 0
+        assert (state_path.read_bytes() if state_path.exists() else None) == before
+        assert [m for m in (e.message for e in of(h, ConfigWarningEvent))
+                if "Keychain unreadable" in m] != []
+
+
 class TestLoginExpiryGuardEngine:
     def test_soft_switch_lands_past_an_account_whose_login_is_about_to_expire(
         self, temp_home
