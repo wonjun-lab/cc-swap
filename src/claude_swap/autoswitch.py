@@ -2238,6 +2238,17 @@ class AutoSwitchEngine:
             if trigger in ("proactive", "consume-first") and self._in_cooldown(state):
                 self._emit(NoSwitchEvent(reason="cooldown"))
                 return TickOutcome.NO_ACTION
+            # A re-login pause (Fleet TUI) that landed after this tick read
+            # the state: the live login is being repaired, do not switch it.
+            from claude_swap.maximize.pause import active_pause
+
+            paused = active_pause(state, self.clock())
+            if paused is not None:
+                self._emit(NoSwitchEvent(
+                    reason="maximize-paused",
+                    detail=f"switching paused ({paused[1]}) — re-checked before the switch",
+                ))
+                return TickOutcome.NO_ACTION
 
             result = self.switcher.switch_to(number, json_output=True)
             if not result or not result.get("switched"):

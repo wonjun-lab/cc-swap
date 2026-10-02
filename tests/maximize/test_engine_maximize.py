@@ -595,6 +595,28 @@ class TestPause:
         assert h.tick_with_usage(usage) is TickOutcome.SWITCHED
         assert primer.calls == ["2"]
 
+    def test_pause_landing_mid_tick_blocks_the_switch_under_the_lock(self, temp_home):
+        # The tick read the state before the pause was written: the locked
+        # re-check right before the switch still sees it.
+        from claude_swap.maximize import engine_hook
+
+        h = make(temp_home)
+        root = h.switcher.backup_dir
+        real = engine_hook.policy.decide
+
+        def decide_then_pause(snap):
+            decision = real(snap)
+            pause.pause(root, "relogin", now=h.clock.now)
+            return decision
+
+        usage = {"1": win(100, 40), "2": win(0, 10), "3": win(0, 50)}
+        with patch.object(engine_hook.policy, "decide", side_effect=decide_then_pause):
+            assert h.tick_with_usage(usage) is TickOutcome.NO_ACTION
+        assert h.active_number() == 1
+        assert not of(h, SwitchEvent)
+        assert "maximize-paused" in no_switch_reasons(h)
+        assert "lastSwitchAt" not in h.state()
+
     def test_resume_lifts_the_pause_at_once(self, temp_home):
         h = make(temp_home)
         root = h.switcher.backup_dir

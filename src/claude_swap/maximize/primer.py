@@ -43,6 +43,7 @@ from claude_swap.autoswitch import (
     PrimeEvent,
 )
 from claude_swap.maximize.model import AccountView, Snapshot
+from claude_swap.maximize.pause import active_pause
 from claude_swap.maximize.snapshot import build_snapshot
 from claude_swap.poll_policy import parse_reset_ts
 from claude_swap.session import AUTH_OVERRIDE_ENV_VARS, delete_macos_keychain_entry
@@ -972,8 +973,9 @@ class Primer:
                 return self._skip_active(target, entry, self._clock()), False, None
             launch_at = self._clock()
         attempts = attempts_used(entry, target.window_key, launch_at) + 1
-        if not self._claim(email, target.window_key, attempts, launch_at, entry):
-            return self._held_back(num, "another cc-swap process claimed this attempt")
+        refused = self._claim(email, target.window_key, attempts, launch_at, entry)
+        if refused is not None:
+            return self._held_back(num, refused)
         return self._launch(target, claude, token, wait or self._sleep), True, None
 
     @staticmethod
@@ -1200,15 +1202,20 @@ class Primer:
 
     def _claim(
         self, email: str, key: str, attempts: int, now: float, seen: Mapping | None
-    ) -> bool:
+    ) -> str | None:
         """Record the attempt before launching, under the state lock, and only
         if nobody else recorded one since we read the state (double-spend
-        guard against a concurrent ``cc-swap prime`` or second engine)."""
+        guard against a concurrent ``cc-swap prime`` or second engine) and no
+        re-login pause landed meanwhile. ``None`` = claimed; otherwise why not."""
         seen_at = _num(seen.get("lastAttemptAt")) if isinstance(seen, Mapping) else None
-        won = False
+        refused: str | None = "another cc-swap process claimed this attempt"
 
         def mutate(state: dict) -> None:
-            nonlocal won
+            nonlocal refused
+            paused = active_pause(state, self._clock())
+            if paused is not None:
+                refused = f"switching paused ({paused[1]})"
+                return
             primes = state.get("primes")
             if not isinstance(primes, dict):
                 primes = state["primes"] = {}
@@ -1222,10 +1229,10 @@ class Primer:
                 "lastAttemptAt": now,
                 "lastOutcome": "launched",
             }
-            won = True
+            refused = None
 
         self.engine._mutate_state(mutate)
-        return won
+        return refused
 
 
 def prime_snapshot(engine, usage: Mapping[str, dict | str | None], now: float) -> Snapshot:

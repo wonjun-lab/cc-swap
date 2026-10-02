@@ -291,6 +291,24 @@ class TestPrimer:
         rig.primer(runner=runner).run_due(rig.snap(nums=("1", "2")))
         assert runner.calls == []
 
+    def test_pause_landing_mid_pass_blocks_the_claim(self, rig, caplog):
+        # A TUI re-login pauses the engine while the primer is between its
+        # checks and its claim: the claim (under the state lock) sees it.
+        from claude_swap.maximize import pause
+
+        caplog.set_level("INFO", logger="claude-swap")
+
+        def relogin_starts(num):
+            if num == "2":
+                pause.pause(rig.switcher.backup_dir, "relogin", now=rig.clock())
+
+        rig.usage.on_fetch = relogin_starts
+        runner = StubRunner(rig)
+        rig.primer(runner=runner).run_due(rig.snap(nums=("1", "2")))
+        assert runner.calls == []
+        assert rig.primes() == {}  # no attempt recorded
+        assert "account 2 not primed this pass: switching paused (relogin)" in caplog.text
+
     def test_refused_precheck_fetch_defers_to_the_next_tick(self, rig, caplog):
         """Same branch that made `cc-swap prime` a silent no-op: the engine
         holds the target back without recording anything, says why in its
