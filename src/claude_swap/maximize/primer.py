@@ -594,6 +594,31 @@ def request_fetch(switcher, number: str, at: float) -> None:
         _logger.debug("prime: could not pull account %s's poll plan", number, exc_info=True)
 
 
+def _no_reading_reason(entry, now: float) -> str:
+    """Why the pre-launch check found no recent usage reading, from the
+    store entry it was left with. Slot-free: the caller names the account."""
+    head = f"no usage reading from the last {PRECHECK_MAX_AGE_S:.0f}s"
+    if entry is None:
+        return head
+    if entry.sentinel is not None:
+        return f"{head}: usage {entry.sentinel}"
+    if entry.held(now):
+        return (
+            f"{head}: usage is held for an imported reading for "
+            f"{entry.held_until - now:.0f}s more"
+        )
+    if entry.in_backoff(now):
+        return (
+            f"{head}: the last usage fetch failed ({entry.last_error or 'error'}); "
+            f"fetches back off for {entry.backoff_until - now:.0f}s more"
+        )
+    if entry.claim_until is not None and now < entry.claim_until:
+        return f"{head}: another cc-swap process is fetching it"
+    if entry.last_error:
+        return f"{head}: the usage fetch failed ({entry.last_error})"
+    return f"{head}: the usage fetch did not run"
+
+
 def _five_hour(usage: Mapping) -> tuple[float | None, str | None]:
     window = usage.get("five_hour")
     raw = window.get("resets_at") if isinstance(window, dict) else None
@@ -632,6 +657,7 @@ class Primer:
         self._clock = clock
         self._sleep = sleep
         self._disabled: str | None = None
+        self.not_primed: dict[str, str] = {}  # last prime_now: slot → reason
 
     @property
     def profile_dir(self) -> Path:
@@ -653,7 +679,8 @@ class Primer:
         for target in due_targets(snap, state, self.settings, now, self._rng):
             if target.due_at > now or guard_wait(self._clock()):
                 break  # the guard: an earlier target's slow checks ran into it
-            new_events, launched = self._attempt(target, state.get(target.email), claude)
+            # A held-back target records nothing, so the next tick retries it.
+            new_events, launched, _held = self._attempt(target, state.get(target.email), claude)
             events.extend(new_events)
             if launched:
                 break  # one launch per tick bounds how long a tick can block
@@ -669,7 +696,11 @@ class Primer:
         """Manual priming (``cc-swap prime``): every eligible target now, no
         jitter, then one verification pass. Same safety checks as ``run_due``;
         ignores ``prime.enabled``. A launch that would fall in a bucket's last
-        seconds waits for the next bucket instead of deferring to a tick."""
+        seconds waits for the next bucket instead of deferring to a tick.
+
+        Targets that were neither launched nor reported by an event land in
+        ``self.not_primed`` (slot → reason), so the caller can say why."""
+        self.not_primed = {}
         claude, events = self._claude_or_disable()
         if claude is None:
             return events
@@ -680,11 +711,13 @@ class Primer:
         for target in due_targets(snap, state, self.settings, now, self._rng):
             if numbers is not None and target.number not in numbers:
                 continue
-            new_events, did = self._attempt(
+            new_events, did, held_back = self._attempt(
                 target, state.get(target.email), claude, wait=sleep
             )
             events.extend(new_events)
             launched = launched or did
+            if held_back is not None:
+                self.not_primed[target.number] = held_back
         if launched:
             sleep(VERIFY_DELAY_S + 5.0)
             events.extend(self._verify_pending(snap))
@@ -692,9 +725,15 @@ class Primer:
 
     def plan_lines(self, snap: Snapshot, numbers: set[str] | None = None) -> list[str]:
         """``cc-swap prime --dry-run`` rows: slot numbers and reasons, no emails."""
+        return [f"#{num}  {text}" for num, text, _ in self.plan(snap, numbers)]
+
+    def plan(
+        self, snap: Snapshot, numbers: set[str] | None = None
+    ) -> list[tuple[str, str, bool]]:
+        """``(slot, text, would_prime)`` per account, in slot order."""
         now = self._clock()
         state = self._prime_state()
-        lines: list[str] = []
+        rows: list[tuple[str, str, bool]] = []
         for view in sorted(snap.accounts, key=lambda v: _slot_order(v.number)):
             if numbers is not None and view.number not in numbers:
                 continue
@@ -704,15 +743,16 @@ class Primer:
             if reason is None and self.engine.switcher.live_session_pids_for(view.number, view.email):
                 reason = "live-session"
             if reason is not None:
-                lines.append(f"#{view.number}  skip ({reason})")
+                rows.append((view.number, f"skip ({reason})", False))
                 continue
             key = window_key(view, entry, now)
             attempt = attempts_used(entry, key, now) + 1
-            lines.append(
-                f"#{view.number}  would prime now "
-                f"(window {key}, attempt {attempt}/{self.settings.max_attempts})"
-            )
-        return lines
+            rows.append((
+                view.number,
+                f"would prime now (window {key}, attempt {attempt}/{self.settings.max_attempts})",
+                True,
+            ))
+        return rows
 
     def pending_accounts(self, snap: Snapshot) -> list[str]:
         state = self._prime_state()
@@ -792,10 +832,15 @@ class Primer:
         claude: str,
         *,
         wait: Sleep | None = None,
-    ) -> tuple[list[PrimeEvent], bool]:
+    ) -> tuple[list[PrimeEvent], bool, str | None]:
         """Pre-check, claim and launch one target. ``wait`` is how a launch
         that would fall in a bucket's last seconds is handled: ``None``
-        defers it to a later tick (the engine), a sleep waits it out (CLI)."""
+        defers it to a later tick (the engine), a sleep waits it out (CLI).
+
+        Returns ``(events, launched, held_back)``. ``held_back`` is the reason
+        a target was neither launched nor reported by an event — nothing is
+        recorded, so the engine simply retries it next tick, but a manual
+        ``cc-swap prime`` must tell the user (it is otherwise a silent no-op)."""
         switcher = self.engine.switcher
         num, email = target.number, target.email
         now = self._clock()
@@ -803,61 +848,61 @@ class Primer:
         # the checks below run, so this is re-read before the token step and
         # right before the claim as well.
         if self._is_active(num):
-            return self._skip_active(target, entry, now), False
+            return self._skip_active(target, entry, now), False, None
         if switcher.live_session_pids_for(num, email):
-            return self._skip_live(target, entry, now), False
-        usage = self._fresh_usage(num, since=now - PRECHECK_MAX_AGE_S)
+            return self._skip_live(target, entry, now), False, None
+        usage, why = self._fresh_reading(num, since=now - PRECHECK_MAX_AGE_S)
         if usage is None:
-            _logger.info("prime: account %s has no fresh usage reading; retrying next tick", num)
-            return [], False
+            return self._held_back(num, why)
         reset, raw = _five_hour(usage)
         if reset is not None and reset > now:
             self._mark(target, entry, now, "already-on", resetsAt=reset)
-            return [PrimeEvent(num, "already-on", raw, "window opened elsewhere")], False
+            return [PrimeEvent(num, "already-on", raw, "window opened elsewhere")], False, None
         pct7 = _seven_day_pct(usage)
         if pct7 is not None and pct7 >= 100.0:
             self._mark(target, entry, now, "rate-limited")
-            return [PrimeEvent(num, "failed", None, "7d window exhausted")], False
+            return [PrimeEvent(num, "failed", None, "7d window exhausted")], False, None
         force = (
             isinstance(entry, Mapping)
             and entry.get("lastOutcome") == "auth-failed"
             and entry.get("windowKey") == target.window_key
         )
         if self._is_active(num):
-            return self._skip_active(target, entry, self._clock()), False
+            return self._skip_active(target, entry, self._clock()), False, None
         token, status = self._access_token(num, email, force_refresh=force)
         if status in ("invalid_grant", "identity-conflict"):
             self.engine._quarantine(num, email, status)
             self._mark(target, entry, now, status)
-            return [PrimeEvent(num, "failed", None, status)], False
+            return [PrimeEvent(num, "failed", None, status)], False, None
         if status == "skip-live-session":
-            return self._skip_live(target, entry, now), False
+            return self._skip_live(target, entry, now), False, None
         if token is None:
-            _logger.info("prime: account %s token not ready (%s); retrying next tick", num, status)
-            return [], False
+            return self._held_back(num, f"access token not ready ({status})")
         # The checks above can take a while (usage fetch, token refresh). The
         # launch instant is read here, guarded here, and recorded as the
         # prime time verification measures against.
         if self._is_active(num):
-            return self._skip_active(target, entry, self._clock()), False
+            return self._skip_active(target, entry, self._clock()), False, None
         launch_at = self._clock()
         pause = guard_wait(launch_at)
         if pause:
             if wait is None:
-                _logger.info(
-                    "prime: account %s deferred: a launch now could land in the "
-                    "next 10-minute bucket", num,
+                return self._held_back(
+                    num, "a launch now could land in the next 10-minute bucket"
                 )
-                return [], False
             wait(pause)
             if self._is_active(num):
-                return self._skip_active(target, entry, self._clock()), False
+                return self._skip_active(target, entry, self._clock()), False, None
             launch_at = self._clock()
         attempts = attempts_used(entry, target.window_key, launch_at) + 1
         if not self._claim(email, target.window_key, attempts, launch_at, entry):
-            _logger.info("prime: account %s was claimed by another cc-swap process", num)
-            return [], False
-        return self._launch(target, claude, token, wait or self._sleep), True
+            return self._held_back(num, "another cc-swap process claimed this attempt")
+        return self._launch(target, claude, token, wait or self._sleep), True, None
+
+    @staticmethod
+    def _held_back(num: str, why: str) -> tuple[list[PrimeEvent], bool, str]:
+        _logger.info("prime: account %s not primed this pass: %s", num, why)
+        return [], False, why
 
     def _access_token(
         self, num: str, email: str, *, force_refresh: bool
@@ -985,15 +1030,26 @@ class Primer:
 
     def _fresh_usage(self, number: str, *, since: float) -> dict | None:
         """A usage reading for ``number`` fetched at or after ``since``."""
+        return self._fresh_reading(number, since=since)[0]
+
+    def _fresh_reading(self, number: str, *, since: float) -> tuple[dict | None, str]:
+        """``_fresh_usage`` plus, when there is no such reading, why not.
+
+        The store decides whether the fetch may run (backoff, holds, another
+        collector's claim) and the endpoint may refuse it (429): either way
+        the stored reading stays as old as it was, and the caller must say so
+        instead of treating the account as having nothing to do."""
         switcher = self.engine.switcher
         entry = switcher.usage_entries_by_account(fetch=set()).get(number)
         if entry is None or entry.fetched_at is None or entry.fetched_at < since:
             request_fetch(switcher, number, self._clock())
             entry = switcher.usage_entries_by_account(fetch={number}).get(number)
         if entry is None or entry.fetched_at is None or entry.fetched_at < since:
-            return None
+            return None, _no_reading_reason(entry, self._clock())
         value = entry.decision_value()
-        return value if isinstance(value, dict) else None
+        if not isinstance(value, dict):
+            return None, f"usage reading unusable ({value or 'unknown'})"
+        return value, ""
 
     def _is_active(self, number: str) -> bool:
         return self.engine.switcher.current_account_number() == number

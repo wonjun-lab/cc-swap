@@ -6,12 +6,12 @@ import sys
 
 import pytest
 
-from claude_swap import cli
+from claude_swap import cli, oauth
 from claude_swap.maximize import prime_cli
 from claude_swap.maximize.primer import expected_reset
 from claude_swap.settings import atomic_write_json, settings_path
 from tests.maximize.fake_claude import FakeClaude
-from tests.maximize.primer_support import FakeUsage, H
+from tests.maximize.primer_support import FakeUsage, H, _usage
 from tests.test_autoswitch import EngineHarness
 
 needs_posix = pytest.mark.skipif(
@@ -79,6 +79,109 @@ def test_unknown_account_is_an_error(cli_rig, capsys):
         prime_cli.prime_command(["9"])
     assert exc.value.code == 1
     assert "Error:" in capsys.readouterr().err
+
+
+@pytest.fixture
+def store_rig(temp_home, tmp_path, monkeypatch):
+    """Like ``cli_rig`` but on the REAL usage store (claims, serve TTL,
+    backoff, poll plans); only the usage endpoint is scripted:
+    ``endpoint["errors"][num]`` makes that slot's next fetches fail."""
+    monkeypatch.setattr("claude_swap.switcher._FETCH_STAGGER_S", 0)
+    harness = EngineHarness(temp_home)
+    for num, email in ((1, "a@example.com"), (2, "b@example.com")):
+        harness.seed(num, email)
+    harness.make_live("a@example.com", 1)
+    monkeypatch.setattr(harness.switcher, "_live_session_pids", lambda *a: [])
+    fake = FakeClaude.install(tmp_path / "fakebin")
+    atomic_write_json(
+        settings_path(harness.switcher.backup_dir),
+        {"schemaVersion": 1, "prime": {"claudePath": str(fake.path)}},
+    )
+    now = harness.clock()
+    endpoint: dict = {
+        "usage": {"1": _usage(pct5=40.0, reset5=now + 2 * H), "2": _usage()},
+        "errors": {},
+        "fetches": [],
+    }
+
+    def fetch(num, email, creds, is_active=False, persist_credentials=None, **kwargs):
+        endpoint["fetches"].append(num)
+        error = endpoint["errors"].get(num)
+        if error:
+            return oauth.UsageOutcome(None, error=error)
+        primes = harness.state().get("primes", {})
+        entry = primes.get(email)
+        if fake.calls() and entry and entry.get("lastOutcome") == "launched":
+            endpoint["usage"][num] = _usage(reset5=expected_reset(entry["lastAttemptAt"]))
+        return oauth.UsageOutcome(dict(endpoint["usage"][num]))
+
+    monkeypatch.setattr("claude_swap.oauth.try_fetch_usage_for_account", fetch)
+    monkeypatch.setattr(prime_cli, "ClaudeAccountSwitcher", lambda debug=False: harness.switcher)
+    monkeypatch.setattr(prime_cli, "_clock", harness.clock)
+    monkeypatch.setattr(prime_cli, "_sleep", harness.clock.advance)
+    harness.switcher.usage_entries_by_account(fetch=None)  # last-good readings
+    return harness, fake, endpoint
+
+
+def _run_prime(argv: list[str]) -> int:
+    with pytest.raises(SystemExit) as exc:
+        prime_cli.prime_command(argv)
+    return exc.value.code
+
+
+@needs_posix
+def test_dry_run_then_prime_never_silently_does_nothing(store_rig, capsys):
+    """Live 2026-10-02: `prime --dry-run 4` said "would prime now", `prime 4`
+    printed "Nothing to prime." in the same second, `prime 4` ~20 s later
+    primed. The usage endpoint throttled the account (429): its pre-launch
+    reading could not be refreshed, the attempt returned without an event,
+    and the CLI reported nothing at all."""
+    harness, fake, endpoint = store_rig
+    harness.clock.advance(200)  # past the serve TTL: collectors re-fetch
+    endpoint["errors"]["2"] = "http-429"
+
+    prime_cli.prime_command(["--dry-run", "2"])
+    assert "#2  would prime now (window cold, attempt 1/2)" in capsys.readouterr().out
+
+    code = _run_prime(["2"])
+    out = capsys.readouterr().out
+    assert fake.calls() == []
+    assert "Nothing to prime." not in out
+    [line] = [ln for ln in out.splitlines() if "#2" in ln or "Account-2" in ln]
+    assert line == (
+        "#2  not primed (no usage reading from the last 60s: the last usage "
+        "fetch failed (http-429); fetches back off for 30s more)"
+    )
+    assert "@example.com" not in out
+    assert code == 1  # asked to prime, nothing was sent
+
+    # Once the endpoint answers again, the same command primes.
+    endpoint["errors"].clear()
+    harness.clock.advance(600)  # past the failure backoff
+    assert _run_prime(["2"]) == 0
+    out = capsys.readouterr().out
+    assert "Account-2: 5h window primed" in out
+    assert len(fake.calls()) == 1
+
+
+@needs_posix
+def test_prime_reports_every_account_it_did_not_launch(store_rig, capsys, monkeypatch):
+    """Without account arguments too: one line per target, slot number only."""
+    harness, fake, endpoint = store_rig
+    harness.clock.advance(200)
+    # The CLI builds its own engine: patch the class.
+    monkeypatch.setattr(
+        prime_cli.AutoSwitchEngine, "_freshen_target", lambda self, num, email: "transient"
+    )
+    code = _run_prime([])
+    out = capsys.readouterr().out
+    assert fake.calls() == []
+    assert "Nothing to prime." not in out
+    assert "#1  skip (active)" in out
+    [line] = [ln for ln in out.splitlines() if "#2" in ln or "Account-2" in ln]
+    assert line == "#2  not primed (access token not ready (transient))"
+    assert "@example.com" not in out
+    assert code == 1
 
 
 def test_main_dispatches_prime(monkeypatch):

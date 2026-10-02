@@ -14,7 +14,7 @@ import time
 
 from claude_swap.autoswitch import AutoSwitchEngine, AutoSwitchEvent
 from claude_swap.exceptions import ClaudeSwitchError
-from claude_swap.maximize.primer import Primer, prime_snapshot
+from claude_swap.maximize.primer import Primer, _slot_order, prime_snapshot
 from claude_swap.printer import dimmed, error
 from claude_swap.settings import load_prime_settings, load_settings
 from claude_swap.switcher import ClaudeAccountSwitcher
@@ -79,25 +79,40 @@ def prime_command(argv: list[str]) -> None:
         entries = switcher.usage_entries_by_account(fetch=None)
         usage = {num: entry.decision_value() for num, entry in entries.items()}
         snap = prime_snapshot(engine, usage, _clock())
-        lines = primer.plan_lines(snap, numbers)
+        plan = primer.plan(snap, numbers)
         if args.dry_run:
-            for line in lines or ["No accounts."]:
-                print(line)
+            for num, text, _ in plan:
+                print(f"#{num}  {text}")
+            if not plan:
+                print("No accounts.")
             return
-        for line in lines:
-            if " skip (" in line:
-                print(dimmed(line))
+        for num, text, would_prime in plan:
+            if not would_prime:
+                print(dimmed(f"#{num}  {text}"))
         events = primer.prime_now(snap, numbers, sleep=_sleep)
         for event in events:
             _print_event(event)
-        for num in primer.pending_accounts(snap):
+        pending = primer.pending_accounts(snap)
+        for num in pending:
             print(dimmed(
                 f"#{num}  verification pending (the running engine or the next "
                 "`cc-swap prime` checks it)"
             ))
-        if not events and not primer.pending_accounts(snap):
+        # Every account the plan would prime gets a line: an event, pending,
+        # or the reason it was not primed — never a silent no-op.
+        # (A missing `claude` already printed its own event for all of them.)
+        not_primed = dict(primer.not_primed)
+        reported = {getattr(e, "account", None) for e in events} | set(pending)
+        disabled = any(e.outcome == "disabled" for e in events)
+        for num, _text, would_prime in plan:
+            if would_prime and not disabled and num not in reported and num not in not_primed:
+                not_primed[num] = "no longer a priming target"
+        for num in sorted(not_primed, key=_slot_order):
+            print(f"#{num}  not primed ({not_primed[num]})")
+        if not events and not pending and not not_primed:
             print(dimmed("Nothing to prime."))
-        sys.exit(1 if any(e.outcome in _FAILED for e in events) else 0)
+        failed = any(e.outcome in _FAILED for e in events) or bool(not_primed)
+        sys.exit(1 if failed else 0)
     except ClaudeSwitchError as e:
         error(f"Error: {e}")
         sys.exit(1)

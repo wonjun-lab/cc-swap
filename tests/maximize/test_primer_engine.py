@@ -15,6 +15,7 @@ from claude_swap.maximize import primer as primer_mod
 from claude_swap.maximize.model import Snapshot
 from claude_swap.maximize.primer import BUCKET_S, PrimeRunResult, Primer, expected_reset
 from claude_swap.settings import MaximizeSettings, PrimeSettings
+from claude_swap.usage_store import UsageEntry
 from tests.maximize.primer_support import H, Rig, StubRunner, needs_posix
 from tests.test_autoswitch import _iso_at
 
@@ -289,6 +290,32 @@ class TestPrimer:
         runner = StubRunner(rig)
         rig.primer(runner=runner).run_due(rig.snap(nums=("1", "2")))
         assert runner.calls == []
+
+    def test_refused_precheck_fetch_defers_to_the_next_tick(self, rig, caplog):
+        """Same branch that made `cc-swap prime` a silent no-op: the engine
+        holds the target back without recording anything, says why in its
+        log, and launches once a fresh reading comes in."""
+        caplog.set_level("INFO", logger="claude-swap")
+        snap = rig.snap(nums=("1", "2"))
+        value = rig.usage.server.pop("2")  # the endpoint is throttling slot 2
+        rig.usage.stored["2"] = UsageEntry(
+            last_good=value, fetched_at=rig.clock() - 300, age_s=300.0,
+            consecutive_failures=1, last_error="http-429",
+            backoff_until=rig.clock() + 30, trust_extended=True,
+        )
+        runner = StubRunner(rig)
+        primer = rig.primer(runner=runner)
+        assert primer.run_due(snap) == []
+        assert runner.calls == []
+        assert rig.primes() == {}  # nothing spent, nothing to wait for
+        assert (
+            "account 2 not primed this pass: no usage reading from the last 60s: "
+            "the last usage fetch failed (http-429); fetches back off for 30s more"
+        ) in caplog.text
+        rig.usage.server["2"] = value  # the throttle lifts
+        rig.clock.advance(30)
+        primer.run_due(rig.snap(nums=("1", "2")))
+        assert runner.tokens() == ["sk-2"]
 
     def test_no_launch_in_the_last_seconds_of_a_bucket(self, rig):
         rig.clock.now = (rig.clock.now // BUCKET_S + 1) * BUCKET_S - 5
