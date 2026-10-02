@@ -2041,6 +2041,98 @@ class ClaudeAccountSwitcher:
             "uuid": (acct.get("uuid") or "").strip(),
         }
 
+    def adopt_new_active_login(self, account_num: str) -> str:
+        """Back up a NEW live login on the active slot ``account_num``
+        whose stored lineage is dead (the engine calls this only for a
+        quarantined/struck slot). Never raises. Returns:
+
+        - ``"adopted"``: the live login (identity- and oracle-verified, the
+          checks ``cswap add`` makes) is now the slot's backup and its dead
+          strike is cleared;
+        - ``"same"``: the live login IS the slot's stored lineage — no new
+          login; ``"not-needed"``: nothing adoptable (no full OAuth pair);
+        - ``"mismatch"``: the live identity or token belongs to another
+          account; ``"unverified"``: ownership could not be established yet;
+        - ``"unreadable"``/``"busy"``/``"error"``: try again next pass.
+
+        Uses this pass's live read (``_active_verdict``); logs fingerprint
+        prefixes only.
+        """
+        num = str(account_num)
+        try:
+            record = (self._get_sequence_data() or {}).get("accounts", {}).get(num)
+            if not isinstance(record, dict):
+                return "mismatch"
+            identity = self._get_current_identity_triple()
+            if identity is None:
+                return "not-needed"
+            email, org_uuid, account_uuid = identity
+            rec_email = str(record.get("email") or "")
+            rec_org = str(record.get("organizationUuid") or "")
+            rec_uuid = str(record.get("uuid") or "").strip()
+            if (
+                email.strip().lower() != rec_email.strip().lower()
+                or org_uuid != rec_org
+                or (rec_uuid and account_uuid and account_uuid != rec_uuid)
+            ):
+                return "mismatch"
+            active = self._active_verdict()
+            if active.value is None or active.keychain_unavailable or active.degraded:
+                return "unreadable"
+            live = active.value
+            live_oauth = oauth.extract_oauth_data(live) if live else None
+            if not (
+                live_oauth
+                and live_oauth.get("accessToken")
+                and live_oauth.get("refreshToken")
+            ):
+                return "not-needed"
+            backup, backup_unreadable = self._read_account_credentials_ex(num, rec_email)
+            if backup_unreadable:
+                return "unreadable"
+            live_fp = oauth.credential_fingerprint(live) or ""
+            if backup and oauth.credential_fingerprint(backup) == live_fp:
+                return "same"
+            key = self._lineage_key(num, rec_email, live_fp)
+            verdict = self._probe_verdicts.get(key)
+            if verdict is None:
+                if oauth.is_oauth_token_expired(live_oauth.get("expiresAt")):
+                    return "unverified"
+                resolved = oauth.fetch_oauth_profile(live_oauth["accessToken"])
+                if not resolved:
+                    return "unverified"
+                verdict = self._resolved_matches_slot_identity(num, resolved)
+                if verdict is None:
+                    return "unverified"
+                self._probe_verdicts[self._lineage_key(num, rec_email, live_fp)] = verdict
+            if verdict is False:
+                return "mismatch"
+            with FileLock(self.lock_file), claude_credentials_lock():
+                # Re-check under the locks: a /login or switch landing since
+                # the read means these bytes are no longer the ones verified.
+                if self._get_current_identity_triple() != identity:
+                    return "busy"
+                now_live = self._read_credentials()
+                if not now_live or oauth.credential_fingerprint(now_live) != live_fp:
+                    return "busy"
+                config_text = self._get_claude_config_path().read_text(encoding="utf-8")
+                self._write_account_credentials(num, rec_email, now_live)
+                self._write_account_config(num, rec_email, config_text)
+            self._usage_store.clear_dead_token([num], {num: (rec_email, rec_org)})
+            self._logger.info(
+                "adopted new login for #%s (rt %s -> %s)",
+                num, oauth.fingerprint8(backup), oauth.fingerprint8(live),
+            )
+            return "adopted"
+        except LockError:
+            return "busy"
+        except Exception:
+            self._logger.warning(
+                "Adopting the new live login for account %s failed; holding "
+                "and retrying next pass.", num, exc_info=True,
+            )
+            return "error"
+
     def backfill_account_uuid(
         self,
         account_num: str,

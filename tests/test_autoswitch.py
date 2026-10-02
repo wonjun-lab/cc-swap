@@ -749,6 +749,122 @@ class TestActiveCredentialUnreadable:
         assert len(warnings) == 2
 
 
+class TestNewLoginOnDeadActiveSlot:
+    """A fresh /login on a dead active slot is adopted into the slot, never
+    overwritten by a failover (2026-10-03)."""
+
+    NEW_LIVE = {"accessToken": "sk-new-login", "refreshToken": "rt-new-login",
+                "expiresAt": 9_999_999_999_000}
+    PROFILE_1 = {"uuid": "uuid-1", "email": "a@example.com", "organizationUuid": None}
+
+    def _dead_slot_1_with_new_login(self, harness, *, account_uuid="uuid-1"):
+        # Slot 1's backup lineage is dead and quarantined …
+        harness.engine._quarantine("1", "a@example.com", "login_expired")
+        # … and the user just ran /login as the same account.
+        live = json.dumps({"claudeAiOauth": self.NEW_LIVE})
+        (harness.temp_home / ".claude" / ".credentials.json").write_text(live)
+        (harness.temp_home / ".claude.json").write_text(json.dumps({
+            "oauthAccount": {"emailAddress": "a@example.com", "accountUuid": account_uuid},
+        }))
+        return live
+
+    def _tick(self, harness, live, usage_1):
+        from claude_swap.credentials import ActiveCredentials
+
+        usage = {"1": usage_1, "2": _usage(10), "3": _usage(20)}
+        return tick_with_active_read(harness, usage, ActiveCredentials(live, False, False))
+
+    def test_matching_identity_is_adopted_and_never_failed_over(self, harness):
+        from claude_swap.autoswitch import LoginAdoptedEvent
+        from claude_swap.json_output import USAGE_LOGIN_EXPIRED
+
+        live = self._dead_slot_1_with_new_login(harness)
+        with patch("claude_swap.oauth.fetch_oauth_profile", return_value=self.PROFILE_1):
+            # The pass that still reads the dead lineage's verdict adopts …
+            assert self._tick(harness, live, USAGE_LOGIN_EXPIRED) is TickOutcome.NO_ACTION
+            # … and the next passes read the new login's usage.
+            for _ in range(4):
+                harness.clock.advance(60)
+                assert self._tick(harness, live, _usage(30)) is TickOutcome.NO_ACTION
+        assert harness.active_number() == 1
+        assert not any(isinstance(e, SwitchEvent) for e in harness.events)
+        stored = harness.switcher.read_account_credentials("1", "a@example.com")
+        assert oauth.credential_fingerprint(stored) == oauth.credential_fingerprint(live)
+        assert "1" not in harness.state().get("quarantine", {})
+        [adopted] = [e for e in harness.events if isinstance(e, LoginAdoptedEvent)]
+        assert adopted.number == "1"
+        assert adopted.human().startswith("adopted new login for #1")
+        assert "@" not in adopted.human() and "rt-new" not in adopted.human()
+
+    def test_mismatched_identity_holds_and_warns(self, harness):
+        from claude_swap.autoswitch import ConfigWarningEvent
+        from claude_swap.json_output import USAGE_LOGIN_EXPIRED
+
+        live = self._dead_slot_1_with_new_login(harness, account_uuid="uuid-someone-else")
+        before = harness.switcher.read_account_credentials("1", "a@example.com")
+        with patch("claude_swap.oauth.fetch_oauth_profile") as probe:
+            for _ in range(5):
+                assert self._tick(harness, live, USAGE_LOGIN_EXPIRED) is TickOutcome.NO_ACTION
+                harness.clock.advance(60)
+        probe.assert_not_called()
+        assert harness.active_number() == 1
+        assert not any(isinstance(e, SwitchEvent) for e in harness.events)
+        assert harness.switcher.read_account_credentials("1", "a@example.com") == before
+        warnings = [e.message for e in harness.events if isinstance(e, ConfigWarningEvent)]
+        assert len(warnings) == 1 and "unmanaged login, run cc-swap add" in warnings[0]
+
+    def test_token_of_another_account_holds_and_warns(self, harness):
+        from claude_swap.autoswitch import ConfigWarningEvent
+        from claude_swap.json_output import USAGE_LOGIN_EXPIRED
+
+        live = self._dead_slot_1_with_new_login(harness)
+        other = {"uuid": "uuid-2", "email": "b@example.com", "organizationUuid": None}
+        with patch("claude_swap.oauth.fetch_oauth_profile", return_value=other):
+            assert self._tick(harness, live, USAGE_LOGIN_EXPIRED) is TickOutcome.NO_ACTION
+        assert not any(isinstance(e, SwitchEvent) for e in harness.events)
+        assert any("unmanaged login, run cc-swap add" in e.message
+                   for e in harness.events if isinstance(e, ConfigWarningEvent))
+
+    def test_unverifiable_new_login_holds_without_writing(self, harness):
+        from claude_swap.json_output import USAGE_LOGIN_EXPIRED
+
+        live = self._dead_slot_1_with_new_login(harness)
+        before = harness.switcher.read_account_credentials("1", "a@example.com")
+        with patch("claude_swap.oauth.fetch_oauth_profile", return_value=None):
+            for _ in range(4):
+                assert self._tick(harness, live, USAGE_LOGIN_EXPIRED) is TickOutcome.NO_ACTION
+        assert not any(isinstance(e, SwitchEvent) for e in harness.events)
+        assert harness.switcher.read_account_credentials("1", "a@example.com") == before
+        reasons = {e.reason for e in harness.events if isinstance(e, NoSwitchEvent)}
+        assert "new-login-not-backed-up" in reasons
+        assert harness.engine._unhealthy_ticks == 0
+
+    def test_dead_slot_without_a_new_login_still_fails_over(self, harness):
+        from claude_swap.credentials import ActiveCredentials
+
+        harness.engine._quarantine("1", "a@example.com", "invalid_grant")
+        old = harness.switcher.read_account_credentials("1", "a@example.com")
+        (harness.temp_home / ".claude" / ".credentials.json").write_text(old)
+        usage = {"1": None, "2": _usage(10), "3": _usage(20)}
+        outcomes = [
+            tick_with_active_read(harness, usage, ActiveCredentials(old, False, False))
+            for _ in range(3)
+        ]
+        assert outcomes[-1] is TickOutcome.SWITCHED
+
+    def test_unmanaged_live_login_warns_once(self, harness):
+        from claude_swap.autoswitch import ConfigWarningEvent
+
+        (harness.temp_home / ".claude.json").write_text(json.dumps({
+            "oauthAccount": {"emailAddress": "stranger@example.com", "accountUuid": "u-x"},
+        }))
+        for _ in range(3):
+            assert harness.tick_with_usage({"2": _usage(10)}) is TickOutcome.NO_ACTION
+        warnings = [e.message for e in harness.events if isinstance(e, ConfigWarningEvent)]
+        assert warnings == ["unmanaged login, run cc-swap add (the live login is not a managed account; holding)"]
+        assert "stranger" not in warnings[0]
+
+
 class TestAdaptiveScheduler:
     """End-to-end through the real store: O(1) baseline, escalations,
     skip-to-reset, movement-based cadence."""

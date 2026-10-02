@@ -694,6 +694,29 @@ class TestActiveCredentialUnreadableMaximize:
                 if "Keychain unreadable" in m] != []
 
 
+def test_maximize_adopts_a_new_login_on_a_dead_active_slot(temp_home):
+    from claude_swap import oauth
+    from claude_swap.autoswitch import LoginAdoptedEvent
+    from claude_swap.credentials import ActiveCredentials
+    from claude_swap.json_output import USAGE_LOGIN_EXPIRED
+    from tests.test_autoswitch import tick_with_active_read
+
+    h = make(temp_home)
+    h.engine._quarantine("1", EMAILS[1], "login_expired")
+    live = json.dumps({"claudeAiOauth": {
+        "accessToken": "sk-fresh", "refreshToken": "rt-fresh", "expiresAt": 9_999_999_999_000,
+    }})
+    (h.temp_home / ".claude" / ".credentials.json").write_text(live)
+    profile = {"uuid": "uuid-1", "email": EMAILS[1], "organizationUuid": None}
+    usage = {"1": USAGE_LOGIN_EXPIRED, "2": win(0, 10), "3": win(0, 50)}
+    with patch("claude_swap.oauth.fetch_oauth_profile", return_value=profile):
+        out = tick_with_active_read(h, usage, ActiveCredentials(live, False, False))
+    assert out is TickOutcome.NO_ACTION and h.active_number() == 1
+    assert of(h, LoginAdoptedEvent) and not of(h, SwitchEvent)
+    stored = h.switcher.read_account_credentials("1", EMAILS[1])
+    assert oauth.credential_fingerprint(stored) == oauth.credential_fingerprint(live)
+
+
 class TestLoginExpiryGuardEngine:
     def test_soft_switch_lands_past_an_account_whose_login_is_about_to_expire(
         self, temp_home

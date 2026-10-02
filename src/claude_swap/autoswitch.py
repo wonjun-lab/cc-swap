@@ -44,7 +44,12 @@ from typing import ClassVar
 
 from claude_swap import oauth, poll_policy
 from claude_swap.exceptions import ClaudeSwitchError
-from claude_swap.json_output import SCHEMA_VERSION, USAGE_TOKEN_EXPIRED
+from claude_swap.json_output import (
+    SCHEMA_VERSION,
+    USAGE_LOGIN_EXPIRED,
+    USAGE_RELOGIN_REQUIRED,
+    USAGE_TOKEN_EXPIRED,
+)
 from claude_swap.locking import FileLock
 from claude_swap.poll_policy import (
     ESCALATION_MARGIN_PCT,
@@ -53,7 +58,14 @@ from claude_swap.poll_policy import (
 )
 from claude_swap.settings import AutoSwitchSettings, atomic_write_json, parse_model_names
 from claude_swap.switcher import ClaudeAccountSwitcher
-from claude_swap.usage_store import due_candidate, plan_oversleeps_interval
+from claude_swap.usage_store import (
+    PERMANENT_AUTH_ERRORS,
+    due_candidate,
+    plan_oversleeps_interval,
+)
+
+# Usage sentinels that say the active slot's stored lineage is dead.
+_DEAD_SENTINELS = (USAGE_RELOGIN_REQUIRED, USAGE_LOGIN_EXPIRED)
 
 STATE_FILENAME = "autoswitch_state.json"
 STATE_SCHEMA_VERSION = 1
@@ -436,6 +448,23 @@ class UnquarantineEvent(AutoSwitchEvent):
 
 
 @dataclass(frozen=True)
+class LoginAdoptedEvent(AutoSwitchEvent):
+    """A new live login on the active slot (whose stored lineage was dead)
+    was backed up into the slot. Slot number only — no email."""
+
+    kind: ClassVar[str] = "login-adopted"
+    number: str
+    lifted: bool = False  # a quarantine on the slot was lifted with it
+
+    def _fields(self) -> dict:
+        return {"number": self.number, "lifted": self.lifted}
+
+    def human(self) -> str:
+        tail = "; back in rotation" if self.lifted else ""
+        return f"adopted new login for #{self.number}{tail}"
+
+
+@dataclass(frozen=True)
 class AllExhaustedEvent(AutoSwitchEvent):
     kind: ClassVar[str] = "all-exhausted"
     earliest_reset_at: str | None
@@ -768,6 +797,8 @@ class AutoSwitchEngine:
         # One warning per episode of an unreadable live credential (the
         # tick holds while it lasts; see `_active_read_unhealthy`).
         self._read_hold_warned = False
+        # One "unmanaged login" warning per episode.
+        self._unmanaged_warned = False
         # One-shot typo guard for ``autoswitch.model``: resolved (and possibly
         # warned) on the first tick where every relevant account has readable
         # usage — adaptive polling legitimately leaves gaps before that.
@@ -1024,6 +1055,7 @@ class AutoSwitchEngine:
             if self.switcher.has_live_login():
                 # Live login exists but cswap doesn't manage it: never act —
                 # a switch would overwrite it without a backup.
+                self._warn_unmanaged_login("the live login is not a managed account")
                 self._emit(
                     NoSwitchEvent(
                         reason="unmanaged-active-account",
@@ -1090,6 +1122,10 @@ class AutoSwitchEngine:
             ))
             return TickOutcome.NO_ACTION
         self._read_hold_warned = False
+
+        held = self._back_up_new_active_login(current, entries, quarantined)
+        if held is not None:
+            return held
 
         if not self._model_check_done:
             self._check_model_names(quarantined, usage)
@@ -2324,6 +2360,67 @@ class AutoSwitchEngine:
         return TickOutcome.SWITCHED
 
     # -- helpers --------------------------------------------------------------
+
+    def _warn_unmanaged_login(self, why: str) -> None:
+        if not self._unmanaged_warned:
+            self._unmanaged_warned = True
+            self._emit(ConfigWarningEvent(
+                message=f"unmanaged login, run cc-swap add ({why}; holding)"
+            ))
+
+    def _back_up_new_active_login(
+        self, current: str, entries: dict, quarantined: set[str]
+    ) -> TickOutcome | None:
+        """A dead active slot (quarantined, struck, or reported dead) whose
+        live login is NEW is backed up before anything else may happen —
+        a failover would otherwise overwrite the only copy of a fresh
+        ``/login`` (2026-10-03). ``None`` = carry on with the tick."""
+        entry = entries.get(current)
+        dead = current in quarantined or (
+            entry is not None
+            and (
+                entry.sentinel in _DEAD_SENTINELS
+                or entry.last_error in PERMANENT_AUTH_ERRORS
+            )
+        )
+        adopt = getattr(self.switcher, "adopt_new_active_login", None)
+        if not dead or adopt is None:
+            self._unmanaged_warned = False
+            return None
+        if self.dry_run:
+            return None  # dry runs never write, and never switch either
+        kind = adopt(current)
+        if kind in ("same", "not-needed"):
+            self._unmanaged_warned = False
+            return None  # no new login: the dead slot is what it was
+        if kind == "adopted":
+            self._unmanaged_warned = False
+            lifted = current in quarantined
+            if lifted:
+                def lift(state: dict) -> None:
+                    q = state.get("quarantine")
+                    if isinstance(q, dict):
+                        q.pop(current, None)
+
+                self._mutate_state(lift)
+            self._emit(LoginAdoptedEvent(number=current, lifted=lifted))
+            # This pass's usage still describes the dead lineage: decide on
+            # the next pass's fresh reading, not on it.
+            return TickOutcome.NO_ACTION
+        if kind == "mismatch":
+            self._warn_unmanaged_login(
+                f"the live login does not match Account-{current}"
+            )
+            self._emit(NoSwitchEvent(
+                reason="unmanaged-active-account",
+                detail="run 'cc-swap add' to include the live login",
+            ))
+            return TickOutcome.NO_ACTION
+        self._emit(NoSwitchEvent(
+            reason="new-login-not-backed-up",
+            detail=f"Account-{current}'s new login is not backed up yet ({kind}); holding",
+        ))
+        return TickOutcome.NO_ACTION
 
     def _active_read_unhealthy(self) -> bool:
         """Whether this pass's read of the live credential failed or was
