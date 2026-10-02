@@ -58,11 +58,36 @@ def _usage(v: AccountView) -> str:
     return f"5h {_pct(v.pct5)} / 7d {_pct(v.pct7)}"
 
 
+def login_guarded(v: AccountView, now: float, s) -> bool:
+    """The account's login expires within ``loginExpiryGuardMin`` (or has
+    already): landing there now would strand the user on a login about to
+    die. Unknown deadlines are never guarded."""
+    if v.login_deadline is None:
+        return False
+    return v.login_deadline - now < s.login_expiry_guard_min * 60.0
+
+
+def login_lapsed(v: AccountView, now: float) -> bool:
+    """Past its recorded login deadline: the next refresh is refused, so no
+    switch — not even a forced fallback — should land there."""
+    return v.login_deadline is not None and now >= v.login_deadline
+
+
 def landing_candidates(snap: Snapshot) -> list[AccountView]:
-    """Every non-active landable account, best first (spec §5.2 + §5.4)."""
+    """Every non-active landable account, best first (spec §5.2 + §5.4).
+
+    An account inside its login-expiry guard is no landing target (soft,
+    rebalance, and the first choice of hard/at-limit); the hard/at-limit
+    fallbacks (``escape_candidates``, ``limit_candidates``) still take it."""
     s = snap.settings
     return rank(
-        [v for v in snap.accounts if v.number != snap.active and landable(v, s)],
+        [
+            v
+            for v in snap.accounts
+            if v.number != snap.active
+            and landable(v, s)
+            and not login_guarded(v, snap.now, s)
+        ],
         snap.now,
         s.tie_epsilon,
     )
@@ -80,6 +105,7 @@ def escape_candidates(snap: Snapshot) -> list[AccountView]:
             and v.tier != "excluded"
             and not v.quarantined
             and not v.api_key
+            and not login_lapsed(v, snap.now)
             and below_hard(v, s)
         ],
         snap.now,
@@ -145,6 +171,7 @@ def limit_candidates(snap: Snapshot) -> list[AccountView]:
         and v.tier != "excluded"
         and not v.quarantined
         and not v.api_key
+        and not login_lapsed(v, snap.now)
         and v.pct5 is not None
         and v.pct7 is not None
         and v.pct5 < LIMIT_PCT

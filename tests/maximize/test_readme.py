@@ -24,7 +24,7 @@ def _table_rows() -> dict[str, list[str]]:
 
 
 def test_every_fork_key_is_registered():
-    assert len(FORK_KEYS) == 18  # 13 maximize.* + 5 prime.*
+    assert len(FORK_KEYS) == 19  # 14 maximize.* + 5 prime.*
 
 
 @pytest.mark.parametrize("key", FORK_KEYS)
@@ -53,6 +53,9 @@ def test_readme_strategy_row_mentions_maximize():
     "CLAUDE_CODE_OAUTH_TOKEN",
     "Terms of service",
     "cc-swap auto --once --dry-run",
+    "### Logins expire",
+    "refreshTokenExpiresAt",
+    "maximize.loginExpiryGuardMin",
 ])
 def test_readme_covers_install_migration_priming_and_the_service(snippet):
     assert snippet in README.read_text(encoding="utf-8")
@@ -65,6 +68,18 @@ def test_readme_describes_the_service_takeover_as_a_retry_not_a_wait_for_termina
     assert "the service waits and takes over" not in text
     assert "retries every minute and takes over once that engine stops" in text
     assert "run `cc-swap service uninstall` first" in text
+
+
+@pytest.mark.parametrize("snippet", [
+    "## Fleet: the TUI home for maximize",
+    "`ctrl+f`",
+    "cc-swap launches nothing itself",
+    "it refuses a login that belongs to another slot",
+    "`pausedUntil`",
+    "CC_SWAP_FETCH_ON_OPEN=0",
+])
+def test_readme_documents_the_fleet_screen_and_relogin(snippet):
+    assert snippet in README.read_text(encoding="utf-8")
 
 
 def test_readme_warns_that_the_macos_error_log_is_not_rotated():

@@ -30,7 +30,11 @@ from claude_swap.autoswitch import (
     _recovery_is_useful,
     pct_label,
 )
-from claude_swap.json_output import USAGE_FOREIGN_CREDENTIAL, USAGE_TOKEN_EXPIRED
+from claude_swap.json_output import (
+    USAGE_FOREIGN_CREDENTIAL,
+    USAGE_KEYCHAIN_UNAVAILABLE,
+    USAGE_TOKEN_EXPIRED,
+)
 from claude_swap.usage_store import FetchRecord, UsageEntry
 from claude_swap.models import Platform
 from claude_swap.settings import AutoSwitchSettings
@@ -673,6 +677,243 @@ class TestIdleHold:
         switch = next(e for e in harness.events if isinstance(e, SwitchEvent))
         assert switch.trigger == "failover"
         assert harness.engine._idle_hold_since is None
+
+
+def tick_with_active_read(h: EngineHarness, usage: dict, verdict) -> TickOutcome:
+    """One tick whose collection pass read the live credential with
+    ``verdict`` (``credentials.ActiveCredentials``) — how the real
+    ``_build_accounts_info`` records an rc=36 Keychain read."""
+    entries = {num: _entry_for(value, h.clock.now) for num, value in usage.items()}
+
+    def collect(*_a, **_kw):
+        h.switcher._record_active_verdict(verdict)
+        return entries
+
+    with patch.object(h.switcher, "usage_entries_by_account", side_effect=collect):
+        return h.engine.tick()
+
+
+class TestActiveCredentialUnreadable:
+    """2026-10-03 incident: right after a /login the Keychain answered
+    rc=36 (errSecInteractionNotAllowed) for ~3 minutes; three "usage
+    unknown" ticks later the engine failed over and wrote another slot over
+    the fresh, never-backed-up login. An unreadable or degraded live read
+    must hold — no counting, no switch, no state write."""
+
+    # Keychain denied, nothing else readable (keychain_unavailable).
+    DENIED = ("", True, True)
+    # Keychain denied, a plaintext fallback served instead (degraded).
+    FALLBACK = (json.dumps({"claudeAiOauth": {"accessToken": "sk-stale",
+                                              "refreshToken": "rt-stale"}}),
+                False, True)
+    # The plaintext file itself could not be read.
+    FILE_ERROR = (None, False, False)
+
+    @pytest.mark.parametrize("raw", [DENIED, FALLBACK, FILE_ERROR],
+                             ids=["denied", "plaintext-fallback", "file-error"])
+    @pytest.mark.parametrize("active_usage", [USAGE_KEYCHAIN_UNAVAILABLE, None])
+    def test_unreadable_active_never_fails_over(self, harness, raw, active_usage):
+        from claude_swap.autoswitch import ConfigWarningEvent
+        from claude_swap.credentials import ActiveCredentials
+
+        verdict = ActiveCredentials(*raw)
+        usage = {"1": active_usage, "2": _usage(10), "3": _usage(20)}
+        state_path = harness.switcher.backup_dir / "autoswitch_state.json"
+        before = state_path.read_bytes() if state_path.exists() else None
+        for _ in range(6):  # twice unhealthy_ticks (3)
+            assert tick_with_active_read(harness, usage, verdict) is TickOutcome.NO_ACTION
+            harness.clock.advance(60)
+        assert harness.active_number() == 1
+        assert not any(isinstance(e, SwitchEvent) for e in harness.events)
+        assert harness.engine._unhealthy_ticks == 0
+        after = state_path.read_bytes() if state_path.exists() else None
+        assert after == before  # no state change
+        warnings = [e for e in harness.events if isinstance(e, ConfigWarningEvent)]
+        assert len(warnings) == 1 and "Keychain unreadable; holding" in warnings[0].message
+        reasons = {e.reason for e in harness.events if isinstance(e, NoSwitchEvent)}
+        assert reasons == {"active-credential-unreadable"}
+
+    def test_a_long_hold_warns_every_15_minutes_with_the_remedy(self, harness):
+        from claude_swap.autoswitch import ConfigWarningEvent
+        from claude_swap.credentials import ActiveCredentials
+
+        denied = ActiveCredentials("", True, True)
+        usage = {"1": None, "2": _usage(10), "3": _usage(20)}
+        for _ in range(40):  # 40 minutes, one tick a minute
+            tick_with_active_read(harness, usage, denied)
+            harness.clock.advance(60)
+        warnings = [e.message for e in harness.events if isinstance(e, ConfigWarningEvent)]
+        assert len(warnings) == 3  # the first one, then at 15 and 30 minutes
+        assert "unlock" in warnings[1] and "restart" in warnings[1]
+        assert not harness.engine._stop.is_set()  # not a service: keeps holding
+
+    def test_the_service_exits_non_zero_after_a_15_minute_hold(self, harness, monkeypatch):
+        from claude_swap.credentials import ActiveCredentials
+
+        monkeypatch.setenv("CC_SWAP_SERVICE", "1")
+        denied = ActiveCredentials("", True, True)
+        usage = {"1": None, "2": _usage(10), "3": _usage(20)}
+        for _ in range(14):
+            tick_with_active_read(harness, usage, denied)
+            harness.clock.advance(60)
+        assert not harness.engine._stop.is_set()
+        tick_with_active_read(harness, usage, denied)
+        harness.clock.advance(60)
+        tick_with_active_read(harness, usage, denied)
+        assert harness.engine._stop.is_set()
+        assert harness.engine.run_loop() != 0  # launchd/systemd restart it
+        assert harness.active_number() == 1
+
+    def test_switch_refusing_a_degraded_read_holds_without_state_change(self, harness):
+        from claude_swap.exceptions import CredentialReadError
+
+        state_path = harness.switcher.backup_dir / "autoswitch_state.json"
+        before = state_path.read_bytes() if state_path.exists() else None
+        refusal = CredentialReadError(
+            "Keychain unreadable right now — not switching; retry in a GUI terminal"
+        )
+        with patch.object(harness.switcher, "switch_to", side_effect=refusal):
+            outcome = harness.tick_with_usage(
+                {"1": _usage(100), "2": _usage(10), "3": _usage(20)}
+            )
+        assert outcome is TickOutcome.NO_ACTION
+        assert harness.active_number() == 1
+        assert not any(isinstance(e, SwitchEvent) for e in harness.events)
+        reasons = [e.reason for e in harness.events if isinstance(e, NoSwitchEvent)]
+        assert "active-credential-unreadable" in reasons
+        after = state_path.read_bytes() if state_path.exists() else None
+        assert after == before
+
+    def test_holds_even_at_limit_and_resumes_after_a_clean_read(self, harness):
+        from claude_swap.autoswitch import ConfigWarningEvent
+        from claude_swap.credentials import ActiveCredentials
+
+        degraded = ActiveCredentials(*self.FALLBACK)
+        at_limit = {"1": _usage(100), "2": _usage(10), "3": _usage(20)}
+        assert tick_with_active_read(harness, at_limit, degraded) is TickOutcome.NO_ACTION
+        assert harness.active_number() == 1
+        clean = ActiveCredentials(self.FALLBACK[0], False, False)
+        assert tick_with_active_read(harness, at_limit, clean) is TickOutcome.SWITCHED
+        # A later episode warns again.
+        assert tick_with_active_read(harness, at_limit, degraded) is TickOutcome.NO_ACTION
+        warnings = [e for e in harness.events if isinstance(e, ConfigWarningEvent)]
+        assert len(warnings) == 2
+
+
+class TestNewLoginOnDeadActiveSlot:
+    """A fresh /login on a dead active slot is adopted into the slot, never
+    overwritten by a failover (2026-10-03)."""
+
+    NEW_LIVE = {"accessToken": "sk-new-login", "refreshToken": "rt-new-login",
+                "expiresAt": 9_999_999_999_000}
+    PROFILE_1 = {"uuid": "uuid-1", "email": "a@example.com", "organizationUuid": None}
+
+    def _dead_slot_1_with_new_login(self, harness, *, account_uuid="uuid-1"):
+        # Slot 1's backup lineage is dead and quarantined …
+        harness.engine._quarantine("1", "a@example.com", "login_expired")
+        # … and the user just ran /login as the same account.
+        live = json.dumps({"claudeAiOauth": self.NEW_LIVE})
+        (harness.temp_home / ".claude" / ".credentials.json").write_text(live)
+        (harness.temp_home / ".claude.json").write_text(json.dumps({
+            "oauthAccount": {"emailAddress": "a@example.com", "accountUuid": account_uuid},
+        }))
+        return live
+
+    def _tick(self, harness, live, usage_1):
+        from claude_swap.credentials import ActiveCredentials
+
+        usage = {"1": usage_1, "2": _usage(10), "3": _usage(20)}
+        return tick_with_active_read(harness, usage, ActiveCredentials(live, False, False))
+
+    def test_matching_identity_is_adopted_and_never_failed_over(self, harness):
+        from claude_swap.autoswitch import LoginAdoptedEvent
+        from claude_swap.json_output import USAGE_LOGIN_EXPIRED
+
+        live = self._dead_slot_1_with_new_login(harness)
+        with patch("claude_swap.oauth.fetch_oauth_profile", return_value=self.PROFILE_1):
+            # The pass that still reads the dead lineage's verdict adopts …
+            assert self._tick(harness, live, USAGE_LOGIN_EXPIRED) is TickOutcome.NO_ACTION
+            # … and the next passes read the new login's usage.
+            for _ in range(4):
+                harness.clock.advance(60)
+                assert self._tick(harness, live, _usage(30)) is TickOutcome.NO_ACTION
+        assert harness.active_number() == 1
+        assert not any(isinstance(e, SwitchEvent) for e in harness.events)
+        stored = harness.switcher.read_account_credentials("1", "a@example.com")
+        assert oauth.credential_fingerprint(stored) == oauth.credential_fingerprint(live)
+        assert "1" not in harness.state().get("quarantine", {})
+        [adopted] = [e for e in harness.events if isinstance(e, LoginAdoptedEvent)]
+        assert adopted.number == "1"
+        assert adopted.human().startswith("adopted new login for #1")
+        assert "@" not in adopted.human() and "rt-new" not in adopted.human()
+
+    def test_mismatched_identity_holds_and_warns(self, harness):
+        from claude_swap.autoswitch import ConfigWarningEvent
+        from claude_swap.json_output import USAGE_LOGIN_EXPIRED
+
+        live = self._dead_slot_1_with_new_login(harness, account_uuid="uuid-someone-else")
+        before = harness.switcher.read_account_credentials("1", "a@example.com")
+        with patch("claude_swap.oauth.fetch_oauth_profile") as probe:
+            for _ in range(5):
+                assert self._tick(harness, live, USAGE_LOGIN_EXPIRED) is TickOutcome.NO_ACTION
+                harness.clock.advance(60)
+        probe.assert_not_called()
+        assert harness.active_number() == 1
+        assert not any(isinstance(e, SwitchEvent) for e in harness.events)
+        assert harness.switcher.read_account_credentials("1", "a@example.com") == before
+        warnings = [e.message for e in harness.events if isinstance(e, ConfigWarningEvent)]
+        assert len(warnings) == 1 and "unmanaged login, run cc-swap add" in warnings[0]
+
+    def test_token_of_another_account_holds_and_warns(self, harness):
+        from claude_swap.autoswitch import ConfigWarningEvent
+        from claude_swap.json_output import USAGE_LOGIN_EXPIRED
+
+        live = self._dead_slot_1_with_new_login(harness)
+        other = {"uuid": "uuid-2", "email": "b@example.com", "organizationUuid": None}
+        with patch("claude_swap.oauth.fetch_oauth_profile", return_value=other):
+            assert self._tick(harness, live, USAGE_LOGIN_EXPIRED) is TickOutcome.NO_ACTION
+        assert not any(isinstance(e, SwitchEvent) for e in harness.events)
+        assert any("unmanaged login, run cc-swap add" in e.message
+                   for e in harness.events if isinstance(e, ConfigWarningEvent))
+
+    def test_unverifiable_new_login_holds_without_writing(self, harness):
+        from claude_swap.json_output import USAGE_LOGIN_EXPIRED
+
+        live = self._dead_slot_1_with_new_login(harness)
+        before = harness.switcher.read_account_credentials("1", "a@example.com")
+        with patch("claude_swap.oauth.fetch_oauth_profile", return_value=None):
+            for _ in range(4):
+                assert self._tick(harness, live, USAGE_LOGIN_EXPIRED) is TickOutcome.NO_ACTION
+        assert not any(isinstance(e, SwitchEvent) for e in harness.events)
+        assert harness.switcher.read_account_credentials("1", "a@example.com") == before
+        reasons = {e.reason for e in harness.events if isinstance(e, NoSwitchEvent)}
+        assert "new-login-not-backed-up" in reasons
+        assert harness.engine._unhealthy_ticks == 0
+
+    def test_dead_slot_without_a_new_login_still_fails_over(self, harness):
+        from claude_swap.credentials import ActiveCredentials
+
+        harness.engine._quarantine("1", "a@example.com", "invalid_grant")
+        old = harness.switcher.read_account_credentials("1", "a@example.com")
+        (harness.temp_home / ".claude" / ".credentials.json").write_text(old)
+        usage = {"1": None, "2": _usage(10), "3": _usage(20)}
+        outcomes = [
+            tick_with_active_read(harness, usage, ActiveCredentials(old, False, False))
+            for _ in range(3)
+        ]
+        assert outcomes[-1] is TickOutcome.SWITCHED
+
+    def test_unmanaged_live_login_warns_once(self, harness):
+        from claude_swap.autoswitch import ConfigWarningEvent
+
+        (harness.temp_home / ".claude.json").write_text(json.dumps({
+            "oauthAccount": {"emailAddress": "stranger@example.com", "accountUuid": "u-x"},
+        }))
+        for _ in range(3):
+            assert harness.tick_with_usage({"2": _usage(10)}) is TickOutcome.NO_ACTION
+        warnings = [e.message for e in harness.events if isinstance(e, ConfigWarningEvent)]
+        assert warnings == ["unmanaged login, run cc-swap add (the live login is not a managed account; holding)"]
+        assert "stranger" not in warnings[0]
 
 
 class TestAdaptiveScheduler:
@@ -1819,6 +2060,28 @@ class TestFreshening:
         assert (q.number, q.reason) == ("2", "invalid_grant")
         assert "2" in h.state()["quarantine"]
 
+    def test_invalid_grant_past_the_login_deadline_quarantines_as_login_expired(
+        self, temp_home
+    ):
+        h = EngineHarness(temp_home)
+        h.seed(1, "a@example.com")
+        h.seed(3, "c@example.com")
+        lapsed = {"accessToken": "sk-2", "refreshToken": "rt-2", "expiresAt": 1,
+                  "refreshTokenExpiresAt": 1000}
+        h.seed(2, "b@example.com", expires_at=1)
+        h.switcher._write_account_credentials(
+            "2", "b@example.com", json.dumps({"claudeAiOauth": lapsed})
+        )
+        h.make_live("a@example.com", 1)
+        with patch(
+            "claude_swap.autoswitch.oauth.try_refresh_oauth_credentials",
+            return_value=oauth.RefreshOutcome(None, "invalid_grant"),
+        ):
+            h.tick_with_usage({"1": _usage(95), "2": _usage(10), "3": _usage(20)})
+        q = next(e for e in h.events if isinstance(e, QuarantineEvent))
+        assert (q.number, q.reason) == ("2", "login_expired")
+        assert h.state()["quarantine"]["2"]["reason"] == "login_expired"
+
     def test_transient_failure_skips_without_quarantine(self, temp_home):
         h = EngineHarness(temp_home)
         h.seed(1, "a@example.com")
@@ -2780,6 +3043,39 @@ def _usage7(pct5: float, pct7: float, reset7: str | None = None) -> dict:
     if reset7:
         seven["resets_at"] = reset7
     return {"five_hour": {"pct": pct5}, "seven_day": seven}
+
+
+def test_consume_first_phase2_degraded_read_holds(temp_home):
+    """consume-first re-reads the live credential in its phase-2 refetch; a
+    degraded read there must stop the switch right before `switch_to`."""
+    from claude_swap.credentials import ActiveCredentials
+
+    h = EngineHarness(temp_home, strategy="consume-first")
+    for n, e in ((1, "a@example.com"), (2, "b@example.com"), (3, "c@example.com")):
+        h.seed(n, e)
+    h.make_live("a@example.com", 1)
+    usage = {"1": _usage7(20, 20, _R_LATER), "2": _usage7(10, 10, _R_SOON),
+             "3": _usage7(10, 10, _R_LATEST)}
+    entries = {k: _entry_for(v, h.clock.now) for k, v in usage.items()}
+    live = (temp_home / ".claude" / ".credentials.json").read_text()
+    calls = []
+
+    def collect(*_a, fetch=None, **_kw):
+        calls.append(fetch)
+        # Clean for the collection the tick-level hold inspects; the phase-2
+        # refetch (fetch covers current + candidates) reads degraded.
+        degraded = fetch is not None and fetch >= {"1", "2", "3"} and len(calls) > 2
+        h.switcher._record_active_verdict(ActiveCredentials(live, False, degraded))
+        return entries
+
+    with patch.object(h.switcher, "usage_entries_by_account", side_effect=collect), \
+         patch.object(h.switcher, "switch_to") as switch_to:
+        out = h.engine.tick()
+    assert h.switcher._active_verdict().degraded  # premise: phase 2 read degraded
+    assert out is TickOutcome.NO_ACTION
+    switch_to.assert_not_called()
+    reasons = [e.reason for e in h.events if isinstance(e, NoSwitchEvent)]
+    assert reasons[-1] == "active-credential-unreadable"
 
 
 class TestConsumeFirstStrategy:

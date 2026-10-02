@@ -11,7 +11,14 @@ from claude_swap.maximize.plan import (
     plan_weight,
     rate_limit_tier_from_credentials,
 )
-from claude_swap.maximize.tiers import parse_account_list, tier_for
+from claude_swap.exceptions import ConfigError
+from claude_swap.maximize.tiers import (
+    last_resort_entry,
+    last_resort_matches,
+    parse_account_list,
+    tier_for,
+    toggle_last_resort,
+)
 
 
 class TestTiers:
@@ -70,3 +77,38 @@ class TestPlanWeight:
         assert rate_limit_tier_from_credentials(
             json.dumps({"claudeAiOauth": {"rateLimitTier": None}})
         ) is None
+
+
+# -- last-resort entries (moved from cli.py for the TUI's `l` key) ---------------
+
+ACCOUNTS = {
+    "1": {"email": "a@x.com"},
+    "2": {"email": "team@x.com", "alias": "work"},
+    "3": {"email": "Team@x.com"},
+    "4": {"email": "d@x.com", "alias": "dee"},
+}
+
+
+def test_toggle_last_resort_adds_email_or_alias_and_removes_all_matches():
+    # Unique email: the email is the entry, appended after what is there.
+    assert toggle_last_resort(ACCOUNTS, None, "1") == "a@x.com"
+    assert toggle_last_resort(ACCOUNTS, "dee", "1") == "dee,a@x.com"
+    # Shared email: the alias names exactly this account.
+    assert toggle_last_resort(ACCOUNTS, "", "2") == "work"
+    # Already marked (by email or alias, any case): every matching entry goes.
+    assert toggle_last_resort(ACCOUNTS, "A@X.com,dee,a@x.com", "1") == "dee"
+    assert toggle_last_resort(ACCOUNTS, "D@x.com, Dee", "4") == ""
+    assert last_resort_matches(ACCOUNTS, "team@x.com") == ["2", "3"]
+    assert last_resort_entry(ACCOUNTS, "4", "d@x.com") == "d@x.com"
+
+
+def test_toggle_last_resort_shared_email_without_alias_raises():
+    with pytest.raises(ConfigError, match="give Account-3 an alias first"):
+        toggle_last_resort(ACCOUNTS, None, "3")
+
+
+def test_cli_keeps_the_private_names():
+    from claude_swap import cli
+
+    assert cli._last_resort_entry is last_resort_entry
+    assert cli._last_resort_matches is last_resort_matches

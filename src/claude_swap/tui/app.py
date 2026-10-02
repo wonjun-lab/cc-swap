@@ -18,6 +18,7 @@ from textual.reactive import reactive
 from textual.worker import WorkerState
 
 from claude_swap import printer
+from claude_swap.exceptions import KEYCHAIN_REFUSAL
 from claude_swap.maximize.lease import EngineLease, LeaseKeeper
 from claude_swap.maximize.view import window_ticks
 from claude_swap.models import AccountsSnapshot
@@ -32,6 +33,7 @@ from claude_swap.switcher import ClaudeAccountSwitcher
 from claude_swap.tui.autoview import AutoScreen
 from claude_swap.tui.dashboard import DashboardScreen, WatchScreen
 from claude_swap.tui.data import ActionResult, SnapshotSource, format_duration, run_action
+from claude_swap.tui.fleet import EngineHost, FleetScreen, fork_home, open_fleet
 from claude_swap.tui.modals import AddTokenModal, ConfirmModal, OutputModal, TokenForm
 from claude_swap.tui.theme import CSWAP_DARK, CSWAP_LIGHT
 
@@ -44,7 +46,10 @@ class CswapApp(App):
     # No command palette: actions live in the dashboard's nested menu, in
     # their own context — not in a global searchable list.
     ENABLE_COMMAND_PALETTE = False
-    BINDINGS = [Binding("ctrl+t", "toggle_theme", "Theme")]
+    BINDINGS = [
+        Binding("ctrl+t", "toggle_theme", "Theme"),
+        Binding("ctrl+f", "open_fleet", "Fleet", show=False),  # cc-swap fork
+    ]
 
     POLL_INTERVAL_S = 3.0  # matches the old watch view's recapture cadence
     # Snapshot age stays hidden while polling is healthy (age never exceeds
@@ -81,6 +86,7 @@ class CswapApp(App):
         # reopened auto screen re-claims the lease its predecessor's engine
         # thread may still hold while it finishes a tick.
         self.engine_keeper = LeaseKeeper(EngineLease(switcher.backup_dir))
+        self.engine_host = EngineHost(self)  # cc-swap: Fleet's one in-process engine
         # The auto-switch threshold, drawn as a tick on the status strip's
         # bars everywhere. Missing/invalid settings fall back to the default.
         try:
@@ -113,6 +119,11 @@ class CswapApp(App):
         self.theme = f"cswap-{resolved}"
         printer.set_theme(resolved)
         self.push_screen(DashboardScreen())
+        if self._start == "dashboard" and fork_home(self.switcher.backup_dir):
+            # cc-swap fork: maximize opens on Fleet, stacked over the
+            # dashboard (c pops back to it, ctrl+f returns).
+            self.install_screen(FleetScreen(), "fleet")
+            self.push_screen("fleet")
         if self._start == "watch":
             # Stacked over the dashboard so Esc lands there, not on exit.
             self.push_screen(WatchScreen())
@@ -286,6 +297,13 @@ class CswapApp(App):
         self.busy = False
         self.request_refresh()
         if not result.ok:
+            if KEYCHAIN_REFUSAL in result.output:
+                # A transient condition, not a failure to read about: a toast.
+                self.notify(
+                    result.first_line.removeprefix("Error: ") or result.output.strip(),
+                    title=label, severity="error", timeout=10,
+                )
+                return
             self.push_screen(OutputModal(f"{label} — failed", result.output))
             return
         payload = result.payload or {}
@@ -425,6 +443,10 @@ class CswapApp(App):
         if isinstance(self.screen, WatchScreen):
             return
         self.push_screen(WatchScreen())
+
+    def action_open_fleet(self) -> None:
+        """cc-swap fork: back to the Fleet home from any screen."""
+        open_fleet(self)
 
     # -- theme --------------------------------------------------------------
 

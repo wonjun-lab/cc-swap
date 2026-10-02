@@ -33,6 +33,7 @@ import enum
 import json
 import logging
 import math
+import os
 import random
 import threading
 import time
@@ -43,8 +44,13 @@ from pathlib import Path
 from typing import ClassVar
 
 from claude_swap import oauth, poll_policy
-from claude_swap.exceptions import ClaudeSwitchError
-from claude_swap.json_output import SCHEMA_VERSION, USAGE_TOKEN_EXPIRED
+from claude_swap.exceptions import ClaudeSwitchError, CredentialReadError
+from claude_swap.json_output import (
+    SCHEMA_VERSION,
+    USAGE_LOGIN_EXPIRED,
+    USAGE_RELOGIN_REQUIRED,
+    USAGE_TOKEN_EXPIRED,
+)
 from claude_swap.locking import FileLock
 from claude_swap.poll_policy import (
     ESCALATION_MARGIN_PCT,
@@ -53,7 +59,23 @@ from claude_swap.poll_policy import (
 )
 from claude_swap.settings import AutoSwitchSettings, atomic_write_json, parse_model_names
 from claude_swap.switcher import ClaudeAccountSwitcher
-from claude_swap.usage_store import due_candidate, plan_oversleeps_interval
+from claude_swap.usage_store import (
+    PERMANENT_AUTH_ERRORS,
+    due_candidate,
+    plan_oversleeps_interval,
+)
+
+# A hold on an unreadable live credential nags (and the service restarts)
+# after this long.
+READ_HOLD_NAG_S = 15 * 60.0
+# Set by `cc-swap service install` in the service's environment.
+SERVICE_ENV = "CC_SWAP_SERVICE"
+# EX_TEMPFAIL: launchd's KeepAlive/SuccessfulExit=false and systemd's
+# Restart=on-failure both restart on it.
+READ_HOLD_EXIT_CODE = 75
+
+# Usage sentinels that say the active slot's stored lineage is dead.
+_DEAD_SENTINELS = (USAGE_RELOGIN_REQUIRED, USAGE_LOGIN_EXPIRED)
 
 STATE_FILENAME = "autoswitch_state.json"
 STATE_SCHEMA_VERSION = 1
@@ -436,6 +458,23 @@ class UnquarantineEvent(AutoSwitchEvent):
 
 
 @dataclass(frozen=True)
+class LoginAdoptedEvent(AutoSwitchEvent):
+    """A new live login on the active slot (whose stored lineage was dead)
+    was backed up into the slot. Slot number only — no email."""
+
+    kind: ClassVar[str] = "login-adopted"
+    number: str
+    lifted: bool = False  # a quarantine on the slot was lifted with it
+
+    def _fields(self) -> dict:
+        return {"number": self.number, "lifted": self.lifted}
+
+    def human(self) -> str:
+        tail = "; back in rotation" if self.lifted else ""
+        return f"adopted new login for #{self.number}{tail}"
+
+
+@dataclass(frozen=True)
 class AllExhaustedEvent(AutoSwitchEvent):
     kind: ClassVar[str] = "all-exhausted"
     earliest_reset_at: str | None
@@ -765,6 +804,16 @@ class AutoSwitchEngine:
         # ``_idle_hold_slow`` is per-tick like ``_blocked_wait_long``.
         self._idle_hold_since: float | None = None
         self._idle_hold_slow = False
+        # One warning per episode of an unreadable live credential (the
+        # tick holds while it lasts; see `_active_read_unhealthy`).
+        self._read_hold_warned = False
+        self._read_hold_since: float | None = None
+        self._read_hold_last_warn = 0.0
+        # Set when the loop should end with a failure code (a service exit
+        # that asks launchd/systemd for a restart).
+        self._exit_code: int | None = None
+        # One "unmanaged login" warning per episode.
+        self._unmanaged_warned = False
         # One-shot typo guard for ``autoswitch.model``: resolved (and possibly
         # warned) on the first tick where every relevant account has readable
         # usage — adaptive polling legitimately leaves gaps before that.
@@ -801,6 +850,10 @@ class AutoSwitchEngine:
     def _quarantine(self, number: str, email: str, reason: str) -> None:
         creds = self.switcher.read_account_credentials(number, email)
         fingerprint = _refresh_fingerprint(creds) if creds else None
+        if reason == "invalid_grant" and creds:
+            # Refused after the login's recorded deadline: the login lapsed on
+            # schedule (``oauth.permanent_refresh_kind``), not a stolen token.
+            reason = oauth.permanent_refresh_kind(reason, creds) or reason
 
         def add(state: dict) -> None:
             state.setdefault("quarantine", {})[number] = {
@@ -1017,6 +1070,7 @@ class AutoSwitchEngine:
             if self.switcher.has_live_login():
                 # Live login exists but cswap doesn't manage it: never act —
                 # a switch would overwrite it without a backup.
+                self._warn_unmanaged_login("the live login is not a managed account")
                 self._emit(
                     NoSwitchEvent(
                         reason="unmanaged-active-account",
@@ -1060,6 +1114,39 @@ class AutoSwitchEngine:
                 },
             )
         )
+
+        if self._active_read_unhealthy():
+            # The live credential could not be read cleanly this pass
+            # (Keychain rc 36/51/…, a plaintext-only fallback, or an
+            # unreadable file). Whatever usage says, a switch now would
+            # overwrite a login cswap cannot see — possibly a fresh /login
+            # that was never backed up (2026-10-03). Hold, count nothing,
+            # write nothing, until a read succeeds.
+            now = self.clock()
+            if not self._read_hold_warned:
+                self._read_hold_warned = True
+                self._read_hold_since = now
+                self._read_hold_last_warn = now
+                self._emit(ConfigWarningEvent(
+                    message=(
+                        f"Keychain unreadable; holding — Account-{current}'s "
+                        "live credential could not be read cleanly, so no "
+                        "switch until a read succeeds"
+                    )
+                ))
+            else:
+                self._long_read_hold(now)
+            self._emit(NoSwitchEvent(
+                reason="active-credential-unreadable",
+                detail="live credential read failed or degraded; holding",
+            ))
+            return TickOutcome.NO_ACTION
+        self._read_hold_warned = False
+        self._read_hold_since = None
+
+        held = self._back_up_new_active_login(current, entries, quarantined)
+        if held is not None:
+            return held
 
         if not self._model_check_done:
             self._check_model_names(quarantined, usage)
@@ -2238,8 +2325,36 @@ class AutoSwitchEngine:
             if trigger in ("proactive", "consume-first") and self._in_cooldown(state):
                 self._emit(NoSwitchEvent(reason="cooldown"))
                 return TickOutcome.NO_ACTION
+            # A re-login pause (Fleet TUI) that landed after this tick read
+            # the state: the live login is being repaired, do not switch it.
+            from claude_swap.maximize.pause import active_pause
 
-            result = self.switcher.switch_to(number, json_output=True)
+            paused = active_pause(state, self.clock())
+            if paused is not None:
+                self._emit(NoSwitchEvent(
+                    reason="maximize-paused",
+                    detail=f"switching paused ({paused[1]}) — re-checked before the switch",
+                ))
+                return TickOutcome.NO_ACTION
+
+            if self._active_read_unhealthy():
+                # A read since the tick-level hold (consume-first's phase-2
+                # refetch) found the live credential degraded: re-checked
+                # here, right before the switch would overwrite it.
+                self._emit(NoSwitchEvent(
+                    reason="active-credential-unreadable",
+                    detail="live credential read degraded before the switch; holding",
+                ))
+                return TickOutcome.NO_ACTION
+            try:
+                result = self.switcher.switch_to(number, json_output=True)
+            except CredentialReadError as exc:
+                # The switch refused a degraded/unreadable live read: hold,
+                # write nothing (the state lock is released unchanged).
+                self._emit(NoSwitchEvent(
+                    reason="active-credential-unreadable", detail=str(exc),
+                ))
+                return TickOutcome.NO_ACTION
             if not result or not result.get("switched"):
                 self._emit(
                     NoSwitchEvent(
@@ -2283,6 +2398,106 @@ class AutoSwitchEngine:
         return TickOutcome.SWITCHED
 
     # -- helpers --------------------------------------------------------------
+
+    def _long_read_hold(self, now: float) -> None:
+        """A hold on an unreadable live credential that outlasts
+        :data:`READ_HOLD_NAG_S` says what to do, every READ_HOLD_NAG_S; the
+        service (``CC_SWAP_SERVICE=1``) exits non-zero so launchd/systemd
+        restart it with fresh Keychain state."""
+        since = self._read_hold_since if self._read_hold_since is not None else now
+        if now - since < READ_HOLD_NAG_S or now - self._read_hold_last_warn < READ_HOLD_NAG_S:
+            return
+        self._read_hold_last_warn = now
+        minutes = int((now - since) // 60)
+        service = os.environ.get(SERVICE_ENV) == "1"
+        self._emit(ConfigWarningEvent(
+            message=(
+                f"Keychain unreadable for {minutes} min; still holding. Unlock "
+                "the login keychain (Keychain Access, or `security "
+                "unlock-keychain` in a GUI terminal), or restart cc-swap"
+                + (" — the service now exits so launchd/systemd restarts it"
+                   if service else " (quit and run it again)")
+            )
+        ))
+        if service:
+            self._exit_code = READ_HOLD_EXIT_CODE
+            self.stop()
+
+    def _warn_unmanaged_login(self, why: str) -> None:
+        if not self._unmanaged_warned:
+            self._unmanaged_warned = True
+            self._emit(ConfigWarningEvent(
+                message=f"unmanaged login, run cc-swap add ({why}; holding)"
+            ))
+
+    def _back_up_new_active_login(
+        self, current: str, entries: dict, quarantined: set[str]
+    ) -> TickOutcome | None:
+        """A dead active slot (quarantined, struck, or reported dead) whose
+        live login is NEW is backed up before anything else may happen —
+        a failover would otherwise overwrite the only copy of a fresh
+        ``/login`` (2026-10-03). ``None`` = carry on with the tick."""
+        entry = entries.get(current)
+        dead = current in quarantined or (
+            entry is not None
+            and (
+                entry.sentinel in _DEAD_SENTINELS
+                or entry.last_error in PERMANENT_AUTH_ERRORS
+            )
+        )
+        adopt = getattr(self.switcher, "adopt_new_active_login", None)
+        if not dead or adopt is None:
+            self._unmanaged_warned = False
+            return None
+        if self.dry_run:
+            return None  # dry runs never write, and never switch either
+        kind = adopt(current)
+        if kind in ("same", "not-needed"):
+            self._unmanaged_warned = False
+            return None  # no new login: the dead slot is what it was
+        if kind == "adopted":
+            self._unmanaged_warned = False
+            lifted = current in quarantined
+            if lifted:
+                def lift(state: dict) -> None:
+                    q = state.get("quarantine")
+                    if isinstance(q, dict):
+                        q.pop(current, None)
+
+                self._mutate_state(lift)
+            self._emit(LoginAdoptedEvent(number=current, lifted=lifted))
+            # This pass's usage still describes the dead lineage: decide on
+            # the next pass's fresh reading, not on it.
+            return TickOutcome.NO_ACTION
+        if kind == "mismatch":
+            self._warn_unmanaged_login(
+                f"the live login does not match Account-{current}"
+            )
+            self._emit(NoSwitchEvent(
+                reason="unmanaged-active-account",
+                detail="run 'cc-swap add' to include the live login",
+            ))
+            return TickOutcome.NO_ACTION
+        self._emit(NoSwitchEvent(
+            reason="new-login-not-backed-up",
+            detail=f"Account-{current}'s new login is not backed up yet ({kind}); holding",
+        ))
+        return TickOutcome.NO_ACTION
+
+    def _active_read_unhealthy(self) -> bool:
+        """Whether this pass's read of the live credential failed or was
+        degraded (``credentials.ActiveCredentials``: Keychain unreadable,
+        served from the plaintext fallback, or the file unreadable)."""
+        verdict_of = getattr(self.switcher, "_active_verdict", None)
+        if verdict_of is None:
+            return False
+        try:
+            verdict = verdict_of()
+        except Exception:
+            return False
+        return bool(
+            verdict.value is None or verdict.keychain_unavailable or verdict.degraded
+        )
 
     def _in_cooldown(self, state: dict) -> bool:
         last = state.get("lastSwitchAt")
@@ -2453,7 +2668,7 @@ class AutoSwitchEngine:
             # already sees whatever settings that wake announced.
             self._wake.clear()
             if self._stop.is_set():
-                return 0
+                return self._exit_code or 0
             try:
                 outcome = self.tick()
             except Exception as e:  # pragma: no cover - tick() already guards

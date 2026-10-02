@@ -19,6 +19,11 @@ class CredentialReadError(CredentialError):
     pass
 
 
+# How a switch refusing a degraded live read starts its message; surfaces
+# (the TUI) key on it to show a toast instead of a failure report.
+KEYCHAIN_REFUSAL = "Keychain unreadable right now — not switching"
+
+
 class CredentialWriteError(CredentialError):
     """Failed to write credentials."""
 

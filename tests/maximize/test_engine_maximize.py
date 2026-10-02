@@ -21,7 +21,9 @@ from claude_swap.autoswitch import (
     SwitchEvent,
     TickOutcome,
 )
+from claude_swap.maximize import pause
 from claude_swap.maximize.engine_hook import (
+    DECISION_KEY,
     SAMPLES_KEY,
     _primer_class,
     apply_maximize_settings,
@@ -520,6 +522,214 @@ class TestPrimerHook:
         name = "claude_swap.maximize.primer"
         monkeypatch.setitem(sys.modules, name, types.ModuleType(name))
         assert _primer_class() is None
+
+
+class TestPublishDecision:
+    """The engine writes its decision to the state file for TUI viewers."""
+
+    def test_live_tick_publishes_decision_slot_numbers_only(self, temp_home):
+        h = make(temp_home)
+        h.switcher._write_account_credentials("3", EMAILS[3], json.dumps({
+            "claudeAiOauth": {"accessToken": "sk-3", "refreshToken": "rt-3",
+                              "rateLimitTier": "default_claude_max_20x"},
+        }))
+        h.tick_with_usage({"1": win(62, 40), "2": win(0, 10), "3": win(0, 50)})
+        record = h.state()[DECISION_KEY]
+        assert record == {
+            "at": h.clock.now, "pid": os.getpid(), "active": "1",
+            "decision": "hold", "trigger": None, "target": "2",
+            "reason": record["reason"], "pending": True,
+            "plans": {"1": None, "2": None, "3": "20x"},
+        }
+        assert record["reason"].startswith("#1 5h 62% >= soft 50")
+        text = json.dumps(h.state()[DECISION_KEY])
+        assert "@" not in text and "sk-" not in text
+
+    def test_switch_is_published_with_its_trigger_and_target(self, temp_home):
+        h = make(temp_home)
+        assert h.tick_with_usage(
+            {"1": win(96, 40), "2": win(0, 10), "3": win(0, 50)}
+        ) is TickOutcome.SWITCHED
+        record = h.state()[DECISION_KEY]
+        assert (record["decision"], record["trigger"], record["target"]) == ("switch", "hard", "2")
+
+    def test_dry_run_tick_does_not_publish(self, temp_home):
+        h = make(temp_home)
+        h.engine = h._make_engine(dry_run=True)
+        h.tick_with_usage({"1": win(62, 40), "2": win(0, 10), "3": win(0, 50)})
+        assert DECISION_KEY not in h.state()
+
+    def test_publish_skips_unchanged_decision_within_300s(self, temp_home):
+        h = make(temp_home)
+        usage = {"1": win(10, 10), "2": win(0, 10), "3": win(0, 10)}
+        h.tick_with_usage(usage)
+        first = h.state()[DECISION_KEY]["at"]
+        h.clock.advance(200)
+        h.tick_with_usage(usage)
+        assert h.state()[DECISION_KEY]["at"] == first
+        h.clock.advance(150)
+        h.tick_with_usage(usage)
+        assert h.state()[DECISION_KEY]["at"] == h.clock.now
+        h.clock.advance(10)
+        h.tick_with_usage({**usage, "1": win(62, 10)})  # a new decision: written at once
+        assert h.state()[DECISION_KEY]["at"] == h.clock.now
+
+
+class TestPause:
+    """A re-login in the TUI pauses the engine (pausedUntil in the state file)."""
+
+    def test_paused_tick_neither_switches_nor_primes(self, temp_home):
+        h = make(temp_home)
+        rt = runtime_for(h.engine)
+        primer = FakePrimer()
+        rt.primer, rt.prime_settings = primer, PrimeSettings(enabled=True)
+        pause.pause(h.switcher.backup_dir, "relogin", now=h.clock.now)
+        usage = {"1": win(100, 40), "2": win(0, 10), "3": win(0, 50)}
+        assert h.tick_with_usage(usage) is TickOutcome.NO_ACTION
+        assert h.active_number() == 1 and primer.calls == []
+        assert no_switch_reasons(h) == ["maximize-paused"]
+        assert "relogin" in of(h, NoSwitchEvent)[0].detail
+        assert not of(h, MaximizeDecisionEvent)
+        # It expires on its own after 10 minutes.
+        h.clock.advance(pause.MAX_PAUSE_S + 1)
+        assert h.tick_with_usage(usage) is TickOutcome.SWITCHED
+        assert primer.calls == ["2"]
+
+    def test_pause_landing_mid_tick_blocks_the_switch_under_the_lock(self, temp_home):
+        # The tick read the state before the pause was written: the locked
+        # re-check right before the switch still sees it.
+        from claude_swap.maximize import engine_hook
+
+        h = make(temp_home)
+        root = h.switcher.backup_dir
+        real = engine_hook.policy.decide
+
+        def decide_then_pause(snap):
+            decision = real(snap)
+            pause.pause(root, "relogin", now=h.clock.now)
+            return decision
+
+        usage = {"1": win(100, 40), "2": win(0, 10), "3": win(0, 50)}
+        with patch.object(engine_hook.policy, "decide", side_effect=decide_then_pause):
+            assert h.tick_with_usage(usage) is TickOutcome.NO_ACTION
+        assert h.active_number() == 1
+        assert not of(h, SwitchEvent)
+        assert "maximize-paused" in no_switch_reasons(h)
+        assert "lastSwitchAt" not in h.state()
+
+    def test_resume_lifts_the_pause_at_once(self, temp_home):
+        h = make(temp_home)
+        root = h.switcher.backup_dir
+        pause.pause(root, "relogin", now=h.clock.now)
+        pause.resume(root)
+        assert "pausedUntil" not in h.state()
+        usage = {"1": win(100, 40), "2": win(0, 10), "3": win(0, 50)}
+        assert h.tick_with_usage(usage) is TickOutcome.SWITCHED
+
+
+def set_login_deadline(h: EngineHarness, num: int, seconds_left: float) -> None:
+    """Rewrite slot ``num``'s backup with a login deadline ``seconds_left`` away."""
+    blob = {"accessToken": f"sk-{num}", "refreshToken": f"rt-{num}",
+            "refreshTokenExpiresAt": int((h.clock.now + seconds_left) * 1000)}
+    h.switcher._write_account_credentials(
+        str(num), EMAILS[num], json.dumps({"claudeAiOauth": blob})
+    )
+
+
+def login_warnings(h: EngineHarness) -> list[str]:
+    return [e.message for e in of(h, ConfigWarningEvent) if " login expire" in e.message]
+
+
+class TestLoginExpiryWarning:
+    def test_one_engine_log_line_per_account_per_day_inside_the_last_week(self, temp_home):
+        h = make(temp_home)
+        set_login_deadline(h, 2, 2 * 86400)
+        set_login_deadline(h, 3, 20 * 86400)       # outside the week: silent
+        usage = {"1": win(10, 30), "2": win(0, 10), "3": win(0, 50)}
+        h.tick_with_usage(usage)
+        [line] = login_warnings(h)
+        assert line.startswith("Account-2 login expires ") and " in 2d 0h" in line
+        assert "cc-swap add" in line
+        assert "@" not in line and "rt-2" not in line and "sk-2" not in line
+        h.clock.advance(3600)
+        h.tick_with_usage(usage)
+        assert len(login_warnings(h)) == 1          # once a day
+        h.clock.advance(86400)
+        h.tick_with_usage(usage)
+        assert len(login_warnings(h)) == 2
+
+    def test_the_active_slot_is_read_from_the_live_login(self, temp_home):
+        h = make(temp_home)
+        live = {"accessToken": "sk-live", "refreshToken": "rt-live",
+                "refreshTokenExpiresAt": int((h.clock.now - 60) * 1000)}
+        (h.temp_home / ".claude" / ".credentials.json").write_text(
+            json.dumps({"claudeAiOauth": live})
+        )
+        h.tick_with_usage({"1": win(10, 30), "2": win(0, 10), "3": win(0, 50)})
+        [line] = login_warnings(h)
+        assert line.startswith("Account-1 login expired ")
+
+
+class TestActiveCredentialUnreadableMaximize:
+    def test_rc36_on_the_active_read_holds_maximize_without_writes(self, temp_home):
+        from claude_swap.credentials import ActiveCredentials
+        from tests.test_autoswitch import tick_with_active_read
+
+        h = make(temp_home)
+        denied = ActiveCredentials("", True, True)
+        state_path = h.switcher.backup_dir / "autoswitch_state.json"
+        before = state_path.read_bytes() if state_path.exists() else None
+        for usage in (
+            {"1": None, "2": win(0, 10), "3": win(0, 50)},          # usage unknown
+            {"1": win(100, 40), "2": win(0, 10), "3": win(0, 50)},  # even at limit
+        ):
+            for _ in range(5):
+                assert tick_with_active_read(h, usage, denied) is TickOutcome.NO_ACTION
+                h.clock.advance(60)
+        assert h.active_number() == 1 and not of(h, SwitchEvent)
+        assert not of(h, MaximizeDecisionEvent)
+        assert h.engine._unhealthy_ticks == 0
+        assert (state_path.read_bytes() if state_path.exists() else None) == before
+        assert [m for m in (e.message for e in of(h, ConfigWarningEvent))
+                if "Keychain unreadable" in m] != []
+
+
+def test_maximize_adopts_a_new_login_on_a_dead_active_slot(temp_home):
+    from claude_swap import oauth
+    from claude_swap.autoswitch import LoginAdoptedEvent
+    from claude_swap.credentials import ActiveCredentials
+    from claude_swap.json_output import USAGE_LOGIN_EXPIRED
+    from tests.test_autoswitch import tick_with_active_read
+
+    h = make(temp_home)
+    h.engine._quarantine("1", EMAILS[1], "login_expired")
+    live = json.dumps({"claudeAiOauth": {
+        "accessToken": "sk-fresh", "refreshToken": "rt-fresh", "expiresAt": 9_999_999_999_000,
+    }})
+    (h.temp_home / ".claude" / ".credentials.json").write_text(live)
+    profile = {"uuid": "uuid-1", "email": EMAILS[1], "organizationUuid": None}
+    usage = {"1": USAGE_LOGIN_EXPIRED, "2": win(0, 10), "3": win(0, 50)}
+    with patch("claude_swap.oauth.fetch_oauth_profile", return_value=profile):
+        out = tick_with_active_read(h, usage, ActiveCredentials(live, False, False))
+    assert out is TickOutcome.NO_ACTION and h.active_number() == 1
+    assert of(h, LoginAdoptedEvent) and not of(h, SwitchEvent)
+    stored = h.switcher.read_account_credentials("1", EMAILS[1])
+    assert oauth.credential_fingerprint(stored) == oauth.credential_fingerprint(live)
+
+
+class TestLoginExpiryGuardEngine:
+    def test_soft_switch_lands_past_an_account_whose_login_is_about_to_expire(
+        self, temp_home
+    ):
+        h = make(temp_home)
+        set_login_deadline(h, 2, 90 * 60)  # inside the 120-minute guard
+        usage = {"1": win(62, 40), "2": win(0, 10), "3": win(0, 50)}
+        for _ in range(3):
+            if h.tick_with_usage(usage) is TickOutcome.SWITCHED:
+                break
+            h.clock.advance(300)
+        assert h.active_number() == 3
+        assert of(h, SwitchEvent)[-1].trigger == "soft"
 
 
 def test_combined_soft_idle_last_resort_excluded_and_priming(temp_home):

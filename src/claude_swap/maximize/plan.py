@@ -47,6 +47,21 @@ def plan_weight(
     return DEFAULT_WEIGHT
 
 
+def plan_label(rate_limit_tier: str | None) -> str | None:
+    """A stored ``rateLimitTier`` as the TUI's plan label: ``20x``, ``5x``,
+    ``team``, or None when it says none of those. Never the raw string."""
+    if not isinstance(rate_limit_tier, str):
+        return None
+    text = rate_limit_tier.strip().lower()
+    if "20x" in text:
+        return "20x"
+    if "5x" in text:
+        return "5x"
+    if "team" in text or "enterprise" in text:
+        return "team"
+    return None
+
+
 def rate_limit_tier_from_credentials(credentials: str | None) -> str | None:
     """``claudeAiOauth.rateLimitTier`` from a stored credential blob, or None.
 

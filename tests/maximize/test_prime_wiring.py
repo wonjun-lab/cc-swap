@@ -53,6 +53,27 @@ def test_prime_snapshot_reads_engine_state(temp_home, tmp_path):
     assert not any(v.api_key for v in snap.accounts)
 
 
+def test_prime_snapshot_carries_login_deadlines_so_lapsed_logins_are_skipped(
+    temp_home, tmp_path
+):
+    import json
+
+    from claude_swap.maximize.primer import skip_reason
+
+    harness, _ = _harness(temp_home, tmp_path)
+    now = harness.clock()
+    blob = {"accessToken": "sk-2", "refreshToken": "rt-2",
+            "refreshTokenExpiresAt": int((now - 60) * 1000)}
+    harness.switcher._write_account_credentials(
+        "2", "b@example.com", json.dumps({"claudeAiOauth": blob})
+    )
+    snap = prime_snapshot(harness.engine, {"1": _usage(), "2": _usage(), "3": _usage()}, now)
+    views = {v.number: v for v in snap.accounts}
+    assert views["2"].login_deadline == pytest.approx(now - 60, abs=1)
+    assert views["3"].login_deadline is None
+    assert skip_reason(views["2"], "1", None, now, 2) == "login-expired"
+
+
 def test_disabled_by_default_builds_no_primer(temp_home, tmp_path):
     harness, fake = _harness(temp_home, tmp_path)
     now = harness.clock()

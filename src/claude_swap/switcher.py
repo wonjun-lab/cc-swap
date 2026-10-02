@@ -17,6 +17,7 @@ from pathlib import Path
 from claude_swap import macos_keychain
 
 from claude_swap.exceptions import (
+    KEYCHAIN_REFUSAL,
     AccountNotFoundError,
     ConfigError,
     CredentialReadError,
@@ -33,6 +34,7 @@ from claude_swap.json_output import (
     USAGE_FOREIGN_CREDENTIAL,
     USAGE_KEYCHAIN_UNAVAILABLE,
     USAGE_NO_CREDENTIALS,
+    USAGE_LOGIN_EXPIRED,
     USAGE_RELOGIN_REQUIRED,
     USAGE_TOKEN_EXPIRED,
     account_ref,
@@ -74,6 +76,8 @@ from claude_swap.printer import (
     ide_short_name,
     muted,
     warning,
+    reddened,
+    yellowed,
 )
 from claude_swap.paths import (
     get_backup_root,
@@ -194,15 +198,82 @@ ERROR_NOTES = {
         "this slot's stashed successor is unreadable — unlock the keychain "
         "or fix the file, then retry; `cswap unclaimed` inspects it"
     ),
+    "login_expired": (
+        "the stored login has expired (Claude Code logins expire about a "
+        "month after login) — log in with Claude Code, then run: cswap add"
+    ),
 }
+
+# The remedy for a dead lineage is the same whatever killed it; the note is
+# not. "refresh token dead" sends the reader looking for what spent the token
+# (another machine, a torn write) — when the login simply reached the
+# deadline Claude Code stamped at login, that search finds nothing and costs
+# an afternoon. ``dead_token_sentinel`` picks between the two.
+_RELOGIN_REMEDY = "log in with Claude Code, then run: cswap add"
 
 SENTINEL_NOTES = {
     USAGE_TOKEN_EXPIRED: "token expired — refresh deferred this pass; retries automatically",
     USAGE_FOREIGN_CREDENTIAL: "live credential belongs to another account — a switch repairs it",
     USAGE_API_KEY: "API key (no quota)",
     USAGE_KEYCHAIN_UNAVAILABLE: "keychain unavailable — locked or in use; try again",
-    USAGE_RELOGIN_REQUIRED: "re-login needed — refresh token dead; log in with Claude Code, then run: cswap add",
+    USAGE_RELOGIN_REQUIRED: f"re-login needed — refresh token dead; {_RELOGIN_REMEDY}",
+    USAGE_LOGIN_EXPIRED: (
+        "re-login needed — login expired (Claude Code logins expire about a "
+        f"month after login); {_RELOGIN_REMEDY}"
+    ),
 }
+
+
+def dead_token_sentinel(entry: UsageEntry, credentials: str = "") -> str:
+    """The sentinel for a quarantined slot, named by what the verdict was.
+
+    A strike recorded as ``login_expired`` (``oauth.permanent_refresh_kind``:
+    the server refused the grant after the login's recorded deadline) reads
+    as the login lapsing on schedule. So does a plain ``invalid_grant`` strike
+    whose stored credential carries a deadline that has passed — a strike
+    written by a release that did not yet name the cause, or by a peer
+    surface still running one; the stored stamp is the same evidence
+    ``permanent_refresh_kind`` read. Any other permanent verdict keeps the
+    generic dead-token wording.
+    """
+    if entry.last_error == "login_expired":
+        return USAGE_LOGIN_EXPIRED
+    if entry.last_error == "invalid_grant" and oauth.is_login_expired(credentials):
+        return USAGE_LOGIN_EXPIRED
+    return USAGE_RELOGIN_REQUIRED
+
+
+def login_expiry_warning_from_ms(
+    deadline_ms: float | None,
+    sentinel: str | None,
+    now_ms: int | None = None,
+) -> str | None:
+    """A one-line heads-up when a login is inside its last week.
+
+    Rendered under the usage lines of ``cswap list`` and on the TUI card (no
+    flag needed — the point is to be seen before the deadline, and
+    ``--token-status`` is the line nobody reads until something is already
+    dead). Silent once the slot is quarantined for that very reason (the
+    sentinel already says it), and silent for logins that record no deadline.
+    """
+    if sentinel in (USAGE_LOGIN_EXPIRED, USAGE_RELOGIN_REQUIRED):
+        return None
+    if not oauth.login_expiring_soon_ms(deadline_ms, now_ms):
+        return None
+    note = oauth.login_expiry_note_ms(deadline_ms, now_ms)
+    if note is None:
+        return None
+    now = now_ms if now_ms is not None else oauth._now_ms()
+    if deadline_ms is not None and now >= deadline_ms:
+        return f"{note} — re-login needed: {_RELOGIN_REMEDY}"
+    return f"{note} — re-login before then: {_RELOGIN_REMEDY}"
+
+
+def login_expiry_warning_line(credentials: str, entry: UsageEntry) -> str | None:
+    """:func:`login_expiry_warning_from_ms` for a stored credential."""
+    return login_expiry_warning_from_ms(
+        oauth.login_expires_at_ms(credentials), entry.sentinel
+    )
 
 
 def last_seen_note(entry: UsageEntry) -> str | None:
@@ -1765,6 +1836,7 @@ class ClaudeAccountSwitcher:
                     usage=entries[n],
                     alias=alias,
                     disabled=self._disabled_from_data(seq_data, n),
+                    login_expires_at=oauth.login_expires_at_ms(_creds),
                 )
             )
         return AccountsSnapshot(
@@ -1970,6 +2042,141 @@ class ClaudeAccountSwitcher:
             "uuid": (acct.get("uuid") or "").strip(),
         }
 
+    def sync_active_backup(self, *, skip_number: str | None = None) -> tuple[bool, str]:
+        """Make the active slot's backup hold the live login's lineage (the
+        oracle-checked resync), then verify it. ``(ok, reason)``: ``ok`` only
+        when the live and backup refresh-token fingerprints match. Nothing
+        to do when there is no managed live login, it is an API key, or the
+        active slot is ``skip_number``. Never raises; no secrets in reasons."""
+        try:
+            num = self.current_account_number()
+            if num is None:
+                if self.has_live_login():
+                    return False, (
+                        "the live login is not a managed account; run "
+                        "`cc-swap add` first so it is not lost"
+                    )
+                return True, ""
+            if skip_number is not None and num == str(skip_number):
+                return True, ""
+            ident = self.account_identity(num)
+            email, org = ident["email"], ident["organizationUuid"]
+            self._store.forget_last_active_read()
+            live = self._read_credentials()
+            verdict = self._store.last_active_read()
+            if verdict is not None and (verdict.degraded or verdict.keychain_unavailable):
+                return False, f"{KEYCHAIN_REFUSAL}; retry in a GUI terminal"
+            if live is None:
+                return False, f"#{num}'s live login could not be read"
+            if not live or looks_like_api_key(live):
+                return True, ""
+            live_fp = oauth.credential_fingerprint(live)
+            backup = self._read_account_credentials(num, email)
+            if oauth.credential_fingerprint(backup) != live_fp:
+                self._resync_rotated_backup(num, email, org, live)
+                backup = self._read_account_credentials(num, email)
+            if oauth.credential_fingerprint(backup) == live_fp:
+                return True, ""
+            return False, (
+                f"#{num}'s current login could not be backed up (its owner "
+                f"could not be verified); run `cc-swap add` while logged in "
+                f"as #{num}, then retry"
+            )
+        except Exception as e:
+            return False, f"backing up the active login failed ({type(e).__name__})"
+
+    def adopt_new_active_login(self, account_num: str) -> str:
+        """Back up a NEW live login on the active slot ``account_num``
+        whose stored lineage is dead (the engine calls this only for a
+        quarantined/struck slot). Never raises. Returns:
+
+        - ``"adopted"``: the live login (identity- and oracle-verified, the
+          checks ``cswap add`` makes) is now the slot's backup and its dead
+          strike is cleared;
+        - ``"same"``: the live login IS the slot's stored lineage — no new
+          login; ``"not-needed"``: nothing adoptable (no full OAuth pair);
+        - ``"mismatch"``: the live identity or token belongs to another
+          account; ``"unverified"``: ownership could not be established yet;
+        - ``"unreadable"``/``"busy"``/``"error"``: try again next pass.
+
+        Uses this pass's live read (``_active_verdict``); logs fingerprint
+        prefixes only.
+        """
+        num = str(account_num)
+        try:
+            record = (self._get_sequence_data() or {}).get("accounts", {}).get(num)
+            if not isinstance(record, dict):
+                return "mismatch"
+            identity = self._get_current_identity_triple()
+            if identity is None:
+                return "not-needed"
+            email, org_uuid, account_uuid = identity
+            rec_email = str(record.get("email") or "")
+            rec_org = str(record.get("organizationUuid") or "")
+            rec_uuid = str(record.get("uuid") or "").strip()
+            if (
+                email.strip().lower() != rec_email.strip().lower()
+                or org_uuid != rec_org
+                or (rec_uuid and account_uuid and account_uuid != rec_uuid)
+            ):
+                return "mismatch"
+            active = self._active_verdict()
+            if active.value is None or active.keychain_unavailable or active.degraded:
+                return "unreadable"
+            live = active.value
+            live_oauth = oauth.extract_oauth_data(live) if live else None
+            if not (
+                live_oauth
+                and live_oauth.get("accessToken")
+                and live_oauth.get("refreshToken")
+            ):
+                return "not-needed"
+            backup, backup_unreadable = self._read_account_credentials_ex(num, rec_email)
+            if backup_unreadable:
+                return "unreadable"
+            live_fp = oauth.credential_fingerprint(live) or ""
+            if backup and oauth.credential_fingerprint(backup) == live_fp:
+                return "same"
+            key = self._lineage_key(num, rec_email, live_fp)
+            verdict = self._probe_verdicts.get(key)
+            if verdict is None:
+                if oauth.is_oauth_token_expired(live_oauth.get("expiresAt")):
+                    return "unverified"
+                resolved = oauth.fetch_oauth_profile(live_oauth["accessToken"])
+                if not resolved:
+                    return "unverified"
+                verdict = self._resolved_matches_slot_identity(num, resolved)
+                if verdict is None:
+                    return "unverified"
+                self._probe_verdicts[self._lineage_key(num, rec_email, live_fp)] = verdict
+            if verdict is False:
+                return "mismatch"
+            with FileLock(self.lock_file), claude_credentials_lock():
+                # Re-check under the locks: a /login or switch landing since
+                # the read means these bytes are no longer the ones verified.
+                if self._get_current_identity_triple() != identity:
+                    return "busy"
+                now_live = self._read_credentials()
+                if not now_live or oauth.credential_fingerprint(now_live) != live_fp:
+                    return "busy"
+                config_text = self._get_claude_config_path().read_text(encoding="utf-8")
+                self._write_account_credentials(num, rec_email, now_live)
+                self._write_account_config(num, rec_email, config_text)
+            self._usage_store.clear_dead_token([num], {num: (rec_email, rec_org)})
+            self._logger.info(
+                "adopted new login for #%s (rt %s -> %s)",
+                num, oauth.fingerprint8(backup), oauth.fingerprint8(live),
+            )
+            return "adopted"
+        except LockError:
+            return "busy"
+        except Exception:
+            self._logger.warning(
+                "Adopting the new live login for account %s failed; holding "
+                "and retrying next pass.", num, exc_info=True,
+            )
+            return "error"
+
     def backfill_account_uuid(
         self,
         account_num: str,
@@ -2008,6 +2215,39 @@ class ClaudeAccountSwitcher:
                 data["lastUpdated"] = get_timestamp()
                 self._write_json(self.sequence_file, data)
 
+    def _audited_refresh(
+        self,
+        refresh_input: str,
+        *,
+        caller: str,
+        slot: str,
+        active: bool,
+        source: str,
+        **kwargs,
+    ) -> "oauth.RefreshOutcome":
+        """``oauth.try_refresh_oauth_credentials`` plus one INFO audit line
+        (``oauth.refresh_audit_line``: fingerprint prefixes only)."""
+        started = time.monotonic()
+        result = oauth.try_refresh_oauth_credentials(refresh_input, **kwargs)
+        try:
+            ok = result.error is None and bool(result.credentials)
+            self._logger.info(
+                "%s",
+                oauth.refresh_audit_line(
+                    caller=caller,
+                    slot=str(slot),
+                    active=active,
+                    source=source,
+                    before=refresh_input,
+                    after=result.credentials if ok else None,
+                    result="ok" if ok else (result.error or "empty"),
+                    latency_s=time.monotonic() - started,
+                ),
+            )
+        except Exception:
+            pass  # an audit line never breaks a refresh
+        return result
+
     def consume_backup_grant(
         self, account_num: str, email: str, snapshot: str
     ) -> "oauth.RefreshOutcome":
@@ -2043,6 +2283,10 @@ class ClaudeAccountSwitcher:
 
         The caller must NOT hold ``self.lock_file`` (non-reentrant).
         """
+        try:  # for the refresh audit line: who asked for this grant
+            caller = sys._getframe(1).f_code.co_name
+        except Exception:
+            caller = "?"
         # Store-resolution parity: CC ≥2.1.220 honors
         # CLAUDE_SECURESTORAGE_CONFIG_DIR for its credential store. cswap
         # mirrors that resolution on the CAPTURE path (#205 —
@@ -2089,15 +2333,17 @@ class ClaudeAccountSwitcher:
             return oauth.RefreshOutcome(None, "consume-busy")
         try:
             return self._consume_backup_grant_locked(
-                account_num, email, snapshot
+                account_num, email, snapshot, caller=caller
             )
         finally:
             consume_lock.release()
 
     def _consume_backup_grant_locked(
-        self, account_num: str, email: str, snapshot: str
+        self, account_num: str, email: str, snapshot: str, *, caller: str = "?"
     ) -> "oauth.RefreshOutcome":
-        """Body of ``consume_backup_grant``; caller holds the consume lock."""
+        """Body of ``consume_backup_grant``; caller holds the consume lock.
+        ``caller`` names who asked, for the refresh audit line."""
+        refresh_source = "backup"
         from claude_swap.session import (
             is_session_stale,
             read_session_credentials,
@@ -2214,6 +2460,7 @@ class ClaudeAccountSwitcher:
                             )
                             refresh_input = profile
                             input_oauth = prof_oauth
+                            refresh_source = "profile"
                 consumed_fp = oauth.credential_fingerprint(refresh_input)
         except LockError:
             # Nothing consumed yet — a holder (switch, collector, CC) owns
@@ -2270,9 +2517,21 @@ class ClaudeAccountSwitcher:
             # nothing. When the re-read equals the snapshot (the 401-retry
             # shape: the server just rejected these exact bytes), this
             # never fires and the POST proceeds.
+            self._logger.info(
+                "refresh: account %s already rotated past the caller's copy "
+                "(rt %s); adopted without a POST", account_num,
+                oauth.fingerprint8(refresh_input),
+            )
             return oauth.RefreshOutcome(refresh_input, None, None, consumed_fp)
 
-        result = oauth.try_refresh_oauth_credentials(refresh_input)
+        try:
+            gate_active = self.current_account_number() == str(account_num)
+        except Exception:
+            gate_active = False
+        result = self._audited_refresh(
+            refresh_input, caller=caller, slot=account_num,
+            active=gate_active, source=refresh_source,
+        )
         if result.error is not None or not result.credentials:
             # Strike binding must follow the POSTed bytes: the gate may have
             # substituted a locked re-read or the session profile for the
@@ -4357,6 +4616,13 @@ class ClaudeAccountSwitcher:
                             self._write_account_credentials(
                                 account_num, email, live
                             )
+                            self._logger.info(
+                                "refresh: adopted Claude Code's rotated "
+                                "credential for account %s into its backup "
+                                "(rt %s -> %s)", account_num,
+                                oauth.fingerprint8(backup),
+                                oauth.fingerprint8(live),
+                            )
                         except Exception:
                             self._logger.warning(
                                 "Backup resync after adopting a rotated "
@@ -4477,8 +4743,17 @@ class ClaudeAccountSwitcher:
                         # inside that budget so a slow network can't make a
                         # concurrent switch's acquire expire — the switch
                         # then waits out the tail instead of erroring.
-                        result = oauth.try_refresh_oauth_credentials(
-                            refresh_input, timeout_s=6.0
+                        result = self._audited_refresh(
+                            refresh_input,
+                            caller="_fetch_active_usage",
+                            slot=account_num,
+                            active=True,
+                            source=(
+                                "live" if refresh_input == live
+                                else "backup" if refresh_input == backup
+                                else "snapshot"
+                            ),
+                            timeout_s=6.0,
                         )
                         if result.error in (
                             "invalid_grant", "no_refresh_token"
@@ -4531,9 +4806,14 @@ class ClaudeAccountSwitcher:
                             # scan flips the account to "re-login needed" —
                             # a bare sentinel is a no-op to the store and
                             # would re-POST every pass. The strike binds to
-                            # the consumed generation's fingerprint.
+                            # the consumed generation's fingerprint. Past the
+                            # login's recorded deadline the same verdict is
+                            # named ``login_expired`` (same strike).
                             return FetchRecord(
-                                error=result.error or "invalid_grant",
+                                error=oauth.permanent_refresh_kind(
+                                    result.error or "invalid_grant",
+                                    refresh_input,
+                                ),
                                 struck_fp=oauth.credential_fingerprint(
                                     refresh_input
                                 ),
@@ -4593,6 +4873,16 @@ class ClaudeAccountSwitcher:
                             else "; the rotated credential was NOT persisted "
                                  "anywhere — re-login may be required",
                         )
+                    self._logger.info(
+                        "refresh: account %s active %s persisted "
+                        "(rt %s; backup %s, live %s)",
+                        account_num,
+                        "restore" if restore_source is not None else "refresh",
+                        oauth.fingerprint8(working),
+                        "kept" if restore_source is not None
+                        else ("ok" if backup_ok else "FAILED"),
+                        "ok" if live_ok else "FAILED",
+                    )
                     if not live_ok:
                         # Live still holds the dead token — don't serve
                         # usage for a credential CC can't currently use.
@@ -4994,7 +5284,7 @@ class ClaudeAccountSwitcher:
             entry = entries[num]
             _i = info_by_num[num]
             if self._entry_token_dead(entry, num, _i[1], _i[5], _i[4]):
-                sentinels[num] = USAGE_RELOGIN_REQUIRED
+                sentinels[num] = dead_token_sentinel(entry, _i[5])
             elif entry.auth_dead_strikes and entry.token_dead():
                 # Struck, but no stored source still matches the condemned
                 # generation — the fingerprint healed the verdict.
@@ -5077,7 +5367,7 @@ class ClaudeAccountSwitcher:
                 if self._entry_token_dead(
                     entries[num], num, _i[1], _i[5], _i[4]
                 ):
-                    sentinels[num] = USAGE_RELOGIN_REQUIRED
+                    sentinels[num] = dead_token_sentinel(entries[num], _i[5])
 
         return {
             num: with_sentinel(entries[num], sentinels.get(num))
@@ -5500,6 +5790,7 @@ class ClaudeAccountSwitcher:
                     alias=alias,
                     disabled=self._disabled_from_data(seq_data, str(num)),
                     login_expires_at=oauth.login_expires_at_iso(creds),
+                    login_expired=oauth.is_login_expired(creds),
                 )
             )
         payload = {
@@ -5567,6 +5858,16 @@ class ClaudeAccountSwitcher:
             print(f"  {num}: {label} {muted(f'[{tag}]')}{markers}")
             for line in _usage_entry_lines(entries[str(num)]):
                 print(f"     {line}")
+            expiry_line = login_expiry_warning_line(
+                accounts_info[i][5], entries[str(num)]
+            )
+            if expiry_line is not None:
+                # Amber inside the last week, red inside the last day.
+                urgent = oauth.login_expiring_soon(
+                    accounts_info[i][5], within_ms=86_400_000
+                )
+                paint = reddened if urgent else yellowed
+                print(f"     {paint(expiry_line)}")
 
             if show_token_status:
                 for line in self._token_status_lines(accounts_info[i]):
@@ -6689,6 +6990,23 @@ class ClaudeAccountSwitcher:
             "or run from a normal shell."
         )
 
+    def _read_live_for_switch(self) -> str | None:
+        """The live credential for a switch's backup/snapshot step, or a
+        refusal. A degraded read (the Keychain failed and a possibly stale
+        plaintext mirror answered) or an unavailable Keychain would back up
+        the wrong generation and overwrite the item holding the newest one —
+        a fresh ``/login`` included (2026-10-03). ``None`` keeps meaning a
+        file read error, as from ``_read_credentials``."""
+        self._store.forget_last_active_read()
+        value = self._read_credentials()
+        active = self._store.last_active_read()
+        if active is not None and (active.degraded or active.keychain_unavailable):
+            raise CredentialReadError(
+                f"{KEYCHAIN_REFUSAL}; retry in a GUI terminal (the live login "
+                "could not be read, and switching would overwrite it)"
+            )
+        return value
+
     def _perform_switch(
         self,
         target_account: str,
@@ -6847,7 +7165,7 @@ class ClaudeAccountSwitcher:
                 # than overwrite state that has no safety copy; "" means
                 # absent in every backend and composes/restores nothing.
                 rollback_config_text: str | None = None
-                rollback_creds: str | None = self._read_credentials()
+                rollback_creds: str | None = self._read_live_for_switch()
                 if rollback_creds is None:
                     raise CredentialReadError(
                         "Cannot snapshot live credentials before activation"
@@ -7002,7 +7320,7 @@ class ClaudeAccountSwitcher:
 
             # Create transaction for rollback capability
             try:
-                original_creds = self._read_credentials()
+                original_creds = self._read_live_for_switch()
                 if original_creds is None:
                     raise CredentialReadError("Failed to read current credentials")
                 if not original_creds:

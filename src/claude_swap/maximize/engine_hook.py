@@ -25,15 +25,16 @@ from __future__ import annotations
 import json
 import logging
 import math
+import os
 from collections.abc import Mapping
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from typing import Any, Protocol
 
 from claude_swap import autoswitch as aw
-from claude_swap import poll_policy
+from claude_swap import oauth, poll_policy
 from claude_swap.exceptions import ConfigError
-from claude_swap.maximize import idle, policy
+from claude_swap.maximize import idle, pause, policy
 from claude_swap.maximize.model import (
     AccountView,
     Decision,
@@ -44,7 +45,7 @@ from claude_swap.maximize.model import (
     Snapshot,
     Switch,
 )
-from claude_swap.maximize.plan import rate_limit_tier_from_credentials
+from claude_swap.maximize.plan import plan_label, rate_limit_tier_from_credentials
 from claude_swap.maximize.report import decision_rows
 from claude_swap.maximize.score import score
 from claude_swap.maximize.snapshot import build_snapshot, usage_windows
@@ -66,6 +67,18 @@ CHANGED_KEY = "activeChangedAt"
 # rateLimitTier only changes with a plan change; re-read the stored
 # credential (a Keychain read on macOS) at most hourly per slot.
 TIER_CACHE_TTL_S = 3600.0
+# A login's deadline (``refreshTokenExpiresAt``) only moves with a re-login:
+# re-read the stored credentials at most this often.
+LOGIN_DEADLINE_TTL_S = 600.0
+# Warn in the engine log from this long before a login's deadline ...
+LOGIN_WARN_S = 7 * 86400.0
+# ... once per account per this long.
+LOGIN_WARN_EVERY_S = 86400.0
+# The decision this engine last made, for TUI viewers (``_publish_decision``).
+DECISION_KEY = "maximizeDecision"
+# An unchanged decision is rewritten this often, so a reader can tell a
+# steady engine from a stopped one by the record's age.
+PUBLISH_REFRESH_S = 300.0
 
 # Numeric ``maximize`` keys. The settings loader is lenient per key (wrong
 # type → default, out of range → clamped) and reports only pair repairs in
@@ -83,6 +96,7 @@ _NUMERIC_KEYS: tuple[tuple[str, str], ...] = (
     ("pendingPollS", "pending_poll_s"),
     ("rebalanceCooldownMin", "rebalance_cooldown_min"),
     ("tieEpsilon", "tie_epsilon"),
+    ("loginExpiryGuardMin", "login_expiry_guard_min"),
 )
 
 
@@ -102,6 +116,10 @@ class MaximizeRuntime:
     tier_cache: dict[str, tuple[str, str | None, float]] = field(default_factory=dict)
     last_snapshot: Snapshot | None = None
     last_decision: Decision | None = None
+    # Login deadlines (epoch s) by slot, read at ``login_deadlines_at``.
+    login_deadlines: dict[str, float] = field(default_factory=dict)
+    login_deadlines_at: float | None = None
+    login_warned: dict[str, float] = field(default_factory=dict)
 
 
 # -- settings ------------------------------------------------------------------
@@ -358,6 +376,76 @@ def _rate_limit_tiers(
     return out
 
 
+def read_login_deadlines(
+    switcher, records: Mapping[str, Mapping], current: str | None
+) -> dict[str, float]:
+    """Each slot's login deadline (epoch s): the live login for the active
+    slot, the stored backup for the rest. Slots without one are absent.
+    Only the deadline leaves this function — never a token."""
+    out: dict[str, float] = {}
+    for number, record in records.items():
+        if record.get("kind") == "api_key":
+            continue
+        try:
+            if number == current:
+                creds = switcher._read_credentials()
+            else:
+                creds = switcher.read_account_credentials(
+                    number, str(record.get("email") or "")
+                )
+        except Exception:
+            _logger.debug("login deadline unreadable for account %s", number)
+            continue
+        deadline_ms = oauth.login_expires_at_ms(creds or "")
+        if deadline_ms is not None:
+            out[number] = deadline_ms / 1000.0
+    return out
+
+
+def _login_deadlines(
+    engine: aw.AutoSwitchEngine,
+    rt: MaximizeRuntime,
+    records: Mapping[str, Mapping],
+    current: str,
+    now: float,
+) -> dict[str, float]:
+    """:func:`read_login_deadlines`, re-read at most every
+    :data:`LOGIN_DEADLINE_TTL_S` (Keychain reads on macOS)."""
+    if (
+        rt.login_deadlines_at is not None
+        and 0 <= now - rt.login_deadlines_at < LOGIN_DEADLINE_TTL_S
+    ):
+        return rt.login_deadlines
+    out = read_login_deadlines(engine.switcher, records, current)
+    rt.login_deadlines, rt.login_deadlines_at = out, now
+    return out
+
+
+def _warn_login_expiry(
+    engine: aw.AutoSwitchEngine,
+    rt: MaximizeRuntime,
+    deadlines: Mapping[str, float],
+    now: float,
+) -> None:
+    """One ``ConfigWarningEvent`` per account per day from a week before its
+    login deadline: a parked slot has no Claude Code session to warn in."""
+    for number, deadline in deadlines.items():
+        if deadline - now >= LOGIN_WARN_S:
+            continue
+        last = rt.login_warned.get(number)
+        if last is not None and 0 <= now - last < LOGIN_WARN_EVERY_S:
+            continue
+        rt.login_warned[number] = now
+        note = oauth.login_expiry_note_ms(deadline * 1000.0, int(now * 1000))
+        then = "re-login needed" if now >= deadline else "re-login before then"
+        engine._emit(aw.ConfigWarningEvent(
+            message=(
+                f"Account-{number} {note} — {then}: log in with Claude Code as "
+                f"that account, then run: cc-swap add (or Fleet → r)"
+            )
+        ))
+
+
 def _stored_samples(source: Mapping, current: str) -> list[Sample]:
     raw = source.get(SAMPLES_KEY)
     if not isinstance(raw, Mapping) or str(raw.get("account")) != current:
@@ -474,6 +562,64 @@ def _decision_event(
         rows=decision_rows(snap),
         dry_run=dry_run,
     )
+
+
+def _decision_fields(decision: Decision) -> tuple[str, str | None, bool]:
+    if isinstance(decision, Switch):
+        return "switch", decision.trigger, False
+    if isinstance(decision, Hold):
+        return "hold", None, decision.pending
+    if isinstance(decision, Exhausted):
+        return "exhausted", None, False
+    return "indeterminate", None, False
+
+
+def _publish_decision(
+    engine: aw.AutoSwitchEngine,
+    snap: Snapshot,
+    decision: Decision,
+    state: Mapping,
+    tiers: Mapping[str, str | None],
+) -> None:
+    """Write this tick's decision to the state file for TUI viewers.
+
+    Slot numbers and the policy's own reason only — no emails, no raw
+    ``rateLimitTier`` strings. Rewritten when the decision changes, or when
+    the stored one is :data:`PUBLISH_REFRESH_S` old (the TUI's freshness
+    clock); never on dry runs, which write nothing."""
+    if engine.dry_run:
+        return
+    name, trigger, pending = _decision_fields(decision)
+    target: str | None = decision.target if isinstance(decision, Switch) else None
+    if pending:
+        landing = policy.landing_candidates(snap)
+        target = landing[0].number if landing else None
+    record = {
+        "at": snap.now,
+        "pid": os.getpid(),
+        "active": snap.active,
+        "decision": name,
+        "trigger": trigger,
+        "target": target,
+        "reason": decision.reason,
+        "pending": pending,
+        "plans": {num: plan_label(tier) for num, tier in tiers.items()},
+    }
+    previous = state.get(DECISION_KEY)
+    if isinstance(previous, Mapping):
+        at = previous.get("at")
+        same = all(previous.get(k) == record[k] for k in record if k not in ("at", "pid"))
+        if (
+            same
+            and isinstance(at, (int, float))
+            and not isinstance(at, bool)
+            and 0 <= snap.now - at < PUBLISH_REFRESH_S
+        ):
+            return
+    try:
+        engine._mutate_state(lambda s: s.__setitem__(DECISION_KEY, record))
+    except Exception as e:  # a display aid must never break a tick
+        _logger.debug("could not publish the maximize decision: %s", type(e).__name__)
 
 
 def _without(snap: Snapshot, failed: set[str]) -> Snapshot:
@@ -708,11 +854,24 @@ def run_maximize_tick(
     rt = runtime_for(engine)
     reload_if_changed(engine, rt)
     now = engine.clock()
+    paused = pause.active_pause(state, now)
+    if paused is not None:
+        # A TUI re-login owns the live login for now: no switch, no prime,
+        # and no samples (the login it shows is not a manual switch).
+        until, why = paused
+        engine._emit(aw.NoSwitchEvent(
+            reason="maximize-paused",
+            detail=f"switching paused ({why}) for {until - now:.0f}s more",
+        ))
+        return aw.TickOutcome.NO_ACTION
     records = _records(engine, current)
+    deadlines = _login_deadlines(engine, rt, records, current, now)
+    _warn_login_expiry(engine, rt, deadlines, now)
     samples, active_changed_at = _update_samples(
         engine, rt, state, current, entries.get(current), usage.get(current), now
     )
     last = state.get("lastSwitchAt")
+    tiers = _rate_limit_tiers(engine, rt, records, now)
     snap = build_snapshot(
         now=now,
         active=current,
@@ -720,7 +879,7 @@ def run_maximize_tick(
         records=records,
         quarantined=set(quarantined) | _unavailable(engine, records, current),
         api_key_accounts={n for n, r in records.items() if r.get("kind") == "api_key"},
-        rate_limit_tiers=_rate_limit_tiers(engine, rt, records, now),
+        rate_limit_tiers=tiers,
         samples=samples,
         last_switch_at=(
             float(last)
@@ -729,10 +888,12 @@ def run_maximize_tick(
         ),
         settings=rt.settings,
         active_changed_at=active_changed_at,
+        login_deadlines=deadlines,
     )
     decision = policy.decide(snap)
     rt.last_snapshot, rt.last_decision = snap, decision
     engine._emit(_decision_event(snap, decision, engine.dry_run))
+    _publish_decision(engine, snap, decision, state, tiers)
     if isinstance(decision, Indeterminate):
         _run_primer(engine, rt, snap)
         return None

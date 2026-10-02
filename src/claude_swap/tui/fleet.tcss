@@ -1,0 +1,162 @@
+/* cc-swap Fleet screen (fork). Screen-scoped so cswap.tcss stays upstream's.
+   Colors come from the registered cswap themes (theme.py). */
+
+FleetScreen {
+    layout: vertical;
+    background: $background;
+}
+
+#fx-head {
+    height: 1;
+    padding: 0 1;
+}
+
+#fx-engine, #fx-now, #fx-prime {
+    height: 1;
+    padding: 0 1;
+}
+
+#fx-attention {
+    height: auto;
+    padding: 0 1;
+    margin-top: 1;
+}
+
+#fx-table {
+    height: auto;
+    max-height: 60%;
+    margin-top: 1;
+    padding: 0;
+    background: $background;
+    scrollbar-size-vertical: 1;
+}
+
+#fx-table > .datatable--header {
+    color: $secondary;
+    background: $background;
+    text-style: none;
+}
+
+#fx-table > .datatable--cursor {
+    background: $surface;
+    text-style: none;
+}
+
+#fx-table:focus > .datatable--cursor {
+    background: $panel;
+}
+
+#fx-detail {
+    height: auto;
+    padding: 1 2 0 2;
+}
+
+#fx-menu {
+    height: auto;
+    padding: 1 2 0 1;
+    background: $background;
+}
+
+#fx-menu:focus {
+    background-tint: $foreground 0%;
+}
+
+#fx-menu ListItem {
+    background: transparent;
+    padding: 0 1;
+    border-left: thick $background;
+}
+
+#fx-menu ListItem.-highlight,
+#fx-menu:focus ListItem.-highlight {
+    color: $foreground;
+    background: $surface;
+    text-style: none;
+    border-left: thick $primary;
+}
+
+#fx-menu-folded {
+    height: auto;
+    padding: 1 2 0 2;
+}
+
+#fx-keys {
+    dock: bottom;
+    height: 1;
+    padding: 0 2;
+}
+
+FleetScreen.-compact #fx-attention,
+FleetScreen.-compact #fx-table,
+FleetScreen.-compact #fx-detail,
+FleetScreen.-compact #fx-menu,
+FleetScreen.-compact #fx-menu-folded {
+    margin-top: 0;
+    padding-top: 0;
+}
+
+/* -- swap strategy / account settings ---------------------------------------------- */
+
+#fx-st-head, #fx-ac-head {
+    height: 1;
+    padding: 0 1;
+}
+
+#fx-st-body {
+    height: auto;
+    padding: 1 1 0 1;
+}
+
+#fx-st-preview {
+    height: auto;
+    padding: 1 2;
+}
+
+#fx-st-keys, #fx-ac-keys {
+    dock: bottom;
+    height: 1;
+    padding: 0 2;
+}
+
+#fx-ac-table {
+    height: auto;
+    max-height: 60%;
+    margin-top: 1;
+    background: $background;
+}
+
+#fx-ac-table > .datatable--header {
+    color: $secondary;
+    background: $background;
+}
+
+#fx-ac-prompt {
+    height: auto;
+    padding: 0 2;
+}
+
+#fx-ac-menu {
+    height: auto;
+    padding: 1 2 0 1;
+    background: $background;
+}
+
+#fx-ac-menu ListItem {
+    background: transparent;
+    padding: 0 1;
+    border-left: thick $background;
+}
+
+#fx-ac-menu ListItem.-highlight,
+#fx-ac-menu:focus ListItem.-highlight {
+    color: $foreground;
+    background: $surface;
+    text-style: none;
+    border-left: thick $primary;
+}
+
+/* -- help ------------------------------------------------------------------------ */
+
+#fx-help {
+    padding: 1 2;
+}

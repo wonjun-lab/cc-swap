@@ -82,6 +82,7 @@ Turn it on with `cc-swap config set autoswitch.strategy maximize`, or use `cc-sw
 | `maximize.tieEpsilon` | float 0–2 | 0.1 | Scores this close count as a tie |
 | `maximize.lastResort` | string | — | Last-resort accounts: emails or aliases, comma-separated |
 | `maximize.planOverride` | string | — | Manual plan per account: `email:20x,email:5x` |
+| `maximize.loginExpiryGuardMin` | int 0–1440 | 120 | A soft or rebalance switch never lands on an account whose login expires within this many minutes (an at-limit or hard fallback still may) |
 | `prime.enabled` | bool | false | Turn 5h priming on |
 | `prime.model` | string | claude-haiku-4-5 | Model used for the priming request |
 | `prime.jitterS` | string | 45-300 | Random delay after a reset before priming, in seconds |
@@ -96,7 +97,7 @@ The four thresholds (`soft5h`, `hard5h`, `soft7d`, `hard7d`) can change at any t
 
 - **Persistent**: `cc-swap config set maximize.soft5h 60`. The range and soft ≤ hard are both validated.
 - **One run**: `cc-swap auto --soft5h 60 --hard5h 95 --soft7d 90 --hard7d 98`. Flags override the file.
-- **TUI**: open the auto screen (`g`) and press `t` to select 5h soft. Press `t` again to move to 5h hard, 7d soft and 7d hard. `←`/`→` move the selected value by 1, `enter` saves to `settings.json`, and `esc` discards. The 5h and 7d bars show the soft threshold as a yellow tick and the hard ceiling as a red one. Saving works even when the screen is only a viewer of the service's engine.
+- **TUI**: on the Fleet home screen press `s` (Swap strategy) to edit every `maximize.*` and `prime.*` knob with a live preview (see [Fleet](#fleet-the-tui-home-for-maximize)). Or open the auto screen (`g`) and press `t` to select 5h soft. Press `t` again to move to 5h hard, 7d soft and 7d hard. `←`/`→` move the selected value by 1, `enter` saves to `settings.json`, and `esc` discards. The 5h and 7d bars show the soft threshold as a yellow tick and the hard ceiling as a red one. Saving works even when the screen is only a viewer of the service's engine.
 - The engine checks the modification time of `settings.json` every tick. If the new values fail validation, it keeps the old ones and logs a configuration warning.
 
 ## 5h window priming
@@ -169,7 +170,40 @@ cc-swap service uninstall   # stop it and remove it
 
 `install` forwards `CLAUDE_CONFIG_DIR` and `CLAUDE_SECURESTORAGE_CONFIG_DIR` from the shell you run it in to the service, and prints which ones it forwarded, so a custom profile is read by the service too. It refuses to install while `CLAUDE_CONFIG_DIR` points at a `cswap run` session profile; run it from a terminal outside the session.
 
+**An unreadable login holds the engine.** If the live credential cannot be read cleanly (for example, the macOS Keychain answers `rc=36` for a few minutes after a `/login`, or only the plaintext fallback is readable), the engine logs `Keychain unreadable; holding` once and makes no switch for any trigger until a read succeeds. These ticks do not count toward failover. Switching then would overwrite a login cc-swap cannot see, possibly one that has not been backed up yet. Once the Keychain answers again (re-checked every 60 s), switching resumes on its own. A hold that lasts more than 15 minutes logs what to do every 15 minutes (unlock the login keychain, or restart cc-swap); the service exits with code 75 at that point so launchd or systemd restarts it.
+
+**A new login on a dead active slot is adopted.** When the active slot's stored login is dead (quarantined, `re-login needed`, or `login expired`) and you have just run `/login` as that same account, the engine backs the new login up into the slot before doing anything else. It checks the config identity (email, organization, account id) and the token's own identity, as `cc-swap add` does. It then lifts the quarantine and logs `adopted new login for #N`. Until the backup is written, the engine makes no switch. A live login that belongs to no slot, or to a different account than the slot's, holds the engine with the warning `unmanaged login, run cc-swap add`.
+
 **One engine per machine.** Whatever runs the engine (the service, a terminal `cc-swap auto`, the TUI's auto screen, or the menu bar's auto-switch) holds a lock, `<backup root>/.engine.lock`, for as long as it runs. The OS frees the lock when the process exits, even after a crash. While another process holds it, `cc-swap auto` refuses to start and exits with code `4`, and the TUI's auto screen (badge **VIEWER**) and the menu bar only show what the running engine is doing. `cc-swap auto --once --dry-run` needs no lock and always works. If another engine held the lease when the service started, the service retries every minute and takes over once that engine stops. To run an engine in a terminal instead, run `cc-swap service uninstall` first.
+
+## Fleet: the TUI home for maximize
+
+With `autoswitch.strategy` set to `maximize`, the TUI (`cc-swap` on its own, or `cc-swap tui`) opens on **Fleet** instead of the upstream dashboard; `cc-swap watch` still opens the watch view. `c` shows the classic dashboard; `ctrl+f` comes back from any screen. Other strategies keep the upstream TUI unchanged.
+
+```
+cc-swap @ studio (ssh) · maximize · 5h 50/95 · 7d 90/98 · margin 5 · priming on      Fri 14:33
+engine  ● service · launchd · pid 4121 · holds the lease — this TUI is a viewer
+now     HOLD — waiting for idle → #2 · #1 5h 62% >= soft 50% · +3%p/10m · hard in ~1h50m · 14:32 · engine
+prime   #2 #6 due ≤14:35 · #5 15:06–15:10 · #3 needs re-login
+⚠ #3 old needs re-login (refresh token dead) — select it and press r
+```
+
+- **Status lines.** `engine` says who switches: the service (recognised by its pid), another process, this TUI, or nothing. `now` is the decision the engine last published to its state file (slot numbers only), or `computed here` when none is fresh. `prime` lists accounts due for priming, upcoming windows and blockers.
+- **Table**, one row per account in slot order: `*` active · `plan` (`20x`/`5x` from the engine, `team` for an organization account, `?` unknown) · `tier` (`normal`, `last-r`, `excl`) · `rank` (the order maximize would pick) · `5h`/`7d` coloured against the soft/hard marks (`~` = stale) · `7d in` · `pace` (remaining 7d share over an even daily allotment) · `land` (`yes`, or why not: `5h≥45`, `excluded`, `login<2h`, `re-login`…) · `login` (time left on the login) · `5h window` (`cold`, `running → 16:20`, `primed → 17:50`) · `next prime`. A narrow or short terminal drops the detail card, then folds the menu, then the `prime` line.
+- **Menu** (first letter = key): `s` Swap strategy · `m` Mode · `p` Prime now · `f` Fetch latest usage · `a` Account settings · `e` Engine log (the auto screen; also `g`) · `c` Classic dashboard · `q` Quit. **Row keys:** `enter` switch (asks first only when maximize would not land there) · `l` last resort on/off · `x` exclude/include · `r` re-login · `w` watch · `?` help.
+- **Viewer by default.** Fleet never takes the engine lease by itself, so it never pushes the service aside. `m` (Mode) runs an engine in this TUI on request — dry-run, or live after a confirmation — and quitting asks first while a live one runs. The auto screen attaches to that engine instead of starting a second one.
+- **Re-login.** A dead refresh token turns the row red and names it in the attention line. `r` on it (or Account settings → Re-login) first backs up the active account's current login into its slot (and refuses to start, saying why, if that backup cannot be verified), then shows the steps; cc-swap launches nothing itself, so it works the same over SSH: in another terminal run `claude` (the path in `prime.claudePath`, else `~/.local/bin/claude`), type `/login` and sign in as that account's email (over SSH, open the printed URL anywhere and paste the code back), quit `claude`, then press `enter`. cc-swap stores the live login into the slot only if its email, organization and account id match that slot — it refuses a login that belongs to another slot — and switches back to the account that was active. While the guide is open the engine is paused (`pausedUntil` in `autoswitch_state.json`, at most 10 minutes): no switch and no priming. Other machines keep their own logins; repeat the re-login on each machine that needs it rather than copying one login between machines.
+- `CC_SWAP_FETCH_ON_OPEN=0` stops Fleet from fetching stale rows once when it opens as a viewer.
+
+### Logins expire
+
+A Claude Code login has a fixed deadline. The token endpoint sets it at `/login`, Claude Code stores it as `refreshTokenExpiresAt`, and refreshing never moves it: in practice it falls 27–30 days after the login. Up to the deadline the access token keeps rotating as normal. The first refresh after it is refused with `invalid_grant`, and only a new `/login` brings the account back. Claude Code warns its own session three days ahead, but a parked slot has no session to warn in, so cc-swap tracks the deadline for every account (the backup copy, or the live login for the active slot):
+
+- **Warnings from 7 days out.** Fleet has a `login` column (time left: amber inside the last week, red inside the last day) and an attention line, and the detail card shows the time left. `r` re-logs an account in early, before anything breaks; a new login starts a new deadline. `cc-swap list` prints a `login expires … in …` line under the account, red inside the last day. The engine log gets one warning per account per day.
+- **Named when it happens.** A refused refresh after the deadline reads `re-login needed — login expired` (Fleet: `re-login needed (login expired)`; engine quarantine reason `login_expired`), not `refresh token dead`. Nothing spent the token, so there is nothing to look for; just log in again. `--json` keeps `usageStatus: relogin_required` and adds `loginExpired: true`.
+- **No landing on a dying login.** `maximize` never makes a soft or rebalance switch onto an account whose login expires within `maximize.loginExpiryGuardMin` minutes (default 120). An at-limit or hard fallback can still use it while it works, but never once its deadline has passed. Priming skips accounts past their deadline.
+- **Re-login.** Use Fleet's `r` (see above), or run `claude`, `/login` as that account, then `cc-swap add`. The Fleet guide stores the login only once the live refresh token has changed, so pressing `enter` before logging in stores nothing.
+- **Refresh audit.** Every refresh POST cc-swap makes logs one INFO line to the engine log (`refresh POST caller=… slot=… active=… source=live|backup|profile rt=<8 hex>-><8 hex> accessExp=… login=… result=… latency=…`). It holds fingerprint prefixes only, never tokens or emails, so it is safe to paste into an issue when you need to know which machine spent a token.
 
 ---
 
@@ -518,7 +552,7 @@ Every payload carries a `schemaVersion` (currently `1`); on a handled error stdo
 
 Usage is served from a per-account cache: when the usage API is briefly unreachable, the last-known numbers are shown instead of nothing (the human view marks them with their age, e.g. `· 2m ago`). Rows with decision-trusted usage carry additive `usageFetchedAt`/`usageAgeSeconds` fields telling you how old the measurement is. Whenever `usage` is null but a last-known measurement exists — data too old to drive a decision (`usageStatus` stays `unavailable`), or a row in a non-`ok` state such as `token_expired` — additive `lastGoodUsage`/`lastGoodFetchedAt`/`lastGoodAgeSeconds` fields preserve the human display without making the account actionable. When `usage` is null and nothing else explains it (`usageStatus` is `unavailable`), an additive `usageError` names the last fetch failure by kind (e.g. `http-429`, `timeout`) and, while the cache is backing off from it, `usageRetryAt` gives the time of the next attempt. These fields apply to list rows and the managed active row from `status --json`. An account held out of rotation with `cswap disable` carries an additive `"disabled": true` on its row (absent otherwise).
 
-A row carries an additive `loginExpiresAt` (ISO-8601 UTC) when the stored login records when its refresh token expires, which is the moment the slot will need a fresh `/login` and `cswap add --slot N`; a script can warn a few days ahead instead of discovering `relogin_required`. Absent when Claude Code recorded no such date for that login.
+A row carries an additive `loginExpiresAt` (ISO-8601 UTC) when the stored login records when its refresh token expires, which is the moment the slot will need a fresh `/login` and `cswap add --slot N`; a script can warn a few days ahead instead of discovering `relogin_required`. Absent when Claude Code recorded no such date for that login. Once that moment has passed the row also carries `"loginExpired": true` (derived from the stored date, so it can flip a few hours before the server refuses the next refresh).
 
 An account row also carries an additive `alias` field once one is set with `cswap alias` (e.g. `"alias": "dev"`); accounts without one simply omit the key.
 

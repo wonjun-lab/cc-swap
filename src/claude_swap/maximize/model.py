@@ -31,6 +31,9 @@ class AccountView:
     reset7: float | None
     quarantined: bool
     api_key: bool
+    # When the stored login lapses (epoch s, ``refreshTokenExpiresAt``);
+    # None = the login records no deadline (never treated as expiring).
+    login_deadline: float | None = None
 
 
 @dataclass(frozen=True)

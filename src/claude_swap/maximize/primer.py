@@ -43,6 +43,7 @@ from claude_swap.autoswitch import (
     PrimeEvent,
 )
 from claude_swap.maximize.model import AccountView, Snapshot
+from claude_swap.maximize.pause import active_pause
 from claude_swap.maximize.snapshot import build_snapshot
 from claude_swap.poll_policy import parse_reset_ts
 from claude_swap.session import AUTH_OVERRIDE_ENV_VARS, delete_macos_keychain_entry
@@ -264,6 +265,10 @@ def skip_reason(
         return "api-key"
     if view.quarantined:
         return "quarantined"
+    if view.login_deadline is not None and now >= view.login_deadline:
+        # Past its login deadline: the next refresh is refused, so a launch
+        # would spend an access token on a login that is already gone.
+        return "login-expired"
     if view.pct5 is None or view.pct7 is None:
         return "usage-unknown"
     if view.pct7 >= 100.0:
@@ -344,6 +349,88 @@ def due_targets(
         targets.append(PrimeTarget(view.number, view.email, key, due_at))
     targets.sort(key=lambda t: (t.due_at, _slot_order(t.number)))
     return targets
+
+
+def _jitter(settings: PrimeSettings) -> tuple[int, int]:
+    try:
+        return parse_jitter_range(settings.jitter_s)
+    except ValueError:
+        return DEFAULT_JITTER
+
+
+def prime_window(
+    view: AccountView,
+    entry: Mapping | None,
+    active: str | None,
+    settings: PrimeSettings,
+    now: float,
+) -> tuple[float, float] | None:
+    """When the primer would launch for ``view``: the ``[lo, hi]`` range its
+    jittered ``due_at`` is drawn from (:func:`due_targets`). A target due now
+    (an unverified/auth-failed retry) is ``(now, now)``. A running window is
+    primed right after its reset: ``reset5 + jitter``. None when the primer
+    skips the account for any other reason (TUI read model; pure)."""
+    lo, hi = _jitter(settings)
+    reason = skip_reason(view, active, entry, now, settings.max_attempts)
+    if reason == "window-on" and view.reset5 is not None and view.reset5 > now:
+        return view.reset5 + lo, view.reset5 + hi
+    if reason is not None:
+        return None
+    key = window_key(view, entry, now)
+    if (
+        entry is not None
+        and entry.get("lastOutcome") in RETRY_NOW_OUTCOMES
+        and attempts_used(entry, key, now) > 0
+    ):
+        return now, now
+    anchor = _anchor(view, now)
+    return anchor + lo, anchor + hi
+
+
+@dataclass(frozen=True)
+class PlanRow:
+    """One account's manual-priming plan: why it is skipped, or which window
+    and attempt a launch now would be."""
+
+    number: str
+    reason: str | None       # skip_reason, or None when it would prime
+    window_key: str | None   # set when it would prime
+    attempt: int | None      # 1-based attempt a launch now would make
+
+
+def plan_rows(
+    snap: Snapshot,
+    prime_state: Mapping[str, Mapping],
+    settings: PrimeSettings,
+    now: float,
+    numbers: set[str] | None = None,
+) -> list[PlanRow]:
+    """``cc-swap prime --dry-run``'s plan, in slot order. Pure: the live
+    ``cswap run`` session check is the caller's (:meth:`Primer.plan`)."""
+    rows: list[PlanRow] = []
+    for view in sorted(snap.accounts, key=lambda v: _slot_order(v.number)):
+        if numbers is not None and view.number not in numbers:
+            continue
+        raw = prime_state.get(view.email)
+        entry = raw if isinstance(raw, Mapping) else None
+        reason = skip_reason(view, snap.active, entry, now, settings.max_attempts)
+        if reason is not None:
+            rows.append(PlanRow(view.number, reason, None, None))
+            continue
+        key = window_key(view, entry, now)
+        rows.append(PlanRow(view.number, None, key, attempts_used(entry, key, now) + 1))
+    return rows
+
+
+def plan_text(row: PlanRow, max_attempts: int) -> str:
+    if row.reason is not None:
+        return f"skip ({row.reason})"
+    return f"would prime now (window {row.window_key}, attempt {row.attempt}/{max_attempts})"
+
+
+def plan_lines(rows: Sequence[PlanRow], max_attempts: int) -> list[str]:
+    """``cc-swap prime --dry-run`` lines: slot numbers and reasons, no emails."""
+    return [f"#{row.number}  {plan_text(row, max_attempts)}" for row in rows]
 
 
 def _scrubbed(name: str) -> bool:
@@ -727,32 +814,27 @@ class Primer:
         """``cc-swap prime --dry-run`` rows: slot numbers and reasons, no emails."""
         return [f"#{num}  {text}" for num, text, _ in self.plan(snap, numbers)]
 
+    def plan_rows(self, snap: Snapshot, numbers: set[str] | None = None) -> list[PlanRow]:
+        """:func:`plan_rows` plus the live ``cswap run`` session check."""
+        by_number = {view.number: view for view in snap.accounts}
+        rows: list[PlanRow] = []
+        for row in plan_rows(snap, self._prime_state(), self.settings, self._clock(), numbers):
+            view = by_number[row.number]
+            if row.reason is None and self.engine.switcher.live_session_pids_for(
+                view.number, view.email
+            ):
+                row = PlanRow(row.number, "live-session", None, None)
+            rows.append(row)
+        return rows
+
     def plan(
         self, snap: Snapshot, numbers: set[str] | None = None
     ) -> list[tuple[str, str, bool]]:
         """``(slot, text, would_prime)`` per account, in slot order."""
-        now = self._clock()
-        state = self._prime_state()
-        rows: list[tuple[str, str, bool]] = []
-        for view in sorted(snap.accounts, key=lambda v: _slot_order(v.number)):
-            if numbers is not None and view.number not in numbers:
-                continue
-            raw = state.get(view.email)
-            entry = raw if isinstance(raw, Mapping) else None
-            reason = skip_reason(view, snap.active, entry, now, self.settings.max_attempts)
-            if reason is None and self.engine.switcher.live_session_pids_for(view.number, view.email):
-                reason = "live-session"
-            if reason is not None:
-                rows.append((view.number, f"skip ({reason})", False))
-                continue
-            key = window_key(view, entry, now)
-            attempt = attempts_used(entry, key, now) + 1
-            rows.append((
-                view.number,
-                f"would prime now (window {key}, attempt {attempt}/{self.settings.max_attempts})",
-                True,
-            ))
-        return rows
+        return [
+            (row.number, plan_text(row, self.settings.max_attempts), row.reason is None)
+            for row in self.plan_rows(snap, numbers)
+        ]
 
     def pending_accounts(self, snap: Snapshot) -> list[str]:
         state = self._prime_state()
@@ -895,8 +977,9 @@ class Primer:
                 return self._skip_active(target, entry, self._clock()), False, None
             launch_at = self._clock()
         attempts = attempts_used(entry, target.window_key, launch_at) + 1
-        if not self._claim(email, target.window_key, attempts, launch_at, entry):
-            return self._held_back(num, "another cc-swap process claimed this attempt")
+        refused = self._claim(email, target.window_key, attempts, launch_at, entry)
+        if refused is not None:
+            return self._held_back(num, refused)
         return self._launch(target, claude, token, wait or self._sleep), True, None
 
     @staticmethod
@@ -1123,15 +1206,20 @@ class Primer:
 
     def _claim(
         self, email: str, key: str, attempts: int, now: float, seen: Mapping | None
-    ) -> bool:
+    ) -> str | None:
         """Record the attempt before launching, under the state lock, and only
         if nobody else recorded one since we read the state (double-spend
-        guard against a concurrent ``cc-swap prime`` or second engine)."""
+        guard against a concurrent ``cc-swap prime`` or second engine) and no
+        re-login pause landed meanwhile. ``None`` = claimed; otherwise why not."""
         seen_at = _num(seen.get("lastAttemptAt")) if isinstance(seen, Mapping) else None
-        won = False
+        refused: str | None = "another cc-swap process claimed this attempt"
 
         def mutate(state: dict) -> None:
-            nonlocal won
+            nonlocal refused
+            paused = active_pause(state, self._clock())
+            if paused is not None:
+                refused = f"switching paused ({paused[1]})"
+                return
             primes = state.get("primes")
             if not isinstance(primes, dict):
                 primes = state["primes"] = {}
@@ -1145,10 +1233,10 @@ class Primer:
                 "lastAttemptAt": now,
                 "lastOutcome": "launched",
             }
-            won = True
+            refused = None
 
         self.engine._mutate_state(mutate)
-        return won
+        return refused
 
 
 def prime_snapshot(engine, usage: Mapping[str, dict | str | None], now: float) -> Snapshot:
@@ -1160,9 +1248,13 @@ def prime_snapshot(engine, usage: Mapping[str, dict | str | None], now: float) -
     records = (switcher._get_sequence_data() or {}).get("accounts", {})
     if not isinstance(records, dict):
         records = {}
+    from claude_swap.maximize.engine_hook import read_login_deadlines
+
+    active = switcher.current_account_number()
     return build_snapshot(
         now=now,
-        active=switcher.current_account_number(),
+        active=active,
+        login_deadlines=read_login_deadlines(switcher, records, active),
         usage=usage,
         records=records,
         quarantined=set(quarantine) if isinstance(quarantine, dict) else set(),
