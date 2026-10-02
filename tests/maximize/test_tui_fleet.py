@@ -256,6 +256,35 @@ class TestFleetScreen:
         finally:
             other.release()
 
+    async def test_classic_dashboard_f_fetches_and_fleet_restores_store_only(self, tmp_path):
+        from claude_swap.tui.dashboard import DashboardScreen
+        from claude_swap.tui.fleet import FleetScreen
+
+        _settings(tmp_path)
+        other = EngineLease(tmp_path)
+        assert other.acquire()
+        try:
+            fake = _fleet(tmp_path)
+            app = make_app(fake)
+            async with app.run_test(size=(140, 40)) as pilot:
+                await _open(pilot)
+                assert app._store_only is True
+                await pilot.press("c")
+                await settle(pilot)
+                assert isinstance(app.screen, DashboardScreen)
+                assert app._store_only is False  # upstream dashboard owns the lane
+                await settle(pilot)
+                fake.fetch_sets.clear()
+                await pilot.press("f")
+                await _open(pilot)
+                assert None in fake.fetch_sets  # a real fetch, not a store read
+                await pilot.press("ctrl+f")
+                await settle(pilot)
+                assert isinstance(app.screen, FleetScreen)
+                assert app._store_only is True  # Fleet put the viewer lane back
+        finally:
+            other.release()
+
     async def test_published_decision_drives_the_now_line(self, tmp_path):
         _settings(tmp_path)
         _state(tmp_path, maximizeDecision={

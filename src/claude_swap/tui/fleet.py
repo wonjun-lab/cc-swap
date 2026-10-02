@@ -872,6 +872,10 @@ class FleetScreen(Screen):
         self._render_menu()
 
     def action_classic(self) -> None:
+        # The upstream dashboard has no notion of a viewer lane: hand it the
+        # fetch-enabled lane so its ``f`` performs a real fetch. Fleet's
+        # ``on_screen_resume`` re-applies store-only when it comes back.
+        self.app.set_store_only(False)
         self.app.pop_screen()
 
     def action_help(self) -> None:
