@@ -36,7 +36,12 @@ class TestPrimeEvent:
         assert payload["account"] == "3"
         assert payload["outcome"] == "primed"
         assert payload["resetsAt"] == "2026-10-02T14:20:00Z"
-        assert event.human() == "Account-3: 5h window primed, resets 2026-10-02T14:20:00Z"
+        from claude_swap.autoswitch import local_time_label
+
+        assert event.human() == (
+            f"Account-3: 5h window primed, resets {local_time_label('2026-10-02T14:20:00Z')}"
+        )
+        assert "T14:20" not in event.human()
         assert PrimeEvent("", "disabled", None, "x").human() == "priming: 5h window disabled (x)"
 
 

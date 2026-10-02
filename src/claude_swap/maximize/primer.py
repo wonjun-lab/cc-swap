@@ -425,7 +425,12 @@ def plan_rows(
 def plan_text(row: PlanRow, max_attempts: int) -> str:
     if row.reason is not None:
         return f"skip ({row.reason})"
-    return f"would prime now (window {row.window_key}, attempt {row.attempt}/{max_attempts})"
+    window = row.window_key
+    if window != COLD_KEY:
+        from claude_swap.autoswitch import local_time_label
+
+        window = f"after the reset at {local_time_label(window)}"  # the key is an ISO minute
+    return f"would prime now (window {window}, attempt {row.attempt}/{max_attempts})"
 
 
 def plan_lines(rows: Sequence[PlanRow], max_attempts: int) -> list[str]:

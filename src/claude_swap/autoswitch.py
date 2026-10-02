@@ -284,6 +284,19 @@ def _now_iso() -> str:
     )
 
 
+def local_time_label(iso: str) -> str:
+    """An event's ISO timestamp for a human line: local time with the date
+    and how far off it is (``oauth.deadline_text``), never the raw ISO with
+    microseconds. Anything unparseable is returned as is. JSON keeps the ISO."""
+    try:
+        when = datetime.fromisoformat(iso.replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return iso
+    if when.tzinfo is None:
+        when = when.replace(tzinfo=timezone.utc)
+    return oauth.deadline_text(when.timestamp())
+
+
 def pct_label(value: float) -> str:
     """A percentage for display, as configured: 85.555555 stays itself
     (never a rounded "85.5556") and 99.9 never becomes a lying "100" the
@@ -490,7 +503,10 @@ class AllExhaustedEvent(AutoSwitchEvent):
 
     def human(self) -> str:
         if self.earliest_reset_at:
-            return f"all accounts exhausted; earliest reset {self.earliest_reset_at}"
+            return (
+                "all accounts exhausted; earliest reset "
+                f"{local_time_label(self.earliest_reset_at)}"
+            )
         return "all accounts exhausted; no reset time known"
 
 
@@ -610,7 +626,7 @@ class PrimeEvent(AutoSwitchEvent):
         who = f"Account-{self.account}" if self.account else "priming"
         text = f"{who}: 5h window {self.outcome}"
         if self.resets_at:
-            text += f", resets {self.resets_at}"
+            text += f", resets {local_time_label(self.resets_at)}"
         if self.detail:
             text += f" ({self.detail})"
         return text

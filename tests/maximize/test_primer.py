@@ -514,3 +514,16 @@ def test_plan_rows_and_plan_lines_agree():
         "#4  skip (excluded)",
     ]
     assert plan_rows(snap, state, SETTINGS, NOW, numbers={"2"}) == [rows[1]]
+
+
+def test_plan_line_shows_an_elapsed_reset_in_local_time():
+    """The window key is an ISO minute; the dry run printed it raw."""
+    from claude_swap.maximize.primer import iso_minute, plan_text
+    from claude_swap.oauth import local_clock
+
+    key = iso_minute(NOW - H)
+    text = plan_text(PlanRow("2", None, key, 1), 2)
+    minute = round((NOW - H) / 60.0) * 60.0
+    assert text.startswith(f"would prime now (window after the reset at {local_clock(minute)} (")
+    assert key not in text
+    assert text.endswith("attempt 1/2)")

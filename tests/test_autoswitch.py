@@ -2274,6 +2274,36 @@ class TestDryRunAndNoOp:
         assert "lastSwitchAt" not in harness.state()
 
 
+class TestEventTimesAreLocal:
+    """The all-exhausted and prime lines printed raw ISO with microseconds
+    ("2026-10-02T11:04:00.123456+00:00"); --json keeps the ISO."""
+
+    ISO = "2026-10-02T11:04:00.123456+00:00"
+    TS = 1_790_939_040.123456
+
+    def test_all_exhausted_prints_local_time(self):
+        from claude_swap.oauth import local_clock
+
+        event = AllExhaustedEvent(earliest_reset_at=self.ISO)
+        text = event.human()
+        assert local_clock(self.TS) in text
+        assert "T11:04" not in text and ".123456" not in text
+        assert event.to_json()["earliestResetAt"] == self.ISO
+
+    def test_prime_event_prints_local_time(self):
+        from claude_swap.autoswitch import PrimeEvent
+        from claude_swap.oauth import local_clock
+
+        event = PrimeEvent("2", "primed", self.ISO.replace("+00:00", "Z"), None)
+        text = event.human()
+        assert f"resets {local_clock(self.TS)}" in text
+        assert "T11:04" not in text
+        assert event.to_json()["resetsAt"] == self.ISO.replace("+00:00", "Z")
+
+    def test_an_unparseable_time_is_shown_as_is(self):
+        assert "soon-ish" in AllExhaustedEvent(earliest_reset_at="soon-ish").human()
+
+
 class TestEventsShape:
     def test_every_event_has_envelope(self, harness):
         harness.tick_with_usage({"1": _usage(95), "2": _usage(10), "3": _usage(50)})
