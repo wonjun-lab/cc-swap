@@ -16,10 +16,11 @@ far-future value) cannot stop switching for good.
 from __future__ import annotations
 
 import math
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from pathlib import Path
 
 from claude_swap import autoswitch as aw
+from claude_swap.settings import atomic_write_json
 
 PAUSED_UNTIL_KEY = "pausedUntil"
 PAUSED_REASON_KEY = "pausedReason"
@@ -55,31 +56,43 @@ class _StateFile:
 
 
 def pause(
-    backup_root: Path, reason: str, *, now: float, seconds: float = MAX_PAUSE_S
-) -> float:
+    backup_root: Path,
+    reason: str,
+    *,
+    now: float,
+    seconds: float = MAX_PAUSE_S,
+    wanted: Callable[[], bool] | None = None,
+) -> float | None:
     """Pause switching and priming until ``now + seconds`` (capped at
-    :data:`MAX_PAUSE_S`); returns that time. Blocking (state-file lock)."""
-    until = now + min(max(seconds, 0.0), MAX_PAUSE_S)
+    :data:`MAX_PAUSE_S`); returns that time. Blocking (state-file lock).
 
-    def mutate(state: dict) -> None:
+    A renewal passes ``wanted``: it is asked under the state lock, and a
+    False answer (the pause was lifted meanwhile) writes nothing and
+    returns None — so a renewal racing a resume never re-pauses."""
+    until = now + min(max(seconds, 0.0), MAX_PAUSE_S)
+    file = _StateFile(backup_root)
+    with file._state_lock():
+        if wanted is not None and not wanted():
+            return None
+        state = file._read_state()
+        state["schemaVersion"] = aw.STATE_SCHEMA_VERSION
         state[PAUSED_UNTIL_KEY] = until
         state[PAUSED_REASON_KEY] = reason
-
-    _StateFile(backup_root)._mutate_state(mutate)
+        atomic_write_json(file.state_path, state)
     return until
 
 
 def resume(backup_root: Path) -> None:
-    """Lift a pause now. A no-op (no write) when none is recorded."""
+    """Lift a pause now. A no-op (no write) when none is recorded; the
+    check and the clear happen under the same state lock."""
     file = _StateFile(backup_root)
     if not file.state_path.exists():
         return
-    current = file._read_state()
-    if PAUSED_UNTIL_KEY not in current and PAUSED_REASON_KEY not in current:
-        return
-
-    def mutate(state: dict) -> None:
+    with file._state_lock():
+        state = file._read_state()
+        if PAUSED_UNTIL_KEY not in state and PAUSED_REASON_KEY not in state:
+            return
         state.pop(PAUSED_UNTIL_KEY, None)
         state.pop(PAUSED_REASON_KEY, None)
-
-    file._mutate_state(mutate)
+        state["schemaVersion"] = aw.STATE_SCHEMA_VERSION
+        atomic_write_json(file.state_path, state)

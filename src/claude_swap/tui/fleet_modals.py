@@ -26,6 +26,10 @@ from claude_swap.maximize.prime_cli import manual_prime
 from claude_swap.tui.data import ActionResult
 from claude_swap.tui.theme import Palette
 
+# How often an open re-login modal renews its engine pause.
+RENEW_S = 60.0
+_now = time.time  # the pause clock (tests move it)
+
 
 def prime_lines(switcher, numbers: set[str]) -> list[str]:
     """Run one manual priming pass (blocking) and return its report lines."""
@@ -157,6 +161,7 @@ class ReloginModal(ModalScreen["ActionResult | None"]):
         self._root = backup_root
         self._store = store
         self._busy = False
+        self._lifted = False  # the pause was lifted (cancel, store, unmount)
 
     def compose(self) -> ComposeResult:
         with Vertical(classes="modal-box modal-box-wide fx-modal"):
@@ -169,18 +174,58 @@ class ReloginModal(ModalScreen["ActionResult | None"]):
             )
 
     def on_mount(self) -> None:
-        self.run_worker(
-            self._pause_blocking, thread=True, group="fleet-pause",
-            exit_on_error=False, name="fleet-pause",
+        self._run_pause_op(self._pause_blocking, "fleet-pause")
+        # Renew while the modal stays open: the marker never outlives the
+        # last renewal by more than MAX_PAUSE_S, so a crash still lifts it.
+        self._renew_timer = self.set_interval(RENEW_S, self._renew)
+
+    def _run_pause_op(self, work: Callable[[], None], name: str) -> None:
+        """Pause, renewal and resume share one exclusive group on the app
+        (a resume survives this modal's unmount and supersedes a pause that
+        has not started); ``_still_paused`` settles the ones already running."""
+        self.app.run_worker(
+            work, thread=True, group="fleet-pause", exclusive=True,
+            exit_on_error=False, name=name,
         )
+
+    def _still_paused(self) -> bool:
+        return not self._lifted
+
+    def _renew(self) -> None:
+        if not self._lifted:
+            self._run_pause_op(self._pause_blocking, "fleet-pause-renew")
 
     def _pause_blocking(self) -> None:
         try:
-            until = pause.pause(self._root, "relogin", now=time.time())
+            until = pause.pause(
+                self._root, "relogin", now=_now(), wanted=self._still_paused
+            )
+            if until is None:
+                return  # lifted meanwhile: nothing written
             note = f"switching paused until {fx.hhmm(until)}"
         except Exception as e:  # the guidance still works; say the pause did not
             note = f"could not pause the engine ({type(e).__name__}); it may react to the login"
-        self.app.call_from_thread(self._status, note)
+        if not self._busy:
+            self.app.call_from_thread(self._status, note)
+
+    def _lift(self, *, wait: bool) -> None:
+        """Resume switching, once. ``wait`` resumes on this thread (the app
+        is going away and a worker might never run)."""
+        if self._lifted:
+            return
+        self._lifted = True
+        timer = getattr(self, "_renew_timer", None)
+        if timer is not None:
+            timer.stop()
+        if wait:
+            _resume(self._root)
+        else:
+            self._run_pause_op(partial(_resume, self._root), "fleet-resume")
+
+    def on_unmount(self) -> None:
+        # Quit (or anything else) while the modal is open: lift the pause now
+        # instead of leaving the engine paused for up to 10 minutes.
+        self._lift(wait=True)
 
     def _status(self, note: str) -> None:
         if self.is_attached:
@@ -207,20 +252,21 @@ class ReloginModal(ModalScreen["ActionResult | None"]):
         except Exception as e:
             result = ActionResult(False, f"Error: {type(e).__name__}: {e}")
         finally:
+            self._lifted = True  # no renewal from here on
             _resume(self._root)
         self.app.call_from_thread(self._stored, result)
 
     def _stored(self, result: ActionResult) -> None:
         self.app.busy = False
+        timer = getattr(self, "_renew_timer", None)
+        if timer is not None:
+            timer.stop()
         self.dismiss(result)
 
     def action_cancel(self) -> None:
         if self._busy:
             return
-        self.app.run_worker(
-            partial(_resume, self._root), thread=True, group="fleet-pause",
-            exit_on_error=False, name="fleet-resume",
-        )
+        self._lift(wait=False)
         self.dismiss(None)
 
 

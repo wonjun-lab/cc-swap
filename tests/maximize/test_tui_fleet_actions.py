@@ -335,6 +335,52 @@ class TestRelogin:
             await _open(pilot)
             assert "pausedUntil" not in json.loads(state.read_text())
 
+    async def test_quit_while_the_relogin_modal_is_open_lifts_the_pause(self, tmp_path):
+        from claude_swap.tui.fleet_modals import ReloginModal
+
+        _settings(tmp_path)
+        app = make_app(_fleet(tmp_path))
+        state = tmp_path / "autoswitch_state.json"
+        async with app.run_test(size=(140, 40)) as pilot:
+            await _open(pilot)
+            await _to_row(pilot, "4")
+            await pilot.press("r")
+            await _open(pilot)
+            assert isinstance(app.screen, ReloginModal)
+            assert "pausedUntil" in json.loads(state.read_text())
+            app.exit()
+            await pilot.pause()
+        assert "pausedUntil" not in json.loads(state.read_text())
+
+    async def test_open_modal_renews_the_pause_and_a_late_renewal_never_repauses(
+        self, tmp_path, monkeypatch
+    ):
+        from claude_swap.tui import fleet_modals
+        from claude_swap.tui.fleet_modals import ReloginModal
+
+        _settings(tmp_path)
+        app = make_app(_fleet(tmp_path))
+        state = tmp_path / "autoswitch_state.json"
+        async with app.run_test(size=(140, 40)) as pilot:
+            await _open(pilot)
+            await _to_row(pilot, "4")
+            await pilot.press("r")
+            await _open(pilot)
+            modal = app.screen
+            assert isinstance(modal, ReloginModal)
+            first = json.loads(state.read_text())["pausedUntil"]
+            later = time.time() + 400
+            monkeypatch.setattr(fleet_modals, "_now", lambda: later)
+            modal._renew()
+            await _open(pilot)
+            renewed = json.loads(state.read_text())["pausedUntil"]
+            assert renewed == later + 600 > first  # 10 min past the renewal
+            await pilot.press("escape")
+            await _open(pilot)
+            assert "pausedUntil" not in json.loads(state.read_text())
+            modal._pause_blocking()  # a renewal that was already running
+            assert "pausedUntil" not in json.loads(state.read_text())
+
     async def test_relogin_modal_stores_the_right_login_and_switches_back(self, tmp_path):
         from claude_swap.tui.fleet import FleetScreen
 

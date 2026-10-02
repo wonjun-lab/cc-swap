@@ -50,3 +50,30 @@ def test_pause_is_capped_and_resume_without_a_file_is_a_no_op(tmp_path):
     assert pause.pause(tmp_path, "relogin", now=NOW, seconds=10_000) == NOW + pause.MAX_PAUSE_S
     pause.resume(tmp_path / "missing")
     assert not (tmp_path / "missing").exists()
+
+
+def test_pause_is_skipped_when_no_longer_wanted_checked_under_the_lock(tmp_path):
+    # A renewal racing a resume: the "still wanted" check runs inside the
+    # state lock, so a resume that already ran is never undone.
+    path = tmp_path / "autoswitch_state.json"
+    path.write_text(json.dumps({"schemaVersion": 1}))
+    assert pause.pause(tmp_path, "relogin", now=NOW, wanted=lambda: False) is None
+    assert "pausedUntil" not in json.loads(path.read_text())
+    assert pause.pause(tmp_path, "relogin", now=NOW, wanted=lambda: True) == NOW + 600
+
+
+def test_renewal_extends_to_ten_minutes_past_the_last_renewal(tmp_path):
+    pause.pause(tmp_path, "relogin", now=NOW)
+    until = pause.pause(tmp_path, "relogin", now=NOW + 300)
+    assert until == NOW + 300 + pause.MAX_PAUSE_S
+    raw = json.loads((tmp_path / "autoswitch_state.json").read_text())
+    assert raw["pausedUntil"] == until
+
+
+def test_resume_without_a_marker_does_not_rewrite_the_file(tmp_path):
+    path = tmp_path / "autoswitch_state.json"
+    path.write_text('{"schemaVersion": 1, "x": 1}')
+    before = path.stat().st_mtime_ns
+    pause.resume(tmp_path)
+    assert path.read_text() == '{"schemaVersion": 1, "x": 1}'
+    assert path.stat().st_mtime_ns == before
