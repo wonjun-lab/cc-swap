@@ -21,7 +21,10 @@ you. Its horizon is the time to the next quiet window, capped at
 ``preemptHorizonMaxH`` (``NO_PATTERN_HORIZON_H`` with no pattern). In a
 usually-busy slot (P(busy) >= ``history.QUIET_P``, not inside a quiet window)
 a rebalance (b) gaining less than ``busyRebalanceGap`` waits for a quiet
-window starting within ``DEFER_WITHIN_S``.
+window starting within ``DEFER_WITHIN_S``. With preempt on, rebalance (b)
+skips a candidate preempt would move off again (its 7d passing soft7d
+within the horizon, :func:`crosses_soft7_within`): otherwise the two
+triggers bounce between the same accounts every ``rebalanceCooldownMin``.
 
 The destination is always the top of ``landing_candidates``. With none:
 
@@ -510,6 +513,26 @@ def preempt_horizon(snap: Snapshot) -> tuple[float, str]:
     return cap, f"within the next {cap:g}h"
 
 
+def landed_rate7(snap: Snapshot, a: AccountView, v: AccountView) -> float:
+    """``v``'s 7d pace (pct/hour) once you are on it, as preempt projects
+    it: its own, but never below the active's scaled to ``v``'s plan, since
+    your usage moves with you (a 20x -> 5x move climbs four times faster in
+    pct). 0 when neither is known."""
+    active = snap.rates7.get(a.number) or 0.0
+    return max(snap.rates7.get(v.number, 0.0), active * max(1.0, a.plan_weight / v.plan_weight))
+
+
+def crosses_soft7_within(
+    snap: Snapshot, a: AccountView, v: AccountView, horizon: float
+) -> float | None:
+    """Hours until ``v``'s 7d would pass soft7d once you are on it
+    (:func:`landed_rate7`), when that is within ``horizon``; else None. The
+    one check preempt picks a target with and rebalance skips a candidate by,
+    so neither lands where preempt would move off again."""
+    hours = soft7_eta_h(v, landed_rate7(snap, a, v), snap)
+    return hours if hours is not None and hours <= horizon else None
+
+
 def _preempt(
     snap: Snapshot, a: AccountView, landing: list[AccountView]
 ) -> Decision | None:
@@ -517,9 +540,8 @@ def _preempt(
     stretch; None when there is no reason to (decide goes on to rebalance).
 
     The active's 7d must reach soft7d within the horizon at its burn rate,
-    and a landable account of no worse a tier must not: projected at its
-    own rate, but never below the active's scaled by plan (a 20x -> 5x move
-    climbs four times faster in pct). The rebalance cooldown applies.
+    and a landable account of no worse a tier must not
+    (:func:`crosses_soft7_within`). The rebalance cooldown applies.
     """
     s = snap.settings
     rate = snap.rates7.get(a.number)
@@ -533,9 +555,7 @@ def _preempt(
     for v in landing:
         if TIER_ORDER[v.tier] > TIER_ORDER[a.tier]:
             continue
-        theirs = max(snap.rates7.get(v.number, 0.0), rate * max(1.0, a.plan_weight / v.plan_weight))
-        crosses = soft7_eta_h(v, theirs, snap)
-        if crosses is None or crosses > horizon:
+        if crosses_soft7_within(snap, a, v, horizon) is None:
             target = v
             break
     if target is None:
@@ -565,6 +585,26 @@ def _preempt(
     )
 
 
+def _preempt_would_leave(
+    snap: Snapshot, a: AccountView, landing: list[AccountView]
+) -> dict[str, float]:
+    """``{slot: hours}`` for each candidate a same-tier rebalance must skip:
+    with ``preempt`` on, one whose 7d would pass soft7d within preempt's
+    horizon once you are on it (:func:`crosses_soft7_within`). Landing
+    there would only have preempt move you off again a cooldown later, and
+    rebalance back after the next one: a switch, and a full context
+    re-read, every ``rebalanceCooldownMin``."""
+    if not snap.settings.preempt:
+        return {}
+    horizon, _ = preempt_horizon(snap)
+    out: dict[str, float] = {}
+    for v in landing:
+        hours = crosses_soft7_within(snap, a, v, horizon)
+        if hours is not None:
+            out[v.number] = hours
+    return out
+
+
 def _deferred_to(snap: Snapshot, gain: float) -> QuietWindow | None:
     """The quiet window a rebalance gaining ``gain`` waits for, or None to
     rebalance as usual: only in a usually-busy slot outside a quiet window,
@@ -591,22 +631,42 @@ def _rebalance(
         )
     top = landing[0]
     a_score = score(a, snap.now)
-    t_score = score(top, snap.now)
     gain: float | None = None
     if TIER_ORDER[top.tier] < TIER_ORDER[a.tier]:
+        # Leaving an excluded or last-resort account is the user's rule:
+        # never skipped for a 7d pace.
         why = f"#{a.number} is {a.tier} and #{top.number} ({top.tier}) can land"
-    elif top.tier == a.tier and t_score - a_score > s.tie_epsilon:
-        gain = t_score - a_score
-        why = (
-            f"#{top.number} score {t_score:.2f} beats #{a.number} "
-            f"{a_score:.2f} by more than {s.tie_epsilon:g}"
-        )
     else:
-        return Hold(
-            f"#{a.number} under soft ({_usage(a)}); no better account "
-            f"(score {a_score:.2f})",
-            pending=False,
-        )
+        skipped = _preempt_would_leave(snap, a, landing)
+        pool = [v for v in landing if v.number not in skipped]
+        top = pool[0] if pool else None
+        t_score = score(top, snap.now) if top is not None else -math.inf
+        if top is not None and top.tier == a.tier and t_score - a_score > s.tie_epsilon:
+            gain = t_score - a_score
+            why = (
+                f"#{top.number} score {t_score:.2f} beats #{a.number} "
+                f"{a_score:.2f} by more than {s.tie_epsilon:g}"
+            )
+        else:
+            best = landing[0]
+            b_score = score(best, snap.now)
+            if (
+                best.number in skipped
+                and best.tier == a.tier
+                and b_score - a_score > s.tie_epsilon
+            ):
+                _, when = preempt_horizon(snap)
+                return Hold(
+                    f"#{a.number} under soft ({_usage(a)}); #{best.number} scores better "
+                    f"({b_score:.2f}) but its 7d would pass {_pct(s.soft_7d)} in "
+                    f"{_hours(skipped[best.number])}, {when} — staying",
+                    pending=False,
+                )
+            return Hold(
+                f"#{a.number} under soft ({_usage(a)}); no better account "
+                f"(score {a_score:.2f})",
+                pending=False,
+            )
     remaining_s = _cooldown_left(snap)
     if remaining_s is not None:
         return Hold(

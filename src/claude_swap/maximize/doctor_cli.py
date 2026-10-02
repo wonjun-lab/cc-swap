@@ -470,7 +470,7 @@ REASONS: dict[str, tuple[str, str]] = {
         "Nothing; a hard ceiling switches at once. Lower maximize.idleWindowMin to switch sooner.",
     ),
     "maximize-hold": (
-        "maximize sees no reason to move: below every soft mark and no better-scored account (or within rebalanceCooldownMin).",
+        "maximize sees no reason to move: below every soft mark and no better-scored account (or within rebalanceCooldownMin, or the better-scored one's 7d would pass soft7d before your next quiet time, so preempt would only move you off it again).",
         "Nothing.",
     ),
     "reset-wait": (

@@ -763,3 +763,74 @@ class TestRebalanceDeferral:
                          forecast=pattern(next=quiet(3, 11)))
         got = decide(s)
         assert isinstance(got, Hold) and got.code is None and "cooldown" in got.reason
+
+
+# -- preempt <-> rebalance: no ping-pong (review of rel/0.4.0) ------------------------------
+#
+# Preempt moves #1 -> #2 because #1's 7d would pass soft7d within the horizon.
+# Rebalance ranks by score only, so once the cooldown was over it moved straight
+# back to #1 (the better score), and preempt moved off it again: a switch every
+# rebalanceCooldownMin, each one a full context re-read. Rebalance now skips a
+# candidate that preempt's own check says would cross soft7d within the horizon.
+
+# #1 7d 80% resetting in a day, climbing 3 pts/h while active (90% in ~3.3 h);
+# #2 7d 30% resetting in 6 days.
+PING_1 = acct("1", 0, 80, reset7_d=1.0)
+PING_2 = acct("2", 0, 30, reset7_d=6.0)
+
+
+def ping(active: str, *accounts, rates=None, **settings) -> Snapshot:
+    from dataclasses import replace
+
+    s = snap(active, *(accounts or (PING_1, PING_2)), samples="idle",
+             last_switch_min=31, active_changed_min=31, **settings)
+    return replace(s, rates7={"1": 3.0} if rates is None else rates)
+
+
+class TestNoPreemptRebalancePingPong:
+    def test_the_reviewers_case_preempts_once_and_stays(self):
+        on_1 = decide(ping("1"))
+        assert isinstance(on_1, Switch) and on_1.trigger == "preempt" and on_1.target == "2"
+        on_2 = decide(ping("2"))
+        assert not isinstance(on_2, Switch), on_2
+        assert isinstance(on_2, Hold) and on_2.code is None and not on_2.pending
+        assert on_2.reason == (
+            "#2 under soft (5h 0% / 7d 30%); #1 scores better (1.40) but its 7d would "
+            "pass 90% in ~3h, within the next 4h — staying"
+        )
+
+    def test_preempt_off_rebalances_by_score_as_before(self):
+        got = decide(ping("2", preempt=False))
+        assert isinstance(got, Switch) and got.trigger == "rebalance" and got.target == "1"
+
+    def test_without_a_known_pace_nothing_is_skipped(self):
+        got = decide(ping("2", rates={}))
+        assert isinstance(got, Switch) and got.trigger == "rebalance" and got.target == "1"
+
+    def test_the_next_best_candidate_that_will_not_cross_is_taken(self):
+        third = acct("3", 0, 40, reset7_d=3.0)   # score 1.40, no known pace
+        got = decide(ping("2", PING_1, PING_2, third))
+        assert isinstance(got, Switch) and got.trigger == "rebalance" and got.target == "3"
+
+    def test_the_active_pace_scaled_by_plan_counts_for_the_candidate(self):
+        # #2 is a 20x climbing 1 pt/h; on a 5x #1 that is 4 pts/h: 90% in 2.5 h.
+        big_2 = acct("2", 0, 30, reset7_d=6.0, weight=4)
+        got = decide(ping("2", acct("1", 0, 80, reset7_d=1.0), big_2, rates={"2": 1.0}))
+        assert isinstance(got, Hold) and "would pass 90% in ~2h" in got.reason
+        # Same plan: 1 pt/h, 90% in 10 h: past the horizon, a plain rebalance.
+        same_1 = acct("1", 0, 80, reset7_d=1.0, weight=4)
+        got = decide(ping("2", same_1, big_2, rates={"2": 1.0}))
+        assert isinstance(got, Switch) and got.trigger == "rebalance" and got.target == "1"
+
+    def test_a_crossing_past_the_horizon_or_after_the_7d_reset_is_no_reason(self):
+        late = acct("1", 0, 80, reset7_d=2 / 24)   # 7d resets in 2 h, before 90%
+        got = decide(ping("2", late, PING_2))
+        assert isinstance(got, Switch) and got.target == "1"
+        slow = decide(ping("2", rates={"1": 1.0}))   # 90% in 10 h > 4 h
+        assert isinstance(slow, Switch) and slow.target == "1"
+
+    def test_a_tier_move_is_never_skipped(self):
+        # Leaving a last-resort account is the user's rule, not a score.
+        resort_2 = acct("2", 0, 30, reset7_d=6.0, tier="last_resort")
+        got = decide(ping("2", PING_1, resort_2))
+        assert isinstance(got, Switch) and got.trigger == "rebalance" and got.target == "1"
