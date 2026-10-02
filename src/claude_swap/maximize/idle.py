@@ -108,16 +108,16 @@ def is_idle(samples: Sequence[Sample], now: float, s: MaximizeSettings) -> bool:
     return d5 <= s.idle_max_delta_pct and d7 <= IDLE_MAX_DELTA_7D_PCT
 
 
-def eta_to_hard(
+def velocity(
     samples: Sequence[Sample], s: MaximizeSettings
 ) -> tuple[float | None, float | None]:
-    """``(5h, 7d)`` minutes until each hard cap at the recent burn rate.
+    """``(5h, 7d)`` points per minute at the recent burn rate.
 
-    Velocity is :func:`span_rise` over the span from the earliest sample
-    within ``idle_window_min`` of the newest (the nearest older sample when
-    polling is sparser than the window), so a reset inside the span cannot
-    hide a climb after it. A window that did not climb has no ETA (None);
-    both are None when the span is too short to trust.
+    :func:`span_rise` over the span from the earliest sample within
+    ``idle_window_min`` of the newest (the nearest older sample when polling
+    is sparser than the window), so a reset inside the span cannot hide a
+    climb after it. A window that did not climb reads 0; both are None when
+    the span is too short to trust.
     """
     ordered = _ordered(samples)
     if len(ordered) < 2:
@@ -132,12 +132,26 @@ def eta_to_hard(
         return None, None
     span_min = span_s / 60.0
     d5, d7 = span_rise(span)
+    return d5 / span_min, d7 / span_min
 
-    def eta(used: float, now_pct: float, cap: float) -> float | None:
-        velocity = used / span_min
-        return max(cap - now_pct, 0.0) / velocity if velocity > 0 else None
 
-    return eta(d5, newest.pct5, s.hard_5h), eta(d7, newest.pct7, s.hard_7d)
+def eta_to_hard(
+    samples: Sequence[Sample], s: MaximizeSettings
+) -> tuple[float | None, float | None]:
+    """``(5h, 7d)`` minutes until each hard cap at the recent burn rate
+    (:func:`velocity`, from the newest sample's reading). A window that did
+    not climb has no ETA (None); both are None when the span is too short
+    to trust.
+    """
+    v5, v7 = velocity(samples, s)
+    if v5 is None or v7 is None:
+        return None, None
+    newest = _ordered(samples)[-1]
+
+    def eta(rate: float, now_pct: float, cap: float) -> float | None:
+        return max(cap - now_pct, 0.0) / rate if rate > 0 else None
+
+    return eta(v5, newest.pct5, s.hard_5h), eta(v7, newest.pct7, s.hard_7d)
 
 
 def eta_to_hard_min(

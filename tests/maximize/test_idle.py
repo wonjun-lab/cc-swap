@@ -11,6 +11,7 @@ from claude_swap.maximize.idle import (
     is_idle,
     span_rise,
     trim_samples,
+    velocity,
 )
 from claude_swap.maximize.model import Sample
 from claude_swap.settings import MaximizeSettings
@@ -177,3 +178,20 @@ class TestEta:
     )
     def test_no_eta(self, rows):
         assert eta_to_hard_min(samples(*rows), S) is None
+
+
+class TestVelocity:
+    def test_points_per_minute_per_window(self):
+        assert velocity(samples((600, 60, 40), (0, 80, 41)), S) == pytest.approx((2.0, 0.1))
+
+    def test_a_flat_window_reads_zero(self):
+        assert velocity(samples((600, 60, 40), (0, 60, 40)), S) == (0.0, 0.0)
+
+    def test_a_reset_mid_span_counts_only_the_climbs(self):
+        # 80 -> 0 is the rollover; 0 -> 30 over 5 min is the pace.
+        v5, _ = velocity(samples((600, 80, 40), (300, 0, 40), (0, 30, 40)), S)
+        assert v5 == pytest.approx(3.0)
+
+    @pytest.mark.parametrize("rows", [(), ((0, 10, 10),), ((60, 10, 10), (0, 12, 10))])
+    def test_unknown_on_too_short_a_span(self, rows):
+        assert velocity(samples(*rows), S) == (None, None)
