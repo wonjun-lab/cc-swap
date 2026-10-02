@@ -184,6 +184,33 @@ def test_prime_reports_every_account_it_did_not_launch(store_rig, capsys, monkey
     assert code == 1
 
 
+def test_manual_prime_reports_reasons_when_nothing_is_eligible(cli_rig):
+    """The TUI's entry point: the same plan and checks as the CLI, returned
+    as a report whose lines always say why nothing was primed."""
+    harness, fake = cli_rig
+    seen: list = []
+    report = prime_cli.manual_prime(
+        harness.switcher, {"1", "3"}, dry_run=False,
+        emit=seen.append, sleep=harness.clock.advance, clock=harness.clock,
+    )
+    assert fake.calls() == []
+    assert (report.events, report.pending, report.not_primed) == ([], [], {})
+    assert report.lines() == [
+        "#1  skip (active)", "#3  skip (window-on)", "Nothing to prime.",
+    ]
+    assert report.failed is False
+    dry = prime_cli.manual_prime(
+        harness.switcher, None, dry_run=True,
+        emit=seen.append, sleep=harness.clock.advance, clock=harness.clock,
+    )
+    assert dry.lines() == [
+        "#1  skip (active)",
+        "#2  would prime now (window cold, attempt 1/2)",
+        "#3  skip (window-on)",
+    ]
+    assert "@" not in "\n".join(report.lines() + dry.lines())
+
+
 def test_main_dispatches_prime(monkeypatch):
     seen: list[list[str]] = []
     monkeypatch.setattr(prime_cli, "prime_command", seen.append)

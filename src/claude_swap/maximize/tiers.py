@@ -33,3 +33,78 @@ def tier_for(record: Mapping, email: str, last_resort: tuple[str, ...]) -> Tier:
     if names & wanted:
         return "last_resort"
     return "normal"
+
+
+# -- maximize.lastResort entries (shared by `cc-swap last-resort` and the TUI) --
+
+
+def last_resort_entry(accounts: Mapping, num: str, email: str) -> str:
+    """The ``maximize.lastResort`` entry that names exactly Account-``num``.
+
+    The email (slot numbers move under swap/move, spec §5.1) — unless another
+    managed account shares it (a personal and a Team login), where the email
+    would mark both; then the account's alias, which is unique.
+    ``accounts`` is ``sequence.json``'s ``accounts`` map (slot → record).
+    """
+    shared = sorted(
+        (
+            n for n, rec in accounts.items()
+            if n != num and (rec.get("email") or "").lower() == email.lower()
+        ),
+        key=int,
+    )
+    if not shared:
+        return email
+    alias = accounts.get(num, {}).get("alias")
+    if alias:
+        return alias
+    from claude_swap.exceptions import ConfigError
+
+    raise ConfigError(
+        f"{email} is shared by Account-{num} and Account-{', Account-'.join(shared)}; "
+        f"give Account-{num} an alias first (cc-swap alias {num} NAME) so "
+        "last-resort names only that account"
+    )
+
+
+def last_resort_matches(accounts: Mapping, entry: str) -> list[str]:
+    """Slot numbers an entry marks: email or alias, case-insensitive (the
+    same rule :func:`tier_for` applies)."""
+    needle = entry.lower()
+    return sorted(
+        (
+            n for n, rec in accounts.items()
+            if needle in {
+                (rec.get("email") or "").lower(),
+                (rec.get("alias") or "").lower(),
+            }
+        ),
+        key=int,
+    )
+
+
+def _entries(value: str | None) -> list[str]:
+    """The comma list as written: trimmed, case-insensitively deduped, first
+    spelling kept (``settings.parse_model_names``' rule, which the CLI uses)."""
+    seen: dict[str, str] = {}
+    for part in (value or "").split(","):
+        item = part.strip()
+        if item and item.lower() not in seen:
+            seen[item.lower()] = item
+    return list(seen.values())
+
+
+def toggle_last_resort(accounts: Mapping, current: str | None, num: str) -> str:
+    """The new ``maximize.lastResort`` value with Account-``num`` toggled.
+
+    Marked by any entry → every entry that marks it is dropped (it is then
+    guaranteed normal). Not marked → :func:`last_resort_entry` is appended,
+    which raises ``ConfigError`` for a shared email without an alias.
+    ``""`` means the key should be unset.
+    """
+    entries = _entries(current)
+    marking = [e for e in entries if num in last_resort_matches(accounts, e)]
+    if marking:
+        return ",".join(e for e in entries if e not in marking)
+    email = str(accounts.get(num, {}).get("email") or "")
+    return ",".join([*entries, last_resort_entry(accounts, num, email)])

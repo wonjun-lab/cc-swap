@@ -11,6 +11,8 @@ import argparse
 import os
 import sys
 import time
+from collections.abc import Callable
+from dataclasses import dataclass, field
 
 from claude_swap.autoswitch import AutoSwitchEngine, AutoSwitchEvent
 from claude_swap.exceptions import ClaudeSwitchError
@@ -28,6 +30,107 @@ _FAILED = frozenset({"failed", "timeout", "unverified", "disabled"})
 
 def _print_event(event: AutoSwitchEvent) -> None:
     print(f"{time.strftime('%H:%M:%S')}  {event.human()}", flush=True)
+
+
+_PENDING_NOTE = (
+    "verification pending (the running engine or the next `cc-swap prime` checks it)"
+)
+_NOTHING = "Nothing to prime."
+# Report lines the CLI prints dimmed (the rest print plain, as before).
+_DIM_SUFFIXES = (_PENDING_NOTE, _NOTHING)
+
+
+@dataclass(frozen=True)
+class PrimeReport:
+    """What one manual priming pass did, by slot number only (no emails).
+
+    ``plan`` is ``Primer.plan``: ``(slot, text, would_prime)`` in slot order.
+    Every account the plan would prime ends up in ``events``, ``pending`` or
+    ``not_primed`` — never silently nowhere."""
+
+    dry_run: bool
+    plan: list[tuple[str, str, bool]]
+    events: list[AutoSwitchEvent] = field(default_factory=list)
+    pending: list[str] = field(default_factory=list)
+    not_primed: dict[str, str] = field(default_factory=dict)
+
+    @property
+    def failed(self) -> bool:
+        return any(getattr(e, "outcome", None) in _FAILED for e in self.events) or bool(
+            self.not_primed
+        )
+
+    def tail_lines(self) -> list[str]:
+        """The lines after the events: pending, not primed, or nothing to do."""
+        lines = [f"#{num}  {_PENDING_NOTE}" for num in self.pending]
+        lines += [
+            f"#{num}  not primed ({self.not_primed[num]})"
+            for num in sorted(self.not_primed, key=_slot_order)
+        ]
+        if not self.events and not self.pending and not self.not_primed:
+            lines.append(_NOTHING)
+        return lines
+
+    def lines(self) -> list[str]:
+        """The whole report as plain text: the plan's skip lines (all of the
+        plan on a dry run), the events, then :meth:`tail_lines`."""
+        if self.dry_run:
+            return [f"#{num}  {text}" for num, text, _ in self.plan] or ["No accounts."]
+        out = [f"#{num}  {text}" for num, text, would in self.plan if not would]
+        out += [event.human() for event in self.events]
+        return out + self.tail_lines()
+
+
+def _print_skips(plan: list[tuple[str, str, bool]]) -> None:
+    for num, text, would_prime in plan:
+        if not would_prime:
+            print(dimmed(f"#{num}  {text}"))
+
+
+def manual_prime(
+    switcher,
+    numbers: set[str] | None,
+    *,
+    dry_run: bool,
+    emit: Callable[[AutoSwitchEvent], None],
+    sleep: Callable[[float], None] = time.sleep,
+    clock: Callable[[], float] = time.time,
+    on_plan: Callable[[list[tuple[str, str, bool]]], None] | None = None,
+) -> PrimeReport:
+    """One manual priming pass (``cc-swap prime``; the TUI's Prime now).
+
+    Blocking: reads usage, may refresh tokens and run ``claude``. ``emit``
+    receives the engine's own events (a quarantine); the primer's events come
+    back in the report. ``on_plan`` sees the plan before anything launches,
+    so a caller can show the skips while the launches run."""
+    engine = AutoSwitchEngine(
+        switcher,
+        load_settings(switcher.backup_dir),
+        emit,
+        dry_run=dry_run,
+        clock=clock,
+    )
+    primer = Primer(engine, load_prime_settings(switcher.backup_dir), clock=clock)
+    entries = switcher.usage_entries_by_account(fetch=None)
+    usage = {num: entry.decision_value() for num, entry in entries.items()}
+    snap = prime_snapshot(engine, usage, clock())
+    plan = primer.plan(snap, numbers)
+    if dry_run:
+        return PrimeReport(True, plan)
+    if on_plan is not None:
+        on_plan(plan)
+    events = primer.prime_now(snap, numbers, sleep=sleep)
+    pending = primer.pending_accounts(snap)
+    # Every account the plan would prime gets a line: an event, pending,
+    # or the reason it was not primed — never a silent no-op.
+    # (A missing `claude` already produced its own event for all of them.)
+    not_primed = dict(primer.not_primed)
+    reported = {getattr(e, "account", None) for e in events} | set(pending)
+    disabled = any(getattr(e, "outcome", None) == "disabled" for e in events)
+    for num, _text, would_prime in plan:
+        if would_prime and not disabled and num not in reported and num not in not_primed:
+            not_primed[num] = "no longer a priming target"
+    return PrimeReport(False, plan, list(events), pending, not_primed)
 
 
 def prime_command(argv: list[str]) -> None:
@@ -68,51 +171,24 @@ def prime_command(argv: list[str]) -> None:
             if args.accounts
             else None
         )
-        engine = AutoSwitchEngine(
+        report = manual_prime(
             switcher,
-            load_settings(switcher.backup_dir),
-            _print_event,
+            numbers,
             dry_run=args.dry_run,
+            emit=_print_event,
+            sleep=_sleep,
             clock=_clock,
+            on_plan=_print_skips,
         )
-        primer = Primer(engine, load_prime_settings(switcher.backup_dir), clock=_clock)
-        entries = switcher.usage_entries_by_account(fetch=None)
-        usage = {num: entry.decision_value() for num, entry in entries.items()}
-        snap = prime_snapshot(engine, usage, _clock())
-        plan = primer.plan(snap, numbers)
         if args.dry_run:
-            for num, text, _ in plan:
-                print(f"#{num}  {text}")
-            if not plan:
-                print("No accounts.")
+            for line in report.lines():
+                print(line)
             return
-        for num, text, would_prime in plan:
-            if not would_prime:
-                print(dimmed(f"#{num}  {text}"))
-        events = primer.prime_now(snap, numbers, sleep=_sleep)
-        for event in events:
+        for event in report.events:
             _print_event(event)
-        pending = primer.pending_accounts(snap)
-        for num in pending:
-            print(dimmed(
-                f"#{num}  verification pending (the running engine or the next "
-                "`cc-swap prime` checks it)"
-            ))
-        # Every account the plan would prime gets a line: an event, pending,
-        # or the reason it was not primed — never a silent no-op.
-        # (A missing `claude` already printed its own event for all of them.)
-        not_primed = dict(primer.not_primed)
-        reported = {getattr(e, "account", None) for e in events} | set(pending)
-        disabled = any(e.outcome == "disabled" for e in events)
-        for num, _text, would_prime in plan:
-            if would_prime and not disabled and num not in reported and num not in not_primed:
-                not_primed[num] = "no longer a priming target"
-        for num in sorted(not_primed, key=_slot_order):
-            print(f"#{num}  not primed ({not_primed[num]})")
-        if not events and not pending and not not_primed:
-            print(dimmed("Nothing to prime."))
-        failed = any(e.outcome in _FAILED for e in events) or bool(not_primed)
-        sys.exit(1 if failed else 0)
+        for line in report.tail_lines():
+            print(dimmed(line) if line.endswith(_DIM_SUFFIXES) else line)
+        sys.exit(1 if report.failed else 0)
     except ClaudeSwitchError as e:
         error(f"Error: {e}")
         sys.exit(1)

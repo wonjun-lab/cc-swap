@@ -12,7 +12,9 @@ from claude_swap.maximize.model import AccountView, Snapshot
 from claude_swap.maximize.primer import (
     COLD_KEY,
     DEFAULT_JITTER,
+    PlanRow,
     PrimeRunResult,
+    _anchor,
     attempts_used,
     build_prime_argv,
     build_prime_env,
@@ -22,6 +24,9 @@ from claude_swap.maximize.primer import (
     floor10,
     iso_minute,
     mask_secrets,
+    plan_lines,
+    plan_rows,
+    prime_window,
     resolve_claude_path,
     skip_reason,
     verified,
@@ -455,3 +460,53 @@ def test_mask_secrets():
     assert "s3cr3t-value" not in masked
     assert len(mask_secrets(text, "s3cr3t-value")) == 500
     assert mask_secrets(None) == ""
+
+
+# -- the TUI's read helpers: prime windows and plan rows ------------------------------
+
+
+def test_prime_window_matches_due_targets_bounds():
+    jitter = PrimeSettings(enabled=True, jitter_s="45-300")
+    cold = _view("2")
+    rolled = _view("3", reset5=NOW - 100.0)  # its reset is inside this bucket
+    running = _view("4", reset5=NOW + H)
+    snap = _snap([ACTIVE, cold, rolled, running])
+    for view in (cold, rolled):
+        lo, hi = prime_window(view, None, "1", jitter, NOW)
+        assert (lo, hi) == (_anchor(view, NOW) + 45, _anchor(view, NOW) + 300)
+        for seed in range(20):
+            [target] = [
+                t for t in due_targets(snap, {}, jitter, NOW, random.Random(seed))
+                if t.number == view.number
+            ]
+            assert lo <= target.due_at <= hi
+    # A running window is primed right after its reset.
+    assert prime_window(running, None, "1", jitter, NOW) == (NOW + H + 45, NOW + H + 300)
+    # The active account, and accounts the primer skips, have no window.
+    assert prime_window(ACTIVE, None, "1", jitter, NOW) is None
+    assert prime_window(_view("5", quarantined=True), None, "1", jitter, NOW) is None
+    # A retry after an unverified attempt is due now, without jitter.
+    entry = {"windowKey": COLD_KEY, "attempts": 1, "lastAttemptAt": NOW - 60,
+             "lastOutcome": "unverified"}
+    assert prime_window(cold, entry, "1", jitter, NOW) == (NOW, NOW)
+
+
+def test_plan_rows_and_plan_lines_agree():
+    views = [ACTIVE, _view("2"), _view("3", reset5=NOW + H), _view("4", tier="excluded")]
+    snap = _snap(views)
+    state = {"u2@example.com": {"windowKey": COLD_KEY, "attempts": 1,
+                                "lastAttemptAt": NOW - H, "lastOutcome": "auth-failed"}}
+    rows = plan_rows(snap, state, SETTINGS, NOW)
+    assert rows == [
+        PlanRow("1", "active", None, None),
+        PlanRow("2", None, COLD_KEY, 2),
+        PlanRow("3", "window-on", None, None),
+        PlanRow("4", "excluded", None, None),
+    ]
+    assert plan_lines(rows, SETTINGS.max_attempts) == [
+        "#1  skip (active)",
+        "#2  would prime now (window cold, attempt 2/2)",
+        "#3  skip (window-on)",
+        "#4  skip (excluded)",
+    ]
+    assert plan_rows(snap, state, SETTINGS, NOW, numbers={"2"}) == [rows[1]]

@@ -997,48 +997,11 @@ Examples:
         sys.exit(130)
 
 
-def _last_resort_entry(accounts: dict, num: str, email: str) -> str:
-    """The ``maximize.lastResort`` entry that names exactly Account-``num``.
+# Moved to maximize/tiers.py (the TUI toggles last-resort too).
+from claude_swap.maximize import tiers as _mx_tiers  # noqa: E402
 
-    The email (slot numbers move under swap/move, spec §5.1) — unless another
-    managed account shares it (a personal and a Team login), where the email
-    would mark both; then the account's alias, which is unique.
-    """
-    shared = sorted(
-        (
-            n for n, rec in accounts.items()
-            if n != num and (rec.get("email") or "").lower() == email.lower()
-        ),
-        key=int,
-    )
-    if not shared:
-        return email
-    alias = accounts.get(num, {}).get("alias")
-    if alias:
-        return alias
-    from claude_swap.exceptions import ConfigError
-
-    raise ConfigError(
-        f"{email} is shared by Account-{num} and Account-{', Account-'.join(shared)}; "
-        f"give Account-{num} an alias first (cc-swap alias {num} NAME) so "
-        "last-resort names only that account"
-    )
-
-
-def _last_resort_matches(accounts: dict, entry: str) -> list[str]:
-    """Slot numbers an entry marks: email or alias, case-insensitive (the
-    same rule the maximize tiering applies)."""
-    needle = entry.lower()
-    return sorted(
-        (
-            n for n, rec in accounts.items()
-            if needle in {
-                (rec.get("email") or "").lower(),
-                (rec.get("alias") or "").lower(),
-            }
-        ),
-        key=int,
-    )
+_last_resort_entry = _mx_tiers.last_resort_entry
+_last_resort_matches = _mx_tiers.last_resort_matches
 
 
 def _last_resort_command(argv: list[str]) -> None:
