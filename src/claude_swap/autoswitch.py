@@ -43,7 +43,7 @@ from pathlib import Path
 from typing import ClassVar
 
 from claude_swap import oauth, poll_policy
-from claude_swap.exceptions import ClaudeSwitchError
+from claude_swap.exceptions import ClaudeSwitchError, CredentialReadError
 from claude_swap.json_output import (
     SCHEMA_VERSION,
     USAGE_LOGIN_EXPIRED,
@@ -2316,7 +2316,15 @@ class AutoSwitchEngine:
                 ))
                 return TickOutcome.NO_ACTION
 
-            result = self.switcher.switch_to(number, json_output=True)
+            try:
+                result = self.switcher.switch_to(number, json_output=True)
+            except CredentialReadError as exc:
+                # The switch refused a degraded/unreadable live read: hold,
+                # write nothing (the state lock is released unchanged).
+                self._emit(NoSwitchEvent(
+                    reason="active-credential-unreadable", detail=str(exc),
+                ))
+                return TickOutcome.NO_ACTION
             if not result or not result.get("switched"):
                 self._emit(
                     NoSwitchEvent(

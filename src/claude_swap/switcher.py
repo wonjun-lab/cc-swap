@@ -17,6 +17,7 @@ from pathlib import Path
 from claude_swap import macos_keychain
 
 from claude_swap.exceptions import (
+    KEYCHAIN_REFUSAL,
     AccountNotFoundError,
     ConfigError,
     CredentialReadError,
@@ -6946,6 +6947,23 @@ class ClaudeAccountSwitcher:
             "or run from a normal shell."
         )
 
+    def _read_live_for_switch(self) -> str | None:
+        """The live credential for a switch's backup/snapshot step, or a
+        refusal. A degraded read (the Keychain failed and a possibly stale
+        plaintext mirror answered) or an unavailable Keychain would back up
+        the wrong generation and overwrite the item holding the newest one —
+        a fresh ``/login`` included (2026-10-03). ``None`` keeps meaning a
+        file read error, as from ``_read_credentials``."""
+        self._store.forget_last_active_read()
+        value = self._read_credentials()
+        active = self._store.last_active_read()
+        if active is not None and (active.degraded or active.keychain_unavailable):
+            raise CredentialReadError(
+                f"{KEYCHAIN_REFUSAL}; retry in a GUI terminal (the live login "
+                "could not be read, and switching would overwrite it)"
+            )
+        return value
+
     def _perform_switch(
         self,
         target_account: str,
@@ -7104,7 +7122,7 @@ class ClaudeAccountSwitcher:
                 # than overwrite state that has no safety copy; "" means
                 # absent in every backend and composes/restores nothing.
                 rollback_config_text: str | None = None
-                rollback_creds: str | None = self._read_credentials()
+                rollback_creds: str | None = self._read_live_for_switch()
                 if rollback_creds is None:
                     raise CredentialReadError(
                         "Cannot snapshot live credentials before activation"
@@ -7259,7 +7277,7 @@ class ClaudeAccountSwitcher:
 
             # Create transaction for rollback capability
             try:
-                original_creds = self._read_credentials()
+                original_creds = self._read_live_for_switch()
                 if original_creds is None:
                     raise CredentialReadError("Failed to read current credentials")
                 if not original_creds:

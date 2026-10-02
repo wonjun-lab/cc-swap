@@ -16,6 +16,7 @@ from collections.abc import Mapping
 from pathlib import Path
 
 from claude_swap import oauth
+from claude_swap.exceptions import CredentialReadError
 from claude_swap.maximize.tiers import (
     last_resort_matches,
     parse_account_list,
@@ -96,7 +97,12 @@ def relogin_store(
     switcher.add_account(slot=None, assume_yes=True)
     out: dict = {"stored": True, "number": number}
     if return_to and str(return_to) != number:
-        switcher.switch_to(str(return_to), json_output=True)
+        try:
+            switcher.switch_to(str(return_to), json_output=True)
+        except CredentialReadError as exc:
+            # Stored; only the way back was refused (degraded live read).
+            out["switch_back_error"] = str(exc)
+            return out
         out["returned_to"] = str(return_to)
     return out
 

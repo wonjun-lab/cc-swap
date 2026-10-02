@@ -224,6 +224,12 @@ def _relogin_done(app: "CswapApp", number: str, result) -> None:
         )
         return
     back = payload.get("returned_to")
+    if payload.get("switch_back_error"):
+        app.notify(
+            f"#{number} login stored; not switched back: {payload['switch_back_error']}",
+            title="Re-login", severity="warning", timeout=10,
+        )
+        return
     tail = f"; back on #{back}" if back else ""
     app.notify(f"#{number} login stored{tail}", title="Re-login")
 

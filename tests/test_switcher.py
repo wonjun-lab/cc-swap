@@ -9550,7 +9550,9 @@ class TestSwitchUnreadableBackup:
         assert s.current_account_number() == "1"
 
         monkeypatch.setattr(macos_keychain, "get_password", _raise_locked)
-        with pytest.raises(SwitchError) as exc:
+        # Every read denied: the live read is degraded too, so the switch
+        # now refuses at its backup step, before the target read.
+        with pytest.raises((SwitchError, CredentialReadError)) as exc:
             s.switch_to("2")
         msg = str(exc.value).lower()
         assert "keychain" in msg

@@ -18,6 +18,7 @@ from textual.reactive import reactive
 from textual.worker import WorkerState
 
 from claude_swap import printer
+from claude_swap.exceptions import KEYCHAIN_REFUSAL
 from claude_swap.maximize.lease import EngineLease, LeaseKeeper
 from claude_swap.maximize.view import window_ticks
 from claude_swap.models import AccountsSnapshot
@@ -296,6 +297,13 @@ class CswapApp(App):
         self.busy = False
         self.request_refresh()
         if not result.ok:
+            if KEYCHAIN_REFUSAL in result.output:
+                # A transient condition, not a failure to read about: a toast.
+                self.notify(
+                    result.first_line.removeprefix("Error: ") or result.output.strip(),
+                    title=label, severity="error", timeout=10,
+                )
+                return
             self.push_screen(OutputModal(f"{label} — failed", result.output))
             return
         payload = result.payload or {}

@@ -733,6 +733,26 @@ class TestActiveCredentialUnreadable:
         reasons = {e.reason for e in harness.events if isinstance(e, NoSwitchEvent)}
         assert reasons == {"active-credential-unreadable"}
 
+    def test_switch_refusing_a_degraded_read_holds_without_state_change(self, harness):
+        from claude_swap.exceptions import CredentialReadError
+
+        state_path = harness.switcher.backup_dir / "autoswitch_state.json"
+        before = state_path.read_bytes() if state_path.exists() else None
+        refusal = CredentialReadError(
+            "Keychain unreadable right now — not switching; retry in a GUI terminal"
+        )
+        with patch.object(harness.switcher, "switch_to", side_effect=refusal):
+            outcome = harness.tick_with_usage(
+                {"1": _usage(100), "2": _usage(10), "3": _usage(20)}
+            )
+        assert outcome is TickOutcome.NO_ACTION
+        assert harness.active_number() == 1
+        assert not any(isinstance(e, SwitchEvent) for e in harness.events)
+        reasons = [e.reason for e in harness.events if isinstance(e, NoSwitchEvent)]
+        assert "active-credential-unreadable" in reasons
+        after = state_path.read_bytes() if state_path.exists() else None
+        assert after == before
+
     def test_holds_even_at_limit_and_resumes_after_a_clean_read(self, harness):
         from claude_swap.autoswitch import ConfigWarningEvent
         from claude_swap.credentials import ActiveCredentials

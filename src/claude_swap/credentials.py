@@ -23,6 +23,7 @@ import logging
 import os
 import sys
 import tempfile
+import threading
 import time
 from pathlib import Path
 from typing import NamedTuple, Protocol
@@ -335,6 +336,10 @@ class CredentialStore:
         # flag above can stand in for it.
         self._residual_verdict: bool | None = None
         self._last_active_credentials_backend: str | None = None
+        # The full verdict of THIS thread's last `_read_credentials`, so a
+        # caller of the value-only contract can still ask whether that very
+        # read was degraded (the switch's backup step does).
+        self._last_active_read = threading.local()
 
     def _kc_call(self, fn, *args):
         """Run a ``macos_keychain`` wrapper call, learning Keychain usability.
@@ -505,9 +510,19 @@ class CredentialStore:
 
         Thin wrapper over :meth:`_read_active_credentials` preserving the historic
         ``str | None`` contract the switch paths rely on: credential string if
-        found, ``""`` if not found, ``None`` on a file read error.
+        found, ``""`` if not found, ``None`` on a file read error. The full
+        verdict is kept per thread (:meth:`last_active_read`).
         """
-        return self._read_active_credentials().value
+        active = self._read_active_credentials()
+        self._last_active_read.value = active
+        return active.value
+
+    def last_active_read(self) -> ActiveCredentials | None:
+        """The verdict of this thread's last :meth:`_read_credentials`."""
+        return getattr(self._last_active_read, "value", None)
+
+    def forget_last_active_read(self) -> None:
+        self._last_active_read.value = None
 
     def _read_active_oauth_keychain(self) -> tuple[str | None, bool]:
         """Read the active profile's OAuth Keychain item(s).
