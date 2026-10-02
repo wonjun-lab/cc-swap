@@ -1628,6 +1628,15 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
         ),
     )
     parser.add_argument(
+        "--allow-dead-login",
+        action="store_true",
+        help=(
+            "With 'switch <num|email>': switch even to an account whose stored "
+            "login is dead (expired or quarantined), which is refused otherwise; "
+            "the current login is still backed up first"
+        ),
+    )
+    parser.add_argument(
         "--full",
         action="store_true",
         help="Include full ~/.claude.json in export (default: oauthAccount only)",
@@ -1835,6 +1844,9 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
             "or 'upgrade'"
         )
 
+    if args.allow_dead_login and not args.switch_to:
+        parser.error("--allow-dead-login can only be used with 'switch <num|email>'")
+
     if args.check and not args.upgrade:
         parser.error("--check can only be used with 'upgrade'")
 
@@ -1930,7 +1942,10 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
                 payload["modelSource"] = model_source
         elif args.switch_to:
             payload = switcher.switch_to(
-                args.switch_to, json_output=args.json, force=args.force
+                args.switch_to,
+                json_output=args.json,
+                force=args.force,
+                allow_dead_login=args.allow_dead_login,
             )
         elif args.status:
             payload = switcher.status(json_output=args.json)

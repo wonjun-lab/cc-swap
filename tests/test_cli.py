@@ -310,7 +310,7 @@ class TestCLI:
             cli.main()
 
         switcher_cls.return_value.switch_to.assert_called_once_with(
-            "2", json_output=False, force=True
+            "2", json_output=False, force=True, allow_dead_login=False
         )
 
     def test_switch_to_without_force_forwards_false(self):
@@ -322,7 +322,7 @@ class TestCLI:
             cli.main()
 
         switcher_cls.return_value.switch_to.assert_called_once_with(
-            "2", json_output=False, force=False
+            "2", json_output=False, force=False, allow_dead_login=False
         )
 
     def test_export_and_import_are_mutually_exclusive(self):
@@ -914,7 +914,7 @@ class TestSubcommandAliases:
              patch("claude_swap.update_check.check_for_update", return_value=None):
             cli.main()
         switcher_cls.return_value.switch_to.assert_called_once_with(
-            "2", json_output=False, force=False
+            "2", json_output=False, force=False, allow_dead_login=False
         )
 
     def test_bare_switch_subcommand_dispatches_switch(self):

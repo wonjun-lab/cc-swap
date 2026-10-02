@@ -6171,7 +6171,7 @@ class TestSwitchSkipsDeadLogins:
             s.switch_to("2")
         message = str(exc.value)
         assert "Account-2" in message and "login expired" in message
-        assert "--force" in message and "re-login #2" in message
+        assert "--allow-dead-login" in message and "re-login #2" in message
         assert exc.value.reason == "login-dead"
         assert s._get_sequence_data()["activeAccountNumber"] == 1
 
@@ -6184,11 +6184,34 @@ class TestSwitchSkipsDeadLogins:
         assert result["to"]["number"] == 1
         assert s._get_sequence_data()["activeAccountNumber"] == 1
 
-    def test_switch_to_a_dead_login_with_force_goes_through(self, temp_home):
+    def test_allow_dead_login_goes_through_and_backs_up_the_live_login(self, temp_home):
+        """--force skips backing up the current login, so a newer live token
+        would only survive in the unclaimed stash: the override for a dead
+        target is its own flag and keeps the normal backup path."""
         s = self._three(temp_home, s2=-3600)
         with patch.object(s, "list_accounts"):
-            s.switch_to("2", force=True)
+            s.switch_to("2", allow_dead_login=True)
         assert s._get_sequence_data()["activeAccountNumber"] == 2
+        backup = json.loads(s._read_account_credentials("1", "a@example.com"))
+        assert backup["claudeAiOauth"]["refreshToken"] == "rt-live"
+        assert backup["claudeAiOauth"]["accessToken"] == "sk-live"
+
+    def test_force_alone_does_not_override_a_dead_login(self, temp_home):
+        s = self._three(temp_home, s2=-3600)
+        with pytest.raises(SwitchRefusedError) as exc:
+            s.switch_to("2", force=True)
+        assert "--allow-dead-login" in str(exc.value)
+        assert s._get_sequence_data()["activeAccountNumber"] == 1
+
+    def test_the_refusal_names_allow_dead_login(self, temp_home):
+        s = self._three(temp_home, s2=-3600)
+        with pytest.raises(SwitchRefusedError) as exc:
+            s.switch_to("2")
+        assert "cc-swap switch 2 --allow-dead-login" in str(exc.value)
+        assert "--force" not in str(exc.value)
+        payload = s.switch_to("2", json_output=True)
+        assert payload["override"] == "cc-swap switch 2 --allow-dead-login"
+        assert "--force" not in payload["message"]
 
     def test_all_others_disabled_says_so_and_refuses(self, temp_home):
         s = self._three(temp_home)
@@ -6221,6 +6244,29 @@ class TestSwitchSkipsDeadLogins:
 
 class TestSwitchRefusalExitCodes:
     """The CLI exits 1 for a refused switch, in both output modes."""
+
+    def test_allow_dead_login_reaches_switch_to_without_force(self, temp_home, monkeypatch):
+        from claude_swap import cli
+
+        seen: list = []
+        monkeypatch.setattr(
+            ClaudeAccountSwitcher, "switch_to",
+            lambda self, ident, **kw: seen.append((ident, kw)),
+        )
+        monkeypatch.setattr(sys, "argv", ["cc-swap", "switch", "2", "--allow-dead-login"])
+        cli.main()
+        assert seen == [("2", {"json_output": False, "force": False, "allow_dead_login": True})]
+
+    def test_allow_dead_login_needs_a_switch_target(self, temp_home, monkeypatch, capsys):
+        from claude_swap import cli
+
+        monkeypatch.setattr(sys, "argv", ["cc-swap", "switch", "--allow-dead-login"])
+        with pytest.raises(SystemExit) as exc:
+            cli.main()
+        assert exc.value.code == 2
+        assert "--allow-dead-login can only be used with 'switch <num|email>'" in (
+            capsys.readouterr().err
+        )
 
     def test_json_refusal_exits_1_with_the_payload(self, temp_home, monkeypatch, capsys):
         from claude_swap import cli

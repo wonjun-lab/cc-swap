@@ -6646,13 +6646,21 @@ class ClaudeAccountSwitcher:
         )
 
     def switch_to(
-        self, identifier: str, json_output: bool = False, force: bool = False
+        self,
+        identifier: str,
+        json_output: bool = False,
+        force: bool = False,
+        allow_dead_login: bool = False,
     ) -> dict | None:
         """Switch to specific account.
 
         ``force`` activates the target's stored credentials directly, skipping
         both the already-active no-op guard and the backup-current step —
         the recovery path for a live login gone stale (e.g. after --import).
+
+        ``allow_dead_login`` switches even to a slot whose stored login is
+        dead (:meth:`dead_login_reason`), which is refused otherwise. It only
+        lifts that refusal: the current login is still backed up first.
         """
         if not self.sequence_file.exists():
             raise ConfigError("No accounts are managed yet")
@@ -6715,6 +6723,7 @@ class ClaudeAccountSwitcher:
         # a *resolved* divergence falls through so _perform_switch can
         # reconcile it.
         provenance: dict | None = None
+        identity: tuple[str, str] | None = None
         if not force and data:
             identity = self._get_current_account()
             if identity is not None:
@@ -6745,7 +6754,12 @@ class ClaudeAccountSwitcher:
                         to_ref=ref,
                         message=f"Already on Account-{target_account} ({email})",
                     )
-            refused = self._refuse_dead_target(target_account, identity, json_output)
+        if not allow_dead_login and data:
+            refused = self._refuse_dead_target(
+                target_account,
+                self._get_current_account() if force else identity,
+                json_output,
+            )
             if refused is not None:
                 return refused
 
@@ -6786,11 +6800,12 @@ class ClaudeAccountSwitcher:
         dead = self.dead_login_reason(target)
         if dead is None:
             return None
+        override = f"cc-swap switch {target} --allow-dead-login"
         message = (
             f"Not switching to Account-{target}: its stored login cannot be used "
             f"({dead}), so Claude Code would be logged out. "
             f"Fix: {oauth.relogin_fix(target)}. "
-            f"To switch anyway: cc-swap switch {target} --force"
+            f"To switch anyway: {override}"
         )
         if not json_output:
             raise SwitchRefusedError(message, reason="login-dead")
@@ -6803,6 +6818,7 @@ class ClaudeAccountSwitcher:
             int(target), data.get("accounts", {}).get(target, {}).get("email", "")
         )
         payload["loginProblem"] = dead
+        payload["override"] = override
         return payload
 
     def _live_matches_slot_backup(self, slot: str, email: str) -> bool:
