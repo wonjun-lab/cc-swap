@@ -336,6 +336,10 @@ class PollEvent(AutoSwitchEvent):
     # (e.g. "89%") hides which window binds — #115 was reported off that
     # ambiguity.
     windows: dict[str, dict[str, float]] = field(default_factory=dict)
+    # cc-swap: under strategy maximize, the soft/hard marks that decide
+    # ("5h soft 50/hard 95 · 7d soft 90/hard 98"), shown instead of the
+    # "switch at N%" threshold label maximize never switches at. Additive.
+    marks: str | None = None
 
     def _fields(self) -> dict:
         fields = {
@@ -343,6 +347,8 @@ class PollEvent(AutoSwitchEvent):
             "headroomPct": self.headroom,
             "threshold": self.threshold,
         }
+        if self.marks:
+            fields["marks"] = self.marks
         if self.fetch_errors:
             fields["fetchErrors"] = self.fetch_errors
         if self.windows:
@@ -375,9 +381,10 @@ class PollEvent(AutoSwitchEvent):
             if n != str(num)
         )
         tail = f" | others: {others}" if others else ""
+        label = self.marks or f"switch at {pct_label(self.threshold)}%"
         return (
             f"Account-{num} ({self.active.get('email')}): {used} "
-            f"(switch at {pct_label(self.threshold)}%){tail}"
+            f"({label}){tail}"
         )
 
 
@@ -1049,6 +1056,18 @@ class AutoSwitchEngine:
             current=current, quarantined=quarantined, state=state,
         )
 
+    def _maximize_marks(self, settings) -> str | None:
+        """cc-swap: the poll line's label under strategy maximize (see
+        ``PollEvent.marks``); None for every other strategy."""
+        if settings.strategy != "maximize":
+            return None
+        try:
+            from claude_swap.maximize.engine_hook import poll_marks
+
+            return poll_marks(self)
+        except Exception:  # a label never breaks a tick
+            return None
+
     def _tick_inner(self) -> TickOutcome:
         self._sleep_until_ts = None
         self._blocked_wait_long = False
@@ -1115,6 +1134,7 @@ class AutoSwitchEngine:
                         value if isinstance(value, dict) else None, self._models
                     ))
                 },
+                marks=self._maximize_marks(settings),
             )
         )
 

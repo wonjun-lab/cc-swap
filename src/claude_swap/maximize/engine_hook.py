@@ -252,6 +252,21 @@ def runtime_for(engine: aw.AutoSwitchEngine) -> MaximizeRuntime:
     return rt if isinstance(rt, MaximizeRuntime) else attach_maximize(engine)
 
 
+def marks_label(s: MaximizeSettings) -> str:
+    """``5h soft 50/hard 95 · 7d soft 90/hard 98``: when maximize switches."""
+    return (
+        f"5h soft {aw.pct_label(s.soft_5h)}/hard {aw.pct_label(s.hard_5h)} · "
+        f"7d soft {aw.pct_label(s.soft_7d)}/hard {aw.pct_label(s.hard_7d)}"
+    )
+
+
+def poll_marks(engine: aw.AutoSwitchEngine) -> str:
+    """The poll line's label: the marks this engine's maximize policy uses
+    (session overrides and ``auto --soft5h`` flags included). Loads the
+    runtime if the first maximize tick has not yet."""
+    return marks_label(runtime_for(engine).settings)
+
+
 def apply_maximize_settings(
     engine: aw.AutoSwitchEngine, settings: MaximizeSettings
 ) -> None:
