@@ -551,6 +551,21 @@ def autoswitch_item_title(engine_elsewhere: bool) -> str:
     return "Auto-switch accounts"
 
 
+def should_retry_engine_claim(
+    *, auto_switch_enabled: bool, engine_running: bool, engine_elsewhere: bool
+) -> bool:
+    """Whether a refresh tick should try to take the engine lease again.
+
+    The menu bar is a viewer only while it wanted to run an engine and found
+    the lease taken (``engine_elsewhere``). That is not permanent: when the
+    other engine stops, the next tick claims the lease and the menu bar runs
+    its own, instead of sitting in viewer mode until the toggle is flipped.
+    Never while auto-switch is off (the user declined an engine) or while
+    this menu bar already runs one.
+    """
+    return auto_switch_enabled and not engine_running and engine_elsewhere
+
+
 def run(switcher) -> int:
     """Entry point for ``cswap --menubar``. Blocks until the user quits."""
     ensure_notification_identity()
@@ -675,6 +690,20 @@ def run(switcher) -> int:
                     self._last_usage_log[num] = key
 
         def on_refresh_tick(self, _timer):
+            if should_retry_engine_claim(
+                auto_switch_enabled=self.settings.auto_switch_enabled,
+                engine_running=self._engine is not None,
+                engine_elsewhere=self._engine_elsewhere,
+            ):
+                # Non-blocking claim: still held elsewhere leaves viewer mode
+                # as it was; a freed lease starts our engine (which paces the
+                # fetching, so the display stays store-only, as before).
+                self._start_engine()
+                if self._engine is not None:
+                    self.switcher._logger.info(
+                        "engine lease is free: the menu bar now runs auto-switch"
+                    )
+                    self.rebuild_menu()  # drop the "running in another engine" label
             self.refresh_async()
 
         def on_sync_tick(self, _timer):
