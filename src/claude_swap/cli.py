@@ -626,6 +626,10 @@ Exit codes with --once:
   2  no action needed
   3  blocked: wanted to switch but no viable target / all exhausted
 
+Exit code 4 (any mode): another auto-switch engine already holds the engine
+lease (the cc-swap service, another `cc-swap auto`, a TUI auto screen).
+`--once --dry-run` needs no lease and always runs.
+
 Examples:
   cswap auto                       # foreground loop, switch at 90%% used
   cswap auto --threshold 80        # switch earlier
@@ -729,6 +733,11 @@ Defaults live in settings.json in the backup root; flags override them.
     )
     args = parser.parse_args(argv)
 
+    from claude_swap.maximize.lease import (
+        EXIT_ENGINE_BUSY,
+        EngineBusyError,
+        claim_for_auto,
+    )
     from claude_swap.autoswitch import AutoSwitchEngine, AutoSwitchEvent
     from claude_swap.printer import accent, yellowed
     from claude_swap.settings import (
@@ -753,6 +762,7 @@ Defaults live in settings.json in the backup root; flags override them.
             line = dimmed(line)
         print(f"{stamp}  {line}", flush=True)
 
+    lease = None
     try:
         switcher = ClaudeAccountSwitcher(debug=args.debug)
         if sys.platform != "win32":
@@ -760,6 +770,11 @@ Defaults live in settings.json in the backup root; flags override them.
                 error("Error: Do not run this script as root (unless running in a container)")
                 sys.exit(1)
 
+        # One engine per machine (maximize/lease.py), held until this process
+        # exits. `--once --dry-run` is a read-only probe and needs none.
+        lease = claim_for_auto(
+            switcher.backup_dir, once=args.once, dry_run=args.dry_run
+        )
         settings = merged_with_cli(load_settings(switcher.backup_dir), args)
         # cc-swap: --soft5h/--hard5h/--soft7d/--hard7d only mean something to
         # the maximize strategy (flag or settings.json); reject, don't ignore.
@@ -813,6 +828,12 @@ Defaults live in settings.json in the backup root; flags override them.
                 )
             )
         sys.exit(engine.run_loop())
+    except EngineBusyError as e:
+        if args.json:
+            print(json.dumps(error_envelope(e)))
+        else:
+            error(f"Error: {e}")
+        sys.exit(EXIT_ENGINE_BUSY)
     except ClaudeSwitchError as e:
         if args.json:
             print(json.dumps(error_envelope(e)))
@@ -825,6 +846,9 @@ Defaults live in settings.json in the backup root; flags override them.
             file=sys.stderr if args.json else sys.stdout,
         )
         sys.exit(130)
+    finally:
+        if lease is not None:
+            lease.release()
 
 
 def _config_command(argv: list[str]) -> None:
