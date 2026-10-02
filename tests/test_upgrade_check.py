@@ -32,6 +32,9 @@ def _isolation(tmp_path, monkeypatch):
         raise OSError("network disabled in tests")
 
     monkeypatch.setattr("claude_swap.update_check.urllib.request.urlopen", _offline)
+    # The installed build: older than the cc-v0.4.0 release the tests mock,
+    # whatever pyproject's version is (tests that need another one set it).
+    monkeypatch.setattr("claude_swap.update_check.__version__", "0.3.2", raising=False)
     monkeypatch.setattr("claude_swap.update_check.CACHE_PATH", tmp_path / "cache.json")
     monkeypatch.setattr("claude_swap.update_check._has_menubar_extra", lambda: False)
     monkeypatch.setattr(service, "status", lambda **kw: {"installed": False})

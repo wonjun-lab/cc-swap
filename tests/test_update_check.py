@@ -30,6 +30,13 @@ def _no_menubar_extra(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _installed_version(monkeypatch):
+    """The installed build the upgrade tests start from: older than the
+    ``cc-v0.4.0`` release they mock, whatever pyproject's version is."""
+    monkeypatch.setattr("claude_swap.update_check.__version__", "0.3.2", raising=False)
+
+
+@pytest.fixture(autouse=True)
 def _no_network(monkeypatch):
     """Nothing here may reach GitHub. Tests that exercise the release lookup
     patch ``urlopen`` themselves, which replaces this for their duration."""

@@ -297,7 +297,7 @@ class TestFleet:
         app = make_app(_fleet(tmp_path))  # live: #1 — the ledger says #3
         async with app.run_test(size=(140, 40)) as pilot:
             await _open(pilot)
-            await pilot.press("v")
+            await pilot.press("m", "v")
             await pilot.pause()
             assert isinstance(app.screen, OutputModal)
             lines = app.screen._output.splitlines()

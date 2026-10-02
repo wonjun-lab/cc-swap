@@ -82,17 +82,16 @@ class TestGate:
         assert "2.1.3 -> 2.1.4" in verdict.reason and "cc-swap prime verify" in verdict.reason
         assert pv.paused_note(tmp_path) == "paused: claude 2.1.3 -> 2.1.4 (cc-swap prime verify)"
 
-    def test_fleet_prime_line_names_the_pause(self, tmp_path):
-        from claude_swap.maximize import fleet as fx
-        from claude_swap.settings import PrimeSettings
+    def test_fleet_attention_line_names_the_pause(self, tmp_path):
+        from claude_swap.maximize import home
         from claude_swap.tui.fleet import prime_guard
 
         assert prime_guard(tmp_path) is None
         pv.record_verified(tmp_path, "2.1.3", by=pv.VERIFIED_BY_CLI)
         pv.current_version(tmp_path, _claude(tmp_path), reader=Reader("2.1.4"))
         note = prime_guard(tmp_path)
-        parts, tone = fx._prime_parts([], PrimeSettings(enabled=True), guard=note)
-        assert parts == [("paused: claude 2.1.3 -> 2.1.4 (cc-swap prime verify)", 0)]
+        parts, tone = home.attention_parts([], now=0.0, prime_guard=note, priming=True)
+        assert parts == ["! priming paused: claude 2.1.3 -> 2.1.4 (cc-swap prime verify)"]
         assert tone == "warn"
 
     def test_an_unreadable_version_pauses_once_a_version_was_verified(self, tmp_path):

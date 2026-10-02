@@ -394,7 +394,7 @@ class UpdateResult:
 
 def _note_for_priming(root: Path, claude: str, version: str) -> None:
     """Hand the version just read to the priming version guard's cache, so
-    the pause (and Fleet's prime line) shows at once, with no second
+    the pause (and Fleet's attention line) shows at once, with no second
     ``claude --version``."""
     from claude_swap.maximize import prime_verify
 
