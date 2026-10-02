@@ -282,6 +282,28 @@ class TestRunVerify:
         # Nothing secret, nothing from the attributes, no email.
         assert "sk-live" not in lines and "mdat" not in lines and "@" not in lines
 
+    def test_a_verify_refreshes_the_binary_identity_version_cache(self, tmp_path):
+        system = FakeSystem(tmp_path)
+        claude = _claude(tmp_path)
+        root = tmp_path / "root"
+        root.mkdir()
+        pv.note_seen(root, claude, "2.1.3")  # a stale reading of this very file
+        report = pv.run_verify(root, claude, deps=system.deps(), now=NOW)
+        assert report.ok
+        reader = Reader("0.0.0")
+        assert pv.current_version(root, claude, reader=reader) == "2.1.4"
+        assert reader.calls == 0  # served from the refreshed cache
+
+    def test_a_failed_verify_still_refreshes_the_cache(self, tmp_path):
+        system = FakeSystem(tmp_path)
+        system.result = PrimeRunResult(0, False, "", '{"is_error":false}', False)
+        claude = _claude(tmp_path)
+        root = tmp_path / "root"
+        root.mkdir()
+        report = pv.run_verify(root, claude, deps=system.deps(), now=NOW)
+        assert not report.ok
+        assert pv.last_seen_version(root) == "2.1.4"
+
     def test_an_accepted_invalid_token_fails(self, tmp_path):
         system = FakeSystem(tmp_path)
         system.result = PrimeRunResult(0, False, "", '{"is_error":false}', False)

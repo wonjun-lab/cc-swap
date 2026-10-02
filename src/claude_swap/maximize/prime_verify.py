@@ -43,7 +43,6 @@ import argparse
 import hashlib
 import json
 import os
-import re
 import shutil
 import subprocess
 import sys
@@ -54,6 +53,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from claude_swap.maximize.claude_version import parse_version
+
 VERIFY_FILENAME = "prime_verify.json"
 VERSION_TIMEOUT_S = 15.0
 PROBE_TIMEOUT_S = 60.0
@@ -62,9 +63,6 @@ PROBE_TIMEOUT_S = 60.0
 BAD_TOKEN = "sk-ant-oat01-cc-swap-prime-verify-not-a-real-token-0000000000"
 VERIFIED_BY_CLI = "prime verify"
 VERIFIED_BY_PRIME = "primed"
-
-_VERSION_RE = re.compile(r"\b(\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.]+)?)")
-
 
 # -- the record ---------------------------------------------------------------------
 
@@ -132,9 +130,7 @@ def note_verified_prime(root: Path, version: str | None) -> None:
 # -- reading the version -------------------------------------------------------------
 
 
-def parse_version(text: str | None) -> str | None:
-    match = _VERSION_RE.search(text or "")
-    return match.group(1) if match else None
+# `parse_version` is the one parser shared with `cc-swap claude-update`.
 
 
 def _child_env() -> dict[str, str]:
@@ -163,7 +159,7 @@ def read_claude_version(claude_path: str) -> str | None:
     return parse_version(result.stdout) or parse_version(result.stderr)
 
 
-def _identity(claude_path: str) -> list[Any] | None:
+def identity(claude_path: str) -> list[Any] | None:
     """The executable's identity: an update replaces the file (or moves a
     versioned symlink), which changes at least one of these."""
     try:
@@ -183,7 +179,7 @@ def current_version(
 ) -> str | None:
     """The version of ``claude_path``: cached in ``lastSeen`` while the
     executable is the same file, else read (and the cache updated)."""
-    key = _identity(claude_path)
+    key = identity(claude_path)
     data = load(root)
     seen = data.get("lastSeen")
     if (
@@ -212,7 +208,7 @@ def note_seen(
     identity exactly as :func:`current_version` would have."""
     data = load(root)
     data["lastSeen"] = {
-        "version": version, "path": claude_path, "key": _identity(claude_path), "at": clock(),
+        "version": version, "path": claude_path, "key": identity(claude_path), "at": clock(),
     }
     _save(root, data)
 
@@ -557,6 +553,13 @@ def run_verify(
     assert claude_path is not None
     version = deps.version(claude_path)
     report.version = version
+    if version is not None:
+        # What was just read is what the guard's cache must say for this
+        # exact binary; a stale entry would otherwise outlive the verify.
+        try:
+            note_seen(root, claude_path, version)
+        except OSError:
+            pass
     if not report.add("claude --version", version is not None, version or "unreadable"):
         return report
     before = active_fingerprint(deps)

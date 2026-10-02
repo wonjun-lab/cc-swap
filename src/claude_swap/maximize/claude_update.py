@@ -54,7 +54,6 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import re
 import shutil
 import signal
 import subprocess
@@ -69,6 +68,7 @@ from claude_swap.autoswitch import STATE_FILENAME, STATE_SCHEMA_VERSION
 from claude_swap.exceptions import LockError
 from claude_swap.json_output import SCHEMA_VERSION
 from claude_swap.locking import FileLock
+from claude_swap.maximize.claude_version import VERSION_RE, parse_version, sort_key
 from claude_swap.maximize.primer import resolve_claude_path
 from claude_swap.paths import get_backup_root, get_claude_config_home
 from claude_swap.printer import accent, dimmed, error
@@ -89,25 +89,12 @@ KEY_VERSION = "claudeVersion"
 KEY_PREVIOUS = "claudeVersionPrevious"
 KEY_CHANGED_AT = "claudeVersionChangedAt"
 
-_VERSION = re.compile(r"(\d+)\.(\d+)\.(\d+)(-[0-9A-Za-z.-]+)?")
-
-
 # -- versions ---------------------------------------------------------------
+# One parser, shared with the priming version guard (claude_version.py): the
+# version recorded here must equal the one `prime verify` verifies.
 
-
-def parse_version(text: str | None) -> str | None:
-    """``2.1.287 (Claude Code)`` -> ``2.1.287``; None when unreadable."""
-    match = _VERSION.search(text or "")
-    return match.group(0) if match else None
-
-
-def _key(version: str) -> tuple[int, int, int, int]:
-    match = _VERSION.fullmatch(version)
-    if match is None:
-        raise ValueError(version)
-    major, minor, patch, pre = match.groups()
-    # Same number: a release outranks its pre-release (2.2.0-beta.1 < 2.2.0).
-    return int(major), int(minor), int(patch), 0 if pre else 1
+_VERSION = VERSION_RE
+_key = sort_key
 
 
 def is_newer(latest: str, current: str) -> bool:
@@ -132,6 +119,7 @@ def installed_version(claude: str, *, timeout: float = VERSION_TIMEOUT) -> str |
             [claude, "--version"],
             capture_output=True,
             text=True,
+            errors="replace",
             timeout=timeout,
             stdin=subprocess.DEVNULL,
         )
