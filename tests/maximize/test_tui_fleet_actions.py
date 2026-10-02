@@ -1,6 +1,7 @@
-"""Fleet actions: row keys (enter / l / x / r), Prime now, Swap strategy,
-Account settings and the guided re-login. Pilot tests against fakes in
-temp backup roots: no real claude, no Keychain, no service manager."""
+"""Fleet actions: the account keys (enter / l / x / r), Prime now, Swap
+strategy, Account settings and the guided re-login. Pilot tests against
+fakes in temp backup roots: no real claude, no Keychain, no service
+manager."""
 
 from __future__ import annotations
 
@@ -83,9 +84,25 @@ async def _open(pilot) -> None:
 
 
 async def _to_row(pilot, number: str) -> None:
-    table = pilot.app.screen.query_one("#fx-table", DataTable)
-    table.move_cursor(row=table.get_row_index(number))
+    """Select account ``number`` on the Fleet home screen."""
+    pilot.app.screen.select(number)
     await pilot.pause()
+
+
+def _tag(app, number: str) -> str:
+    """The right-aligned tag on account ``number``'s first line."""
+    from claude_swap.maximize import home
+    from claude_swap.tui.fleet_render import Ctx
+
+    screen = app.screen
+    row = next(r for r in screen._rows if r.number == number)
+    ctx = Ctx(screen._palette(), {}, time.time(), next_no=None,
+              priming=screen._priming(screen._situation))
+    tag = home.tag_for(row, is_next=False, now=ctx.now, priming=ctx.priming)
+    first = screen.query_one("#fx-body").layout_map.spans[number][0]
+    line = screen.query_one("#fx-body", Static).render().plain.splitlines()[first]
+    assert tag is None or line.rstrip().endswith(tag[0])
+    return tag[0] if tag else ""
 
 
 @pytest.mark.asyncio
@@ -128,8 +145,7 @@ class TestRowKeys:
             await pilot.press("l")
             await _open(pilot)
             assert _maximize(tmp_path) == {"lastResort": "user2@example.com"}
-            table = app.screen.query_one("#fx-table", DataTable)
-            assert "last-r" in [c.plain for c in table.get_row("2")]
+            assert _tag(app, "2") == "last resort"
             await pilot.press("l")
             await _open(pilot)
             assert _maximize(tmp_path) == {}
@@ -159,8 +175,7 @@ class TestRowKeys:
             await pilot.press("x")
             await _open(pilot)
             assert ("set_disabled", "2", True) in fake.calls
-            table = app.screen.query_one("#fx-table", DataTable)
-            assert "excl" in [c.plain for c in table.get_row("2")]
+            assert _tag(app, "2") == "excluded"
 
     async def test_r_on_healthy_account_says_nothing_to_fix(self, tmp_path):
         from claude_swap.tui.fleet import FleetScreen
@@ -200,7 +215,7 @@ class TestPrime:
         async with app.run_test(size=(140, 40)) as pilot:
             await _open(pilot)
             await _to_row(pilot, "2")
-            await pilot.press("p")
+            await pilot.press("m", "p")
             await pilot.pause()
             assert isinstance(app.screen, PrimeModal)
             options = app.screen.query_one("#fx-prime-list", SelectionList)
@@ -223,7 +238,7 @@ class TestStrategy:
         from claude_swap.tui.fleet_strategy import StrategyScreen
 
         await _open(pilot)
-        await pilot.press("s")
+        await pilot.press("m", "s")
         await pilot.pause()
         assert isinstance(pilot.app.screen, StrategyScreen)
         return pilot.app.screen
@@ -289,7 +304,7 @@ class TestAccounts:
         app = make_app(_fleet(tmp_path))
         async with app.run_test(size=(140, 40)) as pilot:
             await _open(pilot)
-            await pilot.press("a")
+            await pilot.press("m", "a")
             await _open(pilot)
             screen = app.screen
             assert isinstance(screen, AccountsScreen)
@@ -354,11 +369,8 @@ class TestRelogin:
         async with app.run_test(size=(160, 40)) as pilot:
             await _open(pilot)
             attention = app.screen.query_one("#fx-attention", Static).render().plain
-            assert "#2" in attention and "login expires " in attention
-            assert "(in 2d 0h)" in attention
-            table = app.screen.query_one("#fx-table", DataTable)
-            login_col = [c.plain for c in table.get_row("2")]
-            assert "2d 0h" in login_col
+            assert "#2 user2@example.com login ends in 2d 0h" in attention
+            assert _tag(app, "2") == "login 2d left"
             await _to_row(pilot, "2")
             await pilot.press("r")
             await _open(pilot)

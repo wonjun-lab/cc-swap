@@ -1,98 +1,62 @@
 /* cc-swap Fleet screen (fork). Screen-scoped so cswap.tcss stays upstream's.
-   Colors come from the registered cswap themes (theme.py). */
+   Colors come from the registered cswap themes (theme.py).
+
+   Every line is laid out FleetScreen._width() = width - 3 cells wide: one
+   column of padding on the left, two on the right. The account area pads
+   one column each side, so its spare column on the right is where the
+   scrollbar goes when the accounts scroll; the tags on the right line up
+   with the status note above them either way. */
 
 FleetScreen {
     layout: vertical;
     background: $background;
 }
 
-#fx-head {
+#fx-status {
     height: 1;
-    padding: 0 1;
-}
-
-#fx-engine, #fx-now, #fx-prime {
-    height: 1;
-    padding: 0 1;
+    margin-top: 1;
+    padding: 0 2 0 1;
 }
 
 #fx-attention {
-    height: auto;
-    padding: 0 1;
-    margin-top: 1;
+    height: 1;
+    padding: 0 2 0 1;
 }
 
-#fx-table {
+/* Sized to its content; FleetScreen caps max-height at what is left, so
+   the narrow layout's expanded account sits right under the list. */
+#fx-scroll {
     height: auto;
-    max-height: 60%;
+    min-height: 2;
     margin-top: 1;
-    padding: 0;
+    padding: 0 1 0 1;
     background: $background;
+    overflow-x: hidden;
     scrollbar-size-vertical: 1;
 }
 
-#fx-table > .datatable--header {
-    color: $secondary;
-    background: $background;
-    text-style: none;
-}
-
-#fx-table > .datatable--cursor {
-    background: $surface;
-    text-style: none;
-}
-
-#fx-table:focus > .datatable--cursor {
-    background: $panel;
-}
-
-#fx-detail {
+#fx-body {
     height: auto;
-    padding: 1 2 0 2;
+    text-wrap: nowrap;
+    text-overflow: clip;
 }
 
-#fx-menu {
+#fx-expanded {
     height: auto;
-    padding: 1 2 0 1;
-    background: $background;
-}
-
-#fx-menu:focus {
-    background-tint: $foreground 0%;
-}
-
-#fx-menu ListItem {
-    background: transparent;
-    padding: 0 1;
-    border-left: thick $background;
-}
-
-#fx-menu ListItem.-highlight,
-#fx-menu:focus ListItem.-highlight {
-    color: $foreground;
-    background: $surface;
-    text-style: none;
-    border-left: thick $primary;
-}
-
-#fx-menu-folded {
-    height: auto;
-    padding: 1 2 0 2;
+    padding: 0 2 0 1;
+    text-wrap: nowrap;
+    text-overflow: clip;
 }
 
 #fx-keys {
     dock: bottom;
     height: 1;
-    padding: 0 2;
+    padding: 0 1;
 }
 
-FleetScreen.-compact #fx-attention,
-FleetScreen.-compact #fx-table,
-FleetScreen.-compact #fx-detail,
-FleetScreen.-compact #fx-menu,
-FleetScreen.-compact #fx-menu-folded {
+FleetScreen.-compact #fx-status,
+FleetScreen.-compact #fx-scroll {
     margin-top: 0;
-    padding-top: 0;
 }
 
 /* -- swap strategy / account settings ---------------------------------------------- */
@@ -153,10 +117,4 @@ FleetScreen.-compact #fx-menu-folded {
     background: $surface;
     text-style: none;
     border-left: thick $primary;
-}
-
-/* -- help ------------------------------------------------------------------------ */
-
-#fx-help {
-    padding: 1 2;
 }

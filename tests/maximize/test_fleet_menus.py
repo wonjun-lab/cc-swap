@@ -1,4 +1,4 @@
-"""tui/menus.py: the Fleet menus, keys and help (pure, no Textual)."""
+"""tui/menus.py: Fleet's menu, keys and help (pure, no Textual)."""
 
 from __future__ import annotations
 
@@ -7,64 +7,87 @@ import pytest
 from claude_swap.tui import menus
 
 
-def test_menu_letters_are_bold_and_first_letters():
+def test_menu_keys_are_unique_and_every_title_names_its_item():
+    keys = [e.key for e in menus.MAIN_MENU]
+    assert len(set(keys)) == len(keys)
     for entry in menus.MAIN_MENU:
-        title = menus.menu_title(entry.action)
-        assert title[0].lower() == entry.key
-        assert menus.bold_spans(title, entry.key) == (0, 1)
+        assert len(entry.key) == 1 and entry.title
+    # The menu shows its keys in their own column, so a title need not start
+    # with its letter; most still do.
+    firsts = [e for e in menus.MAIN_MENU if e.title[0].lower() == e.key]
+    assert {e.key for e in menus.MAIN_MENU} - {e.key for e in firsts} == {"o", "x"}
     for key, title, _action in menus.ACCOUNT_ITEMS:
         assert menus.bold_spans(title, key) == (0, 1)
-    # A key that is not the first letter is found where it first appears.
     assert menus.bold_spans("Engine log", "l") == (7, 8)
     assert menus.bold_spans("Quit", "z") is None
 
 
-def test_menu_and_row_keys_do_not_collide():
-    main = set(menus.MAIN_KEYS)
-    assert len(main) == len(menus.MAIN_KEYS)
-    assert not main & set(menus.ROW_KEYS)
-    assert not main & set(menus.RESERVED_KEYS)
-    assert not set(menus.ROW_KEYS) & set(menus.RESERVED_KEYS)
+def test_the_menu_holds_every_former_fleet_menu_action():
+    actions = {e.action for e in menus.MAIN_MENU}
+    assert actions >= {
+        "strategy", "mode", "prime", "fetch", "accounts", "engine", "history", "update",
+        "classic", "quit",
+    }
+    assert {"auto", "exclude"} <= actions
+
+
+def test_home_keys_are_the_footer_and_do_not_collide():
+    assert menus.HOME_KEYS == ("enter", "r", "l", "m", "?", "q")
+    assert set(menus.ROW_KEYS) - {"x"} <= set(menus.HOME_KEYS)
+    # Shortcuts: the menu's letters that also work from home, never o (one
+    # stray key must not turn switching off) nor m (the menu itself).
+    assert "o" not in menus.SHORTCUT_KEYS and "m" not in menus.SHORTCUT_KEYS
+    assert set(menus.SHORTCUT_KEYS) <= set(menus.MAIN_KEYS)
+    assert not set(menus.SHORTCUT_KEYS) & (set(menus.HOME_KEYS) | set(menus.RESERVED_KEYS))
+    assert not set(menus.HOME_KEYS) & (set(menus.RESERVED_KEYS) - {"?"})
     account = [key for key, _title, _action in menus.ACCOUNT_ITEMS]
     assert len(set(account)) == len(account)
-    assert "b" not in account  # b is back on every sub-screen
+    assert "b" not in account and "b" not in menus.MAIN_KEYS  # b is back everywhere
 
 
 def test_menu_titles_carry_their_state():
+    assert menus.menu_title("auto", auto_off=False) == "Automatic switching: ON"
+    assert menus.menu_title("auto", auto_off=True) == "Automatic switching: OFF"
     assert menus.menu_title("mode", mode_label="service · viewing") == "Mode: service · viewing"
-    assert menus.menu_title("accounts", relogin=1) == "Account settings · 1 needs re-login"
-    assert menus.menu_title("accounts", relogin=2) == "Account settings · 2 need re-login"
+    assert menus.menu_title("accounts", relogin=1) == "Account settings… · 1 needs re-login"
+    assert menus.menu_title("accounts", relogin=2) == "Account settings… · 2 need re-login"
     assert menus.menu_title("fetch", fetching=True) == "Fetch latest usage — fetching…"
-    assert menus.menu_title("strategy") == "Swap strategy"
+    assert menus.menu_title("strategy") == "Swap strategy…"
+    pick = menus.Selected("2", "side", excluded=False)
+    assert menus.menu_title("exclude", selected=pick) == "Exclude #2 side"
+    back = menus.Selected("5", "alt", excluded=True)
+    assert menus.menu_title("exclude", selected=back) == "Include #5 alt"
 
 
-@pytest.mark.parametrize(("holder", "pid", "label", "short"), [
-    ("service", 4121, "service · viewing", "service"),
-    ("other", 5521, "pid 5521 · viewing", "pid 5521"),
-    ("here-live", 7310, "here · live", "live"),
-    ("here-dry", 7310, "here · dry-run", "dry-run"),
-    ("none", None, "off", "off"),
+def test_menu_rows_explain_and_flag():
+    rows = menus.menu_rows(
+        auto_off=True, holder="none", mode_label="off", thresholds="5h 50/95 · 7d 90/98",
+        relogin=1, selected=menus.Selected("5", "alt", excluded=True),
+    )
+    by = {r.action: r for r in rows}
+    assert [r.key for r in rows] == list(menus.MAIN_KEYS)
+    assert (by["auto"].title, by["auto"].note, by["auto"].tone) == (
+        "Automatic switching: OFF", "turn it on", "warn"
+    )
+    assert by["mode"].tone == "warn"  # nothing runs the engine
+    assert by["strategy"].note == "soft/hard 5h 50/95 · 7d 90/98 · priming"
+    assert by["exclude"].note == "let automatic switching pick it again"
+    assert by["accounts"].tone == "warn" and "inspect logins" in by["accounts"].note
+    on = {r.action: r for r in menus.menu_rows(auto_off=False, holder="service",
+                                                 mode_label="service · viewing")}
+    assert (on["auto"].note, on["auto"].tone, on["mode"].tone) == ("turn it off", "plain", "plain")
+
+
+@pytest.mark.parametrize(("holder", "pid", "label"), [
+    ("service", 4121, "service · viewing"),
+    ("other", 5521, "pid 5521 · viewing"),
+    ("other", None, "another engine · viewing"),
+    ("here-live", 7310, "here · live"),
+    ("here-dry", 7310, "here · dry-run"),
+    ("none", None, "off"),
 ])
-def test_mode_labels(holder, pid, label, short):
+def test_mode_labels(holder, pid, label):
     assert menus.mode_label(holder, pid) == label
-    assert menus.mode_short(holder, pid) == short
-
-
-@pytest.mark.parametrize("width", [120, 100, 80, 60, 40])
-def test_folded_menu_keeps_every_item_in_order_within_the_width(width):
-    lines = menus.folded_menu(width, mode_label="service · viewing")
-    flat = [title for line in lines for title, _key in line]
-    assert [t.split(":")[0] for t in flat] == [e.short for e in menus.MAIN_MENU]
-    assert "Mode: service" in flat
-    for line in lines:
-        assert len(menus.SEP.join(title for title, _ in line)) + 2 <= max(width, 30)
-    if width >= 100:  # ten items since 0.3.0 (u Update, v View swaps)
-        assert len(lines) == 1
-
-
-def test_every_short_name_contains_its_key():
-    for entry in menus.MAIN_MENU:
-        assert menus.bold_spans(entry.short, entry.key) is not None, entry
 
 
 def test_the_0_3_0_keys_mean_one_thing_across_fleet():
@@ -83,9 +106,15 @@ def test_account_key_hints_name_every_item():
         assert f" {key} " in f" {menus.ACCOUNT_KEYS} "
 
 
-def test_help_lists_every_key_and_column():
-    text = "\n".join(f"{k} {d}" for k, d in menus.help_entries())
-    for key in (*menus.MAIN_KEYS, *menus.ROW_KEYS, "w", "?", "ctrl+f", "ctrl+t"):
-        assert key in text
-    for column in ("plan", "tier", "rank", "pace", "land", "5h window", "next prime"):
-        assert column in text
+def test_help_explains_the_jargon_and_lists_every_key():
+    entries = menus.help_entries()
+    terms = {term for term, _what in entries}
+    text = "\n".join(f"{t} {w}" for t, w in entries)
+    for term in ("soft mark", "hard mark", "next", "last resort", "pace / score", "priming",
+                 "viewer / lease", "landable", "dry run", "● active", "re-login (r)",
+                 "excluded", "5h off · prime"):
+        assert term in terms, term
+    for key in (*menus.HOME_KEYS, *menus.SHORTCUT_KEYS, "w", "ctrl+f", "ctrl+t"):
+        assert key in text, key
+    for entry in menus.MAIN_MENU:
+        assert f"{entry.key} " in text

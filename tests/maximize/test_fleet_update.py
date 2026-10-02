@@ -13,7 +13,7 @@ from claude_swap.tui import menus
 def test_update_is_a_main_menu_entry_with_its_own_letter():
     entry = menus.BY_ACTION["update"]
     assert entry.key == "u" and entry.title == "Update Claude Code"
-    assert "u" in entry.short.lower()
+    assert "u" in menus.SHORTCUT_KEYS
     assert "u" not in menus.ROW_KEYS and "u" not in menus.RESERVED_KEYS
     assert "u" not in [k for k, _t, _a in menus.ACCOUNT_ITEMS]
 
@@ -73,7 +73,7 @@ async def test_u_checks_then_y_updates_and_shows_the_output_and_the_prime_hint(
     app = await _fleet_modal(tmp_path, monkeypatch, fakes)
     async with app.run_test(size=(140, 40)) as pilot:
         await _open(pilot)
-        await pilot.press("u")
+        await pilot.press("m", "u")
         await _open(pilot)
         modal = app.screen
         assert isinstance(modal, ClaudeUpdateModal)
@@ -108,7 +108,7 @@ async def test_up_to_date_offers_no_update(tmp_path, monkeypatch):
     app = await _fleet_modal(tmp_path, monkeypatch, fakes)
     async with app.run_test(size=(140, 40)) as pilot:
         await _open(pilot)
-        await pilot.press("u")
+        await pilot.press("m", "u")
         await _open(pilot)
         modal = app.screen
         assert isinstance(modal, ClaudeUpdateModal)
@@ -129,7 +129,7 @@ async def test_a_failed_check_shows_the_error_and_offers_no_update(tmp_path, mon
     app = await _fleet_modal(tmp_path, monkeypatch, fakes)
     async with app.run_test(size=(140, 40)) as pilot:
         await _open(pilot)
-        await pilot.press("u")
+        await pilot.press("m", "u")
         await _open(pilot)
         assert "Error: claude was not found" in app.screen.log_text()
         await pilot.press("y")
@@ -150,7 +150,7 @@ async def test_a_failed_update_shows_the_error_and_no_hint(tmp_path, monkeypatch
     app = await _fleet_modal(tmp_path, monkeypatch, fakes)
     async with app.run_test(size=(140, 40)) as pilot:
         await _open(pilot)
-        await pilot.press("u")
+        await pilot.press("m", "u")
         await _open(pilot)
         await pilot.press("y")
         await _open(pilot)

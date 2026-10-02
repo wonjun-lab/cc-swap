@@ -1,4 +1,5 @@
-"""Fleet modals: Prime now, Re-login (guided), and a one-line text input.
+"""Fleet modals: the menu, Prime now, Re-login (guided), Mode, and a
+one-line text input.
 
 Blocking work runs in thread workers; the modals only lay out the steps and
 the results. Results name accounts by slot number.
@@ -18,7 +19,7 @@ from textual.app import ComposeResult
 from textual.binding import Binding
 from textual.containers import Vertical
 from textual.screen import ModalScreen
-from textual.widgets import Input, Label, RichLog, SelectionList, Static
+from textual.widgets import Input, Label, ListItem, ListView, RichLog, SelectionList, Static
 from textual.widgets.selection_list import Selection
 
 from claude_swap.maximize import fleet as fx
@@ -26,6 +27,7 @@ from claude_swap.maximize import pause
 from claude_swap.maximize.fleet_actions import NO_NEW_LOGIN
 from claude_swap.maximize.prime_cli import manual_prime
 from claude_swap.tui.data import ActionResult
+from claude_swap.tui.menus import MENU_KEYS, MenuRow
 from claude_swap.tui.theme import Palette
 
 # How often an open re-login modal renews its engine pause.
@@ -403,6 +405,88 @@ class ModeModal(ModalScreen["str | None"]):
 
     def action_close(self) -> None:
         self.dismiss(None)
+
+
+class MenuItem(ListItem):
+    def __init__(self, row: MenuRow, text: Text) -> None:
+        super().__init__(Static(text, markup=False))
+        self.row = row
+
+
+class MenuModal(ModalScreen["str | None"]):
+    """The home screen's ``m`` menu: every item with its key, its state and
+    a short note. A letter picks its item at once; ↑↓ and enter work too.
+    Dismisses with the item's action, or None (esc / b)."""
+
+    DEFAULT_CSS = """
+    MenuModal { align: center middle; background: $background 60%; }
+    MenuModal #fx-menu-box {
+        width: 100; max-width: 95%; height: auto; max-height: 95%;
+        background: $surface; border: round $primary; padding: 1 2;
+    }
+    MenuModal #fx-menu-list { height: auto; background: transparent; }
+    MenuModal #fx-menu-list:focus { background-tint: $foreground 0%; }
+    MenuModal #fx-menu-list ListItem {
+        background: transparent; padding: 0 1 0 0; border-left: thick $surface;
+    }
+    MenuModal #fx-menu-list ListItem.-highlight,
+    MenuModal #fx-menu-list:focus ListItem.-highlight {
+        background: $panel; color: $foreground; text-style: none;
+        border-left: thick $primary;
+    }
+    MenuModal #fx-menu-list Static { text-wrap: nowrap; text-overflow: ellipsis; }
+    """
+    BINDINGS = [Binding("escape,b", "close", "Close", show=False)]
+
+    def __init__(self, rows: list[MenuRow]) -> None:
+        super().__init__()
+        self._rows = rows
+        self._by_key = {r.key: r.action for r in rows}
+
+    def compose(self) -> ComposeResult:
+        palette = Palette.DARK
+        try:
+            palette = Palette.from_theme(self.app.current_theme)
+        except Exception:
+            pass
+        title_w = min(max((len(r.title) for r in self._rows), default=0) + 3, 40)
+        with Vertical(id="fx-menu-box"):
+            yield Label("Menu", classes="modal-title")
+            yield ListView(
+                *(MenuItem(r, menu_row_text(r, title_w, palette)) for r in self._rows),
+                id="fx-menu-list",
+            )
+            yield Static(MENU_KEYS, classes="modal-hint", markup=False)
+
+    def on_mount(self) -> None:
+        self.query_one("#fx-menu-list", ListView).focus()
+
+    def on_key(self, event) -> None:
+        action = self._by_key.get(event.character or "")
+        if action is not None and event.key not in ("enter", "escape"):
+            event.stop()
+            self.dismiss(action)
+
+    def on_list_view_selected(self, event: ListView.Selected) -> None:
+        if isinstance(event.item, MenuItem):
+            event.stop()
+            self.dismiss(event.item.row.action)
+
+    def action_close(self) -> None:
+        self.dismiss(None)
+
+
+def menu_row_text(row: MenuRow, title_w: int, palette: Palette) -> Text:
+    """`` s  Swap strategy…         soft/hard 5h 50/95 · 7d 90/98 · priming``."""
+    from claude_swap.tui.fleet_render import tone_style
+
+    text = Text(no_wrap=True, overflow="ellipsis")
+    text.append(f" {row.key}  ", style=f"bold {palette.accent}")
+    title_style = palette.foreground if row.tone == "plain" else tone_style(row.tone, palette)
+    text.append(row.title.ljust(title_w) if row.note else row.title, style=title_style)
+    if row.note:
+        text.append(row.note, style=palette.muted)
+    return text
 
 
 class TextInputModal(ModalScreen["str | None"]):

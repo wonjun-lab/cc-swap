@@ -14,9 +14,11 @@ the ``auto`` parser; ``prime verify`` is a ``prime`` subcommand; ``upgrade
 --check`` extends upstream's ``upgrade``) are not in ``_FORK_COMMANDS`` and
 are listed in ``EXTRA_FORK_ACTIONS`` so they are held to the same rule.
 
-A route is the key path from the Fleet home screen: ``"u"`` is a main-menu
-or row key; ``"a i"`` is ``a`` (Account settings) then ``i`` on that
-screen; ``"m o"`` is ``m`` (Mode) then the Mode modal's ``o``.
+A route is the key path from the Fleet home screen. Since 0.4.0 the home
+screen has six keys (its footer) and everything else lives in the ``m``
+menu: ``"l"`` is a home key; ``"m p"`` is ``m`` (the menu) then ``p``;
+``"m a i"`` is the menu, ``a`` (Account settings), then ``i`` on that
+screen; ``"m m"`` is the menu's Mode modal.
 """
 
 from __future__ import annotations
@@ -40,14 +42,15 @@ EXTRA_FORK_ACTIONS: tuple[str, ...] = (
 
 #: CLI action -> the Fleet key path that performs the same thing.
 FLEET_ROUTES: dict[str, str] = {
-    "last-resort": "l",  # row key: toggle last resort on the highlighted account
-    "prime": "p",  # menu: Prime now…
-    "history": "v",  # menu: View switch history (the ledger, newest first)
-    "claude-update": "u",  # menu: Update Claude Code (check, confirm, run)
-    "doctor": "a i",  # Account settings → Inspect all logins (doctor)
-    "auto off": "m o",  # Mode → o: automatic switching off (persistent)
-    "auto on": "m o",  # Mode → o: automatic switching back on
-    "auto status": "m",  # Mode: its facts say AUTO OFF, by whom and since when
+    "last-resort": "l",  # home key: toggle last resort on the selected account
+    "prime": "m p",  # menu → Prime now…
+    "history": "m v",  # menu → View switch history (the ledger, newest first)
+    "claude-update": "m u",  # menu → Update Claude Code (check, confirm, run)
+    "doctor": "m a i",  # menu → Account settings → Inspect all logins (doctor)
+    "auto off": "m o",  # menu → o: automatic switching off (persistent)
+    "auto on": "m o",  # menu → o: automatic switching back on
+    # The home sentence says Auto OFF; menu → Mode's facts say by whom and since when.
+    "auto status": "m m",
 }
 
 #: CLI action -> why Fleet deliberately has no twin.
@@ -67,13 +70,13 @@ KNOWN_ASYMMETRY: dict[str, str] = {
         "before Fleet is the home screen"
     ),
     "why": (
-        "Fleet's now line already shows the engine's last decision and its reason "
-        "live; why is that same explanation for a shell"
+        "Fleet's status sentence already says what the engine decided, live, and "
+        "when it stopped reporting; why is that same explanation for a shell"
     ),
     "prime verify": (
         "spawns claude in a throwaway profile (and with --live spends a real prime) "
-        "to re-check isolation; Fleet's prime line says when it is needed and names "
-        "the command"
+        "to re-check isolation; Fleet's attention line says when it is needed and "
+        "names the command"
     ),
 }
 
@@ -114,15 +117,27 @@ def _screen_keys(screen_cls) -> set[str]:
     return {k for b in screen_cls.BINDINGS for k in b.key.split(",")}
 
 
-def _sub_keys(first: str) -> set[str]:
-    """Keys the sub-screen that ``first`` opens answers to."""
-    if first == "a":
+def _menu_keys() -> set[str]:
+    """Keys the ``m`` menu answers to (every item's letter, plus closing)."""
+    from claude_swap.tui.fleet_modals import MenuModal
+
+    rows = menus.menu_rows(auto_off=False, holder="service", mode_label="service · viewing")
+    modal = MenuModal(rows)
+    assert set(modal._by_key) == set(menus.MAIN_KEYS), "a menu item has no key"
+    return set(modal._by_key) | _screen_keys(MenuModal)
+
+
+def _sub_keys(path: tuple[str, ...]) -> set[str]:
+    """Keys the screen or modal that the key path ``path`` opens answers to."""
+    if path == ("m",):
+        return _menu_keys()
+    if path == ("m", "a"):
         from claude_swap.tui.fleet_accounts import AccountsScreen
 
         keys = _screen_keys(AccountsScreen)
         assert keys >= {k for k, _t, _a in menus.ACCOUNT_ITEMS}, "an Account item is unbound"
         return keys
-    if first == "m":
+    if path == ("m", "m"):
         from claude_swap.maximize import fleet as fx
 
         return {
@@ -131,20 +146,32 @@ def _sub_keys(first: str) -> set[str]:
             for off in (False, True)
             for a in fx.mode_transitions(holder, auto_off=off)
         }
-    raise AssertionError(f"no sub-screen behind `{first}` is known to this test")
+    raise AssertionError(f"no screen behind `{' '.join(path)}` is known to this test")
 
 
 @pytest.mark.parametrize("action,route", sorted(FLEET_ROUTES.items()))
-def test_a_routed_fleet_key_is_bound_and_in_the_menu_or_row_keys(action, route):
+def test_a_routed_fleet_key_path_is_bound_at_every_step(action, route):
     first, *rest = route.split()
     assert first in _fleet_keys(), f"Fleet binds no `{first}` for `cc-swap {action}`"
-    assert first in menus.MAIN_KEYS + menus.ROW_KEYS, (
-        f"`{first}` (for `cc-swap {action}`) is neither a Fleet menu key nor a row key"
+    assert first in menus.HOME_KEYS, (
+        f"`{first}` (for `cc-swap {action}`) is not one of the home screen's keys"
     )
+    path = (first,)
     for key in rest:
-        assert key in _sub_keys(first), (
-            f"`{route}` (for `cc-swap {action}`): `{key}` is not bound behind `{first}`"
+        assert key in _sub_keys(path), (
+            f"`{route}` (for `cc-swap {action}`): `{key}` is not bound behind "
+            f"`{' '.join(path)}`"
         )
+        path += (key,)
+
+
+def test_menu_routes_name_the_menu_item_that_does_it():
+    assert menus.BY_ACTION["prime"].key == "p"
+    assert menus.BY_ACTION["history"].key == "v"
+    assert menus.BY_ACTION["update"].key == "u"
+    assert menus.BY_ACTION["accounts"].key == "a"
+    assert menus.BY_ACTION["auto"].key == "o"
+    assert menus.BY_ACTION["mode"].key == "m"
 
 
 @pytest.mark.parametrize("action", [a for a in EXTRA_FORK_ACTIONS if " " in a])
@@ -162,10 +189,11 @@ def test_an_asymmetry_gives_a_real_reason(action, reason):
     assert len(reason.split()) >= 8, f"say why `cc-swap {action}` has no Fleet twin"
 
 
-def test_every_fleet_menu_and_row_key_is_bound():
-    unbound = [k for k in (*menus.MAIN_KEYS, *menus.ROW_KEYS) if k not in _fleet_keys()]
-    # `enter` is the DataTable's own selection, not a screen binding.
-    assert [k for k in unbound if k != "enter"] == []
+def test_every_home_key_and_shortcut_is_bound():
+    keys = (*menus.HOME_KEYS, *menus.ROW_KEYS, *menus.SHORTCUT_KEYS)
+    assert [k for k in keys if k not in _fleet_keys()] == []
+    # One stray key on the home screen never turns automatic switching off.
+    assert "o" not in _fleet_keys()
 
 
 def test_ctrl_f_is_bound_app_wide():
