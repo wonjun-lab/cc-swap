@@ -18,9 +18,16 @@ from textual.reactive import reactive
 from textual.worker import WorkerState
 
 from claude_swap import printer
+from claude_swap.maximize.lease import EngineLease, LeaseKeeper
+from claude_swap.maximize.view import window_ticks
 from claude_swap.models import AccountsSnapshot
 from claude_swap.snapshot_source import account_identity
-from claude_swap.settings import load_settings, load_ui_settings, set_setting
+from claude_swap.settings import (
+    load_maximize_settings,
+    load_settings,
+    load_ui_settings,
+    set_setting,
+)
 from claude_swap.switcher import ClaudeAccountSwitcher
 from claude_swap.tui.autoview import AutoScreen
 from claude_swap.tui.dashboard import DashboardScreen, WatchScreen
@@ -70,6 +77,10 @@ class CswapApp(App):
         self._refresh_generation = 0
         self._applied_generation = 0
         self._last_refresh_error = ""
+        # One engine lease per app, shared by every AutoScreen it opens: a
+        # reopened auto screen re-claims the lease its predecessor's engine
+        # thread may still hold while it finishes a tick.
+        self.engine_keeper = LeaseKeeper(EngineLease(switcher.backup_dir))
         # The auto-switch threshold, drawn as a tick on the status strip's
         # bars everywhere. Missing/invalid settings fall back to the default.
         try:
@@ -78,6 +89,17 @@ class CswapApp(App):
             ).threshold
         except Exception:
             self.threshold_pct = None
+        # maximize draws two ticks on the 5h and 7d bars — soft (warn) and
+        # hard (crit) — instead of the single threshold tick. None keeps
+        # upstream's single tick; the auto screen keeps this in sync.
+        self.window_ticks: dict[str, tuple[float, float]] | None = None
+        try:
+            if load_settings(switcher.backup_dir).strategy == "maximize":
+                self.window_ticks = window_ticks(
+                    load_maximize_settings(switcher.backup_dir)
+                )
+        except Exception:
+            self.window_ticks = None
         try:
             self._theme_name = load_ui_settings(switcher.backup_dir).theme
         except Exception:

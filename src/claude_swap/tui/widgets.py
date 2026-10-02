@@ -23,6 +23,8 @@ from claude_swap.tui import data
 from claude_swap.tui.theme import Palette
 
 if TYPE_CHECKING:
+    from collections.abc import Mapping
+
     from claude_swap.tui.app import CswapApp
 
 _BAR_FILLED = "━"
@@ -37,9 +39,15 @@ def bar_cells(
     *,
     stale: bool = False,
     threshold: float | None = None,
+    hard: float | None = None,
     palette: Palette = Palette.DARK,
 ) -> Text:
-    """Just the bar glyphs: severity-colored fill, track, optional tick."""
+    """Just the bar glyphs: severity-colored fill, track, optional ticks.
+
+    ``threshold`` is the warn-colored tick (the auto-switch line; maximize's
+    soft threshold). ``hard`` adds a crit-colored tick for maximize's hard
+    ceiling; when both land on one cell the hard tick wins.
+    """
     text = Text()
     if pct is None:
         text.append(_BAR_EMPTY * width, style=palette.track)
@@ -51,10 +59,15 @@ def bar_cells(
     tick_at: int | None = None
     if threshold is not None:
         tick_at = min(width - 1, max(0, round(threshold / 100.0 * width)))
+    hard_at: int | None = None
+    if hard is not None:
+        hard_at = min(width - 1, max(0, round(hard / 100.0 * width)))
     color = palette.severity(pct)
     fill_style = f"{color} dim" if stale else color
     for i in range(width):
-        if tick_at is not None and i == tick_at:
+        if hard_at is not None and i == hard_at:
+            text.append(_BAR_TICK, style=palette.sev_crit)
+        elif tick_at is not None and i == tick_at:
             text.append(_BAR_TICK, style=palette.sev_warn)
         elif i < full:
             text.append(_BAR_FILLED, style=fill_style)
@@ -73,12 +86,15 @@ def usage_bar(
     *,
     stale: bool = False,
     threshold: float | None = None,
+    hard: float | None = None,
     palette: Palette = Palette.DARK,
 ) -> Text:
     """One full bar line: ``5h ━━━━╸────┃──  47%  resets 2h 13m · 20:39``."""
     text = Text()
     text.append(f"{label} ", style=palette.muted)
-    text.append(bar_cells(pct, width, stale=stale, threshold=threshold, palette=palette))
+    text.append(
+        bar_cells(pct, width, stale=stale, threshold=threshold, hard=hard, palette=palette)
+    )
     if pct is None:
         text.append("  usage unknown", style=palette.muted)
     else:
@@ -167,8 +183,14 @@ def account_card_text(
     threshold: float | None = None,
     now: float | None = None,
     palette: Palette = Palette.DARK,
+    window_ticks: Mapping[str, tuple[float, float]] | None = None,
 ) -> Text:
-    """The full account card: header line + per-window bar rows."""
+    """The full account card: header line + per-window bar rows.
+
+    ``window_ticks`` (maximize) maps a row label to its ``(soft, hard)``
+    ticks; rows it does not name get none, and ``threshold`` is ignored.
+    Without it every row carries the single ``threshold`` tick (upstream).
+    """
     now = now if now is not None else time.time()
 
     text = Text()
@@ -225,6 +247,10 @@ def account_card_text(
         # spend row degrading doesn't cost the 5h/7d rows their clocks
         if suffix_full != suffix and row_overhead + len(suffix_full) <= width:
             suffix = suffix_full
+        if window_ticks is None:
+            soft, hard = threshold, None
+        else:
+            soft, hard = window_ticks.get(label, (None, None))
         text.append("\n    ")
         text.append(
             usage_bar(
@@ -233,7 +259,8 @@ def account_card_text(
                 suffix or None,
                 bar_width,
                 stale=stale,
-                threshold=threshold,
+                threshold=soft,
+                hard=hard,
                 palette=palette,
             )
         )
@@ -341,6 +368,7 @@ class AccountsPanel(Static):
                     account_card_text(
                         acc, width, threshold=app.threshold_pct, now=now,
                         palette=palette,
+                        window_ticks=getattr(app, "window_ticks", None),
                     )
                 )
             elif self._show_minis:

@@ -1,3 +1,178 @@
+# cc-swap
+
+**cc-swap** is a fork of [claude-swap](https://github.com/realiti4/claude-swap) (`cswap`) for running several Claude Code subscriptions at once. It keeps everything upstream does and adds an auto-switch strategy that tries to keep the most usable quota in hand at every moment:
+
+- **`maximize` strategy**: separate soft and hard thresholds for the 5-hour and 7-day windows. It spends the accounts whose weekly quota would otherwise expire unused first, switches at an idle moment once a soft threshold is crossed, and switches immediately at a hard ceiling.
+- **Last-resort and excluded accounts**: `cc-swap last-resort add <account>` keeps an account in reserve until nothing else can take you; `cc-swap disable` (upstream) keeps one out of rotation entirely.
+- **5h window priming** (opt-in): starts an idle account's 5-hour window right after it resets, so the window is already counting down when you need the account.
+- **Always-on service**: `cc-swap service install` runs the engine under launchd (macOS) or systemd (Linux). A lease guarantees one engine per machine.
+
+The upstream documentation follows [below](#claude-swap), and everything in it applies to cc-swap. During the transition cc-swap installs both `cc-swap` and `cswap`, so commands written as `cswap …` keep working.
+
+Where the upstream sections below install, upgrade or remove `claude-swap` from PyPI, use the fork instead — running the upstream commands would replace cc-swap with upstream:
+
+| Upstream command | cc-swap equivalent |
+|---|---|
+| `uv tool install claude-swap` / `pipx install claude-swap` | `uv tool install git+https://github.com/wonjun-lab/cc-swap` |
+| `uv tool install 'claude-swap[menubar]'` | `uv tool install 'cc-swap[menubar] @ git+https://github.com/wonjun-lab/cc-swap'` |
+| `uv tool upgrade claude-swap` / `pipx upgrade claude-swap` | `cc-swap upgrade` (installs the latest fork release tag) |
+| `uv tool uninstall claude-swap` | `uv tool uninstall cc-swap` |
+
+## Install
+
+```bash
+uv tool install git+https://github.com/wonjun-lab/cc-swap
+```
+
+To upgrade, run `uv tool install --force git+https://github.com/wonjun-lab/cc-swap`, then re-run `cc-swap service install` so the service restarts on the new build.
+
+### Migrating from cswap
+
+cc-swap reads and writes the same data as claude-swap: the backup directory (`~/.claude-swap-backup`, or `~/.local/share/claude-swap` on Linux) and the `claude-swap` Keychain items. Your accounts carry over without logging in again. The two tools must not run side by side, because two engines would fight over the active account.
+
+1. Close every running `cswap`: TUI windows, `cswap auto` loops, cron jobs that run `cswap auto --once`, and the menu bar's *Auto-switch accounts* toggle.
+2. `uv tool uninstall claude-swap`
+3. `uv tool install git+https://github.com/wonjun-lab/cc-swap`
+4. `cc-swap config set autoswitch.strategy maximize`. The service runs plain `cc-swap auto`, which reads its strategy from the settings.
+5. `cc-swap service install`
+
+To go back, run `cc-swap service uninstall`, `uv tool uninstall cc-swap` and `uv tool install claude-swap`. Upstream warns about the unknown `maximize` strategy, falls back to `best`, and ignores the `maximize`/`prime` settings.
+
+cc-swap does not manage extra usage (pay-as-you-go beyond the plan). If you never want it, turn it off in your claude.ai account settings.
+
+## The `maximize` strategy
+
+Turn it on with `cc-swap config set autoswitch.strategy maximize`, or use `cc-swap auto --strategy maximize` for one run.
+
+**Tiers.** Accounts held out with `cc-swap disable` are *excluded*: they are never a target and never primed, although a manual `cc-swap switch` still works. Accounts listed in `maximize.lastResort` are *last resort*: they are used only when no normal account can take you. `cc-swap last-resort add|remove|list <account>` edits that list by email or alias, never by slot number, because slots move. Every other account is *normal*.
+
+**Where it may land.** A target must sit below each soft threshold by `maximize.landingMargin`. It must not be quarantined or an API-key account, and its usage must be known. A target whose 5h window is off counts as 0%.
+
+**Which account first.** `score = (100 − 7d used %) ÷ (days until the 7d reset × 100/7)`, with the days floored at one hour. A score above 1 means more weekly quota is left than an even pace would use before the reset; that quota would otherwise expire. Higher scores go first: an account with 30% left and a reset in 12 hours (score 4.2) beats one with 90% left and six days to go (score 1.05). Scores within `maximize.tieEpsilon` tie. Ties go to 20x plans first, then to the 5h window that resets soonest (a window that is off goes last), then to the lower slot.
+
+**When it switches** (the first match wins):
+
+| Trigger | When | Waits for idle |
+|---|---|---|
+| `at-limit` | the active 5h or 7d window is at 100% | no |
+| `hard` | 5h ≥ `hard5h` or 7d ≥ `hard7d`, or the last 10 minutes' pace reaches a hard ceiling within `forceEtaMin` | no |
+| `soft` | 5h ≥ `soft5h` or 7d ≥ `soft7d` | yes |
+| `rebalance` | a better-scored account exists, or the active one is excluded / last resort (at most once per `rebalanceCooldownMin`) | yes |
+| `failover` | the active account's usage could not be read `autoswitch.unhealthyTicks` times in a row | no |
+
+*Idle* means two usage readings at least `idleWindowMin` apart, with at most `idleMaxDeltaPct` growth in both windows. While it waits, the active account is polled every `pendingPollS` seconds. Usage from other machines on the same account counts too: there is no coordination between machines, and cc-swap trusts only what the server reports.
+
+`cc-swap auto --once --dry-run` prints each account's tier, score, landing eligibility and idle state, plus the decision and its reason. It needs no engine lease, so it works while the service runs.
+
+### Settings
+
+| Key | Type | Default | Meaning |
+|---|---|---|---|
+| `autoswitch.strategy` | choice | best | Upstream key; cc-swap adds `maximize` |
+| `maximize.soft5h` | float 1–99.9 | 50 | 5h soft threshold: at or above it, switch at the next idle moment |
+| `maximize.hard5h` | float 1–99.9 | 95 | 5h hard ceiling: switch at once (must be ≥ soft5h) |
+| `maximize.soft7d` | float 1–99.9 | 90 | 7d soft threshold |
+| `maximize.hard7d` | float 1–99.9 | 98 | 7d hard ceiling (must be ≥ soft7d) |
+| `maximize.landingMargin` | float 0–30 | 5 | A target must sit this far below both soft thresholds |
+| `maximize.idleWindowMin` | int 3–60 | 10 | Minutes over which "idle" is judged |
+| `maximize.idleMaxDeltaPct` | float 0–10 | 1 | Most growth (percentage points) in that window that still counts as idle |
+| `maximize.forceEtaMin` | int 0–60 | 10 | Switch at once if the recent pace reaches a hard ceiling within this many minutes (0 = off) |
+| `maximize.pendingPollS` | int 180–600 | 180 | Active-account poll interval while waiting for idle (floor 180 s: the usage endpoint allows ~30 requests/hour per account, shared by every machine) |
+| `maximize.rebalanceCooldownMin` | int 0–240 | 30 | Minimum minutes between rebalancing switches |
+| `maximize.tieEpsilon` | float 0–2 | 0.1 | Scores this close count as a tie |
+| `maximize.lastResort` | string | — | Last-resort accounts: emails or aliases, comma-separated |
+| `maximize.planOverride` | string | — | Manual plan per account: `email:20x,email:5x` |
+| `prime.enabled` | bool | false | Turn 5h priming on |
+| `prime.model` | string | claude-haiku-4-5 | Model used for the priming request |
+| `prime.jitterS` | string | 45-300 | Random delay after a reset before priming, in seconds |
+| `prime.maxAttempts` | int 1–5 | 2 | Attempts per window |
+| `prime.claudePath` | string | auto | `claude` executable (detected and saved by `cc-swap service install`) |
+
+These keys live in `settings.json` in the backup root, in separate `maximize` and `prime` sections; `cc-swap config` lists them. `cc-swap config set` rejects a soft threshold above its hard ceiling. The plan (5x/20x) comes from each account's stored credentials; an entry in `maximize.planOverride` wins over it. It matters only for breaking ties.
+
+### Changing thresholds while it runs
+
+The four thresholds (`soft5h`, `hard5h`, `soft7d`, `hard7d`) can change at any time. A running engine, including the service, picks up a change on its next tick without a restart:
+
+- **Persistent**: `cc-swap config set maximize.soft5h 60`. The range and soft ≤ hard are both validated.
+- **One run**: `cc-swap auto --soft5h 60 --hard5h 95 --soft7d 90 --hard7d 98`. Flags override the file.
+- **TUI**: open the auto screen (`g`) and press `t` to select 5h soft. Press `t` again to move to 5h hard, 7d soft and 7d hard. `←`/`→` move the selected value by 1, `enter` saves to `settings.json`, and `esc` discards. The 5h and 7d bars show the soft threshold as a yellow tick and the hard ceiling as a red one. Saving works even when the screen is only a viewer of the service's engine.
+- The engine checks the modification time of `settings.json` every tick. If the new values fail validation, it keeps the old ones and logs a configuration warning.
+
+## 5h window priming
+
+A 5-hour window starts with an account's first request: the window resets 5 hours after that request, rounded down to 10 minutes. An idle account reports no window at all (`resets_at` is empty), and usage polling does not start one. So an account you have not touched since its last reset starts its 5 hours only when you switch to it.
+
+With `prime.enabled` on, cc-swap sends each idle account one tiny request ("Reply OK", using `prime.model`) 45–300 seconds after its window resets (`prime.jitterS`). The window then runs from that moment. If you come to the account later in those 5 hours, its quota is still there, and it resets again sooner, so you can use up to twice the 5h quota within the same five hours. Priming never touches the active account or excluded accounts.
+
+Each priming run is built so it cannot disturb your login:
+
+- It checks the account's usage first, and skips the account if a window is already running (opened by another machine, or by you).
+- It runs the official `claude` CLI once: `claude -p --model <prime.model> --safe-mode --tools "" --no-session-persistence --max-turns 1 --output-format json "Reply OK"`. The run uses an isolated config directory (`<backup root>/prime-profile`) and gets only the account's **access token**, in `CLAUDE_CODE_OAUTH_TOKEN`. It never gets the refresh token, so the account's token chain cannot fork. `ANTHROPIC_*` credentials, the API base URL and third-party provider variables are removed. On macOS, any Keychain item the run creates for that profile is deleted afterwards.
+- Success is judged by the window's reset time appearing, because utilization often stays at 0%. A failed run is retried once within the same 10-minute slot (`prime.maxAttempts`); after that, priming waits for the next reset. If `claude` cannot be found, priming switches itself off with a warning.
+
+`cc-swap prime [N …] [--dry-run]` primes on demand, or shows what it would do. `cc-swap service install` finds `claude` in your shell and saves it as `prime.claudePath`, because launchd and systemd start the service without your shell's PATH. Set it yourself if `claude` lives somewhere unusual.
+
+> **Terms of service.** Anthropic's consumer terms treat subscription OAuth access as being for ordinary use and allow Anthropic to act without notice. Priming makes one automated request per idle account after every 5-hour reset. With several accounts that is a steady, machine-like pattern, even though it goes through the official `claude` CLI. The jitter blurs the timing but does not remove the risk. Priming is **off by default**. Turn it on with `cc-swap config set prime.enabled true` only if you accept that risk for your accounts.
+
+### After every Claude Code upgrade: check priming's isolation
+
+Priming depends on how the `claude` CLI handles `CLAUDE_CODE_OAUTH_TOKEN` and its Keychain fallback, and that can change between Claude Code versions. Whenever `claude --version` changes, set `prime.enabled` to `false` and run this check before turning priming back on:
+
+1. **Fingerprint the active login.** These commands print hashes only, never secrets:
+
+   ```bash
+   # macOS
+   security find-generic-password -s "Claude Code-credentials" -w | shasum -a 256
+   security dump-keychain 2>/dev/null | grep '"svce"<blob>="Claude Code-credentials' | sort
+   # Linux
+   sha256sum ~/.claude/.credentials.json
+   # both
+   python3 -c 'import json,hashlib,os; a=json.load(open(os.path.expanduser("~/.claude.json"))).get("oauthAccount"); print(hashlib.sha256(json.dumps(a,sort_keys=True).encode()).hexdigest())'
+   ```
+
+2. **Prime one idle account.** Pick an inactive, non-excluded account whose 5h window is off; `cc-swap prime --dry-run` lists them:
+
+   ```bash
+   cc-swap prime 3
+   cc-swap list            # account 3 now shows a 5h reset time
+   ```
+
+3. **Check that a bad token fails cleanly.** You should get no reply, no login prompt, and no fallback to your own login:
+
+   ```bash
+   tmp="$(mktemp -d)"
+   ( cd "$tmp" && env -u ANTHROPIC_API_KEY -u ANTHROPIC_AUTH_TOKEN -u ANTHROPIC_BASE_URL \
+       CLAUDE_CONFIG_DIR="$tmp" CLAUDE_CODE_OAUTH_TOKEN="sk-ant-oat01-invalid" \
+       claude -p --model claude-haiku-4-5 --safe-mode --tools "" --no-session-persistence \
+         --max-turns 1 --output-format json "Reply OK" </dev/null ); echo "exit=$?"
+   rm -rf "$tmp"
+   ```
+
+   Expected: a non-zero exit with an authentication error within seconds. If the command answers, the CLI used some other credential, so keep priming off.
+
+4. **Fingerprint again** (step 1). Every hash and the Keychain item list must be unchanged. Priming must never touch the active login or the account in `~/.claude.json`, and must not leave a Keychain item behind.
+
+If any step fails, run `cc-swap config set prime.enabled false` and open an issue that includes your `claude --version`.
+
+## Always-on service
+
+```bash
+cc-swap service install     # install (or refresh) and start it; re-run after every upgrade
+cc-swap service status      # installed? running? pid?
+cc-swap service uninstall   # stop it and remove it
+```
+
+- **macOS**: a LaunchAgent (`~/Library/LaunchAgents/com.wonjun-lab.cc-swap.plist`) that starts at login and restarts after a crash. Logs go to `~/Library/Logs/cc-swap/` (`auto.log`, `auto.err.log`). `auto.err.log` is not rotated: while another engine holds the lease it grows by about 370 KiB per day, because the service logs the refusal once a minute. Truncate it when it gets large.
+- **Linux**: a systemd user unit (`~/.config/systemd/user/cc-swap.service`, `Restart=on-failure`) that is enabled and started for you. Read its logs with `journalctl --user -u cc-swap -f`. To keep it running after you log out, enable lingering once with `loginctl enable-linger $USER`; `install` tells you when lingering is off.
+- **Windows**: not supported. Run `cc-swap auto` in a terminal instead.
+
+`install` forwards `CLAUDE_CONFIG_DIR` and `CLAUDE_SECURESTORAGE_CONFIG_DIR` from the shell you run it in to the service, and prints which ones it forwarded, so a custom profile is read by the service too. It refuses to install while `CLAUDE_CONFIG_DIR` points at a `cswap run` session profile; run it from a terminal outside the session.
+
+**One engine per machine.** Whatever runs the engine (the service, a terminal `cc-swap auto`, the TUI's auto screen, or the menu bar's auto-switch) holds a lock, `<backup root>/.engine.lock`, for as long as it runs. The OS frees the lock when the process exits, even after a crash. While another process holds it, `cc-swap auto` refuses to start and exits with code `4`, and the TUI's auto screen (badge **VIEWER**) and the menu bar only show what the running engine is doing. `cc-swap auto --once --dry-run` needs no lock and always works. If another engine held the lease when the service started, the service retries every minute and takes over once that engine stops. To run an engine in a terminal instead, run `cc-swap service uninstall` first.
+
+---
+
 # claude-swap
 
 Multi-account switcher for Claude Code. Easily switch between multiple Claude accounts without logging out, or let it switch for you before you hit a rate limit. Track usage for every account in a live dashboard, and run accounts in parallel. Works with both the Claude Code CLI and the VS Code extension.
