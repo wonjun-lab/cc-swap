@@ -156,6 +156,20 @@ Priming depends on how the `claude` CLI handles `CLAUDE_CODE_OAUTH_TOKEN` and it
 
 If any step fails, run `cc-swap config set prime.enabled false` and open an issue that includes your `claude --version`.
 
+### Updating Claude Code
+
+```bash
+cc-swap claude-update --check   # report only: exit 0 up to date, 10 update available, 1 error
+cc-swap claude-update           # run Claude Code's own `claude update`, then show the version before -> after
+cc-swap claude-update --json    # one JSON document on stdout (claude's own output goes to stderr)
+```
+
+`cc-swap claude-update` does not reimplement any install method: it runs the built-in `claude update`, which knows how Claude Code was installed. It finds the real binary the way priming does: `prime.claudePath`, then `~/.local/bin/claude`, then `PATH` as a last resort. A shell alias is never used. Pass `--timeout SECONDS` (default 600) to change when a stuck update is killed. Only one update runs at a time (a lock file in the backup root); a second one exits with status 1.
+
+`--check` never changes anything. It reads the latest version from the npm registry's dist-tags document, `https://registry.npmjs.org/-/package/@anthropic-ai/claude-code/dist-tags`, because `claude update` has no dry-run mode. It reads the `stable` tag when Claude Code's `autoUpdatesChannel` setting is `stable` and the `latest` tag otherwise, so it does not announce a version that `claude update` would not install. If the registry cannot be reached, `--check` exits 1 rather than claim you are up to date. An installed version newer than the registry's (a pre-release or a build ahead of the tag) is never reported as an update.
+
+When a run sees a Claude Code version other than the recorded one, it writes `claudeVersion`, `claudeVersionPrevious` and `claudeVersionChangedAt` into `autoswitch_state.json` in the backup root, so other parts of cc-swap can react to an upgrade. If priming is enabled and the version changed, it also reminds you to run `cc-swap prime verify` (see the check above). Claude Code can also update itself in the background; cc-swap only notices that on its next `claude-update` run.
+
 ## Always-on service
 
 ```bash
