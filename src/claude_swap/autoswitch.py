@@ -537,6 +537,40 @@ class MaximizeDecisionEvent(AutoSwitchEvent):
         return line
 
 
+@dataclass(frozen=True)
+class PrimeEvent(AutoSwitchEvent):
+    """One 5h-window priming outcome (cc-swap ``maximize/primer.py``).
+
+    ``account`` is the slot number ("" for primer-wide events such as
+    ``disabled``) — never the email. ``resets_at`` is the 5h reset the usage
+    endpoint reported when the outcome is about an open window."""
+
+    kind: ClassVar[str] = "prime"
+    account: str
+    # primed | already-on | skipped-live | skipped-active | unverified | failed
+    # | timeout | disabled
+    outcome: str
+    resets_at: str | None
+    detail: str = ""
+
+    def _fields(self) -> dict:
+        return {
+            "account": self.account,
+            "outcome": self.outcome,
+            "resetsAt": self.resets_at,
+            "detail": self.detail,
+        }
+
+    def human(self) -> str:
+        who = f"Account-{self.account}" if self.account else "priming"
+        text = f"{who}: 5h window {self.outcome}"
+        if self.resets_at:
+            text += f", resets {self.resets_at}"
+        if self.detail:
+            text += f" ({self.detail})"
+        return text
+
+
 # ---------------------------------------------------------------------------
 # Engine
 # ---------------------------------------------------------------------------
