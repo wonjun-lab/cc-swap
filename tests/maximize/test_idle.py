@@ -8,6 +8,7 @@ from claude_swap.maximize.idle import (
     eta_to_hard_min,
     idle_evidence,
     is_idle,
+    span_rise,
     trim_samples,
 )
 from claude_swap.maximize.model import Sample
@@ -97,6 +98,34 @@ class TestIdle:
         rows = samples((600, 80, 40), (0, 0, 40))
         assert is_idle(rows, NOW, S) is True
 
+    def test_reset_mid_span_then_flat_is_idle(self):
+        # The drop is the reset (adds nothing); flat on both sides of it.
+        rows = samples((600, 76, 40), (300, 1, 40), (0, 1, 40))
+        assert is_idle(rows, NOW, S) is True
+
+    def test_reset_mid_span_with_climbing_is_not_idle(self):
+        # Busy the whole time: 5h climbs ~1 pt/min before AND after the 5h
+        # reset. First-vs-last reads 72 -> 3 (-69); the increments add to 6.
+        rows = samples(
+            (720, 70, 91), (600, 72, 91), (480, 74, 91), (360, 76, 91),
+            (240, 1, 92), (120, 2, 92), (0, 3, 92),
+        )
+        assert is_idle(rows, NOW, S) is False
+
+    def test_climb_after_a_reset_counts(self):
+        # Only the post-reset climb: 80 -> 0 (reset) -> 3.
+        rows = samples((600, 80, 40), (300, 0, 40), (0, 3, 40))
+        assert is_idle(rows, NOW, S) is False
+
+    def test_7d_reset_mid_span_with_climbing_is_not_idle(self):
+        rows = samples((600, 10, 97), (300, 10, 0), (0, 10, 2))
+        assert is_idle(rows, NOW, S) is False
+
+    def test_span_rise_sums_increments(self):
+        rows = samples((600, 72, 91), (300, 76, 91), (200, 1, 92), (0, 3, 92))
+        assert span_rise(rows) == (6.0, 1.0)
+        assert span_rise(rows[:1]) == (0.0, 0.0)
+
 
 class TestEta:
     def test_five_hour_eta(self):
@@ -118,6 +147,16 @@ class TestEta:
     def test_already_over_the_cap_is_zero(self):
         rows = samples((600, 90, 10), (0, 96, 10))
         assert eta_to_hard_min(rows, S) == 0.0
+
+    def test_climb_after_a_reset_has_an_eta(self):
+        # 5h rolled over mid-span, then climbed 30 pts: first-vs-last is
+        # 80 -> 30 (negative, no ETA); the post-reset increments are 3/min.
+        rows = samples((600, 80, 40), (300, 0, 40), (0, 30, 40))
+        assert eta_to_hard_min(rows, S) == pytest.approx((95 - 30) / 3.0)
+
+    def test_reset_then_flat_has_no_eta(self):
+        rows = samples((600, 80, 40), (300, 0, 40), (0, 0, 40))
+        assert eta_to_hard_min(rows, S) is None
 
     @pytest.mark.parametrize(
         "rows",

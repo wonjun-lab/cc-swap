@@ -71,16 +71,16 @@ def escape_candidates(snap: Snapshot) -> list[AccountView]:
 
 def idle_note(snap: Snapshot) -> str:
     """Human summary of the idle evidence, for reasons and dry-run output."""
-    pair = idle.idle_evidence(snap.samples, snap.now, snap.settings)
-    if pair is None:
+    span = idle.idle_span(snap.samples, snap.now, snap.settings)
+    if span is None:
         window = snap.settings.idle_window_min
         if snap.samples and snap.now - snap.samples[-1].ts > window * 60.0:
             return f"no sample in the last {window} min"
         return f"need samples {window} min apart"
-    older, newest = pair
+    d5, d7 = idle.span_rise(span)
     return (
-        f"5h {newest.pct5 - older.pct5:+g} / 7d {newest.pct7 - older.pct7:+g} pts "
-        f"over {(newest.ts - older.ts) / 60:.0f} min"
+        f"5h {d5:+g} / 7d {d7:+g} pts "
+        f"over {(span[-1].ts - span[0].ts) / 60:.0f} min"
     )
 
 

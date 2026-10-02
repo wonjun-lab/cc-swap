@@ -7,6 +7,12 @@ whole percent, so a slow trickle reads as a plateau — that is what "idle"
 means here: no more than ``idle_max_delta_pct`` of 5h (and 1 point of 7d)
 over ``idle_window_min``. Too few samples, or a hole in them (laptop sleep,
 a 429 episode), is never idle: the policy waits.
+
+Usage over a span is the sum of the increases between consecutive samples
+(``span_rise``), never last-minus-first: a window reset inside the span
+drops the reading (76% -> 3%), and a net difference would read that busy
+stretch as a negative, i.e. idle. The drop itself adds nothing; climbing
+on either side of it counts. Idle and the hard-cap ETA share this measure.
 """
 
 from __future__ import annotations
@@ -45,16 +51,30 @@ def trim_samples(
     return tuple(out)
 
 
-def idle_evidence(
-    samples: Sequence[Sample], now: float, s: MaximizeSettings
-) -> tuple[Sample, Sample] | None:
-    """The ``(older, newest)`` pair idle is judged on, or None if there is none.
+def span_rise(span: Sequence[Sample]) -> tuple[float, float]:
+    """``(5h, 7d)`` points used across ``span`` (oldest first).
 
-    ``newest`` is the latest sample and must itself be within the window of
-    ``now`` (older evidence says nothing about the present); ``older`` is the
-    latest sample at least ``idle_window_min`` before it. No two consecutive
-    samples between them may be more than ``idle_window_min`` apart: a hole
-    is missing observation, not a plateau.
+    The sum of the increases between consecutive samples. A drop is a window
+    reset and adds nothing; increases after it still count, so a busy span
+    that crosses a rollover never nets out to "unused".
+    """
+    d5 = d7 = 0.0
+    for a, b in zip(span, span[1:]):
+        d5 += max(b.pct5 - a.pct5, 0.0)
+        d7 += max(b.pct7 - a.pct7, 0.0)
+    return d5, d7
+
+
+def idle_span(
+    samples: Sequence[Sample], now: float, s: MaximizeSettings
+) -> tuple[Sample, ...] | None:
+    """The oldest-first samples idle is judged on, or None if there are none.
+
+    The span ends at the latest sample, which must itself be within the
+    window of ``now`` (older evidence says nothing about the present), and
+    starts at the latest sample at least ``idle_window_min`` before it. No
+    two consecutive samples in it may be more than ``idle_window_min``
+    apart: a hole is missing observation, not a plateau.
     """
     ordered = _ordered(samples)
     if len(ordered) < 2:
@@ -68,19 +88,24 @@ def idle_evidence(
             span = ordered[i:]
             if any(b.ts - a.ts > window for a, b in zip(span, span[1:])):
                 return None
-            return ordered[i], newest
+            return tuple(span)
     return None
 
 
+def idle_evidence(
+    samples: Sequence[Sample], now: float, s: MaximizeSettings
+) -> tuple[Sample, Sample] | None:
+    """The ``(older, newest)`` ends of :func:`idle_span`, or None."""
+    span = idle_span(samples, now, s)
+    return None if span is None else (span[0], span[-1])
+
+
 def is_idle(samples: Sequence[Sample], now: float, s: MaximizeSettings) -> bool:
-    pair = idle_evidence(samples, now, s)
-    if pair is None:
+    span = idle_span(samples, now, s)
+    if span is None:
         return False
-    older, newest = pair
-    return (
-        newest.pct5 - older.pct5 <= s.idle_max_delta_pct
-        and newest.pct7 - older.pct7 <= IDLE_MAX_DELTA_7D_PCT
-    )
+    d5, d7 = span_rise(span)
+    return d5 <= s.idle_max_delta_pct and d7 <= IDLE_MAX_DELTA_7D_PCT
 
 
 def eta_to_hard_min(
@@ -88,9 +113,10 @@ def eta_to_hard_min(
 ) -> float | None:
     """Minutes until the first hard cap at the recent burn rate, or None.
 
-    Velocity is measured from the earliest sample within ``idle_window_min``
-    of the newest (the nearest older sample when polling is sparser than the
-    window). A window with zero or negative velocity has no ETA; None when
+    Velocity is :func:`span_rise` over the span from the earliest sample
+    within ``idle_window_min`` of the newest (the nearest older sample when
+    polling is sparser than the window), so a reset inside the span cannot
+    hide a climb after it. A window that did not climb has no ETA; None when
     neither window is climbing or the span is too short to trust.
     """
     ordered = _ordered(samples)
@@ -98,18 +124,17 @@ def eta_to_hard_min(
         return None
     newest = ordered[-1]
     window = s.idle_window_min * 60.0
-    inside = [x for x in ordered[:-1] if newest.ts - x.ts <= window]
-    older = inside[0] if inside else ordered[-2]
-    span_s = newest.ts - older.ts
+    inside = [i for i, x in enumerate(ordered[:-1]) if newest.ts - x.ts <= window]
+    start = inside[0] if inside else len(ordered) - 2
+    span = ordered[start:]
+    span_s = newest.ts - span[0].ts
     if span_s < MIN_ETA_SPAN_S:
         return None
     span_min = span_s / 60.0
+    d5, d7 = span_rise(span)
     etas: list[float] = []
-    for new_pct, old_pct, cap in (
-        (newest.pct5, older.pct5, s.hard_5h),
-        (newest.pct7, older.pct7, s.hard_7d),
-    ):
-        velocity = (new_pct - old_pct) / span_min
+    for used, now_pct, cap in ((d5, newest.pct5, s.hard_5h), (d7, newest.pct7, s.hard_7d)):
+        velocity = used / span_min
         if velocity > 0:
-            etas.append(max(cap - new_pct, 0.0) / velocity)
+            etas.append(max(cap - now_pct, 0.0) / velocity)
     return min(etas) if etas else None
