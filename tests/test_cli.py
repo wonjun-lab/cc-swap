@@ -296,7 +296,7 @@ class TestCLI:
                 cli.main()
         assert excinfo.value.code == 2
         assert (
-            "--force can only be used with 'import' or 'switch <num|email>'"
+            "--force can only be used with 'import', 'switch <num|email>' or 'upgrade'"
             in capsys.readouterr().err
         )
 
@@ -425,8 +425,20 @@ class TestCLI:
                 cli.main()
 
         assert excinfo.value.code == 0
-        upgrade_fn.assert_called_once_with()
+        upgrade_fn.assert_called_once_with(force=False)
         switcher_cls.assert_not_called()
+
+    def test_upgrade_force_is_passed_through(self):
+        with patch("claude_swap.cli.ClaudeAccountSwitcher"), \
+             patch(
+                 "claude_swap.update_check.run_self_upgrade", return_value=0
+             ) as upgrade_fn, \
+             patch.object(sys, "argv", ["claude-swap", "upgrade", "--force"]):
+            with pytest.raises(SystemExit) as excinfo:
+                cli.main()
+
+        assert excinfo.value.code == 0
+        upgrade_fn.assert_called_once_with(force=True)
 
     def test_menubar_flag_dispatches(self, monkeypatch):
         called = {}

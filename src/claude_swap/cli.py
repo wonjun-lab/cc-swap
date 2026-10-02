@@ -1521,7 +1521,8 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
         help=(
             "Overwrite existing accounts during import; with 'switch <num|email>', "
             "activate the stored credentials without backing up the current "
-            "login first"
+            "login first; with 'upgrade', reinstall even when already on the "
+            "latest release"
         ),
     )
     parser.add_argument(
@@ -1717,8 +1718,11 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
     if args.alias is not None and not args.add_account:
         parser.error("--alias can only be used with 'add'")
 
-    if args.force and not (args.import_ or args.switch_to):
-        parser.error("--force can only be used with 'import' or 'switch <num|email>'")
+    if args.force and not (args.import_ or args.switch_to or args.upgrade):
+        parser.error(
+            "--force can only be used with 'import', 'switch <num|email>' "
+            "or 'upgrade'"
+        )
 
     if args.full and not args.export:
         parser.error("--full can only be used with 'export'")
@@ -1743,7 +1747,7 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
         from claude_swap.update_check import run_self_upgrade
 
         try:
-            sys.exit(run_self_upgrade())
+            sys.exit(run_self_upgrade(force=args.force))
         except KeyboardInterrupt:
             print(f"\n{dimmed('Upgrade cancelled')}")
             sys.exit(130)
