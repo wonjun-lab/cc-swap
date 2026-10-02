@@ -191,7 +191,7 @@ def test_readme_table_matches_reasons_and_lists_no_dead_codes():
     "errSecInteractionNotAllowed",
     "errSecAuthFailed",
     "cc-swap init --apply",
-    "Account settings → `v`",
+    "Account settings → `i`",
 ])
 def test_readme_documents_doctor_init_and_why(snippet):
     assert snippet in README.read_text(encoding="utf-8")

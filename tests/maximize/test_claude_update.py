@@ -443,6 +443,115 @@ def test_no_hint_when_the_version_did_not_change(fake, root, capsys):
     assert "prime verify" not in capsys.readouterr().out
 
 
+def test_the_hint_names_the_exact_command(fake, root, capsys):
+    _enable_priming(root, fake)
+    fake.set(version="2.1.280", versionAfter="2.1.287")
+    cu.run([])
+    lines = capsys.readouterr().out.splitlines()
+    assert lines[-1] == (
+        "Priming is paused for Claude Code 2.1.287 until its isolation is verified "
+        "again. Run: cc-swap prime verify"
+    )
+
+
+def test_json_names_the_prime_verify_command(fake, root, capsys):
+    _enable_priming(root, fake)
+    fake.set(version="2.1.280", versionAfter="2.1.287")
+    cu.run(["--json"])
+    data = json.loads(capsys.readouterr().out)
+    assert data["primeVerifyAdvised"] is True
+    assert data["primeVerifyCommand"] == "cc-swap prime verify"
+
+
+# -- the priming version guard sees the update ---------------------------------
+#
+# One verified version (prime_verify.json); claude-update's change and the
+# guard's own `claude --version` cache are two views of the installed one.
+
+
+def _no_version_reads(monkeypatch):
+    from claude_swap.maximize import prime_verify as pv
+
+    def boom(_path):
+        raise AssertionError("the guard ran claude --version; claude-update had cached it")
+
+    monkeypatch.setattr(pv, "read_claude_version", boom)
+    return pv
+
+
+def test_an_update_pauses_priming_that_was_verified_for_the_old_version(
+    fake, root, monkeypatch
+):
+    pv = _no_version_reads(monkeypatch)
+    pv.record_verified(root, "2.1.280", by=pv.VERIFIED_BY_CLI, now=1.0)
+    fake.set(version="2.1.280", versionAfter="2.1.287")
+    assert cu.run([]) == 0
+    verdict = pv.gate(root, str(fake.path))  # from the cache claude-update filled
+    assert not verdict.ok and verdict.current == "2.1.287"
+    assert "`cc-swap prime verify`" in verdict.reason
+    assert pv.paused_note(root) == "paused: claude 2.1.280 -> 2.1.287 (cc-swap prime verify)"
+    pv.record_verified(root, "2.1.287", by=pv.VERIFIED_BY_CLI)  # prime verify passed
+    assert pv.gate(root, str(fake.path)).ok
+    assert pv.paused_note(root) is None
+
+
+def test_an_update_pauses_priming_even_with_nothing_verified_yet(fake, root, monkeypatch):
+    pv = _no_version_reads(monkeypatch)
+    assert pv.verified_version(root) is None
+    fake.set(version="2.1.280", versionAfter="2.1.287")
+    cu.run([])
+    verdict = pv.gate(root, str(fake.path))
+    assert not verdict.ok and verdict.verified is None
+    assert "2.1.280 -> 2.1.287" in verdict.reason
+    assert pv.paused_note(root) == "paused: claude 2.1.280 -> 2.1.287 (cc-swap prime verify)"
+    # A confirmed prime cannot adopt the new build as the baseline: none runs.
+    pv.record_verified(root, "2.1.287", by=pv.VERIFIED_BY_CLI)
+    assert pv.gate(root, str(fake.path)).ok
+
+
+def test_a_first_observation_without_a_change_pauses_nothing(fake, root, monkeypatch):
+    pv = _no_version_reads(monkeypatch)
+    fake.set(version="2.1.287")  # already current: recorded, but not a change
+    cu.run([])
+    assert state_of(root)[cu.KEY_VERSION] == "2.1.287"
+    assert cu.recorded_claude_change(root) is None
+    assert pv.gate(root, str(fake.path)).ok
+    assert pv.paused_note(root) is None
+
+
+def test_check_never_touches_the_guard(fake, http, root):
+    from claude_swap.maximize import prime_verify as pv
+
+    cu.run(["--check"])
+    assert pv.load(root) == {}
+
+
+def test_a_verification_after_a_rollback_covers_the_recorded_change(fake, root, monkeypatch):
+    pv = _no_version_reads(monkeypatch)
+    fake.set(version="2.1.280", versionAfter="2.1.287")
+    cu.run([])
+    # Rolled back by hand to 2.1.280, then `prime verify` passed on it.
+    pv.note_seen(root, str(fake.path), "2.1.280")
+    pv.record_verified(root, "2.1.280", by=pv.VERIFIED_BY_CLI, now=4_000_000_000.0)
+    assert pv.pending_update(root) is None
+    assert pv.gate(root, str(fake.path)).ok
+
+
+def test_a_recorded_change_newer_than_the_verification_pauses_on_its_own(root):
+    """Even when the cached `claude --version` still matches (another path
+    updated), the claude-update record alone pauses priming."""
+    from claude_swap.maximize import prime_verify as pv
+
+    pv.record_verified(root, "2.1.280", by=pv.VERIFIED_BY_CLI, now=1.0)
+    cu.record_version(root, "2.1.280")
+    cu.record_version(root, "2.1.287", "2.1.280")
+    claude = root / "claude"
+    claude.write_text("#!/bin/sh\n")
+    verdict = pv.gate(root, str(claude), reader=lambda _p: "2.1.280")
+    assert not verdict.ok
+    assert "recorded claude 2.1.287" in verdict.reason
+
+
 # -- CLI wiring --------------------------------------------------------------
 
 

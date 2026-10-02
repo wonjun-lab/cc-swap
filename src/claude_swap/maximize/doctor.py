@@ -2,7 +2,7 @@
 
 Every check returns :class:`Finding` rows — a severity, one line of detail and
 one line of fix — and the CLI (``maximize/doctor_cli.py``), ``cc-swap init``
-and Fleet's *Verify logins* modal (``tui/fleet_doctor.py``) only present them.
+and Fleet's *Inspect all logins* modal (``tui/fleet_doctor.py``) only present them.
 Environment checks come first (codex-swap's ordering rule: a broken Keychain
 explains every red row below it).
 
@@ -1093,11 +1093,34 @@ def check_priming(ctx: Context) -> list[Finding]:
     path, _ = resolve_claude(ctx)
     if path is None:
         return []  # check_claude already reported it as an error
+    note, verified = priming_guard(ctx.probes.backup_root)
+    if note is not None:
+        return [Finding(
+            "priming", "warn", f"priming is {note}", "cc-swap prime verify",
+        )]
+    if verified is None:
+        return [Finding(
+            "priming", "info",
+            "priming is on; its isolation was never verified with this claude "
+            "(it pauses after a Claude Code update until cc-swap prime verify passes)",
+            "cc-swap prime verify",
+        )]
     return [Finding(
         "priming", "info",
-        "priming is on: re-check its isolation after every Claude Code upgrade",
-        "README: After every Claude Code upgrade: check priming's isolation",
+        f"priming is on; isolation verified for claude {verified} "
+        "(it pauses after a Claude Code update until cc-swap prime verify passes)",
     )]
+
+
+def priming_guard(backup_root: Path) -> tuple[str | None, str | None]:
+    """``(paused note, verified version)`` from the priming version guard's
+    records — read-only, no ``claude --version``."""
+    from claude_swap.maximize import prime_verify
+
+    try:
+        return prime_verify.paused_note(backup_root), prime_verify.verified_version(backup_root)
+    except Exception:
+        return None, None
 
 
 # -- checks: per slot ---------------------------------------------------------------

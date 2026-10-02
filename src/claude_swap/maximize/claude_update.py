@@ -35,9 +35,18 @@ Without ``--check``: 0 when ``claude update`` succeeded, 1 otherwise.
 **The version-change signal.** After a run that observes a Claude Code version
 different from the recorded one, ``autoswitch_state.json`` (backup root) gets
 ``claudeVersion``, ``claudeVersionPrevious`` and ``claudeVersionChangedAt``
-(UTC ISO, ``...Z``). Read them with :func:`recorded_claude_version`. They are
-written under the engine's own state lock and the engine preserves unknown
-keys, so the two writers coexist. ``--check`` never writes.
+(UTC ISO, ``...Z``). Read them with :func:`recorded_claude_version` (or
+:func:`recorded_claude_change` for a change). They are written under the
+engine's own state lock and the engine preserves unknown keys, so the two
+writers coexist. ``--check`` never writes.
+
+**Priming.** The version read after the update also goes into the priming
+version guard's ``claude --version`` cache (``prime_verify.note_seen``), and
+the guard reads the recorded change: a run that changes the version pauses
+priming until ``cc-swap prime verify`` passes, even on an install that never
+recorded a verified version. The *verified* version itself lives only in
+``prime_verify.json`` (``prime_verify.verified_version``); this module never
+writes it.
 """
 
 from __future__ import annotations
@@ -52,6 +61,7 @@ import subprocess
 import sys
 import threading
 import urllib.request
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -193,6 +203,34 @@ def recorded_claude_version(root: Path | None = None) -> tuple[str | None, str |
     )
 
 
+def _iso_epoch(value: object) -> float | None:
+    if not isinstance(value, str):
+        return None
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return None
+
+
+def recorded_claude_change(root: Path) -> tuple[str, str, float | None] | None:
+    """``(claudeVersionPrevious, claudeVersion, changedAt epoch)`` when the
+    record is a version *change* (a previous version different from the
+    current one); None for no record or a first observation.
+
+    The priming version guard (``prime_verify``) reads this so that a
+    ``claude-update`` that changes the version pauses priming until
+    ``cc-swap prime verify`` passes, even when no verified version was
+    recorded before.
+    """
+    state = _read_state(Path(root) / STATE_FILENAME)
+    version, previous = state.get(KEY_VERSION), state.get(KEY_PREVIOUS)
+    if not (isinstance(version, str) and version and isinstance(previous, str) and previous):
+        return None
+    if previous == version:
+        return None
+    return previous, version, _iso_epoch(state.get(KEY_CHANGED_AT))
+
+
 def record_version(root: Path, version: str, previous: str | None = None) -> bool:
     """Record ``version`` unless it already is the recorded one; True if written.
 
@@ -279,6 +317,148 @@ def run_claude_update(claude: str, *, timeout: float, sink) -> UpdateRun:
     return UpdateRun(proc.returncode, timed_out, "".join(chunks))
 
 
+# -- check / update, shared by the CLI and Fleet ------------------------------
+
+_NO_CLAUDE = (
+    "claude was not found (looked at prime.claudePath, ~/.local/bin/claude, then PATH); "
+    "set it with: cc-swap config set prime.claudePath /path/to/claude"
+)
+_BUSY = "another `claude update` is already in progress; try again when it ends"
+#: The exact command that lifts the priming pause after a version change.
+PRIME_VERIFY_COMMAND = "cc-swap prime verify"
+
+
+@dataclass
+class CheckResult:
+    """What ``--check`` found; ``error`` is set when it could not decide."""
+
+    claude: str | None = None
+    installed: str | None = None
+    latest: str | None = None
+    channel: str | None = None
+    error: str | None = None
+
+    @property
+    def available(self) -> bool:
+        return (
+            self.error is None
+            and self.installed is not None
+            and self.latest is not None
+            and is_newer(self.latest, self.installed)
+        )
+
+
+def check_versions(root: Path) -> CheckResult:
+    """The installed and the latest version; changes nothing."""
+    claude = find_claude(root)
+    if claude is None:
+        return CheckResult(error=_NO_CLAUDE)
+    installed = installed_version(claude)
+    if installed is None:
+        return CheckResult(claude=claude, error=f"could not read `{claude} --version`")
+    channel = update_channel()
+    latest = latest_version(channel)
+    if latest is None:
+        return CheckResult(
+            claude=claude, installed=installed, channel=channel,
+            error="could not read the latest Claude Code version from the npm registry "
+            f"({DIST_TAGS_URL})",
+        )
+    return CheckResult(claude=claude, installed=installed, latest=latest, channel=channel)
+
+
+@dataclass
+class UpdateResult:
+    """What one ``claude-update`` run did. ``run`` is None when nothing ran
+    (no claude, or another update holds the lock)."""
+
+    claude: str | None = None
+    before: str | None = None
+    after: str | None = None
+    recorded: bool = False
+    run: UpdateRun | None = None
+    error: str | None = None
+    prime_enabled: bool = False
+
+    @property
+    def changed(self) -> bool:
+        return self.after is not None and self.after != self.before
+
+    @property
+    def ok(self) -> bool:
+        return self.error is None
+
+    @property
+    def prime_hint(self) -> str | None:
+        """The line naming the command that lifts the priming pause, or None."""
+        if not (self.changed and self.prime_enabled):
+            return None
+        return (
+            f"Priming is paused for Claude Code {self.after} until its isolation is "
+            f"verified again. Run: {PRIME_VERIFY_COMMAND}"
+        )
+
+
+def _note_for_priming(root: Path, claude: str, version: str) -> None:
+    """Hand the version just read to the priming version guard's cache, so
+    the pause (and Fleet's prime line) shows at once, with no second
+    ``claude --version``."""
+    from claude_swap.maximize import prime_verify
+
+    try:
+        prime_verify.note_seen(root, claude, version)
+    except OSError:
+        pass
+
+
+def perform_update(root: Path, *, timeout: float, sink) -> UpdateResult:
+    """Run ``claude update`` (its output streamed to ``sink``), then record
+    the version for the rest of cc-swap."""
+    claude = find_claude(root)
+    if claude is None:
+        return UpdateResult(error=_NO_CLAUDE)
+    lock = FileLock(root / LOCK_FILENAME, timeout=0)
+    if not lock.acquire():
+        return UpdateResult(claude=claude, error=_BUSY)
+    try:
+        before = installed_version(claude)
+        run = run_claude_update(claude, timeout=timeout, sink=sink)
+        after = installed_version(claude)
+    finally:
+        lock.release()
+
+    result = UpdateResult(claude=claude, before=before, after=after, run=run)
+    if after is not None and (result.changed or run.ok):
+        try:
+            result.recorded = record_version(root, after, before if result.changed else None)
+        except (OSError, LockError):
+            result.recorded = False
+        _note_for_priming(root, claude, after)
+
+    if run.timed_out:
+        result.error = f"`claude update` timed out after {timeout:g}s and was killed"
+    elif run.returncode != 0:
+        result.error = f"`claude update` exited with status {run.returncode}"
+    try:
+        result.prime_enabled = load_prime_settings(root).enabled
+    except Exception:
+        result.prime_enabled = False
+    return result
+
+
+def _shown(result: UpdateResult) -> str:
+    return f"{result.before or 'unknown'} -> {result.after or 'unknown'}"
+
+
+def summary_line(result: UpdateResult) -> str:
+    """``Claude Code updated: a -> b`` and its siblings, uncoloured."""
+    if result.changed:
+        return f"Claude Code updated: {_shown(result)}"
+    if result.after is not None and result.ok:
+        return f"Claude Code is already at {result.after} (no change)."
+    return f"Claude Code version: {_shown(result)}"
+
+
 # -- the command ----------------------------------------------------------------
 
 
@@ -294,120 +474,77 @@ def _fail(args, message: str, **fields) -> int:
     return EXIT_ERROR
 
 
-_NO_CLAUDE = (
-    "claude was not found (looked at prime.claudePath, ~/.local/bin/claude, then PATH); "
-    "set it with: cc-swap config set prime.claudePath /path/to/claude"
-)
-
-
 def _check(args, root: Path) -> int:
-    claude = find_claude(root)
-    if claude is None:
-        return _fail(args, _NO_CLAUDE, installed=None, latest=None, updateAvailable=None)
-    installed = installed_version(claude)
-    if installed is None:
-        return _fail(
-            args,
-            f"could not read `{claude} --version`",
-            claudePath=claude, installed=None, latest=None, updateAvailable=None,
-        )
-    channel = update_channel()
-    latest = latest_version(channel)
-    if latest is None:
-        return _fail(
-            args,
-            "could not read the latest Claude Code version from the npm registry "
-            f"({DIST_TAGS_URL})",
-            claudePath=claude, installed=installed, latest=None, channel=channel,
-            updateAvailable=None,
-        )
-    available = is_newer(latest, installed)
+    c = check_versions(root)
+    if c.error is not None:
+        fields: dict = {}
+        if c.claude is not None:
+            fields["claudePath"] = c.claude
+        fields.update(installed=c.installed, latest=None)
+        if c.channel is not None:
+            fields["channel"] = c.channel
+        fields["updateAvailable"] = None
+        return _fail(args, c.error, **fields)
+    available = c.available
     if args.json:
         _emit_json(
             {
                 "ok": True,
-                "claudePath": claude,
-                "installed": installed,
-                "latest": latest,
-                "channel": channel,
+                "claudePath": c.claude,
+                "installed": c.installed,
+                "latest": c.latest,
+                "channel": c.channel,
                 "updateAvailable": available,
                 "source": DIST_TAGS_URL,
             }
         )
     elif available:
-        print(f"Claude Code {installed} is installed; {accent(latest)} is available ({channel}).")
+        print(
+            f"Claude Code {c.installed} is installed; {accent(c.latest)} is available "
+            f"({c.channel})."
+        )
         print(dimmed("Run `cc-swap claude-update` to update."))
     else:
-        print(f"Claude Code {installed} is up to date ({channel}: {latest}).")
+        print(f"Claude Code {c.installed} is up to date ({c.channel}: {c.latest}).")
     return EXIT_UPDATE_AVAILABLE if available else EXIT_OK
 
 
 def _update(args, root: Path) -> int:
-    claude = find_claude(root)
-    if claude is None:
-        return _fail(args, _NO_CLAUDE)
-    lock = FileLock(root / LOCK_FILENAME, timeout=0)
-    if not lock.acquire():
-        return _fail(args, "another `claude update` is already in progress; try again when it ends")
-    try:
-        before = installed_version(claude)
-        # --json keeps stdout a single document; claude's output goes to stderr.
-        sink = sys.stderr if args.json else sys.stdout
-        run = run_claude_update(claude, timeout=args.timeout, sink=sink)
-        after = installed_version(claude)
-    finally:
-        lock.release()
-
-    changed = after is not None and after != before
-    recorded = False
-    if after is not None and (changed or run.ok):
-        try:
-            recorded = record_version(root, after, before if changed else None)
-        except (OSError, LockError):
-            recorded = False
-
-    if run.timed_out:
-        problem = f"`claude update` timed out after {args.timeout:g}s and was killed"
-    elif run.returncode != 0:
-        problem = f"`claude update` exited with status {run.returncode}"
-    else:
-        problem = None
-
-    hint = changed and load_prime_settings(root).enabled
+    # --json keeps stdout a single document; claude's output goes to stderr.
+    sink = sys.stderr if args.json else sys.stdout
+    result = perform_update(root, timeout=args.timeout, sink=sink)
+    if result.run is None:  # nothing ran: no claude, or another update holds the lock
+        return _fail(args, result.error or "claude update did not run")
+    run = result.run
+    hint = result.prime_hint
     if args.json:
         payload = {
-            "ok": problem is None,
-            "claudePath": claude,
-            "before": before,
-            "after": after,
-            "changed": changed,
-            "recorded": recorded,
+            "ok": result.ok,
+            "claudePath": result.claude,
+            "before": result.before,
+            "after": result.after,
+            "changed": result.changed,
+            "recorded": result.recorded,
             "exitCode": run.returncode,
             "timedOut": run.timed_out,
-            "primeVerifyAdvised": hint,
+            "primeVerifyAdvised": hint is not None,
         }
-        if problem:
-            payload["error"] = problem
+        if hint is not None:
+            payload["primeVerifyCommand"] = PRIME_VERIFY_COMMAND
+        if result.error:
+            payload["error"] = result.error
         _emit_json(payload)
-        return EXIT_ERROR if problem else EXIT_OK
+        return EXIT_ERROR if result.error else EXIT_OK
 
-    if problem:
-        error(f"Error: {problem}")
-    shown = f"{before or 'unknown'} -> {after or 'unknown'}"
-    if changed:
-        print(f"Claude Code updated: {accent(shown)}")
-    elif after is not None and problem is None:
-        print(f"Claude Code is already at {after} (no change).")
+    if result.error:
+        error(f"Error: {result.error}")
+    if result.changed:
+        print(f"Claude Code updated: {accent(_shown(result))}")
     else:
-        print(f"Claude Code version: {shown}")
+        print(summary_line(result))
     if hint:
-        print(
-            dimmed(
-                "Priming is enabled and the Claude Code version changed: "
-                "run `cc-swap prime verify` before relying on it."
-            )
-        )
-    return EXIT_ERROR if problem else EXIT_OK
+        print(hint)
+    return EXIT_ERROR if result.error else EXIT_OK
 
 
 def run(argv: list[str]) -> int:

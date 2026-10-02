@@ -4,6 +4,15 @@ codex-swap's convention: the menu *is* the shortcut list. Every item's key
 is its first letter (drawn bold), a state is part of the item's name
 (``Mode: service · viewing``), and the key hints list only what the menu
 does not. The menu keys and the row keys never collide; a test pins that.
+
+Keys are unique per menu level: the main menu, the row keys and the reserved
+keys never share a letter, and a sub-screen's items (Account settings) never
+share one with each other or with its ``b``/``q``. A sub-screen may reuse a
+main-menu letter (``a`` Add current login) as codex-swap does, but the items
+added in 0.3.0 do not: ``v`` is only *View switch history* and ``u`` only
+*Update Claude Code* (main menu), ``i`` only *Inspect all logins* (Account
+settings). Every title starts with its key, and every short name (the folded
+menu) contains it.
 """
 
 from __future__ import annotations
@@ -26,7 +35,8 @@ MAIN_MENU: tuple[MenuEntry, ...] = (
     MenuEntry("f", "Fetch latest usage", "fetch", "Fetch"),
     MenuEntry("a", "Account settings", "accounts", "Accounts"),
     MenuEntry("e", "Engine log", "engine", "Engine"),
-    MenuEntry("v", "View switch history", "history", "Swaps"),
+    MenuEntry("v", "View switch history", "history", "View swaps"),
+    MenuEntry("u", "Update Claude Code", "update", "Update"),
     MenuEntry("c", "Classic dashboard", "classic", "Classic"),
     MenuEntry("q", "Quit", "quit", "Quit"),
 )
@@ -45,9 +55,11 @@ ACCOUNT_ITEMS: tuple[tuple[str, str, str], ...] = (
     ("r", "Re-login…", "relogin"),
     ("n", "Name (alias)…", "alias"),
     ("d", "Delete account…", "delete"),
+    ("i", "Inspect all logins (doctor)", "verify"),
 )
 ACCOUNT_KEYS = (
-    "enter select · a add · t token · r re-login · n name · d delete · b back · q quit"
+    "enter select · a add · t token · r re-login · n name · d delete · i inspect · "
+    "b back · q quit"
 )
 KEY_HINTS = (
     "enter switch · l last resort · x exclude · r re-login · w watch · ? help · q quit · ↑↓ move"

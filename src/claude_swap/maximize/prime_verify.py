@@ -19,6 +19,15 @@ ran ``prime verify`` keeps priming until ``claude`` changes). ``lastSeen``
 caches the version by the executable's identity (real path, inode, mtime,
 size), so the engine runs ``claude --version`` only after an update.
 
+``verifiedClaudeVersion`` is the one record of "the claude version priming
+is verified for"; nothing else writes it. ``cc-swap claude-update`` feeds
+the guard two ways: it puts the version it read after updating into
+``lastSeen`` (:func:`note_seen`), and the change it records in
+``autoswitch_state.json`` (``claudeVersionPrevious`` -> ``claudeVersion``)
+pauses priming by itself (:func:`pending_update`) — also on an install
+with no verified version yet, which would otherwise keep priming and adopt
+the new build as its baseline.
+
 ``prime verify`` automates the README's isolation checklist with zero-cost
 checks — an invalid-token run in a throwaway profile must fail with a clean
 401, leave no Keychain item and no ``.credentials.json`` behind, and leave
@@ -194,6 +203,55 @@ def current_version(
     return version
 
 
+def note_seen(
+    root: Path, claude_path: str, version: str, *, clock: Callable[[], float] = time.time
+) -> None:
+    """Put a version someone else just read from ``claude_path`` (``cc-swap
+    claude-update``) into the ``lastSeen`` cache, keyed by the executable's
+    identity exactly as :func:`current_version` would have."""
+    data = load(root)
+    data["lastSeen"] = {
+        "version": version, "path": claude_path, "key": _identity(claude_path), "at": clock(),
+    }
+    _save(root, data)
+
+
+def _num(value: object) -> float | None:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    return float(value)
+
+
+def pending_update(root: Path, data: Mapping[str, Any] | None = None) -> tuple[str, str] | None:
+    """A version change ``cc-swap claude-update`` recorded (``claudeVersion``
+    in ``autoswitch_state.json``) that the verified version does not cover:
+    ``(previous, version)``, or None.
+
+    It is covered once ``version`` is the verified one, or once a
+    verification was recorded after the change (``prime verify`` run on a
+    build that was rolled back since)."""
+    from claude_swap.maximize.claude_update import recorded_claude_change
+
+    change = recorded_claude_change(Path(root))
+    if change is None:
+        return None
+    previous, version, changed_at = change
+    data = load(root) if data is None else data
+    verified = _text(data.get("verifiedClaudeVersion"))
+    if version == verified:
+        return None
+    verified_at = _num(data.get("verifiedAt"))
+    if verified is not None and verified_at is not None and changed_at is not None:
+        # The change is stamped to the second; a verification later in that
+        # same second still counts as before it (pause, never miss one).
+        if verified_at >= changed_at + 1.0:
+            return None
+    return previous, version
+
+
+PAUSED_UNTIL = "priming paused until `cc-swap prime verify` passes"
+
+
 @dataclass(frozen=True)
 class Gate:
     ok: bool
@@ -209,36 +267,61 @@ def gate(
     reader: Callable[[str], str | None] | None = None,
     clock: Callable[[], float] = time.time,
 ) -> Gate:
-    """Whether priming may run with ``claude_path`` now."""
-    verified = verified_version(root)
+    """Whether priming may run with ``claude_path`` now.
+
+    One verified version (``verifiedClaudeVersion``, :func:`verified_version`)
+    is compared with two observations of the installed one: ``claude
+    --version`` (cached per executable in ``lastSeen``) and the change
+    ``cc-swap claude-update`` recorded (:func:`pending_update`). Either one
+    disagreeing pauses priming until ``cc-swap prime verify`` records the
+    new version."""
+    data = load(root)
+    verified = _text(data.get("verifiedClaudeVersion"))
     current = current_version(root, claude_path, reader=reader, clock=clock)
+    update = pending_update(root, data)
     if verified is None:
-        return Gate(True, current, None, "no verified claude version recorded yet")
+        if update is None:
+            return Gate(True, current, None, "no verified claude version recorded yet")
+        previous, version = update
+        return Gate(
+            False, current, None,
+            f"cc-swap claude-update changed claude {previous} -> {version} and priming "
+            f"isolation was never verified; {PAUSED_UNTIL}",
+        )
     if current is None:
         return Gate(
             False, None, verified,
-            "could not read `claude --version`; priming paused until "
-            "`cc-swap prime verify` passes",
+            f"could not read `claude --version`; {PAUSED_UNTIL}",
         )
     if current != verified:
         return Gate(
             False, current, verified,
             f"claude changed {verified} -> {current} since priming isolation was "
-            "last verified; priming paused until `cc-swap prime verify` passes",
+            f"last verified; {PAUSED_UNTIL}",
+        )
+    if update is not None:
+        return Gate(
+            False, current, verified,
+            f"cc-swap claude-update recorded claude {update[1]} after priming isolation "
+            f"was verified with {verified}; {PAUSED_UNTIL}",
         )
     return Gate(True, current, verified, "verified")
 
 
 def paused_note(root: Path) -> str | None:
     """For displays (no subprocess): why priming is paused, from what the
-    engine last saw, or None."""
+    engine last saw and what ``cc-swap claude-update`` recorded, or None.
+    The same rule as :func:`gate`, minus the unreadable-version case."""
     data = load(root)
     verified = _text(data.get("verifiedClaudeVersion"))
     seen = data.get("lastSeen")
     current = _text(seen.get("version")) if isinstance(seen, dict) else None
-    if verified is None or current is None or current == verified:
-        return None
-    return f"paused: claude {verified} -> {current} (cc-swap prime verify)"
+    if verified is not None and current is not None and current != verified:
+        return f"paused: claude {verified} -> {current} (cc-swap prime verify)"
+    update = pending_update(root, data)
+    if update is not None:
+        return f"paused: claude {verified or update[0]} -> {update[1]} (cc-swap prime verify)"
+    return None
 
 
 # -- prime verify ------------------------------------------------------------------------

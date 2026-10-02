@@ -1,4 +1,5 @@
-"""Account settings: add a login, a token or API key, re-login, alias, delete.
+"""Account settings: add a login, a token or API key, re-login, alias,
+delete, and inspect every login (``cc-swap doctor`` in a modal).
 
 codex-swap's ``manage`` screen shape: an account table, then the items,
 then the key hints. Row keys act on the highlighted account; choosing an
@@ -27,8 +28,6 @@ if TYPE_CHECKING:
 
 _NEEDS_ACCOUNT = {"relogin", "alias", "delete"}
 _PICK_VERBS = {"relogin": "re-login", "alias": "name", "delete": "delete"}
-# cc-swap doctor as a modal (tui/fleet_doctor.py); kept here, not in menus.py.
-_VERIFY_ITEM = ("v", "Verify logins (doctor)", "verify")
 
 
 class AccountItem(ListItem):
@@ -45,7 +44,7 @@ class AccountsScreen(Screen):
         Binding("r", "row('relogin')", show=False),
         Binding("n", "row('alias')", show=False),
         Binding("d", "row('delete')", show=False),
-        Binding("v", "item('verify')", show=False),
+        Binding("i", "item('verify')", show=False),
         Binding("b,escape,left", "back", show=False),
         Binding("q", "quit", show=False),
     ]
@@ -62,7 +61,7 @@ class AccountsScreen(Screen):
         yield DataTable(id="fx-ac-table", cursor_type="row", zebra_stripes=False)
         yield Static("", id="fx-ac-prompt", markup=False)
         yield ListView(
-            *(AccountItem(k, t, a) for k, t, a in (*menus.ACCOUNT_ITEMS, _VERIFY_ITEM)),
+            *(AccountItem(k, t, a) for k, t, a in menus.ACCOUNT_ITEMS),
             id="fx-ac-menu",
         )
         yield Static("", id="fx-ac-keys", markup=False)
@@ -90,8 +89,7 @@ class AccountsScreen(Screen):
         for item in self.query(AccountItem):
             item.query_one(Static).update(menu_text(item.title, item.key, palette))
         self.query_one("#fx-ac-keys", Static).update(
-            Text(menus.ACCOUNT_KEYS.replace(" · b back", " · v verify · b back"),
-                 style=palette.muted)
+            Text(menus.ACCOUNT_KEYS, style=palette.muted)
         )
         self._render_prompt()
 

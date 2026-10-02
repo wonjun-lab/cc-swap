@@ -9,16 +9,14 @@ The set it covers is read from ``cli._FORK_COMMANDS`` at run time, so a command
 registered there is enforced automatically: it fails here until it has a
 ``FLEET_ROUTES`` entry (a key Fleet binds) or a ``KNOWN_ASYMMETRY`` entry.
 
-PENDING (not on main when this test was written; each lands with its own
-batch and must be given a verdict here when it is merged):
+Commands that extend another one (``auto on|off|status`` is handled before
+the ``auto`` parser; ``prime verify`` is a ``prime`` subcommand; ``upgrade
+--check`` extends upstream's ``upgrade``) are not in ``_FORK_COMMANDS`` and
+are listed in ``EXTRA_FORK_ACTIONS`` so they are held to the same rule.
 
-* ``doctor``          - Fleet "Verify logins" modal
-* ``init``            - likely an asymmetry (one-time onboarding checklist)
-* ``why``             - Fleet's "now" line already shows the last decision
-* ``history``         - Fleet engine-log tab
-* ``auto on|off``     - Fleet ``m`` (Mode); handled before the auto parser, so
-                        it is not in ``_FORK_COMMANDS`` and not enumerated here
-* ``prime verify``    - a subcommand of ``prime`` (already routed via ``p``)
+A route is the key path from the Fleet home screen: ``"u"`` is a main-menu
+or row key; ``"a i"`` is ``a`` (Account settings) then ``i`` on that
+screen; ``"m o"`` is ``m`` (Mode) then the Mode modal's ``o``.
 """
 
 from __future__ import annotations
@@ -32,15 +30,24 @@ from claude_swap.tui import menus
 from claude_swap.tui.app import CswapApp
 from claude_swap.tui.fleet import FleetScreen
 
-#: Fork actions that are not in ``_FORK_COMMANDS`` because they extend an
-#: upstream command (``upgrade`` gained ``--check`` and the service refresh).
-EXTRA_FORK_ACTIONS: tuple[str, ...] = ("upgrade",)
+#: Fork actions that are not in ``_FORK_COMMANDS`` because they extend
+#: another command: ``upgrade`` gained ``--check`` and the service refresh;
+#: ``auto on|off|status`` is caught before the ``auto`` parser; ``prime
+#: verify`` is a ``prime`` subcommand.
+EXTRA_FORK_ACTIONS: tuple[str, ...] = (
+    "upgrade", "auto on", "auto off", "auto status", "prime verify",
+)
 
-#: CLI action -> the Fleet key that performs the same thing. The key must be
-#: bound on the Fleet screen and be a menu key or a row key.
+#: CLI action -> the Fleet key path that performs the same thing.
 FLEET_ROUTES: dict[str, str] = {
     "last-resort": "l",  # row key: toggle last resort on the highlighted account
     "prime": "p",  # menu: Prime now…
+    "history": "v",  # menu: View switch history (the ledger, newest first)
+    "claude-update": "u",  # menu: Update Claude Code (check, confirm, run)
+    "doctor": "a i",  # Account settings → Inspect all logins (doctor)
+    "auto off": "m o",  # Mode → o: automatic switching off (persistent)
+    "auto on": "m o",  # Mode → o: automatic switching back on
+    "auto status": "m",  # Mode: its facts say AUTO OFF, by whom and since when
 }
 
 #: CLI action -> why Fleet deliberately has no twin.
@@ -51,8 +58,22 @@ KNOWN_ASYMMETRY: dict[str, str] = {
         "be viewed from is a shell job"
     ),
     "upgrade": (
-        "reinstalls the tool under the running TUI; run it from a shell. A Fleet "
-        "'u' Update entry is a planned follow-up and will move this to FLEET_ROUTES"
+        "reinstalls cc-swap itself under the running TUI and restarts the service; "
+        "run it from a shell (Fleet's u updates Claude Code, not cc-swap)"
+    ),
+    "init": (
+        "a one-time onboarding checklist for a machine that is not set up yet; "
+        "--apply sets the strategy and installs the service, both shell jobs "
+        "before Fleet is the home screen"
+    ),
+    "why": (
+        "Fleet's now line already shows the engine's last decision and its reason "
+        "live; why is that same explanation for a shell"
+    ),
+    "prime verify": (
+        "spawns claude in a throwaway profile (and with --live spends a real prime) "
+        "to re-check isolation; Fleet's prime line says when it is needed and names "
+        "the command"
     ),
 }
 
@@ -89,12 +110,51 @@ def test_the_tables_name_no_action_that_does_not_exist():
     assert not stale, f"entries for commands that are not registered: {sorted(stale)}"
 
 
-@pytest.mark.parametrize("action,key", sorted(FLEET_ROUTES.items()))
-def test_a_routed_fleet_key_is_bound_and_in_the_menu_or_row_keys(action, key):
-    assert key in _fleet_keys(), f"Fleet binds no `{key}` for `cc-swap {action}`"
-    assert key in menus.MAIN_KEYS + menus.ROW_KEYS, (
-        f"`{key}` (for `cc-swap {action}`) is neither a Fleet menu key nor a row key"
+def _screen_keys(screen_cls) -> set[str]:
+    return {k for b in screen_cls.BINDINGS for k in b.key.split(",")}
+
+
+def _sub_keys(first: str) -> set[str]:
+    """Keys the sub-screen that ``first`` opens answers to."""
+    if first == "a":
+        from claude_swap.tui.fleet_accounts import AccountsScreen
+
+        keys = _screen_keys(AccountsScreen)
+        assert keys >= {k for k, _t, _a in menus.ACCOUNT_ITEMS}, "an Account item is unbound"
+        return keys
+    if first == "m":
+        from claude_swap.maximize import fleet as fx
+
+        return {
+            a.key
+            for holder in ("none", "here-dry", "here-live", "service", "other")
+            for off in (False, True)
+            for a in fx.mode_transitions(holder, auto_off=off)
+        }
+    raise AssertionError(f"no sub-screen behind `{first}` is known to this test")
+
+
+@pytest.mark.parametrize("action,route", sorted(FLEET_ROUTES.items()))
+def test_a_routed_fleet_key_is_bound_and_in_the_menu_or_row_keys(action, route):
+    first, *rest = route.split()
+    assert first in _fleet_keys(), f"Fleet binds no `{first}` for `cc-swap {action}`"
+    assert first in menus.MAIN_KEYS + menus.ROW_KEYS, (
+        f"`{first}` (for `cc-swap {action}`) is neither a Fleet menu key nor a row key"
     )
+    for key in rest:
+        assert key in _sub_keys(first), (
+            f"`{route}` (for `cc-swap {action}`): `{key}` is not bound behind `{first}`"
+        )
+
+
+@pytest.mark.parametrize("action", [a for a in EXTRA_FORK_ACTIONS if " " in a])
+def test_every_extra_subcommand_exists(action, capsys):
+    verb, sub = action.split()
+    handler = {"auto": cli._auto_command, "prime": cli._prime_command}[verb]
+    with pytest.raises(SystemExit) as excinfo:
+        handler([sub, "--help"])
+    assert excinfo.value.code == 0
+    assert f"cc-swap {verb}" in capsys.readouterr().out
 
 
 @pytest.mark.parametrize("action,reason", sorted(KNOWN_ASYMMETRY.items()))
@@ -123,3 +183,26 @@ def test_every_registered_fork_command_resolves_and_is_routed_by_main(command, m
     cli.main()
 
     assert seen == [["--sentinel"]]
+
+
+def _main_help(monkeypatch, capsys) -> str:
+    monkeypatch.setattr(sys, "argv", ["cc-swap", "help"])
+    with pytest.raises(SystemExit):
+        cli.main()
+    return capsys.readouterr().out
+
+
+@pytest.mark.parametrize("action", sorted({*_actions(), "upgrade --check"}))
+def test_every_fork_action_has_a_one_line_help_listing(action, monkeypatch, capsys):
+    lines = [line.split() for line in _main_help(monkeypatch, capsys).splitlines()]
+    verb, *sub = action.split()
+
+    def listed(line: list[str]) -> bool:
+        if line[1:2] != [verb]:
+            return False
+        # `auto off|on|status` lists three subcommands on one line.
+        return not sub or (len(line) > 2 and sub[0] in line[2].split("|"))
+
+    assert any(listed(line) for line in lines), (
+        f"`cc-swap help` has no one-line listing for `cc-swap {action}`"
+    )

@@ -1493,6 +1493,7 @@ cc-swap:
   %(prog)s why                        why the engine did or didn't switch
   %(prog)s auto off|on|status         stop / resume automatic switching (persistent)
   %(prog)s history [-n N] [--json]    recent account switches (who, why)
+  %(prog)s claude-update [--check]    update Claude Code via `claude update` (exit 10 = available)
 
 Aliases: ls=list  rm=remove  update=upgrade""",
         formatter_class=argparse.RawDescriptionHelpFormatter,

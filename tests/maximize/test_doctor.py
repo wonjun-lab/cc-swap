@@ -430,6 +430,26 @@ def test_priming_on_reminds_about_isolation(world):
     world.settings(prime={"enabled": True})
     [f] = find(run(world), "priming", "info")
     assert "isolation" in f.detail
+    assert f.fix == "cc-swap prime verify"  # nothing verified yet
+
+
+def test_priming_paused_by_a_claude_update_is_a_warning_naming_prime_verify(world):
+    from claude_swap.maximize import claude_update as cu
+    from claude_swap.maximize import prime_verify as pv
+
+    world.healthy()
+    world.settings(prime={"enabled": True})
+    pv.record_verified(world.root, "2.1.280", by=pv.VERIFIED_BY_CLI, now=1.0)
+    [ok] = find(run(world), "priming", "info")
+    assert "verified for claude 2.1.280" in ok.detail
+    cu.record_version(world.root, "2.1.280")
+    cu.record_version(world.root, "2.1.287", "2.1.280")
+    before = files(world.home, world.root)
+    [f] = find(run(world), "priming", "warn")
+    assert "2.1.280 -> 2.1.287" in f.detail and f.fix == "cc-swap prime verify"
+    assert files(world.home, world.root) == before  # still read-only
+    steps = {s.key: s for s in doctor_cli.init_steps(world.probes())}
+    assert steps["priming"].status == "FIX" and steps["priming"].fix == "cc-swap prime verify"
 
 
 def test_settings_not_json_is_an_error(world):

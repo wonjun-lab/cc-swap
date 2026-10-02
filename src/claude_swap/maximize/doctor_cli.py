@@ -243,10 +243,15 @@ def init_steps(probes: dr.Probes) -> list[Step]:
             "priming is on but its claude is missing",
             "cc-swap config set prime.claudePath <path>, or cc-swap config set prime.enabled false",
         ))
+    elif (note := dr.priming_guard(ctx.probes.backup_root)[0]) is not None:
+        steps.append(Step(
+            "priming", "FIX", "Priming off unless verified",
+            f"priming is {note}", "cc-swap prime verify",
+        ))
     else:
         steps.append(Step(
             "priming", "ok", "Priming off unless verified",
-            "priming on: re-check its isolation after every Claude Code upgrade (README)",
+            "priming on: it pauses after a Claude Code update until cc-swap prime verify passes",
         ))
     return steps
 
@@ -433,6 +438,10 @@ REASONS: dict[str, tuple[str, str]] = {
     "maximize-paused": (
         "A Fleet re-login paused switching (pausedUntil, at most 10 minutes).",
         "Finish or cancel the re-login; the pause also ends by itself.",
+    ),
+    "auto-off": (
+        "Automatic switching is off (cc-swap auto off, or Fleet Mode → o): the engine keeps deciding but never switches or primes.",
+        "cc-swap auto on (or Fleet Mode → o); cc-swap auto status shows who turned it off and when.",
     ),
     "maximize-pending": (
         "A soft mark is crossed; maximize waits for an idle moment (idleWindowMin) before switching.",

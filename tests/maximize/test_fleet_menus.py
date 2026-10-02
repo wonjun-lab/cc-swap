@@ -50,7 +50,7 @@ def test_mode_labels(holder, pid, label, short):
     assert menus.mode_short(holder, pid) == short
 
 
-@pytest.mark.parametrize("width", [120, 80, 60, 40])
+@pytest.mark.parametrize("width", [120, 100, 80, 60, 40])
 def test_folded_menu_keeps_every_item_in_order_within_the_width(width):
     lines = menus.folded_menu(width, mode_label="service · viewing")
     flat = [title for line in lines for title, _key in line]
@@ -58,8 +58,29 @@ def test_folded_menu_keeps_every_item_in_order_within_the_width(width):
     assert "Mode: service" in flat
     for line in lines:
         assert len(menus.SEP.join(title for title, _ in line)) + 2 <= max(width, 30)
-    if width >= 80:
+    if width >= 100:  # ten items since 0.3.0 (u Update, v View swaps)
         assert len(lines) == 1
+
+
+def test_every_short_name_contains_its_key():
+    for entry in menus.MAIN_MENU:
+        assert menus.bold_spans(entry.short, entry.key) is not None, entry
+
+
+def test_the_0_3_0_keys_mean_one_thing_across_fleet():
+    """`v` was both View switch history (main) and Verify logins (Account
+    settings) when Batch 1 and 2 met; each new letter now has one meaning."""
+    account = {key: action for key, _title, action in menus.ACCOUNT_ITEMS}
+    main = {e.key: e.action for e in menus.MAIN_MENU}
+    assert main["v"] == "history" and "v" not in account
+    assert main["u"] == "update" and "u" not in account
+    assert account["i"] == "verify" and "i" not in main
+    assert "i" not in (*menus.ROW_KEYS, *menus.RESERVED_KEYS)
+
+
+def test_account_key_hints_name_every_item():
+    for key, _title, _action in menus.ACCOUNT_ITEMS:
+        assert f" {key} " in f" {menus.ACCOUNT_KEYS} "
 
 
 def test_help_lists_every_key_and_column():

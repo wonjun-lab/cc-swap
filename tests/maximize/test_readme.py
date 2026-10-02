@@ -91,8 +91,9 @@ def test_readme_documents_the_fleet_screen_and_relogin(snippet):
 #
 # These read the registries (``_FORK_COMMANDS``, the parsers, the Fleet
 # bindings), so a command or key added later is held to the README as soon as
-# it is registered. Pending when this was written, and enforced after merge:
-# doctor, init, why, history, `auto on|off`, `prime verify`.
+# it is registered. Since 0.3.0 this covers doctor, init, why, history and
+# claude-update; `auto on|off|status`, `prime verify` and `upgrade --check`
+# are not in ``_FORK_COMMANDS`` and are listed explicitly below.
 
 
 def _readme_text() -> str:
@@ -163,8 +164,19 @@ def test_every_fleet_key_the_readme_names_is_bound():
     section = text[start : text.index("\n## ", start + 5)]
     named = set(re.findall(r"`((?:ctrl\+)?[a-z?])`", section))
     assert {"s", "m", "r", "ctrl+f"} <= named, "section parse found too little"
+    from claude_swap.maximize import fleet as fx
+    from claude_swap.tui.fleet_accounts import AccountsScreen
+
     bound = {"?" if k == "question_mark" else k for b in FleetScreen.BINDINGS for k in b.key.split(",")}
     bound |= {k for b in CswapApp.BINDINGS for k in b.key.split(",")}
+    # Sub-screens the section documents: Account settings and the Mode modal.
+    bound |= {k for b in AccountsScreen.BINDINGS for k in b.key.split(",")}
+    bound |= {
+        a.key
+        for holder in ("none", "here-dry", "here-live", "service")
+        for off in (False, True)
+        for a in fx.mode_transitions(holder, auto_off=off)
+    }
     assert sorted(named - bound) == [], "README names Fleet keys that are not bound"
 
 
@@ -200,3 +212,19 @@ def test_readme_says_the_service_rotates_its_macos_logs():
     assert "is not rotated" not in text
     assert "370 KiB" in text
     assert "10 MiB" in text and "three generations" in text
+
+
+@pytest.mark.parametrize("command", [
+    "cc-swap auto off", "cc-swap auto on", "cc-swap auto status",
+    "cc-swap prime verify", "cc-swap prime verify --live",
+    "cc-swap history -n 0", "cc-swap upgrade --check", "cc-swap claude-update --check",
+])
+def test_readme_documents_the_subcommands_outside_fork_commands(command):
+    assert command in _readme_text()
+
+
+def test_readme_replaces_the_manual_isolation_checklist_with_prime_verify():
+    text = _readme_text()
+    assert "### After every Claude Code update: `cc-swap prime verify`" in text
+    assert "It replaces the manual checklist" in text
+    assert "Fingerprint the active login" not in text

@@ -1,6 +1,6 @@
-"""Fleet's *Verify logins* modal: ``cc-swap doctor`` inside the TUI.
+"""Fleet's *Inspect all logins* modal: ``cc-swap doctor`` inside the TUI.
 
-Account settings → ``v`` runs the same read-only checks as ``cc-swap doctor``
+Account settings → ``i`` runs the same read-only checks as ``cc-swap doctor``
 (``maximize/doctor.py``) in a thread worker and lists the findings — slot
 numbers and fingerprint prefixes only — with one fix line each. Nothing is
 refreshed or written; ``r`` reruns, ``esc`` closes.
@@ -67,7 +67,7 @@ class DoctorModal(ModalScreen[None]):
 
     def compose(self) -> ComposeResult:
         with Vertical(classes="modal-box modal-box-wide fx-modal"):
-            yield Label("Verify logins", classes="modal-title")
+            yield Label("Inspect all logins (doctor)", classes="modal-title")
             yield RichLog(id="fx-doctor-log", wrap=True, markup=False, highlight=False)
             yield Static(
                 "read-only: no refresh, no writes · r run again · esc close",

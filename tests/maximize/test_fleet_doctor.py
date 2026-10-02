@@ -1,4 +1,4 @@
-"""Fleet → Account settings → ``v`` (Verify logins): ``cc-swap doctor`` in a
+"""Fleet → Account settings → ``i`` (Inspect all logins): ``cc-swap doctor`` in a
 modal, with a fake doctor runner (no real Keychain, service or claude)."""
 
 from __future__ import annotations
@@ -9,7 +9,7 @@ from claude_swap.maximize import doctor as dr
 
 
 @pytest.mark.asyncio
-async def test_fleet_v_opens_verify_logins_with_the_findings(tmp_path, monkeypatch):
+async def test_fleet_i_opens_inspect_all_logins_with_the_findings(tmp_path, monkeypatch):
     from textual.widgets import RichLog
 
     from claude_swap.tui import fleet_doctor
@@ -37,8 +37,8 @@ async def test_fleet_v_opens_verify_logins_with_the_findings(tmp_path, monkeypat
         await _open(pilot)
         assert isinstance(app.screen, AccountsScreen)
         keys = app.screen.query_one("#fx-ac-keys").render().plain
-        assert "v verify" in keys
-        await pilot.press("v")
+        assert "i inspect" in keys
+        await pilot.press("i")
         await _open(pilot)
         modal = app.screen
         assert isinstance(modal, fleet_doctor.DoctorModal)
