@@ -1845,3 +1845,21 @@ class TestAdopt:
         store.adopt({"2": (USAGE, 0.0)}, IDENT)
         row = json.loads(store.path.read_text(encoding="utf-8"))["accounts"]["2"]
         assert (row["email"], row["organizationUuid"]) == IDENT["2"]
+class TestLoginExpiredStrikes:
+    """``login_expired`` is ``invalid_grant`` named by its cause: same quarantine."""
+
+    def test_login_expired_advances_strikes_and_binds_the_fingerprint(self, store):
+        store.record(
+            {"1": FetchRecord(error="login_expired", struck_fp="sha256:dead")}, IDENT
+        )
+        entry = store.entries(IDENT)["1"]
+        assert entry.auth_dead_strikes == 1
+        assert entry.last_error == "login_expired"
+        assert entry.struck_fingerprint == "sha256:dead"
+        assert entry.token_dead(stored_fp="sha256:dead")
+        assert not entry.token_dead(stored_fp="sha256:fresh-login")
+
+    def test_success_lifts_a_login_expired_quarantine(self, store):
+        store.record({"1": FetchRecord(error="login_expired")}, IDENT)
+        store.record({"1": FetchRecord(usage=USAGE)}, IDENT)
+        assert store.entries(IDENT)["1"].auth_dead_strikes == 0

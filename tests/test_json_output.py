@@ -801,3 +801,25 @@ class TestUsageFromJson:
 
         with pytest.raises(ValueError):
             usage_from_json(usage)
+class TestLoginExpiredProjection:
+    def test_login_expired_sentinel_projects_to_relogin_required(self):
+        from claude_swap.json_output import USAGE_LOGIN_EXPIRED, usage_fields
+
+        assert usage_fields(USAGE_LOGIN_EXPIRED) == ("relogin_required", None)
+
+    def test_account_row_flags_a_lapsed_login(self):
+        from claude_swap.json_output import account_row
+
+        row = account_row(
+            1, "a@x.com", "", "", True, None,
+            login_expires_at="2026-09-12T17:56:00Z", login_expired=True,
+        )
+        assert row["loginExpired"] is True
+        assert row["loginExpiresAt"] == "2026-09-12T17:56:00Z"
+
+    def test_account_row_omits_the_flag_while_the_login_is_live(self):
+        from claude_swap.json_output import account_row
+
+        assert "loginExpired" not in account_row(
+            1, "a@x.com", "", "", True, None, login_expires_at="2026-10-08T01:06:36Z"
+        )

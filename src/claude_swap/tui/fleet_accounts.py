@@ -25,14 +25,6 @@ from claude_swap.tui.theme import Palette
 if TYPE_CHECKING:
     from claude_swap.tui.app import CswapApp
 
-LOGIN_TEXT: dict[str, tuple[str, str]] = {
-    "ok": ("ok", "ok"),
-    "relogin": ("re-login needed", "crit"),
-    "expired": ("token expired (heals itself)", "warn"),
-    "foreign": ("foreign credential (a switch repairs it)", "warn"),
-    "keychain": ("keychain locked or in use", "warn"),
-    "api": ("API key", "dim"),
-}
 _NEEDS_ACCOUNT = {"relogin", "alias", "delete"}
 _PICK_VERBS = {"relogin": "re-login", "alias": "name", "delete": "delete"}
 
@@ -119,7 +111,7 @@ class AccountsScreen(Screen):
         keep = self.current_number()
         table.clear()
         for row in rows:
-            login, tone = LOGIN_TEXT.get(row.login, (row.login, "plain"))
+            login, tone = fx.login_text(row)
             table.add_row(
                 Text(row.number, style=tone_style("bold" if row.active else "plain", palette)),
                 Text(f"{row.name}  [{row.org}]" + ("  ● active" if row.active else ""),

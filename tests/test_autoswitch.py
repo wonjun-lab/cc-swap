@@ -1819,6 +1819,28 @@ class TestFreshening:
         assert (q.number, q.reason) == ("2", "invalid_grant")
         assert "2" in h.state()["quarantine"]
 
+    def test_invalid_grant_past_the_login_deadline_quarantines_as_login_expired(
+        self, temp_home
+    ):
+        h = EngineHarness(temp_home)
+        h.seed(1, "a@example.com")
+        h.seed(3, "c@example.com")
+        lapsed = {"accessToken": "sk-2", "refreshToken": "rt-2", "expiresAt": 1,
+                  "refreshTokenExpiresAt": 1000}
+        h.seed(2, "b@example.com", expires_at=1)
+        h.switcher._write_account_credentials(
+            "2", "b@example.com", json.dumps({"claudeAiOauth": lapsed})
+        )
+        h.make_live("a@example.com", 1)
+        with patch(
+            "claude_swap.autoswitch.oauth.try_refresh_oauth_credentials",
+            return_value=oauth.RefreshOutcome(None, "invalid_grant"),
+        ):
+            h.tick_with_usage({"1": _usage(95), "2": _usage(10), "3": _usage(20)})
+        q = next(e for e in h.events if isinstance(e, QuarantineEvent))
+        assert (q.number, q.reason) == ("2", "login_expired")
+        assert h.state()["quarantine"]["2"]["reason"] == "login_expired"
+
     def test_transient_failure_skips_without_quarantine(self, temp_home):
         h = EngineHarness(temp_home)
         h.seed(1, "a@example.com")

@@ -24,6 +24,7 @@ from claude_swap.json_output import (
     USAGE_API_KEY,
     USAGE_FOREIGN_CREDENTIAL,
     USAGE_KEYCHAIN_UNAVAILABLE,
+    USAGE_LOGIN_EXPIRED,
     USAGE_NO_CREDENTIALS,
     USAGE_RELOGIN_REQUIRED,
     USAGE_TOKEN_EXPIRED,
@@ -48,6 +49,7 @@ PUBLISH_REFRESH_S = 300.0
 
 _SENTINEL_LOGIN: dict[str, LoginState] = {
     USAGE_RELOGIN_REQUIRED: "relogin",
+    USAGE_LOGIN_EXPIRED: "relogin",  # named by its cause on FleetRow.login_expired
     USAGE_NO_CREDENTIALS: "relogin",
     USAGE_TOKEN_EXPIRED: "expired",
     USAGE_FOREIGN_CREDENTIAL: "foreign",
@@ -227,6 +229,9 @@ class FleetRow:
     login: LoginState
     stale: bool
     fetched_at: float | None = None
+    # The re-login is needed because the login reached its recorded deadline
+    # (``login expired`` sentinel), not because the refresh token died.
+    login_expired: bool = False
 
 
 def fleet_snapshot(
@@ -300,6 +305,7 @@ def fleet_rows(
                 login=login,
                 stale=acc.usage.age_s is not None and acc.usage.age_s > STALE_OK_S,
                 fetched_at=acc.usage.fetched_at,
+                login_expired=acc.usage.sentinel == USAGE_LOGIN_EXPIRED,
             )
         )
     return out
@@ -691,15 +697,46 @@ def header_line(
     return _fit(parts, width)  # the clock goes before anything essential
 
 
+def _dead_cause(row: FleetRow, *, plural: bool = False) -> str:
+    if row.login_expired:
+        return "logins expired" if plural else "login expired"
+    return "refresh tokens dead" if plural else "refresh token dead"
+
+
 def attention(rows: Sequence[FleetRow]) -> str | None:
-    """One crit line naming every account whose login only a re-login fixes."""
+    """One crit line naming every account whose login only a re-login fixes,
+    and why (the login reached its deadline, or the refresh token died)."""
     dead = [r for r in rows if r.login == "relogin"]
     if not dead:
         return None
-    names = ", ".join(f"#{r.number} {r.name}" for r in dead)
     if len(dead) == 1:
-        return f"⚠ {names} needs re-login (refresh token dead) — select it and press r"
-    return f"⚠ {names} need re-login (refresh tokens dead) — select one and press r"
+        r = dead[0]
+        return (
+            f"⚠ #{r.number} {r.name} needs re-login ({_dead_cause(r)}) — "
+            "select it and press r"
+        )
+    if len({r.login_expired for r in dead}) == 1:
+        names = ", ".join(f"#{r.number} {r.name}" for r in dead)
+        cause = _dead_cause(dead[0], plural=True)
+        return f"⚠ {names} need re-login ({cause}) — select one and press r"
+    names = ", ".join(f"#{r.number} {r.name} ({_dead_cause(r)})" for r in dead)
+    return f"⚠ {names} need re-login — select one and press r"
+
+
+def login_text(row: FleetRow) -> Cell:
+    """The Accounts screen's login column."""
+    if row.login == "relogin":
+        return f"re-login needed ({_dead_cause(row)})", "crit"
+    return _LOGIN_TEXT.get(row.login, (row.login, "plain"))
+
+
+_LOGIN_TEXT: dict[str, Cell] = {
+    "ok": ("ok", "ok"),
+    "expired": ("token expired (heals itself)", "warn"),
+    "foreign": ("foreign credential (a switch repairs it)", "warn"),
+    "keychain": ("keychain locked or in use", "warn"),
+    "api": ("API key", "dim"),
+}
 
 
 # -- table ----------------------------------------------------------------------------------
@@ -924,8 +961,13 @@ def relogin_steps(
         if return_to is not None and return_to.number != row.number
         else "stays on it"
     )
+    why = (
+        "its login expired (Claude Code logins expire about a month after login)"
+        if row.login_expired
+        else "its refresh token is dead"
+    )
     lines = [
-        f"Re-login #{row.number} {row.name} ({row.email}) — its refresh token is dead; "
+        f"Re-login #{row.number} {row.name} ({row.email}) — {why}; "
         "only a fresh login fixes it.",
         "",
         f"{where}, in another terminal:",

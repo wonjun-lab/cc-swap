@@ -801,6 +801,10 @@ class AutoSwitchEngine:
     def _quarantine(self, number: str, email: str, reason: str) -> None:
         creds = self.switcher.read_account_credentials(number, email)
         fingerprint = _refresh_fingerprint(creds) if creds else None
+        if reason == "invalid_grant" and creds:
+            # Refused after the login's recorded deadline: the login lapsed on
+            # schedule (``oauth.permanent_refresh_kind``), not a stolen token.
+            reason = oauth.permanent_refresh_kind(reason, creds) or reason
 
         def add(state: dict) -> None:
             state.setdefault("quarantine", {})[number] = {

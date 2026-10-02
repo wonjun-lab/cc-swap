@@ -294,7 +294,9 @@ class TestAccounts:
             screen = app.screen
             assert isinstance(screen, AccountsScreen)
             table = screen.query_one("#fx-ac-table", DataTable)
-            assert "re-login needed" in [c.plain for c in table.get_row("4")]
+            assert "re-login needed (refresh token dead)" in [
+                c.plain for c in table.get_row("4")
+            ]
             menu = screen.query_one("#fx-ac-menu", ListView)
             menu.focus()
             menu.index = 2  # Re-login…

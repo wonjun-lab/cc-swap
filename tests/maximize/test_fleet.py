@@ -334,6 +334,32 @@ def test_attention_names_every_relogin_account():
     assert fleet.attention(healthy) is None
 
 
+def test_login_expired_is_a_relogin_named_by_its_cause():
+    from claude_swap.json_output import USAGE_LOGIN_EXPIRED
+
+    snap = accounts(
+        acc(1, active=True),
+        acc(2, sentinel=USAGE_LOGIN_EXPIRED, alias="lapsed"),
+        acc(3, sentinel=USAGE_RELOGIN_REQUIRED, alias="dead"),
+    )
+    rows = {r.number: r for r in fleet.fleet_rows(snap, MX, PRIME, MaximizeState(), now=NOW)}
+    assert rows["2"].login == "relogin" and rows["2"].login_expired is True
+    assert rows["3"].login == "relogin" and rows["3"].login_expired is False
+    assert fleet.relogin_count(list(rows.values())) == 2
+    assert fleet.attention([rows["2"]]) == (
+        "⚠ #2 lapsed needs re-login (login expired) — select it and press r"
+    )
+    assert fleet.attention([rows["2"], rows["3"]]) == (
+        "⚠ #2 lapsed (login expired), #3 dead (refresh token dead) need re-login"
+        " — select one and press r"
+    )
+    steps = "\n".join(fleet.relogin_steps(rows["2"], ssh=False, host="h",
+                                          claude_path=None, return_to=rows["1"]))
+    assert "its login expired" in steps and "refresh token is dead" not in steps
+    assert fleet.login_text(rows["2"]) == ("re-login needed (login expired)", "crit")
+    assert fleet.login_text(rows["3"]) == ("re-login needed (refresh token dead)", "crit")
+
+
 # -- layout -------------------------------------------------------------------------------
 
 
