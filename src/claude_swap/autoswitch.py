@@ -2316,6 +2316,15 @@ class AutoSwitchEngine:
                 ))
                 return TickOutcome.NO_ACTION
 
+            if self._active_read_unhealthy():
+                # A read since the tick-level hold (consume-first's phase-2
+                # refetch) found the live credential degraded: re-checked
+                # here, right before the switch would overwrite it.
+                self._emit(NoSwitchEvent(
+                    reason="active-credential-unreadable",
+                    detail="live credential read degraded before the switch; holding",
+                ))
+                return TickOutcome.NO_ACTION
             try:
                 result = self.switcher.switch_to(number, json_output=True)
             except CredentialReadError as exc:

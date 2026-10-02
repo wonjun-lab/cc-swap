@@ -3014,6 +3014,39 @@ def _usage7(pct5: float, pct7: float, reset7: str | None = None) -> dict:
     return {"five_hour": {"pct": pct5}, "seven_day": seven}
 
 
+def test_consume_first_phase2_degraded_read_holds(temp_home):
+    """consume-first re-reads the live credential in its phase-2 refetch; a
+    degraded read there must stop the switch right before `switch_to`."""
+    from claude_swap.credentials import ActiveCredentials
+
+    h = EngineHarness(temp_home, strategy="consume-first")
+    for n, e in ((1, "a@example.com"), (2, "b@example.com"), (3, "c@example.com")):
+        h.seed(n, e)
+    h.make_live("a@example.com", 1)
+    usage = {"1": _usage7(20, 20, _R_LATER), "2": _usage7(10, 10, _R_SOON),
+             "3": _usage7(10, 10, _R_LATEST)}
+    entries = {k: _entry_for(v, h.clock.now) for k, v in usage.items()}
+    live = (temp_home / ".claude" / ".credentials.json").read_text()
+    calls = []
+
+    def collect(*_a, fetch=None, **_kw):
+        calls.append(fetch)
+        # Clean for the collection the tick-level hold inspects; the phase-2
+        # refetch (fetch covers current + candidates) reads degraded.
+        degraded = fetch is not None and fetch >= {"1", "2", "3"} and len(calls) > 2
+        h.switcher._record_active_verdict(ActiveCredentials(live, False, degraded))
+        return entries
+
+    with patch.object(h.switcher, "usage_entries_by_account", side_effect=collect), \
+         patch.object(h.switcher, "switch_to") as switch_to:
+        out = h.engine.tick()
+    assert h.switcher._active_verdict().degraded  # premise: phase 2 read degraded
+    assert out is TickOutcome.NO_ACTION
+    switch_to.assert_not_called()
+    reasons = [e.reason for e in h.events if isinstance(e, NoSwitchEvent)]
+    assert reasons[-1] == "active-credential-unreadable"
+
+
 class TestConsumeFirstStrategy:
     def _harness(self, temp_home: Path) -> EngineHarness:
         h = EngineHarness(temp_home, strategy="consume-first")
