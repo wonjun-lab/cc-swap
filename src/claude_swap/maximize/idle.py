@@ -108,20 +108,20 @@ def is_idle(samples: Sequence[Sample], now: float, s: MaximizeSettings) -> bool:
     return d5 <= s.idle_max_delta_pct and d7 <= IDLE_MAX_DELTA_7D_PCT
 
 
-def eta_to_hard_min(
+def eta_to_hard(
     samples: Sequence[Sample], s: MaximizeSettings
-) -> float | None:
-    """Minutes until the first hard cap at the recent burn rate, or None.
+) -> tuple[float | None, float | None]:
+    """``(5h, 7d)`` minutes until each hard cap at the recent burn rate.
 
     Velocity is :func:`span_rise` over the span from the earliest sample
     within ``idle_window_min`` of the newest (the nearest older sample when
     polling is sparser than the window), so a reset inside the span cannot
-    hide a climb after it. A window that did not climb has no ETA; None when
-    neither window is climbing or the span is too short to trust.
+    hide a climb after it. A window that did not climb has no ETA (None);
+    both are None when the span is too short to trust.
     """
     ordered = _ordered(samples)
     if len(ordered) < 2:
-        return None
+        return None, None
     newest = ordered[-1]
     window = s.idle_window_min * 60.0
     inside = [i for i, x in enumerate(ordered[:-1]) if newest.ts - x.ts <= window]
@@ -129,12 +129,21 @@ def eta_to_hard_min(
     span = ordered[start:]
     span_s = newest.ts - span[0].ts
     if span_s < MIN_ETA_SPAN_S:
-        return None
+        return None, None
     span_min = span_s / 60.0
     d5, d7 = span_rise(span)
-    etas: list[float] = []
-    for used, now_pct, cap in ((d5, newest.pct5, s.hard_5h), (d7, newest.pct7, s.hard_7d)):
+
+    def eta(used: float, now_pct: float, cap: float) -> float | None:
         velocity = used / span_min
-        if velocity > 0:
-            etas.append(max(cap - now_pct, 0.0) / velocity)
+        return max(cap - now_pct, 0.0) / velocity if velocity > 0 else None
+
+    return eta(d5, newest.pct5, s.hard_5h), eta(d7, newest.pct7, s.hard_7d)
+
+
+def eta_to_hard_min(
+    samples: Sequence[Sample], s: MaximizeSettings
+) -> float | None:
+    """Minutes until the first hard cap (see :func:`eta_to_hard`), or None
+    when neither window is climbing or the span is too short to trust."""
+    etas = [e for e in eta_to_hard(samples, s) if e is not None]
     return min(etas) if etas else None

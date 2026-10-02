@@ -5,6 +5,7 @@ from __future__ import annotations
 import pytest
 
 from claude_swap.maximize.idle import (
+    eta_to_hard,
     eta_to_hard_min,
     idle_evidence,
     is_idle,
@@ -135,6 +136,13 @@ class TestEta:
     def test_smaller_of_both_windows(self):
         rows = samples((600, 10, 90), (0, 20, 95))   # 5h 1/min (75 min); 7d 0.5/min (6 min)
         assert eta_to_hard_min(rows, S) == pytest.approx(6.0)
+
+    def test_per_window(self):
+        rows = samples((600, 10, 90), (0, 20, 95))
+        assert eta_to_hard(rows, S) == (pytest.approx(75.0), pytest.approx(6.0))
+        assert eta_to_hard(samples((600, 10, 90), (0, 20, 90)), S) == (
+            pytest.approx(75.0), None,
+        )
 
     def test_uses_earliest_sample_inside_window(self):
         rows = samples((1200, 0, 10), (600, 60, 10), (300, 70, 10), (0, 80, 10))

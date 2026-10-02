@@ -154,9 +154,37 @@ CASES = [
     Case("hard-nothing-landable-falls-back-under-hard",
          snap("1", acct("1", 96, 40), acct("2", 80, 10), acct("3", 97, 10), samples="busy"),
          Switch, target="2", trigger="hard", reason_has="under the hard caps"),
-    Case("hard-nothing-under-hard-is-exhausted",
+    Case("hard-nothing-under-hard-holds",
+         # The active still has quota below 100%: stay; at-limit decides
+         # once it is spent.
          snap("1", acct("1", 96, 40), acct("2", 95, 10), acct("3", 10, 99)),
-         Exhausted),
+         Hold, pending=False, reason_has="no account under the hard caps has more 5h room"),
+    Case("hard-fallback-ranks-by-room-not-score",
+         # 2 scores higher but sits 1 pt under the cap; 3 has 35 pts of room.
+         snap("1", acct("1", 95, 30), acct("2", 94, 10, reset7_d=1),
+              acct("3", 60, 50, reset7_d=6)),
+         Switch, target="3", trigger="hard", reason_has="most 5h room"),
+    Case("eta-forced-on-7d-needs-more-7d-room",
+         # 7d climbs 0.5 pt/min (ETA 6 min, 3 pts of room). 2 has less 7d
+         # room, 3 is over the 5h cap; 4 and 5 qualify, 4 has the most room.
+         snap("1", acct("1", 10, 95), acct("2", 10, 96), acct("3", 96, 10),
+              acct("4", 70, 94), acct("5", 60, 94.5),
+              samples=rows((600, 10, 90), (0, 10, 95))),
+         Switch, target="4", trigger="hard", reason_has="most 7d room"),
+    Case("hard-on-both-windows-ranks-by-the-tighter-room",
+         # 2: 5 pts of 5h / 48 of 7d; 3: 35 of 5h but 1 of 7d.
+         snap("1", acct("1", 96, 98.5), acct("2", 90, 50), acct("3", 60, 97)),
+         Switch, target="2", trigger="hard", reason_has="most 5h/7d room"),
+    Case("eta-forced-never-moves-to-less-room",
+         # Reviewer's bounce: 1 at 85% burning 1 pt/min (ETA 10 min); 2 at
+         # 90% has less 5h room, so moving there would bounce straight back.
+         snap("1", acct("1", 85, 30), acct("2", 90, 30),
+              samples=rows((600, 75, 30), (300, 80, 30), (0, 85, 30))),
+         Hold, pending=False, reason_has="hard cap in ~10.0 min"),
+    Case("eta-forced-takes-an-account-with-more-room",
+         snap("1", acct("1", 85, 30), acct("2", 90, 30), acct("3", 70, 30),
+              samples=rows((600, 75, 30), (300, 80, 30), (0, 85, 30))),
+         Switch, target="3", trigger="hard"),
     Case("hard-ignores-cooldown",
          snap("1", acct("1", 96, 40), acct("2"), last_switch_min=1),
          Switch, target="2", trigger="hard"),

@@ -11,15 +11,26 @@ Triggers, first match wins:
               tier's best beats the active by > eps     idle + cooldown
 
 The destination is always the top of ``landing_candidates``. With none:
-at-limit/hard fall back to any eligible account under both hard caps;
-at-limit then to any eligible account under 100% on both windows (most
-room first), else ``Exhausted``; soft/rebalance ``Hold``. Unknown active
-usage is ``Indeterminate`` (the engine's upstream failover path counts it).
+
+* at-limit: any eligible account under both hard caps (score order), then
+  any eligible account under 100% on both windows (most room first), else
+  ``Exhausted``.
+* hard: an eligible account under both hard caps with strictly more room
+  than the active on every window that forced the switch (most room
+  first); else ``Hold`` — the active is still under 100% (at 100% the
+  at-limit trigger wins), and moving to less room would bounce straight
+  back.
+* soft/rebalance: ``Hold``.
+
+Unknown active usage is ``Indeterminate`` (the engine's upstream failover
+path counts it).
 """
 
 from __future__ import annotations
 
 import math
+from dataclasses import dataclass
+from typing import Literal
 
 from claude_swap.maximize import idle
 from claude_swap.maximize.model import (
@@ -31,9 +42,12 @@ from claude_swap.maximize.model import (
     Indeterminate,
     Snapshot,
     Switch,
-    Trigger,
 )
 from claude_swap.maximize.score import below_hard, landable, rank, score, slot_order
+
+Window = Literal["5h", "7d"]
+# Utilization at which a window is spent (the at-limit trigger).
+LIMIT_PCT = 100.0
 
 
 def _pct(value: float) -> str:
@@ -55,7 +69,8 @@ def landing_candidates(snap: Snapshot) -> list[AccountView]:
 
 
 def escape_candidates(snap: Snapshot) -> list[AccountView]:
-    """The at-limit/hard fallback: eligible accounts under both hard caps."""
+    """The at-limit/hard fallback pool: eligible accounts under both hard
+    caps, in §5.4 order."""
     s = snap.settings
     return rank(
         [
@@ -72,7 +87,33 @@ def escape_candidates(snap: Snapshot) -> list[AccountView]:
     )
 
 
-LIMIT_PCT = 100.0
+def hard_room(v: AccountView, window: Window, snap: Snapshot) -> float:
+    """Points left on ``window`` before its hard cap (negative when over)."""
+    s = snap.settings
+    return s.hard_5h - v.pct5 if window == "5h" else s.hard_7d - v.pct7
+
+
+def roomier_candidates(
+    snap: Snapshot, active: AccountView, windows: tuple[Window, ...]
+) -> list[AccountView]:
+    """The hard fallback: ``escape_candidates`` with strictly more room than
+    the active on every window in ``windows``, most room first.
+
+    Room is what a forced move buys; a target with less of it on the window
+    that forced the move reaches its own cap sooner and forces the move
+    straight back. Room on several forcing windows is the tighter of them;
+    equal room keeps the §5.4 order.
+    """
+
+    def room(v: AccountView) -> float:
+        return min(hard_room(v, w, snap) for w in windows)
+
+    out = [
+        v
+        for v in escape_candidates(snap)
+        if all(hard_room(v, w, snap) > hard_room(active, w, snap) for w in windows)
+    ]
+    return sorted(out, key=lambda v: -room(v))
 
 
 def binding_room(v: AccountView) -> float:
@@ -134,22 +175,44 @@ def _target(v: AccountView, now: float) -> str:
     return f"#{v.number} ({v.tier}, score {score(v, now):.2f})"
 
 
-def _hard_reason(snap: Snapshot, a: AccountView) -> str | None:
+@dataclass(frozen=True)
+class _Force:
+    """Why the hard trigger fired, and on which window(s)."""
+
+    reason: str
+    windows: tuple[Window, ...]
+
+
+def _hard_force(snap: Snapshot, a: AccountView) -> _Force | None:
     s = snap.settings
-    if a.pct5 >= s.hard_5h:
-        return f"#{a.number} 5h {_pct(a.pct5)} >= hard {_pct(s.hard_5h)}"
-    if a.pct7 >= s.hard_7d:
-        return f"#{a.number} 7d {_pct(a.pct7)} >= hard {_pct(s.hard_7d)}"
+    reached: tuple[Window, ...] = tuple(
+        w
+        for w, pct, cap in (("5h", a.pct5, s.hard_5h), ("7d", a.pct7, s.hard_7d))
+        if pct >= cap
+    )
+    if reached:
+        if reached[0] == "5h":
+            why = f"#{a.number} 5h {_pct(a.pct5)} >= hard {_pct(s.hard_5h)}"
+        else:
+            why = f"#{a.number} 7d {_pct(a.pct7)} >= hard {_pct(s.hard_7d)}"
+        return _Force(why, reached)
     if (
         s.force_eta_min > 0
         and snap.samples
         and snap.now - snap.samples[-1].ts <= s.idle_window_min * 60.0
     ):
-        eta = idle.eta_to_hard_min(snap.samples, s)
-        if eta is not None and eta <= s.force_eta_min:
-            return (
+        eta5, eta7 = idle.eta_to_hard(snap.samples, s)
+        forced: tuple[Window, ...] = tuple(
+            w
+            for w, eta in (("5h", eta5), ("7d", eta7))
+            if eta is not None and eta <= s.force_eta_min
+        )
+        if forced:
+            eta = min(e for e in (eta5, eta7) if e is not None)
+            return _Force(
                 f"#{a.number} reaches a hard cap in ~{eta:.1f} min "
-                f"(<= {s.force_eta_min} min)"
+                f"(<= {s.force_eta_min} min)",
+                forced,
             )
     return None
 
@@ -163,36 +226,54 @@ def _soft_reason(a: AccountView, snap: Snapshot) -> str | None:
     return None
 
 
-def _escape(
-    snap: Snapshot,
-    landing: list[AccountView],
-    trigger: Trigger,
-    why: str,
-) -> Decision:
+def _at_limit(snap: Snapshot, landing: list[AccountView], why: str) -> Decision:
     if landing:
         top = landing[0]
-        return Switch(top.number, trigger, f"{why}; -> {_target(top, snap.now)}")
+        return Switch(top.number, "at-limit", f"{why}; -> {_target(top, snap.now)}")
     fallback = escape_candidates(snap)
     if fallback:
         top = fallback[0]
         return Switch(
             top.number,
-            trigger,
+            "at-limit",
             f"{why}; nothing landable, #{top.number} is under the hard caps "
             f"({_usage(top)})",
         )
-    if trigger == "at-limit":
-        last = limit_candidates(snap)
-        if last:
-            top = last[0]
-            return Switch(
-                top.number,
-                trigger,
-                f"{why}; nothing under the hard caps, #{top.number} has "
-                f"{binding_room(top):g} pts left ({_usage(top)})",
-            )
-        return Exhausted(f"{why}; every account is at its limit")
-    return Exhausted(f"{why}; no account is under the hard caps")
+    last = limit_candidates(snap)
+    if last:
+        top = last[0]
+        return Switch(
+            top.number,
+            "at-limit",
+            f"{why}; nothing under the hard caps, #{top.number} has "
+            f"{binding_room(top):g} pts left ({_usage(top)})",
+        )
+    return Exhausted(f"{why}; every account is at its limit")
+
+
+def _hard(
+    snap: Snapshot, a: AccountView, landing: list[AccountView], force: _Force
+) -> Decision:
+    if landing:
+        top = landing[0]
+        return Switch(top.number, "hard", f"{force.reason}; -> {_target(top, snap.now)}")
+    windows = "/".join(force.windows)
+    fallback = roomier_candidates(snap, a, force.windows)
+    if fallback:
+        top = fallback[0]
+        return Switch(
+            top.number,
+            "hard",
+            f"{force.reason}; nothing landable, #{top.number} has the most "
+            f"{windows} room under the hard caps ({_usage(top)})",
+        )
+    # Every reachable account would hit a cap no later than the active: stay
+    # on it while it lasts. At 100% the at-limit trigger takes over.
+    return Hold(
+        f"{force.reason}; nothing landable and no account under the hard caps "
+        f"has more {windows} room than #{a.number}; staying",
+        pending=False,
+    )
 
 
 def _rebalance(
@@ -245,11 +326,11 @@ def decide(snap: Snapshot) -> Decision:
         return Indeterminate(f"#{a.number} usage unknown")
     landing = landing_candidates(snap)
 
-    if a.pct5 >= 100.0 or a.pct7 >= 100.0:
-        return _escape(snap, landing, "at-limit", f"#{a.number} at limit ({_usage(a)})")
-    hard = _hard_reason(snap, a)
-    if hard is not None:
-        return _escape(snap, landing, "hard", hard)
+    if a.pct5 >= LIMIT_PCT or a.pct7 >= LIMIT_PCT:
+        return _at_limit(snap, landing, f"#{a.number} at limit ({_usage(a)})")
+    force = _hard_force(snap, a)
+    if force is not None:
+        return _hard(snap, a, landing, force)
     soft = _soft_reason(a, snap)
     if soft is not None:
         if not landing:

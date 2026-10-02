@@ -149,6 +149,16 @@ class TestSoftAndHard:
         assert [e.trigger for e in of(h, SwitchEvent)] == ["hard"]
         assert h.active_number() == 2
 
+    def test_hard_with_nothing_roomier_holds_on_the_active(self, temp_home):
+        # Over the hard cap but under 100%, and no peer under both hard caps:
+        # keep using the active; at-limit takes over once it is spent.
+        h = make(temp_home)
+        outcome = h.tick_with_usage({"1": win(96, 40), "2": win(97, 10), "3": win(10, 99)})
+        assert outcome is TickOutcome.NO_ACTION
+        assert no_switch_reasons(h) == ["maximize-hold"]
+        assert not of(h, AllExhaustedEvent)
+        assert h.active_number() == 1
+
     def test_pending_hold_pulls_the_active_poll(self, temp_home):
         h = make(temp_home)
         h.tick_with_usage({"1": win(62, 40), "2": win(0, 10), "3": win(0, 50)})
