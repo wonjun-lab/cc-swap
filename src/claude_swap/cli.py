@@ -78,6 +78,7 @@ _SUBCOMMAND_FLAGS = {
 _FORK_COMMANDS: dict[str, str] = {
     "last-resort": "_last_resort_command",
     "prime": "_prime_command",
+    "service": "_service_command",
 }
 
 
@@ -1244,6 +1245,114 @@ def _menubar_service(args) -> int:
     return 0
 
 
+def _print_service_install(result: dict) -> None:
+    print(f"cc-swap service installed ({result['name']}).")
+    print(f"  runs:   {' '.join(result['program'])}")
+    print(f"  file:   {result['path']}")
+    print(f"  logs:   {', '.join(result['logs'])}")
+    if result["claude_path"]:
+        saved = " (saved as prime.claudePath)" if result["claude_path_saved"] else ""
+        print(f"  claude: {result['claude_path']}{saved}")
+    else:
+        warning(
+            "claude was not found on PATH or at ~/.local/bin/claude; 5h priming "
+            "cannot run until you set it: cc-swap config set prime.claudePath "
+            "/path/to/claude (then re-run cc-swap service install)",
+            file=sys.stderr,
+        )
+    print(
+        dimmed(
+            "It starts at login and restarts after a crash. Re-run "
+            "`cc-swap service install` after upgrading cc-swap."
+        )
+    )
+    if result["platform"] == "linux" and result["linger"] is not True:
+        print(
+            dimmed(
+                "To keep it running after you log out, run once: "
+                "loginctl enable-linger $USER"
+            )
+        )
+
+
+def _print_service_status(result: dict) -> None:
+    if not result["installed"] and not result["loaded"]:
+        print("cc-swap service is not installed.")
+        print(dimmed("Install it with: cc-swap service install"))
+        return
+    state = result["state"] or ("running" if result["running"] else "stopped")
+    pid = f" (pid {result['pid']})" if result["pid"] else ""
+    print(f"cc-swap service: {state}{pid}")
+    print(f"  file: {result['path']}")
+    print(f"  logs: {', '.join(result['logs'])}")
+    if not result["installed"]:
+        print(dimmed("The service manager still has it loaded, but its file is gone."))
+
+
+def _service_command(argv: list[str]) -> None:
+    """Handle `cc-swap service install|uninstall|status`.
+
+    Dispatched through `_FORK_COMMANDS` like `last-resort` and `prime`.
+    Runs `cc-swap auto` as a per-user service — a launchd LaunchAgent on
+    macOS, a systemd user unit on Linux — so auto-switching survives
+    closed terminals and reboots. Windows is refused (by the service
+    module, so the API refuses too).
+    """
+    parser = argparse.ArgumentParser(
+        prog="cc-swap service",
+        description="Run the auto-switch engine (`cc-swap auto`) as a background service.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+macOS: LaunchAgent com.wonjun-lab.cc-swap; logs in ~/Library/Logs/cc-swap/
+Linux: systemd user unit ~/.config/systemd/user/cc-swap.service
+       (logs: journalctl --user -u cc-swap; keep it running after logout
+        with: loginctl enable-linger $USER)
+
+One engine runs per machine: while the service holds the engine lease,
+`cc-swap auto` refuses to start (exit 4) and the TUI auto screen and the
+menu bar only display. Re-run `cc-swap service install` after upgrading.
+        """,
+    )
+    sub = parser.add_subparsers(dest="action", metavar="{install,uninstall,status}")
+    p_install = sub.add_parser("install", help="Install (or refresh) and start the service")
+    p_install.add_argument(
+        "--claude-path",
+        metavar="PATH",
+        default=None,
+        help=(
+            "claude executable for 5h priming (default: prime.claudePath, "
+            "else found on PATH or at ~/.local/bin/claude); saved as prime.claudePath"
+        ),
+    )
+    sub.add_parser("uninstall", help="Stop the service and remove it")
+    sub.add_parser("status", help="Report whether the service is installed and running")
+    args = parser.parse_args(argv)
+    if args.action is None:
+        parser.print_help()
+        sys.exit(2)
+    if sys.platform != "win32" and os.geteuid() == 0:
+        error("Error: install the service as your own user, not root")
+        sys.exit(1)
+
+    from claude_swap.maximize import service
+
+    try:
+        if args.action == "install":
+            _print_service_install(service.install(claude_path=args.claude_path))
+        elif args.action == "uninstall":
+            result = service.uninstall()
+            if result["was_running"] or result["removed"]:
+                print("cc-swap service removed.")
+            else:
+                print("cc-swap service was not installed.")
+        else:
+            _print_service_status(service.status())
+    except ClaudeSwitchError as e:
+        error(f"Error: {e}")
+        sys.exit(1)
+    sys.exit(0)
+
+
 def main() -> None:
     """Main entry point for the CLI."""
     force_utf8_output()
@@ -1349,6 +1458,7 @@ cc-swap:
   %(prog)s last-resort add|remove <a> use an account only as a last resort
   %(prog)s last-resort list           list last-resort accounts
   %(prog)s prime [N ...] [--dry-run]  open idle accounts' 5h windows now
+  %(prog)s service install            run auto-switch as a background service
 
 Aliases: ls=list  rm=remove  update=upgrade""",
         formatter_class=argparse.RawDescriptionHelpFormatter,
