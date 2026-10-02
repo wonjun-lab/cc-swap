@@ -562,21 +562,25 @@ def _hold(
     return aw.TickOutcome.NO_ACTION
 
 
-def _blocking_resets(v: AccountView, s: MaximizeSettings) -> list[float | None]:
+def _blocking_resets(v: AccountView) -> list[float | None]:
+    """Resets of the windows at the limit. ``Exhausted`` comes from the
+    at-limit trigger only after its last fallback found no account under
+    100% on both windows, so 100% (not the hard caps) is what blocks."""
     out: list[float | None] = []
-    if v.pct5 is not None and v.pct5 >= s.hard_5h:
+    if v.pct5 is not None and v.pct5 >= policy.LIMIT_PCT:
         out.append(v.reset5)
-    if v.pct7 is not None and v.pct7 >= s.hard_7d:
+    if v.pct7 is not None and v.pct7 >= policy.LIMIT_PCT:
         out.append(v.reset7)
     return out
 
 
-def _earliest_under_hard(snap: Snapshot, views: list[AccountView]) -> float | None:
-    """Earliest moment any of ``views`` drops under both hard caps, or None
-    when some blocking window has no future reset (not provable)."""
+def _earliest_usable(snap: Snapshot, views: list[AccountView]) -> float | None:
+    """Earliest moment any of ``views`` drops under the limit on both
+    windows, or None when some blocking window has no future reset (not
+    provable)."""
     earliest: float | None = None
     for v in views:
-        resets = _blocking_resets(v, snap.settings)
+        resets = _blocking_resets(v)
         if not resets:
             return None
         if any(r is None or r <= snap.now for r in resets):
@@ -590,7 +594,6 @@ def _earliest_under_hard(snap: Snapshot, views: list[AccountView]) -> float | No
 def _exhausted(
     engine: aw.AutoSwitchEngine, snap: Snapshot, decision: Exhausted, current: str
 ) -> aw.TickOutcome:
-    s = snap.settings
     peers = [
         v
         for v in snap.accounts
@@ -604,16 +607,17 @@ def _exhausted(
         engine._emit(aw.NoSwitchEvent(reason="no-candidates", detail=decision.reason))
         return aw.TickOutcome.BLOCKED
     active = snap.view(current)
-    active_blocked = active is not None and bool(_blocking_resets(active, s))
+    active_blocked = active is not None and bool(_blocking_resets(active))
     if not active_blocked or any(v.pct5 is None or v.pct7 is None for v in peers):
-        # An ETA-only force, or a peer we cannot read this tick: either can
-        # change any moment, so keep the normal cadence (upstream's rule).
+        # An active account with quota left, or a peer we cannot read this
+        # tick: either can change any moment, so keep the normal cadence
+        # (upstream's rule).
         engine._emit(aw.NoSwitchEvent(
             reason="no-qualifying-candidate", detail=decision.reason
         ))
         return aw.TickOutcome.BLOCKED
     engine._blocked_wait_long = True
-    earliest = _earliest_under_hard(snap, [active, *peers])
+    earliest = _earliest_usable(snap, [active, *peers])
     if earliest is not None:
         engine._sleep_until_ts = earliest + aw.RESET_SLACK_S
     engine._emit(aw.AllExhaustedEvent(

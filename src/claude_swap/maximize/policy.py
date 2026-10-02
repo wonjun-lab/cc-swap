@@ -11,12 +11,15 @@ Triggers, first match wins:
               tier's best beats the active by > eps     idle + cooldown
 
 The destination is always the top of ``landing_candidates``. With none:
-at-limit/hard fall back to any eligible account under both hard caps, else
-``Exhausted``; soft/rebalance ``Hold``. Unknown active usage is
-``Indeterminate`` (the engine's upstream failover path counts it).
+at-limit/hard fall back to any eligible account under both hard caps;
+at-limit then to any eligible account under 100% on both windows (most
+room first), else ``Exhausted``; soft/rebalance ``Hold``. Unknown active
+usage is ``Indeterminate`` (the engine's upstream failover path counts it).
 """
 
 from __future__ import annotations
+
+import math
 
 from claude_swap.maximize import idle
 from claude_swap.maximize.model import (
@@ -30,7 +33,7 @@ from claude_swap.maximize.model import (
     Switch,
     Trigger,
 )
-from claude_swap.maximize.score import below_hard, landable, rank, score
+from claude_swap.maximize.score import below_hard, landable, rank, score, slot_order
 
 
 def _pct(value: float) -> str:
@@ -66,6 +69,49 @@ def escape_candidates(snap: Snapshot) -> list[AccountView]:
         ],
         snap.now,
         s.tie_epsilon,
+    )
+
+
+LIMIT_PCT = 100.0
+
+
+def binding_room(v: AccountView) -> float:
+    """Points left before the account's fuller window hits the limit."""
+    return LIMIT_PCT - max(v.pct5, v.pct7)
+
+
+def binding_recovery(v: AccountView, now: float) -> float:
+    """Reset of the fuller window (5h on a tie); ``inf`` when unknown/past.
+
+    Mirrors upstream ``_binding_recovery_ts``: pick the binding window
+    first, then ask for its reset.
+    """
+    reset = v.reset5 if v.pct5 >= v.pct7 else v.reset7
+    return reset if reset is not None and reset > now else math.inf
+
+
+def limit_candidates(snap: Snapshot) -> list[AccountView]:
+    """The at-limit last resort: eligible accounts under 100% on both windows.
+
+    Over a hard cap is still quota; with nothing under the hard caps an
+    at-limit account is better off anywhere that has some left. Most binding
+    room first, then the sooner binding reset, then slot.
+    """
+    out = [
+        v
+        for v in snap.accounts
+        if v.number != snap.active
+        and v.tier != "excluded"
+        and not v.quarantined
+        and not v.api_key
+        and v.pct5 is not None
+        and v.pct7 is not None
+        and v.pct5 < LIMIT_PCT
+        and v.pct7 < LIMIT_PCT
+    ]
+    return sorted(
+        out,
+        key=lambda v: (-binding_room(v), binding_recovery(v, snap.now), slot_order(v)),
     )
 
 
@@ -135,6 +181,17 @@ def _escape(
             f"{why}; nothing landable, #{top.number} is under the hard caps "
             f"({_usage(top)})",
         )
+    if trigger == "at-limit":
+        last = limit_candidates(snap)
+        if last:
+            top = last[0]
+            return Switch(
+                top.number,
+                trigger,
+                f"{why}; nothing under the hard caps, #{top.number} has "
+                f"{binding_room(top):g} pts left ({_usage(top)})",
+            )
+        return Exhausted(f"{why}; every account is at its limit")
     return Exhausted(f"{why}; no account is under the hard caps")
 
 

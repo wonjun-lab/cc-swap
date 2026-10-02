@@ -111,6 +111,24 @@ CASES = [
     Case("excluded-is-never-a-target",
          snap("1", acct("1", 100, 40), acct("2", tier="excluded")),
          Exhausted),
+    Case("at-limit-last-fallback-takes-any-quota-left",
+         # Nothing under the hard caps, but 2 has 4 pts of 5h and 3 has
+         # 1.5 pts of 7d: the most binding room wins over Exhausted.
+         snap("1", acct("1", 100, 60), acct("2", 96, 40), acct("3", 0, 98.5)),
+         Switch, target="2", trigger="at-limit", reason_has="4 pts left"),
+    Case("at-limit-last-fallback-skips-ineligible",
+         snap("1", acct("1", 100, 60), acct("2", 99, 0, tier="excluded"),
+              acct("3", 99, 0, quarantined=True), acct("4", 99, 0, api_key=True),
+              acct("5", None, None), acct("6", 100, 10), acct("7", 10, 99.5)),
+         Switch, target="7", trigger="at-limit"),
+    Case("at-limit-last-fallback-ties-on-sooner-recovery",
+         # All three have 3 pts left; 3's binding reset is unknown (last).
+         snap("1", acct("1", 100, 50), acct("2", 97, 10, reset5_h=3),
+              acct("3", 97, 10), acct("4", 97, 10, reset5_h=1)),
+         Switch, target="4", trigger="at-limit"),
+    Case("at-limit-everyone-at-limit-is-exhausted",
+         snap("1", acct("1", 100, 60), acct("2", 100, 10), acct("3", 10, 100)),
+         Exhausted),
     # -- 2. hard: immediate, includes the ETA force -----------------------
     Case("hard-5h-switches-while-busy",
          snap("1", acct("1", 96, 40), acct("2", 10, 10), samples="busy"),

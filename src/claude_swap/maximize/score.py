@@ -54,7 +54,7 @@ def window_off(view: AccountView, now: float) -> bool:
     return view.reset5 is None or view.reset5 <= now
 
 
-def _slot(view: AccountView) -> int:
+def slot_order(view: AccountView) -> int:
     try:
         return int(view.number)
     except ValueError:
@@ -63,7 +63,7 @@ def _slot(view: AccountView) -> int:
 
 def _tie_key(view: AccountView, now: float) -> tuple:
     reset5 = math.inf if window_off(view, now) else view.reset5
-    return (-view.plan_weight, reset5, _slot(view))
+    return (-view.plan_weight, reset5, slot_order(view))
 
 
 def rank(
@@ -79,7 +79,7 @@ def rank(
     for tier in sorted(TIER_ORDER, key=TIER_ORDER.__getitem__):
         members = sorted(
             (v for v in views if v.tier == tier),
-            key=lambda v: (-score(v, now), _slot(v)),
+            key=lambda v: (-score(v, now), slot_order(v)),
         )
         i = 0
         while i < len(members):

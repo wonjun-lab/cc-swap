@@ -335,22 +335,44 @@ class TestUpstreamPaths:
         [switch] = of(h, SwitchEvent)
         assert switch.trigger == "failover" and switch.to_ref["number"] == 2
 
-    def test_exhausted_sleeps_until_the_first_account_under_hard(self, temp_home):
+    def test_exhausted_sleeps_until_the_first_account_under_the_limit(self, temp_home):
         h = make(temp_home)
         now = h.clock.now
         outcome = h.tick_with_usage({
-            "1": win(96, 40, r5=now + 7200),
-            "2": win(97, 10, r5=now + 3600),
-            "3": win(10, 99, r7=now + 3 * 86400),
+            "1": win(100, 40, r5=now + 7200),
+            "2": win(100, 10, r5=now + 3600),
+            "3": win(10, 100, r7=now + 3 * 86400),
         })
         assert outcome is TickOutcome.BLOCKED
         [event] = of(h, AllExhaustedEvent)
         assert event.earliest_reset_at == _iso_at(now + 3600)
         assert h.engine._sleep_until_ts == pytest.approx(now + 3600 + 60)
 
+    def test_exhausted_wakes_when_a_peer_drops_under_100_not_under_hard(self, temp_home):
+        # 2's 7d (99%) is over the hard cap but under the limit: once its 5h
+        # rolls over (1 h) it is a valid at-limit landing, so the sleep must
+        # not wait for its 7d reset (3 days).
+        h = make(temp_home, n=2)
+        now = h.clock.now
+        outcome = h.tick_with_usage({
+            "1": win(100, 40, r5=now + 7200),
+            "2": win(100, 99, r5=now + 3600, r7=now + 3 * 86400),
+        })
+        assert outcome is TickOutcome.BLOCKED
+        [event] = of(h, AllExhaustedEvent)
+        assert event.earliest_reset_at == _iso_at(now + 3600)
+
+    def test_at_limit_lands_on_any_quota_left(self, temp_home):
+        h = make(temp_home)
+        outcome = h.tick_with_usage({"1": win(100, 60), "2": win(96, 40), "3": win(0, 98.5)})
+        assert outcome is TickOutcome.SWITCHED
+        assert [e.trigger for e in of(h, SwitchEvent)] == ["at-limit"]
+        assert h.active_number() == 2
+        assert not of(h, AllExhaustedEvent)
+
     def test_unreadable_peer_is_not_all_exhausted(self, temp_home):
         h = make(temp_home)
-        outcome = h.tick_with_usage({"1": win(96, 40), "2": win(97, 10), "3": None})
+        outcome = h.tick_with_usage({"1": win(100, 40), "2": win(100, 10), "3": None})
         assert outcome is TickOutcome.BLOCKED
         assert not of(h, AllExhaustedEvent)
         assert no_switch_reasons(h) == ["no-qualifying-candidate"]
