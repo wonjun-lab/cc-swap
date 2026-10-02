@@ -109,7 +109,50 @@ class PrimeRunResult:
     timed_out: bool
     stderr_tail: str        # secret-masked, last TAIL_CHARS characters
     stdout_tail: str = ""   # secret-masked, last TAIL_CHARS characters
-    is_error: bool | None = None  # `--output-format json` "is_error", when parseable
+    # Fields of the `--output-format json` result, parsed from the WHOLE stdout
+    # (the real result is longer than the tail, so the tail is not JSON).
+    is_error: bool | None = None
+    api_error_status: int | None = None  # the API's HTTP status, when it reports one
+    result_text: str | None = None  # masked "result" message; None: stdout was not a JSON object
+
+    @classmethod
+    def from_output(
+        cls,
+        returncode: int | None,
+        stdout: str | None,
+        stderr: str | None,
+        *,
+        secret: str | None = None,
+        timed_out: bool = False,
+    ) -> "PrimeRunResult":
+        data = _json_object(stdout)
+        is_error = data.get("is_error") if data is not None else None
+        text = data.get("result") if data is not None else None
+        return cls(
+            returncode,
+            timed_out,
+            mask_secrets(stderr, secret),
+            mask_secrets(stdout, secret),
+            is_error if isinstance(is_error, bool) else None,
+            _http_status(data.get("api_error_status")) if data is not None else None,
+            None if data is None else mask_secrets(text if isinstance(text, str) else "", secret),
+        )
+
+
+def _json_object(text: str | None) -> dict | None:
+    try:
+        data = json.loads(text) if text else None
+    except (TypeError, ValueError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _http_status(value: object) -> int | None:
+    if isinstance(value, str) and value.strip().isdigit():
+        value = int(value)
+    if isinstance(value, bool) or not isinstance(value, int):
+        return None
+    return value
 
 
 def _num(value: object) -> float | None:
@@ -386,9 +429,22 @@ _MODEL_RE = re.compile(
 
 def classify_failure(result: PrimeRunResult) -> str:
     """``"auth"`` | ``"rate-limited"`` | ``"model-not-found"`` | ``"other"`` for
-    a run that did not succeed. Patterns are checked against the masked
-    stdout+stderr tails; Task 9 step 7 records the real CLI wording."""
-    text = f"{result.stdout_tail}\n{result.stderr_tail}"
+    a run that did not succeed.
+
+    The JSON result's structured fields decide first: ``api_error_status``
+    401 / 429 / 404, then the patterns over its ``result`` message. The
+    patterns never run over the raw JSON, whose numeric fields
+    (``"duration_api_ms":401``) would match. Stdout that is not a JSON object,
+    and stderr, are matched as text; Task 9 step 7 records the real wording."""
+    status = result.api_error_status
+    if status == 401:
+        return "auth"
+    if status == 429:
+        return "rate-limited"
+    if status == 404:
+        return "model-not-found"
+    message = result.stdout_tail if result.result_text is None else result.result_text
+    text = f"{message}\n{result.stderr_tail}"
     if _AUTH_RE.search(text):
         return "auth"
     if _RATE_RE.search(text):
@@ -401,16 +457,6 @@ def classify_failure(result: PrimeRunResult) -> str:
 # ---------------------------------------------------------------------------
 # I/O half (Task 11): run the child, talk to the engine, keep state.
 # ---------------------------------------------------------------------------
-
-def _parse_is_error(stdout: str) -> bool | None:
-    try:
-        data = json.loads(stdout)
-    except (TypeError, ValueError):
-        return None
-    if isinstance(data, dict) and isinstance(data.get("is_error"), bool):
-        return data["is_error"]
-    return None
-
 
 def _kill_tree(proc: subprocess.Popen) -> None:
     try:
@@ -489,18 +535,12 @@ def run_prime(
     except subprocess.TimeoutExpired:
         _kill_tree(proc)
         out, err = _drain_killed(proc)
-        return PrimeRunResult(None, True, mask_secrets(err, secret), mask_secrets(out, secret))
+        return PrimeRunResult.from_output(None, out, err, secret=secret, timed_out=True)
     except BaseException:
         _kill_tree(proc)
         _close_and_reap(proc)
         raise
-    return PrimeRunResult(
-        proc.returncode,
-        False,
-        mask_secrets(err, secret),
-        mask_secrets(out, secret),
-        _parse_is_error(out),
-    )
+    return PrimeRunResult.from_output(proc.returncode, out, err, secret=secret)
 
 
 PRECHECK_MAX_AGE_S = 60.0      # the pre-launch reading must be at most this old

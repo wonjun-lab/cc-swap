@@ -131,7 +131,9 @@ class TestPrimer:
         assert (entry["lastOutcome"], entry["resetsAt"]) == ("already-on", opened)
 
     def test_auth_failure_refreshes_token_next_tick(self, rig, monkeypatch):
-        rejected = PrimeRunResult(1, False, "", '{"is_error":true,"result":"Invalid API key · Please run /login"}', True)
+        rejected = PrimeRunResult.from_output(
+            1, '{"is_error":true,"api_error_status":401,"result":"Invalid API key · Please run /login"}', ""
+        )
         runner = StubRunner(rig, [rejected], opens=False)
         refreshed = json.dumps({"claudeAiOauth": {"accessToken": "sk-2b", "refreshToken": "rt-2b"}})
         grants: list[str] = []

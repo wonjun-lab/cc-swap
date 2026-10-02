@@ -393,11 +393,33 @@ class TestResolveClaudePath:
         ("", 'API Error: 404 {"type":"error","error":{"type":"not_found_error","message":"model: claude-haiku-4-5"}}', "model-not-found"),
         ('{"is_error":true,"result":"There\'s an issue with the selected model (claude-haiku-4-5). It may not exist or you may not have access to it."}', "", "model-not-found"),
         ("", "TypeError: undefined is not a function", "other"),
+        # Structured fields decide; numbers elsewhere in the JSON never match.
+        ('{"is_error":true,"duration_api_ms":401,"result":"API Error: 429 rate_limit_error"}', "", "rate-limited"),
+        ('{"is_error":true,"api_error_status":401,"result":"Failed to authenticate"}', "", "auth"),
+        ('{"is_error":true,"api_error_status":429,"duration_api_ms":401,"result":"Request failed"}', "", "rate-limited"),
+        ('{"is_error":true,"api_error_status":404,"result":"Request failed"}', "", "model-not-found"),
+        ('{"is_error":true,"duration_ms":429,"num_turns":401,"session_id":"0-401-429","result":"Execution error"}', "", "other"),
+        ('{"is_error":true,"duration_api_ms":401,"result":"Execution error"}', "API Error: 429 rate_limit_error", "rate-limited"),
+        # Non-JSON stdout is still read as text.
+        ("API Error: 401 Unauthorized", "", "auth"),
     ],
 )
 def test_classify_failure(stdout, stderr, kind):
-    result = PrimeRunResult(1, False, stderr, stdout, True)
+    result = PrimeRunResult.from_output(1, stdout, stderr)
     assert classify_failure(result) == kind
+
+
+def test_from_output_reads_the_structured_fields():
+    result = PrimeRunResult.from_output(
+        1,
+        '{"is_error":true,"api_error_status":429,"result":"limited for b@example.com"}',
+        "",
+        secret="s3cr3t",
+    )
+    assert (result.is_error, result.api_error_status) == (True, 429)
+    assert result.result_text == "limited for <email>"
+    plain = PrimeRunResult.from_output(1, "not json", "")
+    assert (plain.is_error, plain.api_error_status, plain.result_text) == (None, None, None)
 
 
 def test_mask_secrets():

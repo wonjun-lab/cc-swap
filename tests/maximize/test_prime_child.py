@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import signal
 import subprocess
@@ -17,6 +18,7 @@ from claude_swap.maximize.primer import (
     PrimeRunResult,
     build_prime_argv,
     build_prime_env,
+    classify_failure,
     run_prime,
 )
 from tests.maximize.fake_claude import FakeClaude, pid_alive
@@ -47,7 +49,8 @@ class TestRunPrime:
         env = build_prime_env({"PATH": os.environ.get("PATH", "")}, profile, "sk-ant-oat01-abcdefgh")
         result = run_prime(build_prime_argv(str(fake.path), "claude-haiku-4-5"), env, profile)
         assert result == PrimeRunResult(
-            0, False, "", '{"type": "result", "subtype": "success", "is_error": false, "result": "OK"}', False
+            0, False, "", '{"type": "result", "subtype": "success", "is_error": false, "result": "OK"}',
+            False, None, "OK",
         )
         [call] = fake.calls()
         assert call["argv"] == build_prime_argv("x", "claude-haiku-4-5")[1:]
@@ -68,6 +71,22 @@ class TestRunPrime:
         assert result.is_error is True
         assert "sk-ant-oat01" not in result.stderr_tail
         assert "b@example.com" not in result.stderr_tail
+
+    def test_long_json_output_is_parsed_whole(self, tmp_path):
+        # The real result carries usage/cost fields: well past the masked
+        # tail, so classification cannot rely on parsing the tail.
+        fake = FakeClaude.install(tmp_path / "bin")
+        fake.behave({"exitCode": 1, "stdout": json.dumps({
+            "type": "result", "is_error": True, "duration_api_ms": 401,
+            "api_error_status": 429, "result": "API Error: 429 rate_limit_error",
+            "usage": {"pad": "x" * 2000},
+        })})
+        env = build_prime_env({}, tmp_path, "sk-ant-oat01-abcdefgh")
+        result = run_prime(build_prime_argv(str(fake.path), "m"), env, tmp_path)
+        assert len(result.stdout_tail) == 500
+        assert (result.is_error, result.api_error_status) == (True, 429)
+        assert result.result_text == "API Error: 429 rate_limit_error"
+        assert classify_failure(result) == "rate-limited"
 
     def test_timeout_kills_the_child(self, tmp_path):
         fake = FakeClaude.install(tmp_path / "bin")
