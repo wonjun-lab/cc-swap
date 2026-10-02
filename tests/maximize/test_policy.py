@@ -49,6 +49,18 @@ def acct(
     )
 
 
+def resets(view: AccountView, *, m5: float | None = None, m7: float | None = None) -> AccountView:
+    """``view`` with its 5h/7d window resetting ``m5``/``m7`` minutes from NOW."""
+    from dataclasses import replace
+
+    changes: dict[str, float] = {}
+    if m5 is not None:
+        changes["reset5"] = NOW + m5 * 60
+    if m7 is not None:
+        changes["reset7"] = NOW + m7 * 60
+    return replace(view, **changes)
+
+
 def rows(*items: tuple[float, float, float]) -> tuple[Sample, ...]:
     """(seconds before NOW, pct5, pct7), any order."""
     return tuple(sorted((Sample(NOW - ago, p5, p7) for ago, p5, p7 in items), key=lambda x: x.ts))
@@ -315,6 +327,87 @@ CASES = [
     Case("rebalance-busy-holds",
          snap("1", acct("1", 10, 10, reset7_d=6), acct("2", 0, 70, reset7_d=0.5), samples="busy"),
          Hold, pending=False, reason_has="waits for idle"),
+    # -- reset-aware wait (maximize.resetWaitMin, default 15) -----------------
+    # 5h at 96% (over hard 95), +2 pts over 10 min: 0.2 pt/min, 100% in 20 min.
+    Case("reset-wait-holds-when-100-comes-well-after-the-reset",
+         snap("1", resets(acct("1", 96, 40), m5=8), acct("2", 10, 10),
+              samples=rows((600, 94, 40), (0, 96, 40))),
+         Hold, pending=False,
+         reason_has="#1 5h 96% — resets in 8m, waiting it out "
+                    "(switches at once if it hits 100%)"),
+    Case("reset-wait-switches-when-100-comes-within-2-min-of-the-reset",
+         # 95.5% at 0.5 pt/min: 100% in 9 min, the reset in 8 (< 8 + 2).
+         snap("1", resets(acct("1", 95.5, 40), m5=8), acct("2", 10, 10),
+              samples=rows((600, 90.5, 40), (0, 95.5, 40))),
+         Switch, target="2", trigger="hard"),
+    Case("reset-wait-off-for-a-reset-beyond-reset-wait-min",
+         snap("1", resets(acct("1", 96, 40), m5=20), acct("2", 10, 10),
+              samples=rows((600, 94, 40), (0, 96, 40))),
+         Switch, target="2", trigger="hard"),
+    Case("reset-wait-never-delays-at-limit",
+         snap("1", resets(acct("1", 100, 40), m5=2), acct("2", 10, 10),
+              samples=rows((600, 100, 40), (0, 100, 40))),
+         Switch, target="2", trigger="at-limit"),
+    Case("reset-wait-zero-is-off",
+         snap("1", resets(acct("1", 96, 40), m5=8), acct("2", 10, 10),
+              samples=rows((600, 94, 40), (0, 96, 40)), reset_wait_min=0),
+         Switch, target="2", trigger="hard"),
+    Case("reset-wait-soft-skips-the-idle-switch",
+         snap("1", resets(acct("1", 62, 40), m5=5), acct("2"), samples="idle"),
+         Hold, pending=False, reason_has="#1 5h 62% — resets in 5m, waiting it out"),
+    Case("reset-wait-soft-while-busy-is-not-pending",
+         snap("1", resets(acct("1", 62, 40), m5=5), acct("2"), samples="busy"),
+         Hold, pending=False, reason_has="resets in 5m"),
+    Case("reset-wait-7d-hard-holds",
+         # 7d at 98.5% (hard 98), 0.05 pt/min: 100% in 30 min, reset in 10.
+         snap("1", resets(acct("1", 30, 98.5), m7=10), acct("2", 10, 10),
+              samples=rows((600, 30, 98), (0, 30, 98.5))),
+         Hold, pending=False, reason_has="#1 7d 98.5% — resets in 10m"),
+    Case("reset-wait-other-window-over-hard-switches",
+         # 5h could wait out its reset, but 7d 99% (reset in 3 days) cannot.
+         snap("1", resets(acct("1", 96, 99), m5=8), acct("2", 10, 10),
+              samples=rows((600, 94, 99), (0, 96, 99))),
+         Switch, target="2", trigger="hard", reason_has="#1 7d 99% >= hard 98%"),
+    Case("reset-wait-other-window-eta-forced-switches",
+         # 5h waits; 7d is 3 pts under hard at 0.5 pt/min (6 min <= forceEtaMin).
+         snap("1", resets(acct("1", 96, 95), m5=8), acct("2", 10, 10),
+              samples=rows((600, 94, 90), (0, 96, 95))),
+         Switch, target="2", trigger="hard", reason_has="hard cap in ~6.0 min"),
+    Case("reset-wait-other-window-soft-still-waits-for-idle",
+         snap("1", resets(acct("1", 96, 92), m5=8), acct("2", 10, 10),
+              samples=rows((600, 94, 92), (0, 96, 92))),
+         Hold, pending=True, reason_has="#1 7d 92% >= soft 90%; waiting for idle"),
+    Case("reset-wait-other-window-soft-switches-at-idle",
+         # 5h 94% (soft, under hard, idle) waits; the 7d soft mark does not.
+         snap("1", resets(acct("1", 94, 92), m5=8), acct("2", 10, 10), samples="idle"),
+         Switch, target="2", trigger="soft", reason_has="#1 7d 92% >= soft 90%"),
+    Case("reset-wait-unknown-pace-over-hard-switches",
+         snap("1", resets(acct("1", 96, 40), m5=8), acct("2", 10, 10)),
+         Switch, target="2", trigger="hard"),
+    Case("reset-wait-flat-pace-over-hard-switches",
+         snap("1", resets(acct("1", 96, 40), m5=8), acct("2", 10, 10), samples="idle"),
+         Switch, target="2", trigger="hard"),
+    Case("reset-wait-unknown-pace-under-hard-holds",
+         snap("1", resets(acct("1", 62, 40), m5=5), acct("2")),
+         Hold, pending=False, reason_has="resets in 5m"),
+    Case("reset-wait-holds-an-eta-forced-hard",
+         # 90% at 0.5 pt/min: hard 95 in 10 min (forced), 100% in 20; reset in 8.
+         snap("1", resets(acct("1", 90, 40), m5=8), acct("2", 10, 10),
+              samples=rows((600, 85, 40), (0, 90, 40))),
+         Hold, pending=False, reason_has="#1 5h 90% — resets in 8m"),
+    Case("reset-wait-on-stale-samples-is-an-unknown-pace",
+         snap("1", resets(acct("1", 96, 40), m5=8), acct("2", 10, 10),
+              samples=rows((1500, 94, 40), (900, 96, 40))),
+         Switch, target="2", trigger="hard"),
+    Case("reset-wait-both-windows",
+         snap("1", resets(acct("1", 96, 98.5), m5=8, m7=12), acct("2", 10, 10),
+              samples=rows((600, 94, 98), (0, 96, 98.5))),
+         Hold, pending=False,
+         reason_has="#1 5h 96% — resets in 8m, 7d 98.5% — resets in 12m, waiting it out"),
+    Case("reset-wait-leaves-rebalance-alone",
+         snap("1", resets(acct("1", 10, 10, reset7_d=6), m5=5),
+              acct("2", 0, 70, reset7_d=0.5), samples="idle"),
+         Switch, target="2", trigger="rebalance"),
     # -- unknowns -------------------------------------------------------------
     Case("active-usage-unknown-is-indeterminate",
          snap("1", acct("1", None, None), acct("2")),
@@ -421,3 +514,252 @@ class TestFallbacksSkipLapsedLogins:
         s = snap("1", acct("1", 100, 40), expiring(acct("2", 0, 10), 30))
         got = decide(s)
         assert isinstance(got, Switch) and got.target == "2"
+
+
+# -- reset-aware wait (maximize.resetWaitMin) ------------------------------------------
+
+
+class TestResetWait:
+    SLOW = rows((600, 94, 40), (0, 96, 40))  # 0.2 pt/min of 5h
+
+    def test_the_hold_carries_the_latest_reset_it_waits_for(self):
+        got = decide(snap("1", resets(acct("1", 96, 40), m5=8), acct("2", 10, 10),
+                          samples=self.SLOW))
+        assert isinstance(got, Hold) and got.reset_wait_until == NOW + 8 * 60
+        both = decide(snap("1", resets(acct("1", 96, 98.5), m5=8, m7=12), acct("2", 10, 10),
+                           samples=rows((600, 94, 98), (0, 96, 98.5))))
+        assert isinstance(both, Hold) and both.reset_wait_until == NOW + 12 * 60
+
+    def test_other_holds_carry_no_reset(self):
+        for case in CASES:
+            got = decide(case.snap)
+            if isinstance(got, Hold) and not case.id.startswith("reset-wait"):
+                assert got.reset_wait_until is None, case.id
+
+    def test_the_limit_is_inclusive(self):
+        at = snap("1", resets(acct("1", 96, 40), m5=15), acct("2", 10, 10), samples=self.SLOW)
+        assert isinstance(decide(at), Hold)
+        past = snap("1", resets(acct("1", 96, 40), m5=15.5), acct("2", 10, 10),
+                    samples=self.SLOW)
+        assert isinstance(decide(past), Switch)
+
+    def test_the_setting_moves_the_limit(self):
+        # A reset in 17 min (100% in 20): past the default 15, inside 30.
+        default = snap("1", resets(acct("1", 96, 40), m5=17), acct("2", 10, 10),
+                       samples=self.SLOW)
+        assert isinstance(decide(default), Switch)
+        wider = snap("1", resets(acct("1", 96, 40), m5=17), acct("2", 10, 10),
+                     samples=self.SLOW, reset_wait_min=30)
+        assert isinstance(decide(wider), Hold)
+
+    def test_the_margin_is_two_minutes_after_the_reset(self):
+        from claude_swap.maximize.policy import RESET_WAIT_MARGIN_MIN
+
+        assert RESET_WAIT_MARGIN_MIN == 2.0
+        # 0.2 pt/min from 96%: 100% in 20 min. A reset in 18 leaves exactly 2.
+        on_edge = snap("1", resets(acct("1", 96, 40), m5=18), acct("2", 10, 10),
+                       samples=self.SLOW, reset_wait_min=30)
+        assert isinstance(decide(on_edge), Hold)
+        short = snap("1", resets(acct("1", 96, 40), m5=18.5), acct("2", 10, 10),
+                     samples=self.SLOW, reset_wait_min=30)
+        assert isinstance(decide(short), Switch)
+
+    def test_a_past_or_unknown_reset_never_waits(self):
+        for m5 in (None, -1):
+            view = acct("1", 96, 40) if m5 is None else resets(acct("1", 96, 40), m5=m5)
+            got = decide(snap("1", view, acct("2", 10, 10), samples=self.SLOW))
+            assert isinstance(got, Switch) and got.trigger == "hard", m5
+
+    def test_nothing_landable_still_waits_rather_than_hold_for_room(self):
+        # Without the wait this is the "no account has more room" hold; with
+        # it, the reason is the reset.
+        got = decide(snap("1", resets(acct("1", 96, 40), m5=8), acct("2", 97, 10),
+                          samples=self.SLOW))
+        assert isinstance(got, Hold) and got.reset_wait_until is not None
+        assert "resets in 8m" in got.reason
+
+    def test_the_hold_carries_its_code(self):
+        got = decide(snap("1", resets(acct("1", 96, 40), m5=8), acct("2", 10, 10),
+                          samples=self.SLOW))
+        assert got.code == "reset-wait"
+
+
+# -- preempt and the idle pattern (maximize.preempt / learnIdlePattern) ------------------
+
+
+def quiet(start_h: float, end_h: float, label: str = "23:00", end_label: str = "07:00"):
+    from claude_swap.maximize.model import QuietWindow
+
+    return QuietWindow(NOW + start_h * H, NOW + end_h * H, label, end_label)
+
+
+def pattern(*, p_busy: float | None = 0.8, current=None, next=None, days: int = 9):
+    from claude_swap.maximize.model import Forecast
+
+    return Forecast(days=days, p_busy_now=p_busy, current=current, next=next)
+
+
+def with_history(s: Snapshot, *, forecast=None, **rates: float) -> Snapshot:
+    from dataclasses import replace
+
+    return replace(s, forecast=forecast, rates7={k.lstrip("_"): v for k, v in rates.items()})
+
+
+# Active #1: 5h 30% (under soft), 7d 84% climbing 2 pts/h -> soft 90 in 3 h.
+BUSY5 = rows((600, 27, 84), (300, 28.5, 84), (0, 30, 84))
+
+
+def preempt_snap(*, samples="idle", forecast="default", candidate=None, active=None, **settings):
+    a = active or acct("1", 30, 84)
+    s = snap("1", a, candidate or acct("2", 10, 10, reset7_d=6), samples=samples, **settings)
+    f = pattern(next=quiet(5, 13)) if forecast == "default" else forecast
+    return with_history(s, forecast=f, _1=2.0)
+
+
+class TestPreempt:
+    def test_crossing_before_the_quiet_window_switches_at_idle(self):
+        got = decide(preempt_snap())
+        assert isinstance(got, Switch) and got.trigger == "preempt" and got.target == "2"
+        assert got.reason == (
+            "#1 7d 84% would pass 90% in ~3h, before your usual quiet time (23:00) "
+            "— moving to #2 now while you're idle"
+        )
+
+    def test_not_idle_holds_with_the_preempt_code(self):
+        got = decide(preempt_snap(samples=BUSY5))
+        assert isinstance(got, Hold) and got.code == "preempt" and not got.pending
+        assert "will move to #2 at the next idle moment" in got.reason
+
+    def test_a_candidate_that_would_cross_too_is_no_target(self):
+        # #2 at 81% is landable but climbs at the active's pace: 90% in 4.5 h,
+        # inside the 5 h and before its 7d reset (6 h). A second account at
+        # 60% (15 h) is the target, though #2 ranks first by score.
+        crossing = acct("2", 10, 81, reset7_d=0.25)
+        s = preempt_snap(candidate=crossing)
+        got = decide(s)
+        assert not (isinstance(got, Switch) and got.trigger == "preempt")
+        assert getattr(got, "code", None) != "preempt"
+        from dataclasses import replace
+
+        both = replace(s, accounts=(*s.accounts, acct("3", 10, 60, reset7_d=6)))
+        assert [v.number for v in landing_candidates(both)] == ["2", "3"]
+        got = decide(both)
+        assert isinstance(got, Switch) and got.trigger == "preempt" and got.target == "3"
+
+    def test_preempt_off_is_the_old_decision(self):
+        old = decide(snap("1", acct("1", 30, 84), acct("2", 10, 10, reset7_d=6), samples="idle"))
+        got = decide(preempt_snap(preempt=False))
+        assert got == old and got.trigger == "rebalance"
+
+    def test_a_crossing_after_the_quiet_window_starts_waits_for_it(self):
+        got = decide(preempt_snap(forecast=pattern(next=quiet(1, 9))))
+        assert not (isinstance(got, Switch) and got.trigger == "preempt")
+
+    def test_no_pattern_looks_4_hours_ahead(self):
+        got = decide(preempt_snap(forecast=None))
+        assert got.trigger == "preempt" and "within the next 4h" in got.reason
+        slow = with_history(preempt_snap(forecast=None), _1=1.0)   # 6 h away
+        assert not (isinstance(decide(slow), Switch) and decide(slow).trigger == "preempt")
+
+    def test_the_horizon_is_capped(self):
+        far = pattern(next=quiet(20, 28))
+        got = decide(with_history(preempt_snap(forecast=far), forecast=far, _1=0.65))  # ~9 h
+        assert got.trigger == "preempt" and "within the next 12h" in got.reason
+        capped = with_history(preempt_snap(forecast=far, preempt_horizon_max_h=6),
+                              forecast=far, _1=0.65)
+        assert not (isinstance(decide(capped), Switch) and decide(capped).trigger == "preempt")
+
+    def test_unknown_or_flat_pace_never_preempts(self):
+        for rates in ({}, {"_1": 0.0}):
+            got = decide(with_history(preempt_snap(), forecast=pattern(next=quiet(5, 13)), **rates))
+            assert not (isinstance(got, Switch) and got.trigger == "preempt"), rates
+
+    def test_a_7d_reset_before_the_crossing_is_no_reason(self):
+        got = decide(preempt_snap(active=acct("1", 30, 84, reset7_d=2 / 24)))
+        assert not (isinstance(got, Switch) and got.trigger == "preempt")
+
+    def test_the_rebalance_cooldown_applies(self):
+        got = decide(preempt_snap(last_switch_min=10))
+        assert isinstance(got, Hold) and got.code == "preempt"
+        assert got.reason.startswith("preempt cooldown (20 min left): #1 7d 84%")
+
+    def test_never_onto_a_worse_tier(self):
+        got = decide(preempt_snap(candidate=acct("2", 10, 10, reset7_d=6, tier="last_resort")))
+        assert not (isinstance(got, Switch) and got.trigger == "preempt")
+
+    def test_a_smaller_plan_climbs_faster(self):
+        # 20x active -> 5x #2 at 70%: 4x the pct pace, 90% in 2.5 h: no target.
+        big = acct("1", 30, 84, weight=4)
+        got = decide(preempt_snap(active=big, candidate=acct("2", 10, 70, reset7_d=6)))
+        assert not (isinstance(got, Switch) and got.trigger == "preempt")
+        same = decide(preempt_snap(active=big, candidate=acct("2", 10, 70, reset7_d=6, weight=4)))
+        assert same.trigger == "preempt"
+
+    def test_a_candidates_own_faster_pace_counts(self):
+        s = with_history(preempt_snap(candidate=acct("2", 10, 75, reset7_d=6)),
+                         forecast=pattern(next=quiet(5, 13)), _1=2.0, _2=4.0)
+        assert not (isinstance(decide(s), Switch) and decide(s).trigger == "preempt")
+
+    @pytest.mark.parametrize("active, trigger", [
+        (acct("1", 100, 84), "at-limit"),
+        (acct("1", 96, 84), "hard"),
+        (acct("1", 60, 84), "soft"),
+    ])
+    def test_never_overrides_the_usual_triggers(self, active, trigger):
+        got = decide(preempt_snap(active=active))
+        assert isinstance(got, Switch) and got.trigger == trigger
+
+    def test_never_overrides_reset_wait(self):
+        got = decide(preempt_snap(active=resets(acct("1", 60, 84), m5=5)))
+        assert isinstance(got, Hold) and got.code == "reset-wait"
+
+
+# Rebalance with a small gain (#2 0.875 vs #1 0.70) and a big one (#3 2.33).
+SMALL = (acct("1", 10, 30, reset7_d=7), acct("2", 0, 25, reset7_d=6))
+BIG = (acct("1", 10, 30, reset7_d=7), acct("2", 0, 0, reset7_d=3))
+
+
+class TestRebalanceDeferral:
+    def decide(self, accounts=SMALL, **forecast_kw) -> object:
+        f = pattern(**forecast_kw) if forecast_kw else None
+        return decide(with_history(snap("1", *accounts, samples="idle"), forecast=f))
+
+    def test_a_small_gain_in_a_busy_time_waits_for_the_quiet_window(self):
+        got = self.decide(next=quiet(3, 11))
+        assert isinstance(got, Hold) and got.code == "rebalance-deferred"
+        assert got.reason.startswith("rebalance deferred to your quiet time (23:00): #2 score")
+
+    def test_a_big_gain_rebalances_now(self):
+        got = self.decide(BIG, next=quiet(3, 11))
+        assert isinstance(got, Switch) and got.trigger == "rebalance"
+
+    def test_the_gap_setting(self):
+        s = with_history(snap("1", *SMALL, samples="idle", busy_rebalance_gap=0.1),
+                         forecast=pattern(next=quiet(3, 11)))
+        assert decide(s).trigger == "rebalance"
+
+    @pytest.mark.parametrize("kw", [
+        {"p_busy": 0.1, "next": quiet(3, 11)},                    # usually quiet now
+        {"current": quiet(-1, 2), "next": quiet(20, 28)},         # inside a quiet window
+        {"p_busy": None, "next": quiet(3, 11)},                   # never observed
+        {"next": quiet(7, 15)},                                   # more than 6 h away
+        {"next": None},                                           # none ahead
+    ])
+    def test_otherwise_it_rebalances_as_before(self, kw):
+        got = self.decide(**kw)
+        assert isinstance(got, Switch) and got.trigger == "rebalance", kw
+
+    def test_no_pattern_rebalances_as_before(self):
+        got = self.decide()
+        assert isinstance(got, Switch) and got.trigger == "rebalance"
+
+    def test_a_tier_move_is_never_deferred(self):
+        accounts = (acct("1", 10, 30, reset7_d=7, tier="last_resort"), acct("2", 0, 25, reset7_d=6))
+        got = self.decide(accounts, next=quiet(3, 11))
+        assert isinstance(got, Switch) and got.trigger == "rebalance"
+
+    def test_cooldown_still_comes_first(self):
+        s = with_history(snap("1", *SMALL, samples="idle", last_switch_min=10),
+                         forecast=pattern(next=quiet(3, 11)))
+        got = decide(s)
+        assert isinstance(got, Hold) and got.code is None and "cooldown" in got.reason

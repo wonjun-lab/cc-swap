@@ -10,7 +10,8 @@ and maps the decision back onto those upstream paths:
                       (a ``Hold`` then takes the hold path below unless the
                       failure was systemic)
 * ``Hold``          → ``NoSwitchEvent``; a pending hold also pulls the active
-                      account's next poll to ``pending_poll_s``
+                      account's next poll to ``pending_poll_s``, a reset-aware
+                      wait (``reset-wait``) to the urgent 60 s cadence
 * ``Indeterminate`` → ``None``: ``_tick_inner`` continues into its own
                       unknown-usage counting and failover
 * ``Exhausted``     → ``AllExhaustedEvent`` + reset-aware sleep, or a
@@ -34,11 +35,12 @@ from typing import Any, Protocol
 from claude_swap import autoswitch as aw
 from claude_swap import oauth, poll_policy
 from claude_swap.exceptions import ConfigError
-from claude_swap.maximize import idle, ledger, pause, policy
+from claude_swap.maximize import history, idle, ledger, pause, policy
 from claude_swap.maximize.model import (
     AccountView,
     Decision,
     Exhausted,
+    Forecast,
     Hold,
     Indeterminate,
     Sample,
@@ -79,6 +81,10 @@ DECISION_KEY = "maximizeDecision"
 # An unchanged decision is rewritten this often, so a reader can tell a
 # steady engine from a stopped one by the record's age.
 PUBLISH_REFRESH_S = 300.0
+# A reset-aware wait polls the active account every URGENT_INTERVAL_S only
+# over the last this-many seconds before the reset: at most 15 polls a wait,
+# the planner's own bound on an urgent episode, whatever resetWaitMin says.
+RESET_WAIT_URGENT_S = 900.0
 
 # Numeric ``maximize`` keys. The settings loader is lenient per key (wrong
 # type → default, out of range → clamped) and reports only pair repairs in
@@ -97,6 +103,9 @@ _NUMERIC_KEYS: tuple[tuple[str, str], ...] = (
     ("rebalanceCooldownMin", "rebalance_cooldown_min"),
     ("tieEpsilon", "tie_epsilon"),
     ("loginExpiryGuardMin", "login_expiry_guard_min"),
+    ("resetWaitMin", "reset_wait_min"),
+    ("preemptHorizonMaxH", "preempt_horizon_max_h"),
+    ("busyRebalanceGap", "busy_rebalance_gap"),
 )
 
 
@@ -123,6 +132,8 @@ class MaximizeRuntime:
     # (ledger's last destination, live slot) seen on the previous tick while
     # they differed: a login changed outside cc-swap once it repeats.
     drift_seen: tuple[object, str] | None = None
+    # The usage history writer (maximize/history.py), loaded on first use.
+    history: history.Recorder | None = None
 
 
 # -- settings ------------------------------------------------------------------
@@ -543,6 +554,51 @@ def _update_samples(
     return trimmed, changed_at
 
 
+def _history_inputs(
+    engine: aw.AutoSwitchEngine,
+    rt: MaximizeRuntime,
+    entries: Mapping,
+    usage: Mapping[str, dict | str | None],
+    current: str,
+    samples: tuple[Sample, ...],
+    now: float,
+) -> tuple[Forecast | None, dict[str, float]]:
+    """Record this tick in the usage history; ``(forecast, rates7)`` for the
+    Snapshot.
+
+    Only readings the tick already has are recorded (no poll, no refresh):
+    usage points while ``preempt`` is on, slot observations while
+    ``learnIdlePattern`` is. Dry runs record in memory only. History is a
+    planning aid: any failure here is logged and decides as if it had none.
+    """
+    s = rt.settings
+    if not (s.preempt or s.learn_idle_pattern):
+        return None, {}
+    try:
+        root = engine.switcher.backup_dir
+        if rt.history is None or rt.history.root != root:
+            rt.history = history.Recorder(root)
+        readings: dict[str, tuple[float, float, float]] = {}
+        for number, value in usage.items():
+            fetched_at = getattr(entries.get(number), "fetched_at", None)
+            if fetched_at is None:
+                continue
+            pct5, _, pct7, _ = usage_windows(value, fetched_at)
+            if pct5 is not None and pct7 is not None:
+                readings[str(number)] = (float(fetched_at), pct5, pct7)
+        rt.history.observe(
+            now, current, readings, samples,
+            points=s.preempt, slots=s.learn_idle_pattern, write=not engine.dry_run,
+        )
+        kept = rt.history.history
+        forecast = history.forecast(kept.slots, now) if s.learn_idle_pattern else None
+        rates = history.burn_rates(kept.points, now) if s.preempt else {}
+        return forecast, rates
+    except Exception as e:  # a planning aid must never break a tick
+        _logger.debug("usage history unavailable: %s", type(e).__name__)
+        return None, {}
+
+
 def _reset_samples(engine: aw.AutoSwitchEngine, number: str) -> None:
     record = {"account": number, "samples": [], CHANGED_KEY: engine.clock()}
     engine._mutate_state(lambda s: s.__setitem__(SAMPLES_KEY, record))
@@ -599,7 +655,9 @@ def _publish_decision(
     """Write this tick's decision to the state file for TUI viewers.
 
     Slot numbers and the policy's own reason only — no emails, no raw
-    ``rateLimitTier`` strings. Rewritten when the decision changes, or when
+    ``rateLimitTier`` strings; a hold with its own code (``reset-wait``,
+    ``preempt``, ``rebalance-deferred``) adds ``code`` so ``cc-swap why`` can
+    name it. Rewritten when the decision changes, or when
     the stored one is :data:`PUBLISH_REFRESH_S` old (the TUI's freshness
     clock); never on dry runs, which write nothing."""
     if engine.dry_run:
@@ -620,6 +678,8 @@ def _publish_decision(
         "pending": pending,
         "plans": {num: plan_label(tier) for num, tier in tiers.items()},
     }
+    if isinstance(decision, Hold) and decision.code is not None:
+        record["code"] = decision.code
     previous = state.get(DECISION_KEY)
     if isinstance(previous, Mapping):
         at = previous.get("at")
@@ -728,20 +788,28 @@ def _pull_active_poll(
     current: str,
     entry,
     now: float,
+    *,
+    urgent: bool = False,
 ) -> None:
-    """Pending soft switch: poll the active account every ``pending_poll_s``.
+    """Poll the active account sooner while a switch waits.
 
-    Only ever pulls the next poll earlier, and never sooner than
+    A pending soft switch polls every ``pending_poll_s``, never sooner than
     ``fetchedAt + poll_policy.MIN_INTERVAL_S`` whatever the settings say (a
     session override skips the loader's clamp): the per-account poll budget
-    is shared by every machine. A token that 429'd recently keeps the
-    planner's post-429 cadence (spec §5.6), and the collector still enforces
-    any live backoff.
+    is shared by every machine. A reset-aware wait (``urgent``) polls at the
+    planner's urgent cadence, ``poll_policy.URGENT_INTERVAL_S``, so a climb
+    to 100% is caught quickly (``_hold`` bounds how long). Only ever pulls
+    the next poll earlier. A token that 429'd recently keeps the planner's
+    post-429 cadence (spec §5.6), and the collector still enforces any live
+    backoff.
     """
     fetched_at = getattr(entry, "fetched_at", None)
     if fetched_at is None or entry.recent_429(now):
         return
-    interval = max(float(rt.settings.pending_poll_s), poll_policy.MIN_INTERVAL_S)
+    if urgent:
+        interval = poll_policy.URGENT_INTERVAL_S
+    else:
+        interval = max(float(rt.settings.pending_poll_s), poll_policy.MIN_INTERVAL_S)
     deadline = max(now, fetched_at + interval)
     if entry.next_poll_at is not None and entry.next_poll_at <= deadline:
         return
@@ -765,13 +833,29 @@ def _hold(
     entry,
     now: float,
 ) -> aw.TickOutcome:
+    until = decision.reset_wait_until
     if decision.pending:
         _pull_active_poll(engine, rt, current, entry, now)
-    engine._emit(aw.NoSwitchEvent(
-        reason="maximize-pending" if decision.pending else "maximize-hold",
-        detail=decision.reason,
-    ))
+    elif until is not None and until - now <= RESET_WAIT_URGENT_S:
+        _pull_active_poll(engine, rt, current, entry, now, urgent=True)
+    engine._emit(_hold_event(decision))
     return aw.TickOutcome.NO_ACTION
+
+
+def _hold_event(decision: Hold) -> aw.NoSwitchEvent:
+    """A hold's ``NoSwitchEvent``: ``maximize-pending``, the hold's own code,
+    else ``maximize-hold``. One literal per call — tests/maximize/test_why.py
+    reads the codes off these calls."""
+    detail = decision.reason
+    if decision.pending:
+        return aw.NoSwitchEvent(reason="maximize-pending", detail=detail)
+    if decision.code == "reset-wait":
+        return aw.NoSwitchEvent(reason="reset-wait", detail=detail)
+    if decision.code == "preempt":
+        return aw.NoSwitchEvent(reason="preempt", detail=detail)
+    if decision.code == "rebalance-deferred":
+        return aw.NoSwitchEvent(reason="rebalance-deferred", detail=detail)
+    return aw.NoSwitchEvent(reason="maximize-hold", detail=detail)
 
 
 def _blocking_resets(v: AccountView) -> list[float | None]:
@@ -926,6 +1010,9 @@ def run_maximize_tick(
     samples, active_changed_at = _update_samples(
         engine, rt, state, current, entries.get(current), usage.get(current), now
     )
+    forecast, rates7 = _history_inputs(
+        engine, rt, entries, usage, current, samples, now
+    )
     last = state.get("lastSwitchAt")
     tiers = _rate_limit_tiers(engine, rt, records, now)
     snap = build_snapshot(
@@ -945,6 +1032,8 @@ def run_maximize_tick(
         settings=rt.settings,
         active_changed_at=active_changed_at,
         login_deadlines=deadlines,
+        forecast=forecast,
+        rates7=rates7,
     )
     decision = policy.decide(snap)
     rt.last_snapshot, rt.last_decision = snap, decision

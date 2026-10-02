@@ -70,6 +70,10 @@ Turn it on with `cc-swap config set autoswitch.strategy maximize`, or use `cc-sw
 
 *Idle* means two usage readings at least `idleWindowMin` apart, with at most `idleMaxDeltaPct` growth in both windows. While it waits, the active account is polled every `pendingPollS` seconds. Usage from other machines on the same account counts too: there is no coordination between machines, and cc-swap trusts only what the server reports.
 
+**Waiting out a reset.** A switch makes Claude Code re-read the whole context on the new account, and a window that is about to reset clears the reason to switch. So when the window behind a `hard` or `soft` switch resets within `maximize.resetWaitMin` minutes (default 15) and the recent pace will not reach 100% until at least 2 minutes after that, maximize holds (`reset-wait`), polling the active account every 60 s in the last 15 minutes before the reset. With no pace measured yet, it waits only while that window is under its hard ceiling. At 100% the `at-limit` switch still happens at once, a trigger on the other window still switches, and `rebalance` never waits.
+
+**Switching while you are idle.** The engine keeps a small usage history (`usage_history.jsonl` in the backup root: each account's hourly 5h/7d percentages for 8 days, and for 14 days whether the active account's 5h rose in each 15-minute slot). It records only readings it already has, so the poll budget is unchanged. From that it learns when you are usually busy, weekdays and weekends apart, once it has 3 days of data; a *quiet window* is an hour or more of slots that were busy less than 20% of the time. With `maximize.preempt`, if the active 7d is on pace to pass `soft7d` before your next quiet window (at most `preemptHorizonMaxH` hours away, 4 hours while nothing is learned yet), and another account would not, it switches at an idle moment now (trigger `preempt`, after `rebalanceCooldownMin`) instead of being forced to later. In a usually-busy time, a rebalance gaining less than `busyRebalanceGap` waits for a quiet window that starts within 6 hours. Neither ever overrides `at-limit`, `hard`, `soft` or `reset-wait`. `cc-swap why` and `cc-swap doctor` show what has been learned.
+
 `cc-swap auto --once --dry-run` prints each account's tier, score, landing eligibility and idle state, plus the decision and its reason. It needs no engine lease, so it works while the service runs.
 
 ### Settings
@@ -85,12 +89,17 @@ Turn it on with `cc-swap config set autoswitch.strategy maximize`, or use `cc-sw
 | `maximize.idleWindowMin` | int 3–60 | 10 | Minutes over which "idle" is judged |
 | `maximize.idleMaxDeltaPct` | float 0–10 | 1 | Most growth (percentage points) in that window that still counts as idle |
 | `maximize.forceEtaMin` | int 0–60 | 10 | Switch at once if the recent pace reaches a hard ceiling within this many minutes (0 = off) |
+| `maximize.resetWaitMin` | int 0–60 | 15 | Skip a hard or soft switch while the window that triggered it resets within this many minutes and the recent pace stays under 100% until 2 minutes past the reset (0 = off) |
 | `maximize.pendingPollS` | int 180–600 | 180 | Active-account poll interval while waiting for idle (floor 180 s: the usage endpoint allows ~30 requests/hour per account, shared by every machine) |
 | `maximize.rebalanceCooldownMin` | int 0–240 | 30 | Minimum minutes between rebalancing switches |
 | `maximize.tieEpsilon` | float 0–2 | 0.1 | Scores this close count as a tie |
 | `maximize.lastResort` | string | — | Last-resort accounts: emails or aliases, comma-separated |
 | `maximize.planOverride` | string | — | Manual plan per account: `email:20x,email:5x` |
 | `maximize.loginExpiryGuardMin` | int 0–1440 | 120 | A soft or rebalance switch never lands on an account whose login expires within this many minutes (an at-limit or hard fallback still may) |
+| `maximize.preempt` | bool | true | Switch at an idle moment when the active 7d is on pace to pass `soft7d` before your next quiet time (trigger `preempt`) |
+| `maximize.learnIdlePattern` | bool | true | Learn your usual busy and quiet times from the usage history |
+| `maximize.preemptHorizonMaxH` | int 1–48 | 12 | Look at most this many hours ahead for a pre-emptive switch |
+| `maximize.busyRebalanceGap` | float 0–5 | 0.5 | In a usually-busy time, rebalance only for a score gain at least this large; smaller ones wait for a quiet window |
 | `prime.enabled` | bool | false | Turn 5h priming on |
 | `prime.model` | string | claude-haiku-4-5 | Model used for the priming request |
 | `prime.jitterS` | string | 45-300 | Random delay after a reset before priming, in seconds |
@@ -275,6 +284,9 @@ In Fleet, `m` → Account settings → `i` (*Inspect all logins*) runs the same 
 | `auto-off` | Automatic switching is off (cc-swap auto off, or Fleet: m → o): the engine keeps deciding but never switches or primes. | cc-swap auto on (or Fleet: m → o); cc-swap auto status shows who turned it off and when. |
 | `maximize-pending` | A soft mark is crossed; maximize waits for an idle moment (idleWindowMin) before switching. | Nothing; a hard ceiling switches at once. Lower maximize.idleWindowMin to switch sooner. |
 | `maximize-hold` | maximize sees no reason to move: below every soft mark and no better-scored account (or within rebalanceCooldownMin). | Nothing. |
+| `reset-wait` | A hard or soft mark is crossed, but that window resets within maximize.resetWaitMin minutes and the recent pace will not reach 100% before then, so maximize waits for the reset instead of switching (a switch makes Claude Code re-read the whole context on the new account). | Nothing; it switches at once if the window hits 100%. Set maximize.resetWaitMin to 0 to switch without waiting. |
+| `preempt` | The active account's 7d is on pace to pass soft7d before your next quiet time, and another account would not; maximize moves at the next idle moment (after rebalanceCooldownMin). | Nothing; set maximize.preempt to false to wait for the soft mark instead. |
+| `rebalance-deferred` | A better-scored account exists, but this is usually a busy time and the gain is under maximize.busyRebalanceGap, so the move waits for your next quiet window (at most 6 hours away). | Nothing; lower maximize.busyRebalanceGap, or set maximize.learnIdlePattern to false, to rebalance at any idle moment. |
 
 ## Releasing
 

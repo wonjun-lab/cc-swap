@@ -82,6 +82,25 @@ def test_hold_and_exhausted_and_indeterminate_map_to_codes(root, monkeypatch, ca
         assert payload["meaning"] == doctor_cli.REASONS[code][0]
 
 
+def test_a_reset_wait_hold_is_explained_by_its_code(root, monkeypatch, capsys, dry_runs):
+    reason = "#1 5h 96% — resets in 8m, waiting it out (switches at once if it hits 100%)"
+    publish(root, decision="hold", pending=False, target=None, reason=reason, code="reset-wait")
+    payload = json.loads(why(monkeypatch, capsys, "--json")[1])
+    assert payload["code"] == "reset-wait" and payload["source"] == "engine"
+    assert payload["meaning"] == doctor_cli.REASONS["reset-wait"][0]
+    assert payload["reason"] == reason
+    _, out = why(monkeypatch, capsys)
+    assert "code     reset-wait" in out and "resets in 8m" in out
+    assert dry_runs == []
+
+
+def test_a_code_from_another_record_or_on_a_switch_is_ignored(root, monkeypatch, capsys):
+    publish(root, decision="switch", trigger="hard", pending=False, code="reset-wait")
+    assert json.loads(why(monkeypatch, capsys, "--json")[1])["code"] is None
+    publish(root, decision="hold", pending=False, code="not-a-code")
+    assert json.loads(why(monkeypatch, capsys, "--json")[1])["code"] == "maximize-hold"
+
+
 def test_switch_names_its_trigger(root, monkeypatch, capsys):
     publish(root, decision="switch", trigger="soft", pending=False)
     _, out = why(monkeypatch, capsys)

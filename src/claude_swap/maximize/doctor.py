@@ -1080,6 +1080,26 @@ def check_priming(ctx: Context) -> list[Finding]:
     )]
 
 
+def check_idle_pattern(ctx: Context) -> list[Finding]:
+    """What maximize has learned of your busy and quiet times (info only;
+    ``maximize`` strategy only). Reads the usage history, writes nothing."""
+    from claude_swap import settings as st
+    from claude_swap.maximize import history
+
+    if ctx.strategy != "maximize":
+        return []
+    raw = ctx.raw_settings or {}
+    try:
+        enabled = st._section_from_raw(
+            raw.get("maximize"), "maximize", st.MaximizeSettings
+        ).learn_idle_pattern
+    except TypeError:
+        enabled = True
+    p = ctx.probes
+    slots = history.read(p.backup_root, p.now).slots
+    return [Finding("idle-pattern", "info", history.describe(slots, p.now, enabled=enabled))]
+
+
 def priming_guard(backup_root: Path) -> tuple[str | None, str | None]:
     """``(paused note, verified version)`` from the priming version guard's
     records — read-only, no ``claude --version``."""
@@ -1238,6 +1258,7 @@ ENV_CHECKS: tuple[Callable[[Context], list[Finding]], ...] = (
     check_lease,
     check_settings,
     check_priming,
+    check_idle_pattern,
 )
 
 
