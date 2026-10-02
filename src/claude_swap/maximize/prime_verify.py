@@ -13,6 +13,10 @@ State lives in ``<backup root>/prime_verify.json``::
     {"verifiedClaudeVersion": "2.1.3", "verifiedAt": 1.7e9, "verifiedBy": "prime verify",
      "lastSeen": {"version": "2.1.4", "path": "...", "key": [...], "at": 1.7e9}}
 
+A failed ``prime verify`` replaces the three ``verified*`` keys with
+``verifyFailed`` (:data:`FAILED_KEY`), which pauses priming until a verify
+passes.
+
 ``verifiedBy`` is ``prime verify`` or ``primed`` (the first prime the usage
 endpoint confirmed, when nothing was recorded before: an install that never
 ran ``prime verify`` keeps priming until ``claude`` changes). ``lastSeen``
@@ -63,6 +67,7 @@ PROBE_TIMEOUT_S = 60.0
 BAD_TOKEN = "sk-ant-oat01-cc-swap-prime-verify-not-a-real-token-0000000000"
 VERIFIED_BY_CLI = "prime verify"
 VERIFIED_BY_PRIME = "primed"
+LIVE_CHECK = "one live prime"
 
 # -- the record ---------------------------------------------------------------------
 
@@ -106,7 +111,43 @@ def record_verified(
     data["verifiedClaudeVersion"] = version
     data["verifiedAt"] = time.time() if now is None else now
     data["verifiedBy"] = by
+    data.pop(FAILED_KEY, None)
     _save(root, data)
+
+
+#: Set by a failed ``prime verify``: ``{"version": "2.1.4" | None, "at": 1.7e9,
+#: "checks": ["invalid token is rejected", ...]}``. It replaces the verified
+#: record (a build that just failed isolation is not verified, whatever an
+#: earlier run said) and pauses priming until a verify passes.
+FAILED_KEY = "verifyFailed"
+
+
+def record_failed(
+    root: Path, version: str | None, checks: Sequence[str], *, now: float | None = None
+) -> None:
+    data = load(root)
+    for key in ("verifiedClaudeVersion", "verifiedAt", "verifiedBy"):
+        data.pop(key, None)
+    data[FAILED_KEY] = {
+        "version": version,
+        "at": time.time() if now is None else now,
+        "checks": list(checks),
+    }
+    _save(root, data)
+
+
+def failed_verify(root: Path, data: Mapping[str, Any] | None = None) -> dict | None:
+    """The failed-verify marker (see :data:`FAILED_KEY`), or None."""
+    data = load(root) if data is None else data
+    failed = data.get(FAILED_KEY)
+    if failed is None:
+        return None
+    return dict(failed) if isinstance(failed, Mapping) else {}
+
+
+def _failed_text(failed: Mapping) -> str:
+    version = _text(failed.get("version"))
+    return f"prime verify failed for claude {version}" if version else "prime verify failed"
 
 
 def restore(root: Path, data: Mapping[str, Any]) -> None:
@@ -122,8 +163,9 @@ def restore(root: Path, data: Mapping[str, Any]) -> None:
 
 def note_verified_prime(root: Path, version: str | None) -> None:
     """A prime the usage endpoint confirmed: the first one becomes the
-    baseline when nothing was recorded yet (never overrides a record)."""
-    if version and verified_version(root) is None:
+    baseline when nothing was recorded yet (never overrides a record, and
+    never a failed ``prime verify``)."""
+    if version and verified_version(root) is None and failed_verify(root) is None:
         record_verified(root, version, by=VERIFIED_BY_PRIME)
 
 
@@ -292,6 +334,9 @@ def gate(
     verified = _text(data.get("verifiedClaudeVersion"))
     current = current_version(root, claude_path, reader=reader, clock=clock)
     update = pending_update(root, data)
+    failed = failed_verify(root, data)
+    if failed is not None:
+        return Gate(False, current, None, f"{_failed_text(failed)}; {PAUSED_UNTIL}")
     if verified is None:
         if update is None:
             return Gate(True, current, None, "no verified claude version recorded yet")
@@ -326,6 +371,9 @@ def paused_note(root: Path) -> str | None:
     engine last saw and what ``cc-swap claude-update`` recorded, or None.
     The same rule as :func:`gate`, minus the unreadable-version case."""
     data = load(root)
+    failed = failed_verify(root, data)
+    if failed is not None:
+        return f"paused: {_failed_text(failed)} (cc-swap prime verify)"
     verified = _text(data.get("verifiedClaudeVersion"))
     seen = data.get("lastSeen")
     current = _text(seen.get("version")) if isinstance(seen, dict) else None
@@ -590,7 +638,7 @@ def run_verify(
     if live is not None and report.ok:
         before = active_fingerprint(deps)
         ok, detail = live()
-        report.add("one live prime", ok, detail)
+        report.add(LIVE_CHECK, ok, detail)
         changed = _changed(before, active_fingerprint(deps))
         report.add(
             "active login unchanged by the live prime", not changed,
@@ -613,6 +661,18 @@ def run_verify(
         # runs first; the record is written only once everything passed.
         record_verified(root, version, by=VERIFIED_BY_CLI, now=now)
         report.recorded = True
+    elif record and (
+        failures := [c.name for c in report.checks if not c.ok and c.name != LIVE_CHECK]
+    ):
+        # A build that just failed is not verified, whatever an earlier run
+        # recorded: drop that record so priming pauses (engine, `prime`,
+        # `prime --dry-run` and doctor all read it) until a verify passes.
+        # (A missing claude or an unreadable version returned above; a live
+        # prime that found nothing to prime says nothing about isolation.)
+        try:
+            record_failed(root, version, failures, now=now)
+        except OSError:
+            pass
     return report
 
 

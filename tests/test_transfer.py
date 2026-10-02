@@ -402,7 +402,7 @@ class TestConflictPolicy:
 
         err = capsys.readouterr().err
         assert "alice@example.com is your current live login" in err
-        assert "cswap --switch-to 1 --force" in err
+        assert "cc-swap switch 1 --force" in err
 
     def test_import_without_matching_live_login_prints_no_hint(
         self, temp_home: Path, capsys

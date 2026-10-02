@@ -128,6 +128,53 @@ def test_a_relogin_pause_wins(root, monkeypatch, capsys, dry_runs):
     assert "PAUSED" in out and "code     maximize-paused" in out and "re-login #2" in out
 
 
+def test_auto_off_wins_over_a_published_switch(root, monkeypatch, capsys, dry_runs):
+    # The engine still publishes "switch (hard) -> #2" while auto is off, but
+    # the switch was refused: why must say auto-switching is OFF.
+    publish(root, decision="switch", trigger="hard", pending=False)
+    (root / "auto_off.json").write_text(json.dumps(
+        {"schemaVersion": 1, "autoOff": {"since": NOW - 60, "by": "cli", "host": "mbp"}}
+    ))
+    code, out = why(monkeypatch, capsys)
+    assert code == 0 and dry_runs == []
+    assert "auto-switching is OFF" in out
+    assert "code     auto-off" in out
+    assert "SWITCH →" not in out and "is switching" not in out
+    assert "cc-swap auto on" in out
+
+    payload = json.loads(why(monkeypatch, capsys, "--json")[1])
+    assert payload["source"] == "auto-off" and payload["code"] == "auto-off"
+    assert payload["decision"] == "auto-off"
+    # What the engine would have done is still there for the curious.
+    assert payload["wouldDecide"]["decision"] == "switch"
+    assert payload["wouldDecide"]["target"] == "2"
+
+
+def test_auto_off_without_a_fresh_decision_still_says_off(root, monkeypatch, capsys, dry_runs):
+    (root / "auto_off.json").write_text(json.dumps({"schemaVersion": 1, "autoOff": {}}))
+    code, out = why(monkeypatch, capsys)
+    assert code == 0 and dry_runs == []
+    assert "auto-switching is OFF" in out
+
+
+def test_a_switch_that_just_landed_is_explained(root, monkeypatch, capsys, dry_runs):
+    # Published on #1 targeting #2; the switch landed so sequence.json says #2.
+    (root / "sequence.json").write_text(json.dumps({"activeAccountNumber": 2, "accounts": {}}))
+    publish(root, active="1", target="2", decision="switch", trigger="hard", pending=False)
+    code, out = why(monkeypatch, capsys, "--no-fallback")
+    assert code == 0 and dry_runs == []
+    assert "SWITCH → #2 (hard)" in out
+    assert "No engine published" not in out
+    assert "switched" in out
+
+
+def test_a_switch_to_a_third_account_is_still_history(root, monkeypatch, capsys, dry_runs):
+    (root / "sequence.json").write_text(json.dumps({"activeAccountNumber": 3, "accounts": {}}))
+    publish(root, active="1", target="2", decision="switch", trigger="hard", pending=False)
+    why(monkeypatch, capsys)
+    assert dry_runs == [["--once", "--dry-run"]]
+
+
 def test_why_writes_nothing(root, monkeypatch, capsys, dry_runs):
     publish(root)
     before = {p: p.read_bytes() for p in root.iterdir()}

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import io
 import json
 import os
 import subprocess
@@ -309,7 +310,7 @@ class TestCLI:
             cli.main()
 
         switcher_cls.return_value.switch_to.assert_called_once_with(
-            "2", json_output=False, force=True
+            "2", json_output=False, force=True, allow_dead_login=False
         )
 
     def test_switch_to_without_force_forwards_false(self):
@@ -321,7 +322,7 @@ class TestCLI:
             cli.main()
 
         switcher_cls.return_value.switch_to.assert_called_once_with(
-            "2", json_output=False, force=False
+            "2", json_output=False, force=False, allow_dead_login=False
         )
 
     def test_export_and_import_are_mutually_exclusive(self):
@@ -913,7 +914,7 @@ class TestSubcommandAliases:
              patch("claude_swap.update_check.check_for_update", return_value=None):
             cli.main()
         switcher_cls.return_value.switch_to.assert_called_once_with(
-            "2", json_output=False, force=False
+            "2", json_output=False, force=False, allow_dead_login=False
         )
 
     def test_bare_switch_subcommand_dispatches_switch(self):
@@ -1123,6 +1124,98 @@ class TestAutoCommand:
     def test_loop_mode_returns_loop_exit(self, temp_home):
         assert self._run([], temp_home) == 0
         assert self.FakeEngine.instances  # loop path constructed the engine
+
+    @pytest.mark.parametrize("jsonl", [False, True])
+    def test_a_closed_stdout_does_not_abort_the_tick(self, temp_home, monkeypatch, jsonl):
+        """`cc-swap auto --once | head -1`: the reader goes away after the first
+        line. The printer raised BrokenPipeError out of the engine's emit, so
+        the tick (and a due switch) stopped after one line."""
+        from claude_swap.autoswitch import NoSwitchEvent, PollEvent, TickOutcome
+
+        class ClosedPipe(io.StringIO):
+            def write(self, s):
+                raise BrokenPipeError(32, "Broken pipe")
+
+            def flush(self):
+                raise BrokenPipeError(32, "Broken pipe")
+
+        finished: list[bool] = []
+
+        class EmittingEngine(self.FakeEngine):
+            def tick(self):
+                self.on_event(PollEvent(
+                    active={"number": 1, "email": "a@example.com"},
+                    headroom={"1": 1.0}, threshold=90.0,
+                ))
+                self.on_event(NoSwitchEvent(reason="cooldown"))
+                finished.append(True)
+                return TickOutcome.SWITCHED
+
+        monkeypatch.setattr(sys, "stdout", ClosedPipe())
+        argv = ["--once"] + (["--json"] if jsonl else [])
+        with patch("claude_swap.autoswitch.AutoSwitchEngine", EmittingEngine), \
+             patch("os.geteuid", return_value=1000, create=True), \
+             patch.object(sys, "argv", ["claude-swap", "auto", *argv]):
+            with pytest.raises(SystemExit) as excinfo:
+                cli.main()
+        assert finished == [True]
+        assert excinfo.value.code == 0
+
+    @pytest.mark.parametrize("jsonl", [False, True])
+    def test_loop_mode_stops_after_the_tick_once_stdout_is_gone(
+        self, temp_home, monkeypatch, jsonl
+    ):
+        """Loop mode must not go on switching unseen for days after its reader
+        left: it finishes the current tick, then exits 0 with the lease
+        released."""
+        from claude_swap.autoswitch import NoSwitchEvent
+        from claude_swap.maximize.lease import claim_for_auto
+        from claude_swap.paths import get_backup_root
+
+        class ClosedPipe(io.StringIO):
+            """`| head -1`: the first line gets through, then the reader is gone."""
+
+            closed_now = False
+
+            def write(self, s):
+                if self.closed_now:
+                    raise BrokenPipeError(32, "Broken pipe")
+                return super().write(s)
+
+            def flush(self):
+                if self.closed_now:
+                    raise BrokenPipeError(32, "Broken pipe")
+                type(self).closed_now = True
+
+        ticks: list[int] = []
+
+        class LoopEngine(self.FakeEngine):
+            stopped = False
+
+            def run_loop(self):
+                for n in range(5):
+                    if self.stopped:
+                        return 0
+                    self.on_event(NoSwitchEvent(reason="cooldown"))
+                    self.on_event(NoSwitchEvent(reason="cooldown"))  # rest of the tick
+                    ticks.append(n)
+                return 0
+
+            def stop(self):
+                self.stopped = True
+
+        monkeypatch.setattr(sys, "stdout", ClosedPipe())
+        argv = ["--json"] if jsonl else []
+        with patch("claude_swap.autoswitch.AutoSwitchEngine", LoopEngine), \
+             patch("os.geteuid", return_value=1000, create=True), \
+             patch.object(sys, "argv", ["claude-swap", "auto", *argv]):
+            with pytest.raises(SystemExit) as excinfo:
+                cli.main()
+        assert excinfo.value.code == 0
+        assert ticks == [0]  # finished the tick it was in, started no other
+        lease = claim_for_auto(get_backup_root(), once=False, dry_run=False)
+        assert lease is not None
+        lease.release()
 
     def test_flags_override_settings_json(self, temp_home):
         from claude_swap.paths import get_backup_root

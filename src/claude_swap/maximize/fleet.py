@@ -633,8 +633,9 @@ def engine_parts(es: EngineStatus) -> tuple[list[tuple[str, int]], Tone]:
         tone = "accent"
     else:
         if service is not None and service.get("installed"):
-            state = service.get("state") or "not running"
-            why = f"service stopped ({_manager(service)}: {state})"
+            from claude_swap.maximize.service import state_text
+
+            why = f"service stopped ({_manager(service)}: {state_text(service)})"
         elif service is not None:
             why = "no service (cc-swap service install)"
         else:
@@ -816,10 +817,11 @@ def login_cell(row: FleetRow, now: float) -> Cell:
 
 
 def _expiring_text(row: FleetRow, now: float) -> str:
-    left = login_left(row, now) or 0.0
-    if left <= 0:
+    """``login expires Oct 9 20:04 (in 6d 2h)``: the deadline format doctor,
+    list and the auto log use too (``oauth.login_expiry_note_ms``)."""
+    if row.login_deadline is None:
         return "login expired"
-    return f"login expires in {oauth.login_countdown(left)}"
+    return oauth.login_expiry_note_ms(row.login_deadline * 1000.0, int(now * 1000)) or ""
 
 
 def _dead_line(dead: Sequence[FleetRow]) -> str:
@@ -1283,7 +1285,9 @@ def _holder_facts(es: EngineStatus) -> list[str]:
         return [f"This TUI runs the engine ({mode}). Quitting the TUI stops it."]
     lines = ["Nothing is switching accounts on this machine."]
     if service.get("installed"):
-        lines.append(f"The service is installed but not running ({service.get('state') or 'stopped'}).")
+        from claude_swap.maximize.service import state_text
+
+        lines.append(f"The service is installed but not running ({state_text(service)}).")
     else:
         lines.append("For an always-on engine: cc-swap service install")
     if service.get("linger") is False:

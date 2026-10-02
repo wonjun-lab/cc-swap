@@ -187,7 +187,7 @@ def export_accounts(
     """
     sequence_data = switcher._get_sequence_data_migrated()
     if not sequence_data or not sequence_data.get("accounts"):
-        raise TransferError("no accounts to export — run cswap --add-account first")
+        raise TransferError("no accounts to export — run cc-swap add first")
 
     accounts_map = sequence_data["accounts"]
 
@@ -244,7 +244,7 @@ def export_accounts(
                 _eprint(
                     f"Skipping Account-{num} ({email}): no stored "
                     f"credentials/config — re-add with: "
-                    f"cswap --add-account --slot {num}"
+                    f"cc-swap add --slot {num}"
                 )
                 continue
 
@@ -281,7 +281,7 @@ def export_accounts(
     if not accounts_payload:
         raise TransferError(
             "no exportable accounts — all managed slots are missing stored "
-            "credentials/config. Re-add with: cswap --add-account --slot <number>"
+            "credentials/config. Re-add with: cc-swap add --slot <number>"
         )
 
     # Only carry activeAccountNumber if that slot is actually present in the
@@ -644,7 +644,7 @@ def import_accounts(
         if live_slot is not None and live_slot in written_slots:
             _eprint(
                 f"Note: {identity[0]} is your current live login — activate the "
-                f"imported credentials with: cswap --switch-to {live_slot} --force"
+                f"imported credentials with: cc-swap switch {live_slot} --force"
             )
 
 

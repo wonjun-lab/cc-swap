@@ -21,7 +21,7 @@ from claude_swap.printer import (
     warning,
 )
 from claude_swap.settings import load_ui_settings
-from claude_swap.switcher import ClaudeAccountSwitcher
+from claude_swap.switcher import SWITCH_REFUSED_REASONS, ClaudeAccountSwitcher
 
 
 def _prog_name() -> str:
@@ -379,7 +379,7 @@ def _unclaimed_command(argv: list[str]) -> None:
         prog=f"{_prog_name()} unclaimed",
         description=(
             "List stashed credential entries, or purge one by id. "
-            "Purging deletes the bytes — recovery is /login + `cswap add`."
+            "Purging deletes the bytes — recovery is /login + `cc-swap add`."
         ),
     )
     parser.add_argument(
@@ -752,7 +752,7 @@ Defaults live in settings.json in the backup root; flags override them.
     )
     from claude_swap.autoswitch import AutoSwitchEngine, AutoSwitchEvent
     from claude_swap.maximize.logrotate import LogRotator
-    from claude_swap.printer import accent, yellowed
+    from claude_swap.printer import accent, print_line, stdout_gone, yellowed
     from claude_swap.settings import (
         MAXIMIZE_CLI_FLAGS,
         load_maximize_settings,
@@ -761,8 +761,19 @@ Defaults live in settings.json in the backup root; flags override them.
         merged_with_cli,
     )
 
+    # print_line: a closed pipe (`auto --once | head -1`) must not abort the
+    # tick from inside the engine's event callback. `--once` then finishes
+    # its tick silently; the loop stops after the tick it is in (nobody would
+    # see it switch any more), exiting 0 with the lease released.
+    running: list = []  # the loop-mode engine, once built
+
+    def emit_line(text: str) -> None:
+        print_line(text)
+        if stdout_gone() and running:
+            running[0].stop()
+
     def jsonl_emit(event: AutoSwitchEvent) -> None:
-        print(json.dumps(event.to_json()), flush=True)
+        emit_line(json.dumps(event.to_json()))
 
     def human_emit(event: AutoSwitchEvent) -> None:
         stamp = _time.strftime("%H:%M:%S")
@@ -773,7 +784,7 @@ Defaults live in settings.json in the backup root; flags override them.
             line = yellowed(line)
         elif event.kind in ("poll", "no-switch", "sleep"):
             line = dimmed(line)
-        print(f"{stamp}  {line}", flush=True)
+        emit_line(f"{stamp}  {line}")
 
     lease = None
     try:
@@ -822,6 +833,7 @@ Defaults live in settings.json in the backup root; flags override them.
         if args.once:
             sys.exit(engine.tick().value)
 
+        running.append(engine)
         # Loop mode: SIGTERM (systemd stop) exits the loop cleanly.
         signal.signal(signal.SIGTERM, lambda *_: engine.stop())
         # As the launchd service, keep auto.log / auto.err.log bounded: rotate
@@ -840,7 +852,7 @@ Defaults live in settings.json in the backup root; flags override them.
                 )
             else:
                 policy = f"threshold {settings.threshold:.0f}%"
-            print(
+            emit_line(
                 dimmed(
                     f"Auto-switch running: {policy}, "
                     f"every {settings.interval_seconds:.0f}s"
@@ -1089,8 +1101,22 @@ Examples:
                 print(f"  {entry} → {where}")
             return
 
-        num, email, _ = switcher.resolve_account(args.account)
         accounts = (switcher._get_sequence_data() or {}).get("accounts", {})
+        dangling = [
+            e for e in entries
+            if e.lower() == args.account.strip().lower() and not _last_resort_matches(accounts, e)
+        ]
+        if action == "remove" and dangling:
+            # An entry naming no account (left by an older `remove`): drop it
+            # by its text, since it resolves to no account to name.
+            kept = [e for e in entries if e not in dangling]
+            if kept:
+                set_setting(root, "maximize.lastResort", ",".join(kept))
+            else:
+                unset_setting(root, "maximize.lastResort")
+            print(f"{accent('Removed')} {dangling[0]} from last-resort (it named no account)")
+            return
+        num, email, _ = switcher.resolve_account(args.account)
 
         if action == "add":
             if num in {n for e in entries for n in _last_resort_matches(accounts, e)}:
@@ -1306,9 +1332,10 @@ def _print_service_status(result: dict) -> None:
         print("cc-swap service is not installed.")
         print(dimmed("Install it with: cc-swap service install"))
         return
-    state = result["state"] or ("running" if result["running"] else "stopped")
+    from claude_swap.maximize.service import state_text
+
     pid = f" (pid {result['pid']})" if result["pid"] else ""
-    print(f"cc-swap service: {state}{pid}")
+    print(f"cc-swap service: {state_text(result)}{pid}")
     print(f"  file: {result['path']}")
     print(f"  logs: {', '.join(result['logs'])}")
     if not result["installed"]:
@@ -1611,6 +1638,15 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
         ),
     )
     parser.add_argument(
+        "--allow-dead-login",
+        action="store_true",
+        help=(
+            "With 'switch <num|email>': switch even to an account whose stored "
+            "login is dead (expired or quarantined), which is refused otherwise; "
+            "the current login is still backed up first"
+        ),
+    )
+    parser.add_argument(
         "--full",
         action="store_true",
         help="Include full ~/.claude.json in export (default: oauthAccount only)",
@@ -1818,6 +1854,9 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
             "or 'upgrade'"
         )
 
+    if args.allow_dead_login and not args.switch_to:
+        parser.error("--allow-dead-login can only be used with 'switch <num|email>'")
+
     if args.check and not args.upgrade:
         parser.error("--check can only be used with 'upgrade'")
 
@@ -1913,7 +1952,10 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
                 payload["modelSource"] = model_source
         elif args.switch_to:
             payload = switcher.switch_to(
-                args.switch_to, json_output=args.json, force=args.force
+                args.switch_to,
+                json_output=args.json,
+                force=args.force,
+                allow_dead_login=args.allow_dead_login,
             )
         elif args.status:
             payload = switcher.status(json_output=args.json)
@@ -1969,6 +2011,9 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
 
     if args.json and payload is not None:
         print(json.dumps(payload, indent=2))
+        if (args.switch or args.switch_to) and payload.get("reason") in SWITCH_REFUSED_REASONS:
+            # The human path raises SwitchRefusedError (exit 1); keep JSON in step.
+            sys.exit(1)
 
     # Passive update notification (never fails). Skipped after --purge so we
     # don't immediately recreate <backup_root>/cache/update_check.json inside

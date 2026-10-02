@@ -100,6 +100,54 @@ class TestLoadSettings:
         loaded = load_settings(tmp_path)
         assert getattr(loaded, field) == getattr(AutoSwitchSettings(), field)
 
+    @pytest.mark.parametrize("raw, expected", [
+        ("false", False), ("False", False), (" no ", False), ("0", False), (0, False),
+        ("true", True), ("TRUE", True), ("yes", True), ("1", True), (1, True),
+    ])
+    def test_bool_written_as_a_string_or_number_reads_as_meant(
+        self, tmp_path: Path, raw, expected
+    ):
+        """A hand-edited "false" read as TRUE (bool("false"))."""
+        settings_path(tmp_path).write_text(
+            json.dumps({"autoswitch": {"includeApiKeyAccounts": raw}})
+        )
+        assert load_settings(tmp_path).include_api_key_accounts is expected
+
+    def test_bool_repairs_are_reported(self, tmp_path: Path):
+        from claude_swap.settings import _section_from_raw
+
+        repairs: list[str] = []
+        loaded = _section_from_raw(
+            {"includeApiKeyAccounts": "false"}, "autoswitch", AutoSwitchSettings, repairs
+        )
+        assert loaded.include_api_key_accounts is False
+        assert repairs == [
+            "autoswitch.includeApiKeyAccounts must be true or false (no quotes), "
+            "got 'false'; read as false"
+        ]
+        repairs.clear()
+        loaded = _section_from_raw(
+            {"includeApiKeyAccounts": "maybe"}, "autoswitch", AutoSwitchSettings, repairs
+        )
+        assert loaded.include_api_key_accounts is False
+        assert repairs == [
+            "autoswitch.includeApiKeyAccounts must be true or false, got 'maybe'; "
+            "using default false"
+        ]
+        repairs.clear()
+        _section_from_raw({"includeApiKeyAccounts": True}, "autoswitch",
+                          AutoSwitchSettings, repairs)
+        assert repairs == []
+
+    def test_effective_value_of_a_string_bool(self, tmp_path: Path):
+        settings_path(tmp_path).write_text(json.dumps({
+            "autoswitch": {"includeApiKeyAccounts": "false"},
+            "prime": {"enabled": "false"},
+        }))
+        values = {spec.dotted: value for spec, value, _ in effective_settings(tmp_path)}
+        assert values["autoswitch.includeApiKeyAccounts"] is False
+        assert values["prime.enabled"] is False
+
     def test_unsupported_strategy_falls_back_to_best(self, tmp_path: Path):
         settings_path(tmp_path).write_text(
             json.dumps({"autoswitch": {"strategy": "chaos"}})

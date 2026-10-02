@@ -318,6 +318,18 @@ def _is_installed(tag: str) -> bool:
         return False
 
 
+def _is_older_than_running(tag: str) -> bool:
+    """Whether the release ``tag`` names is older than the running version.
+
+    Plain version order, pre-releases included: a 0.4.0rc1 build is ahead of
+    the 0.3.1 release. An unparseable running version is never "newer".
+    """
+    try:
+        return _parse_version(_tag_version(tag)) < _parse_version(__version__)
+    except ValueError:
+        return False
+
+
 def check_for_update(current_version: str) -> str | None:
     """Return a notification string if a newer version exists, else None."""
     try:
@@ -375,9 +387,18 @@ def run_self_upgrade(force: bool = False) -> int:
     method = _detect_install_method()
     # Unlike the passive check, the user asked for this, so wait for GitHub.
     tag, from_cache = _latest_tag_for_upgrade()
-    if tag is not None and not force and _is_installed(tag):
-        print(f"cc-swap is already on {tag}; nothing to do (use --force to reinstall).")
-        return 0
+    if tag is not None and not force:
+        if _is_installed(tag):
+            print(f"cc-swap is already on {tag}; nothing to do (use --force to reinstall).")
+            return 0
+        if _is_older_than_running(tag):
+            # `upgrade --check` calls this "up to date"; installing the
+            # release would be a downgrade nobody asked for.
+            print(
+                f"cc-swap {__version__} is newer than the latest release {tag}; "
+                f"nothing to do (use --force to install {tag} anyway)."
+            )
+            return 0
     cmd = _upgrade_command(method, tag)
     url = _install_url(tag)
     if cmd is None:

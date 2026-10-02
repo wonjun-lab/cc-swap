@@ -33,7 +33,6 @@ import sys
 import time
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Literal
 
@@ -267,7 +266,7 @@ def duration(seconds: float) -> str:
 
 
 def _clock(epoch_s: float) -> str:
-    return datetime.fromtimestamp(epoch_s, tz=timezone.utc).strftime("%b %d %H:%M UTC")
+    return oauth.local_clock(epoch_s)
 
 
 def _read_json(path: Path) -> tuple[dict | None, str | None]:
@@ -890,9 +889,11 @@ def check_service(ctx: Context) -> list[Finding]:
     out: list[Finding] = []
     pid = status.get("pid") if isinstance(status.get("pid"), int) else None
     if not running:
+        from claude_swap.maximize.service import state_text
+
         out.append(Finding(
             "service", "warn",
-            f"service installed but not running (state {status.get('state') or 'unknown'})",
+            f"service installed but not running ({state_text(status)})",
             "cc-swap service install (restarts it); then cc-swap service status",
         ))
     parsed = service_file(p)
@@ -989,7 +990,7 @@ def check_lease(ctx: Context) -> list[Finding]:
             if p.platform in ("darwin", "linux")
             else "run cc-swap auto in a terminal",
         ))
-    from claude_swap.maximize.pause import active_pause
+    from claude_swap.maximize.pause import active_pause, effective_auto_off
 
     paused = active_pause(ctx.state, p.now)
     if paused is not None:
@@ -998,6 +999,15 @@ def check_lease(ctx: Context) -> list[Finding]:
             "lease", "info",
             f"switching is paused for {duration(until - p.now)} more ({why})",
             "finish or cancel the Fleet re-login; the pause ends by itself",
+        ))
+    off = effective_auto_off(p.backup_root, ctx.state)
+    if off is not None:
+        since = f" since {_clock(off.since)}" if off.since is not None else ""
+        by = f" by {off.by}" if off.by else ""
+        out.append(Finding(
+            "lease", "info",
+            f"auto-switching is OFF{since}{by}: the engine decides but never switches or primes",
+            "cc-swap auto on (or Fleet Mode → o)",
         ))
     return out
 
@@ -1018,7 +1028,6 @@ def check_settings(ctx: Context) -> list[Finding]:
         ("autoswitch", st.AutoSwitchSettings),
         ("ui", st.UiSettings),
         ("maximize", st.MaximizeSettings),
-        ("prime", st.PrimeSettings),
     )
     loaded = {}
     for name, cls in sections:
@@ -1028,14 +1037,12 @@ def check_settings(ctx: Context) -> list[Finding]:
             problems.append(f"{name} section has keys of the wrong shape")
     if "maximize" in loaded:
         problems += [f"{m}; using defaults for both" for *_, m in st._maximize_pair_errors(loaded["maximize"])]
-    enabled = ctx.prime_section.get("enabled")
-    if "enabled" in ctx.prime_section and not isinstance(enabled, bool):
-        problems.append(f"prime.enabled must be true or false, got {enabled!r}; priming stays off")
-    if "prime" in loaded:
-        try:
-            st.parse_jitter_range(loaded["prime"].jitter_s)
-        except ValueError as e:
-            problems.append(f"prime.jitterS {e}")
+    try:
+        # The loader's own rules (only a JSON true enables priming; a bad
+        # jitterS reverts), so doctor and the engine agree.
+        st.prime_from_raw(raw.get("prime"), problems)
+    except TypeError:
+        problems.append("prime section has keys of the wrong shape")
     out = [
         Finding("settings", "warn", f"settings.json: {m}", "cc-swap config set <key> <value> (cc-swap config lists the ranges)")
         for m in problems
@@ -1095,10 +1102,7 @@ _QUARANTINE_WHY = {
 
 
 def _relogin_fix(number: str) -> str:
-    return (
-        f"re-login #{number}: Fleet → select it → r, or claude → /login as that "
-        f"account → cc-swap add --slot {number}"
-    )
+    return oauth.relogin_fix(number)
 
 
 def check_slots(ctx: Context) -> list[Finding]:
@@ -1165,13 +1169,13 @@ def check_slots(ctx: Context) -> list[Finding]:
             if left <= 0:
                 out.append(Finding(
                     "login-deadline", "error",
-                    f"login expired {_clock(deadline_ms / 1000.0)}",
+                    oauth.login_expiry_note_ms(deadline_ms, int(p.now * 1000)) or "login expired",
                     _relogin_fix(slot.number), scope,
                 ))
             elif left < LOGIN_WARN_S:
                 out.append(Finding(
                     "login-deadline", "warn",
-                    f"login expires in {duration(left)} ({_clock(deadline_ms / 1000.0)})",
+                    oauth.login_expiry_note_ms(deadline_ms, int(p.now * 1000)) or "login expires soon",
                     _relogin_fix(slot.number) + " (a new login starts a new ~30-day deadline)",
                     scope,
                 ))

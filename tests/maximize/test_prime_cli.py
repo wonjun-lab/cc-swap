@@ -211,6 +211,66 @@ def test_manual_prime_reports_reasons_when_nothing_is_eligible(cli_rig):
     assert "@" not in "\n".join(report.lines() + dry.lines())
 
 
+def _dry_run(argv: list[str]) -> int:
+    """``prime --dry-run``'s exit code (0 when it simply returns)."""
+    try:
+        prime_cli.prime_command(["--dry-run", *argv])
+    except SystemExit as exc:
+        return exc.code
+    return 0
+
+
+@needs_posix
+def test_dry_run_reports_the_version_guard_pause_like_a_real_run(cli_rig, capsys):
+    """After `claude-update` (or a failed `prime verify`) the real run is
+    refused; the dry run used to say "#2 would prime now"."""
+    from claude_swap.maximize import prime_verify as pv
+
+    harness, fake = cli_rig
+    pv.record_failed(harness.switcher.backup_dir, "2.1.230", ["invalid token is rejected"])
+
+    assert _dry_run(["2"]) == 1
+    out = capsys.readouterr().out
+    assert "would prime now" not in out
+    assert "Priming is paused: prime verify failed for claude 2.1.230" in out
+    assert "#2  not primed (priming is paused, see above)" in out
+
+    assert _run_prime(["2"]) == 1
+    real = capsys.readouterr().out
+    assert "prime verify failed for claude 2.1.230" in real
+    assert fake.calls() == []
+
+
+@needs_posix
+def test_dry_run_reports_a_relogin_pause_like_a_real_run(cli_rig, capsys):
+    from claude_swap.maximize import pause
+
+    harness, fake = cli_rig
+    pause.pause(harness.switcher.backup_dir, "re-login #3", now=harness.clock())
+
+    assert _dry_run(["2"]) == 1
+    dry = capsys.readouterr().out
+    assert "#2  not primed (switching paused (re-login #3))" in dry
+
+    assert _run_prime(["2"]) == 1
+    real = capsys.readouterr().out
+    assert "#2  not primed (switching paused (re-login #3))" in real
+    assert fake.calls() == []
+
+
+def test_dry_run_notes_auto_off(cli_rig, capsys):
+    """`auto off` stops the engine's priming, not a manual `cc-swap prime`:
+    the dry run still plans, and says so."""
+    from claude_swap.maximize import pause
+
+    harness, _fake = cli_rig
+    pause.set_auto_off(harness.switcher.backup_dir, True, by="cli", now=harness.clock())
+    assert _dry_run([]) == 0
+    out = capsys.readouterr().out
+    assert "#2  would prime now" in out
+    assert "auto-switching is OFF" in out and "cc-swap prime" in out
+
+
 def test_main_dispatches_prime(monkeypatch):
     seen: list[list[str]] = []
     monkeypatch.setattr(prime_cli, "prime_command", seen.append)

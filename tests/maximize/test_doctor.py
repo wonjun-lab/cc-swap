@@ -224,10 +224,11 @@ def test_expired_and_expiring_logins(world):
     world.store(4, creds(4, login_in_s=10 * DAY))
     findings = run(world)
     [expired] = find(findings, "login-deadline", "error", "#2")
-    assert expired.detail.startswith("login expired")
-    assert "cc-swap add --slot 2" in expired.fix and "r" in expired.fix
+    assert expired.detail.startswith("login expired") and "(1h 0m ago)" in expired.detail
+    assert "UTC" not in expired.detail  # local time, like list / the auto log / Fleet
+    assert expired.fix == "re-login #2: Fleet → select → r, or claude → /login → cc-swap add"
     [soon] = find(findings, "login-deadline", "warn", "#3")
-    assert "expires in 2d 1h" in soon.detail
+    assert soon.detail.startswith("login expires ") and "(in 2d 1h)" in soon.detail
     assert not find(findings, "login-deadline", scope="#4")
 
 
@@ -250,7 +251,7 @@ def test_quarantined_slot_is_an_error_until_its_login_changes(world):
     })
     findings = run(world)
     [dead] = find(findings, "quarantine", "error", "#2")
-    assert "refresh token dead" in dead.detail and "--slot 2" in dead.fix
+    assert "refresh token dead" in dead.detail and dead.fix.startswith("re-login #2: ")
     [lifting] = find(findings, "quarantine", "info", "#3")
     assert "lifts it" in lifting.detail
 
@@ -365,6 +366,22 @@ def test_service_installed_but_stopped(world):
     assert "not running" in find(findings, "service", "warn")[0].detail
 
 
+def test_service_file_present_but_not_loaded_uses_the_status_wording(world, monkeypatch, capsys):
+    """`service status` said "stopped" while doctor said "state unknown"."""
+    from claude_swap import cli
+    from claude_swap.maximize import service
+
+    world.healthy()
+    world.service_installed(running=False)
+    world.service.update(loaded=False, state=None)
+    world.lease = (False, None)
+    [f] = find(run(world), "service", "warn")
+    assert "(stopped (not loaded))" in f.detail
+    cli._print_service_status({**world.service, "logs": []})
+    assert "cc-swap service: stopped (not loaded)" in capsys.readouterr().out
+    assert service.state_text(world.service) == "stopped (not loaded)"
+
+
 def test_linux_unit_file_is_parsed(tmp_path):
     world = World(tmp_path, platform="linux")
     world.healthy()
@@ -385,6 +402,18 @@ def test_paused_engine_is_reported(world):
     world.state(pausedUntil=NOW + 300, pausedReason="re-login #2")
     [f] = [f for f in find(run(world), "lease", "info") if "paused" in f.detail]
     assert "re-login #2" in f.detail and "5m" in f.detail
+
+
+def test_auto_off_is_reported(world):
+    world.healthy()
+    (world.root / "auto_off.json").write_text(json.dumps(
+        {"schemaVersion": 1, "autoOff": {"since": NOW - 3600, "by": "cli"}}
+    ))
+    findings = run(world)
+    [f] = [f for f in find(findings, "lease", "info") if "auto-switching is OFF" in f.detail]
+    assert "cc-swap auto on" in f.fix
+    # A standing user choice, not a problem: doctor's verdict is unchanged.
+    assert dr.exit_code(findings) == 0
 
 
 def test_default_lease_probe_creates_no_lock_file(tmp_path):
@@ -465,6 +494,16 @@ def test_settings_repairs_are_warnings(world):
     details = [f.detail for f in find(run(world), "settings", "warn")]
     assert any("soft5h" in d for d in details)
     assert any("prime.enabled" in d for d in details)
+
+
+def test_a_bool_written_as_a_string_is_a_settings_warning(world):
+    world.healthy()
+    world.settings(autoswitch={"strategy": "maximize", "includeApiKeyAccounts": "false"},
+                   prime={"enabled": "false"})
+    details = [f.detail for f in find(run(world), "settings", "warn")]
+    assert any("autoswitch.includeApiKeyAccounts" in d and "read as false" in d for d in details)
+    [prime] = [d for d in details if "prime.enabled" in d]  # reported once
+    assert "false" in prime
 
 
 # -- robustness, exit codes and the CLI -------------------------------------------------------

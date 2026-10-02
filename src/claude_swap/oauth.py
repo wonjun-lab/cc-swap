@@ -199,20 +199,18 @@ def login_expiring_soon(
 def login_expiry_note_ms(deadline_ms: float | None, now_ms: int | None = None) -> str | None:
     """Human note on a login deadline, or ``None`` when unknown.
 
-    ``"login expires Sep 23 01:23 in 9d 12h"`` ahead of the deadline, and
-    ``"login expired Sep 12 10:56"`` once it has passed. Same clock/countdown
-    formatting as the access-token line so the two read together.
+    ``"login expires Sep 23 01:23 (in 9d 12h)"`` ahead of the deadline, and
+    ``"login expired Sep 12 10:56 (2d 3h ago)"`` once it has passed: local
+    time with the date (:func:`deadline_text`), the one format doctor, list,
+    the auto log and Fleet share.
     """
     if deadline_ms is None:
         return None
     now = now_ms if now_ms is not None else _now_ms()
-    deadline_utc = datetime.fromtimestamp(deadline_ms / 1000, tz=timezone.utc)
-    now_utc = datetime.fromtimestamp(now / 1000, tz=timezone.utc)
-    clock = reset_clock_string(deadline_utc, now_utc)
+    text = deadline_text(deadline_ms / 1000.0, now / 1000.0)
     if now >= deadline_ms:
-        return f"login expired {clock}"
-    countdown = login_countdown((deadline_ms - now) / 1000)
-    return f"login expires {clock} in {countdown}"
+        return f"login expired {text}"
+    return f"login expires {text}"
 
 
 def login_countdown(remaining_s: float) -> str:
@@ -231,6 +229,31 @@ def login_countdown(remaining_s: float) -> str:
 def login_expiry_note(credentials: str, now_ms: int | None = None) -> str | None:
     """:func:`login_expiry_note_ms` for a stored credential."""
     return login_expiry_note_ms(login_expires_at_ms(credentials), now_ms)
+
+
+def local_clock(epoch_s: float) -> str:
+    """Local time with the date, ``"Oct 2 20:04"``: the one format for a login
+    deadline wherever cc-swap shows one (doctor, list, the auto log, Fleet)."""
+    when = datetime.fromtimestamp(epoch_s, tz=timezone.utc).astimezone()
+    return when.strftime(f"%b {when.day} %H:%M")
+
+
+def deadline_text(epoch_s: float, now_s: float | None = None) -> str:
+    """:func:`local_clock` plus how far away it is: ``"Oct 2 20:04 (in 3d 4h)"``
+    ahead of it, ``"Oct 2 20:04 (3d 4h ago)"`` once it has passed."""
+    now = now_s if now_s is not None else _now_ms() / 1000.0
+    if epoch_s > now:
+        return f"{local_clock(epoch_s)} (in {login_countdown(epoch_s - now)})"
+    return f"{local_clock(epoch_s)} ({login_countdown(now - epoch_s)} ago)"
+
+
+#: How to re-login an account, the same words on every surface.
+RELOGIN_STEPS = "Fleet → select → r, or claude → /login → cc-swap add"
+
+
+def relogin_fix(number: str | int) -> str:
+    """The one re-login instruction every surface prints for slot ``number``."""
+    return f"re-login #{number}: {RELOGIN_STEPS}"
 
 
 def is_oauth_token_expired(expires_at: object) -> bool:
@@ -983,7 +1006,7 @@ def _persist(
         _logger.warning(
             "Refreshed OAuth token for account %s (%s) but failed to persist it: %r. "
             "The refresh token on disk may now be stale; if the next refresh fails "
-            "with invalid_grant, re-run `cswap --add-account` after logging in.",
+            "with invalid_grant, re-run `cc-swap add` after logging in.",
             account_num,
             email,
             e,
@@ -992,6 +1015,6 @@ def _persist(
         # other ``--json`` commands, whose stdout is one machine-readable object.
         print_warning(
             f"Warning: failed to save refreshed token for account {account_num} ({email}). "
-            f"If the next refresh fails, re-run `cswap --add-account` after logging in.",
+            f"If the next refresh fails, re-run `cc-swap add` after logging in.",
             file=sys.stderr,
         )

@@ -705,17 +705,43 @@ class TestUpgradeAlreadyCurrent:
             ["uv", "tool", "install", "--force", f"{FORK}@cc-v0.1.1"], check=False
         )
 
-    def test_older_release_than_installed_still_skips_nothing_weird(
+    def test_never_downgrades_to_an_older_release(
+        self, mock_urlopen, mock_run, mock_detect, monkeypatch, capsys
+    ):
+        # `upgrade --check` calls 0.2.0 up to date against a 0.1.1 release;
+        # `upgrade` must not then install that older release.
+        monkeypatch.setattr("claude_swap.update_check.__version__", "0.2.0", raising=False)
+        mock_urlopen.return_value = _make_release_response("0.1.1")
+
+        assert run_self_upgrade() == 0
+
+        mock_run.assert_not_called()
+        out = capsys.readouterr().out
+        assert "0.2.0" in out and "cc-v0.1.1" in out
+        assert "--force" in out
+
+    def test_a_prerelease_build_is_not_moved_back_to_the_last_final(
         self, mock_urlopen, mock_run, mock_detect, monkeypatch
     ):
-        # Not equal -> proceed (the pinned reinstall is what the user asked for).
+        monkeypatch.setattr("claude_swap.update_check.__version__", "0.4.0rc1", raising=False)
+        mock_urlopen.return_value = _make_release_response("0.3.1")
+
+        assert run_self_upgrade() == 0
+
+        mock_run.assert_not_called()
+
+    def test_force_installs_the_older_release(
+        self, mock_urlopen, mock_run, mock_detect, monkeypatch
+    ):
         monkeypatch.setattr("claude_swap.update_check.__version__", "0.2.0", raising=False)
         mock_urlopen.return_value = _make_release_response("0.1.1")
         mock_run.return_value = MagicMock(returncode=0)
 
-        run_self_upgrade()
+        assert run_self_upgrade(force=True) == 0
 
-        mock_run.assert_called_once()
+        mock_run.assert_called_once_with(
+            ["uv", "tool", "install", "--force", f"{FORK}@cc-v0.1.1"], check=False
+        )
 
     def test_unparseable_installed_version_reinstalls(
         self, mock_urlopen, mock_run, mock_detect, monkeypatch

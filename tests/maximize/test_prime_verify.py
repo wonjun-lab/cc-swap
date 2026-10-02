@@ -379,6 +379,56 @@ class TestRunVerify:
         assert "ACCEPTED" in report.checks[2].detail
         assert not report.recorded and pv.verified_version(tmp_path / "root") is None
 
+    def test_a_failed_verify_invalidates_an_earlier_verification(self, tmp_path):
+        # Verified 2.1.4 earlier; now the same build fails isolation. The old
+        # record must not keep priming going.
+        root = tmp_path / "root"
+        root.mkdir()
+        claude = _claude(tmp_path)
+        system = FakeSystem(tmp_path)
+        clean_401 = system.result
+        assert pv.run_verify(root, claude, deps=system.deps(), now=NOW).ok
+        assert pv.gate(root, claude, reader=Reader("2.1.4")).ok
+
+        system.result = PrimeRunResult(0, False, "", '{"is_error":false}', False)
+        report = pv.run_verify(root, claude, deps=system.deps(), now=NOW + 60)
+        assert not report.ok and not report.recorded
+        assert pv.verified_version(root) is None
+        verdict = pv.gate(root, claude, reader=Reader("2.1.4"))
+        assert not verdict.ok
+        assert "failed" in verdict.reason and "cc-swap prime verify" in verdict.reason
+        assert pv.paused_note(root) is not None and "failed" in pv.paused_note(root)
+        # A primed run after the failure must not quietly adopt a baseline.
+        pv.note_verified_prime(root, "2.1.4")
+        assert pv.verified_version(root) is None
+
+        # Passing again lifts it.
+        system.result = clean_401
+        assert pv.run_verify(root, claude, deps=system.deps(), now=NOW + 120).ok
+        assert pv.gate(root, claude, reader=Reader("2.1.4")).ok
+        assert pv.paused_note(root) is None
+
+    def test_a_failed_first_verify_pauses_priming_too(self, tmp_path):
+        root = tmp_path / "root"
+        root.mkdir()
+        claude = _claude(tmp_path)
+        system = FakeSystem(tmp_path)
+        system.result = PrimeRunResult(0, False, "", '{"is_error":false}', False)
+        assert not pv.run_verify(root, claude, deps=system.deps(), now=NOW).ok
+        assert not pv.gate(root, claude, reader=Reader("2.1.4")).ok
+
+    def test_doctor_reports_a_failed_verify_as_paused(self, tmp_path):
+        from claude_swap.maximize import doctor as dr
+
+        root = tmp_path / "root"
+        root.mkdir()
+        system = FakeSystem(tmp_path)
+        assert pv.run_verify(root, _claude(tmp_path), deps=system.deps(), now=NOW).ok
+        system.result = PrimeRunResult(0, False, "", '{"is_error":false}', False)
+        pv.run_verify(root, _claude(tmp_path), deps=system.deps(), now=NOW + 60)
+        note, verified = dr.priming_guard(root)
+        assert note is not None and verified is None
+
     def test_a_failure_that_is_not_auth_fails(self, tmp_path):
         system = FakeSystem(tmp_path)
         system.result = PrimeRunResult(1, False, "network down", "", None)

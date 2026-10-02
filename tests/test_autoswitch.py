@@ -2256,6 +2256,101 @@ class TestDryRunAndNoOp:
         assert outcome is TickOutcome.NO_ACTION
         assert "lastSwitchAt" not in harness.state()
 
+    def test_every_target_refused_as_login_dead_is_no_viable_target(self, harness):
+        # switch_to's last-moment check refused every target (login expired).
+        with patch.object(
+            harness.switcher,
+            "switch_to",
+            return_value={"switched": False, "reason": "login-dead",
+                          "loginProblem": "login expired Oct 2 20:04 (1h 0m ago)"},
+        ) as switch_to:
+            outcome = harness.tick_with_usage({
+                "1": _usage(95), "2": _usage(10), "3": _usage(50),
+            })
+        assert switch_to.call_count == 2  # tried #2, then #3
+        assert outcome is TickOutcome.BLOCKED
+        [event] = [e for e in harness.events if isinstance(e, NoSwitchEvent)]
+        assert event.reason == "no-viable-target"
+        assert "lastSwitchAt" not in harness.state()
+
+    def test_a_login_dead_refusal_moves_on_to_the_next_candidate(self, harness):
+        real = harness.switcher.switch_to
+
+        def refuse_2(number, **kw):
+            if str(number) == "2":
+                return {"switched": False, "reason": "login-dead", "loginProblem": "x"}
+            return real(number, **kw)
+
+        with patch.object(harness.switcher, "switch_to", side_effect=refuse_2), \
+             patch.object(harness.switcher, "list_accounts"):
+            outcome = harness.tick_with_usage({
+                "1": _usage(100), "2": _usage(10), "3": _usage(50),
+            })
+        assert outcome is TickOutcome.SWITCHED
+        assert harness.state()["lastSwitchTo"] == "3"
+
+
+def _lapsed_login_with_live_access_token(h: EngineHarness, num: int, email: str) -> None:
+    """Login deadline passed (by the engine clock and the real one), access
+    token still valid for 6 hours: `_freshen_target` has nothing to refresh."""
+    now = h.clock()
+    h.switcher._write_account_credentials(str(num), email, json.dumps({"claudeAiOauth": {
+        "accessToken": f"sk-{num}", "refreshToken": f"rt-{num}",
+        "expiresAt": int((now + 6 * 3600) * 1000),
+        "refreshTokenExpiresAt": int((now - 3600) * 1000),
+    }}))
+
+
+class TestDeadLoginCandidates:
+    """A dead-login candidate stranded the default engine: `_freshen_target`
+    said "ok" (its access token was still valid), `switch_to` refused it as
+    login-dead, and `_perform` returned without trying the next candidate —
+    every tick, for hours, while the active account sat at 100%."""
+
+    def test_the_engine_switches_to_the_next_candidate_on_the_first_tick(self, harness):
+        _lapsed_login_with_live_access_token(harness, 2, "b@example.com")
+        with patch.object(harness.switcher, "list_accounts"):
+            outcome = harness.tick_with_usage({
+                "1": _usage(100), "2": _usage(10), "3": _usage(50),
+            })
+        assert outcome is TickOutcome.SWITCHED
+        assert harness.state()["lastSwitchTo"] == "3"
+
+    def test_freshen_reports_a_lapsed_login(self, harness):
+        _lapsed_login_with_live_access_token(harness, 2, "b@example.com")
+        assert harness.engine._freshen_target("2", "b@example.com") == "login-dead"
+        assert harness.engine._freshen_target("3", "c@example.com") == "ok"
+
+
+class TestEventTimesAreLocal:
+    """The all-exhausted and prime lines printed raw ISO with microseconds
+    ("2026-10-02T11:04:00.123456+00:00"); --json keeps the ISO."""
+
+    ISO = "2026-10-02T11:04:00.123456+00:00"
+    TS = 1_790_939_040.123456
+
+    def test_all_exhausted_prints_local_time(self):
+        from claude_swap.oauth import local_clock
+
+        event = AllExhaustedEvent(earliest_reset_at=self.ISO)
+        text = event.human()
+        assert local_clock(self.TS) in text
+        assert "T11:04" not in text and ".123456" not in text
+        assert event.to_json()["earliestResetAt"] == self.ISO
+
+    def test_prime_event_prints_local_time(self):
+        from claude_swap.autoswitch import PrimeEvent
+        from claude_swap.oauth import local_clock
+
+        event = PrimeEvent("2", "primed", self.ISO.replace("+00:00", "Z"), None)
+        text = event.human()
+        assert f"resets {local_clock(self.TS)}" in text
+        assert "T11:04" not in text
+        assert event.to_json()["resetsAt"] == self.ISO.replace("+00:00", "Z")
+
+    def test_an_unparseable_time_is_shown_as_is(self):
+        assert "soon-ish" in AllExhaustedEvent(earliest_reset_at="soon-ish").human()
+
 
 class TestEventsShape:
     def test_every_event_has_envelope(self, harness):

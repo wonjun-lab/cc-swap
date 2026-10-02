@@ -255,6 +255,15 @@ class TestLastResort:
         assert self._stored() is None
         assert "Also returned Account-3" in capsys.readouterr().out
 
+    def test_remove_clears_an_entry_that_names_no_account(self, temp_home, capsys):
+        # Left by an older `remove N`: resolving the email failed, so it
+        # could never be cleared from the command line.
+        self._seed()
+        set_setting(_backup_root(), "maximize.lastResort", "team@co.com,ghost@x.com")
+        assert self._cmd(["remove", "ghost@x.com"]) == 0
+        assert self._stored() == "team@co.com"
+        assert "named no account" in capsys.readouterr().out
+
     def test_remove_unmarked_account_is_a_noop(self, temp_home, capsys):
         self._seed()
         assert self._cmd(["remove", "2"]) == 0

@@ -354,7 +354,8 @@ class TestRelogin:
         async with app.run_test(size=(160, 40)) as pilot:
             await _open(pilot)
             attention = app.screen.query_one("#fx-attention", Static).render().plain
-            assert "#2" in attention and "login expires in 2d 0h" in attention
+            assert "#2" in attention and "login expires " in attention
+            assert "(in 2d 0h)" in attention
             table = app.screen.query_one("#fx-table", DataTable)
             login_col = [c.plain for c in table.get_row("2")]
             assert "2d 0h" in login_col
@@ -363,7 +364,7 @@ class TestRelogin:
             await _open(pilot)
             assert isinstance(app.screen, ReloginModal)
             steps = app.screen.query_one("#fx-relogin-steps", Static).render().plain
-            assert "login expires in 2d 0h" in steps and "new ~30-day deadline" in steps
+            assert "(in 2d 0h)" in steps and "new ~30-day deadline" in steps
             await pilot.press("escape")
             await _open(pilot)
 

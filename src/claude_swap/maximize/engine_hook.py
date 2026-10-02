@@ -252,6 +252,21 @@ def runtime_for(engine: aw.AutoSwitchEngine) -> MaximizeRuntime:
     return rt if isinstance(rt, MaximizeRuntime) else attach_maximize(engine)
 
 
+def marks_label(s: MaximizeSettings) -> str:
+    """``5h soft 50/hard 95 · 7d soft 90/hard 98``: when maximize switches."""
+    return (
+        f"5h soft {aw.pct_label(s.soft_5h)}/hard {aw.pct_label(s.hard_5h)} · "
+        f"7d soft {aw.pct_label(s.soft_7d)}/hard {aw.pct_label(s.hard_7d)}"
+    )
+
+
+def poll_marks(engine: aw.AutoSwitchEngine) -> str:
+    """The poll line's label: the marks this engine's maximize policy uses
+    (session overrides and ``auto --soft5h`` flags included). Loads the
+    runtime if the first maximize tick has not yet."""
+    return marks_label(runtime_for(engine).settings)
+
+
 def apply_maximize_settings(
     engine: aw.AutoSwitchEngine, settings: MaximizeSettings
 ) -> None:
@@ -440,12 +455,9 @@ def _warn_login_expiry(
             continue
         rt.login_warned[number] = now
         note = oauth.login_expiry_note_ms(deadline * 1000.0, int(now * 1000))
-        then = "re-login needed" if now >= deadline else "re-login before then"
+        then = "" if now >= deadline else "before then, "
         engine._emit(aw.ConfigWarningEvent(
-            message=(
-                f"Account-{number} {note} — {then}: log in with Claude Code as "
-                f"that account, then run: cc-swap add (or Fleet → r)"
-            )
+            message=f"Account-{number} {note} — {then}{oauth.relogin_fix(number)}"
         ))
 
 
@@ -668,12 +680,18 @@ def _switch(
             return engine._perform(number, email, pick.trigger, left), None
         status = engine._freshen_target(number, email)
         if status == "ok":
-            with ledger.switch_context(reason=pick.reason):
-                outcome = engine._perform(number, email, pick.trigger, left)
-            if outcome is aw.TickOutcome.SWITCHED:
-                _reset_samples(engine, number)
-                return outcome, number
-            return outcome, None
+            try:
+                with ledger.switch_context(reason=pick.reason):
+                    outcome = engine._perform(number, email, pick.trigger, left)
+            except aw.TargetLoginDead:
+                # switch_to refused the target (its login is dead): set it
+                # aside and decide again, as for a target that failed to freshen.
+                status = "login-dead"
+            else:
+                if outcome is aw.TickOutcome.SWITCHED:
+                    _reset_samples(engine, number)
+                    return outcome, number
+                return outcome, None
         if status in ("identity-conflict", "invalid_grant"):
             engine._quarantine(number, email, status)
         elif status == "transient":

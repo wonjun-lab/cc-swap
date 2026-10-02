@@ -284,6 +284,24 @@ def _now_iso() -> str:
     )
 
 
+class TargetLoginDead(Exception):
+    """``_perform``: ``switch_to`` refused the target because its stored login
+    is dead. Nothing was written; the caller tries its next candidate."""
+
+
+def local_time_label(iso: str) -> str:
+    """An event's ISO timestamp for a human line: local time with the date
+    and how far off it is (``oauth.deadline_text``), never the raw ISO with
+    microseconds. Anything unparseable is returned as is. JSON keeps the ISO."""
+    try:
+        when = datetime.fromisoformat(iso.replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return iso
+    if when.tzinfo is None:
+        when = when.replace(tzinfo=timezone.utc)
+    return oauth.deadline_text(when.timestamp())
+
+
 def pct_label(value: float) -> str:
     """A percentage for display, as configured: 85.555555 stays itself
     (never a rounded "85.5556") and 99.9 never becomes a lying "100" the
@@ -336,6 +354,10 @@ class PollEvent(AutoSwitchEvent):
     # (e.g. "89%") hides which window binds — #115 was reported off that
     # ambiguity.
     windows: dict[str, dict[str, float]] = field(default_factory=dict)
+    # cc-swap: under strategy maximize, the soft/hard marks that decide
+    # ("5h soft 50/hard 95 · 7d soft 90/hard 98"), shown instead of the
+    # "switch at N%" threshold label maximize never switches at. Additive.
+    marks: str | None = None
 
     def _fields(self) -> dict:
         fields = {
@@ -343,6 +365,8 @@ class PollEvent(AutoSwitchEvent):
             "headroomPct": self.headroom,
             "threshold": self.threshold,
         }
+        if self.marks:
+            fields["marks"] = self.marks
         if self.fetch_errors:
             fields["fetchErrors"] = self.fetch_errors
         if self.windows:
@@ -375,9 +399,10 @@ class PollEvent(AutoSwitchEvent):
             if n != str(num)
         )
         tail = f" | others: {others}" if others else ""
+        label = self.marks or f"switch at {pct_label(self.threshold)}%"
         return (
             f"Account-{num} ({self.active.get('email')}): {used} "
-            f"(switch at {pct_label(self.threshold)}%){tail}"
+            f"({label}){tail}"
         )
 
 
@@ -438,8 +463,7 @@ class QuarantineEvent(AutoSwitchEvent):
     def human(self) -> str:
         return (
             f"Account-{self.number} ({self.email}) quarantined: {self.reason}. "
-            f"Log in with it and run 'cswap --add-account --slot {self.number}' "
-            "to recover."
+            f"To recover, {oauth.relogin_fix(self.number)}"
         )
 
 
@@ -484,7 +508,10 @@ class AllExhaustedEvent(AutoSwitchEvent):
 
     def human(self) -> str:
         if self.earliest_reset_at:
-            return f"all accounts exhausted; earliest reset {self.earliest_reset_at}"
+            return (
+                "all accounts exhausted; earliest reset "
+                f"{local_time_label(self.earliest_reset_at)}"
+            )
         return "all accounts exhausted; no reset time known"
 
 
@@ -604,7 +631,7 @@ class PrimeEvent(AutoSwitchEvent):
         who = f"Account-{self.account}" if self.account else "priming"
         text = f"{who}: 5h window {self.outcome}"
         if self.resets_at:
-            text += f", resets {self.resets_at}"
+            text += f", resets {local_time_label(self.resets_at)}"
         if self.detail:
             text += f" ({self.detail})"
         return text
@@ -915,7 +942,9 @@ class AutoSwitchEngine:
         Returns ``"ok"``, ``"invalid_grant"`` (dead lineage — quarantine),
         ``"identity-conflict"`` (alive but authenticates as a different
         account — quarantine, do not activate), ``"transient"`` (network
-        trouble — try again next tick) or ``"skip-live-session"``. Only ever
+        trouble — try again next tick), ``"login-dead"`` (the login's deadline
+        passed, or the slot is otherwise dead — skip it) or
+        ``"skip-live-session"``. Only ever
         touches the slot's *backup* store; the active credential belongs to
         Claude Code.
         """
@@ -935,13 +964,19 @@ class AutoSwitchEngine:
         data = oauth.extract_oauth_data(creds)
         if not data:
             return "invalid_grant"
-        expires_at = data.get("expiresAt")
         now_ms = self.clock() * 1000
+        expires_at = data.get("expiresAt")
         near_expiry = (
             isinstance(expires_at, (int, float))
             and now_ms + FRESHEN_BUFFER_MS >= expires_at
         )
         if not near_expiry:
+            if oauth.is_login_expired(creds, now_ms=int(now_ms)) or self._login_dead(number):
+                # The login itself is over, but its access token is still
+                # valid: nothing to refresh (a refresh would get the
+                # invalid_grant that quarantines it), and `switch_to` would
+                # refuse it as login-dead. Not a target; try the next one.
+                return "login-dead"
             return "ok"
         # The consume gate serializes every backup-rt POST (the recovery
         # branch in `_fetch_active_usage` is a second call site, under the
@@ -974,6 +1009,17 @@ class AutoSwitchEngine:
             # send the user to check a connection that is fine.
             return outcome.error
         return "transient"
+
+    def _login_dead(self, number: str) -> bool:
+        """``switcher.dead_login_reason`` (the check ``switch_to`` refuses
+        on); False when the switcher has none or it cannot tell."""
+        check = getattr(self.switcher, "dead_login_reason", None)
+        if check is None:
+            return False
+        try:
+            return check(number) is not None
+        except Exception:
+            return False
 
     def _note_token_identity(
         self, number: str, token_account: dict | None
@@ -1050,6 +1096,18 @@ class AutoSwitchEngine:
             current=current, quarantined=quarantined, state=state,
         )
 
+    def _maximize_marks(self, settings) -> str | None:
+        """cc-swap: the poll line's label under strategy maximize (see
+        ``PollEvent.marks``); None for every other strategy."""
+        if settings.strategy != "maximize":
+            return None
+        try:
+            from claude_swap.maximize.engine_hook import poll_marks
+
+            return poll_marks(self)
+        except Exception:  # a label never breaks a tick
+            return None
+
     def _tick_inner(self) -> TickOutcome:
         self._sleep_until_ts = None
         self._blocked_wait_long = False
@@ -1078,14 +1136,14 @@ class AutoSwitchEngine:
                 self._emit(
                     NoSwitchEvent(
                         reason="unmanaged-active-account",
-                        detail="run 'cswap --add-account' to include it in rotation",
+                        detail="run 'cc-swap add' to include it in rotation",
                     )
                 )
             else:
                 self._emit(
                     NoSwitchEvent(
                         reason="no-active-account",
-                        detail="log in and run 'cswap --add-account' first",
+                        detail="log in and run 'cc-swap add' first",
                     )
                 )
             return TickOutcome.NO_ACTION
@@ -1116,6 +1174,7 @@ class AutoSwitchEngine:
                         value if isinstance(value, dict) else None, self._models
                     ))
                 },
+                marks=self._maximize_marks(settings),
             )
         )
 
@@ -1571,9 +1630,12 @@ class AutoSwitchEngine:
                 ) < _SYSTEMIC_STATUSES.index(systemic):
                     systemic = status
                 continue
-            if status == "skip-live-session":
+            if status in ("skip-live-session", "login-dead"):
                 continue
-            return self._perform(num, email, trigger, left_snapshot)
+            try:
+                return self._perform(num, email, trigger, left_snapshot)
+            except TargetLoginDead:
+                continue  # switch_to's last-moment refusal: next candidate
 
         if systemic or transient_failure:
             self._emit(
@@ -2379,6 +2441,13 @@ class AutoSwitchEngine:
                     )
                 )
                 return TickOutcome.NO_ACTION
+            if result and result.get("reason") == "login-dead" and not result.get("switched"):
+                # switch_to's last-moment check: the target's stored login
+                # is dead (expired / quarantined), so it was not activated.
+                # Nothing changed; the caller moves on to its next candidate.
+                raise TargetLoginDead(
+                    str(result.get("loginProblem") or result.get("message") or "")
+                )
             if not result or not result.get("switched"):
                 self._emit(
                     NoSwitchEvent(

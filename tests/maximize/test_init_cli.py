@@ -8,7 +8,7 @@ import json
 import pytest
 
 from claude_swap.maximize import doctor_cli
-from tests.maximize.doctor_support import World, files
+from tests.maximize.doctor_support import World, creds, files
 
 
 @pytest.fixture
@@ -98,6 +98,28 @@ def test_everything_done_exits_0_and_is_idempotent(world, monkeypatch, capsys):
     assert first[0] == 0 and "All set." in first[1]
     assert files(world.home, world.root) == before, "init without --apply wrote a file"
     assert "SECRET" not in first[1] and "@example.com" not in first[1]
+
+
+def test_all_steps_ok_but_doctor_warns_is_not_all_set(world, monkeypatch, capsys):
+    """init said "All set" (exit 0) while doctor exited 1 over a plaintext
+    copy of the Keychain login: init only looked at plaintext *errors*."""
+    from claude_swap.maximize import doctor as dr
+
+    world.healthy()
+    world.login(1, plaintext=creds(1))  # the same login, also in plaintext
+    doctor_findings = dr.run_checks(world.probes())
+    problems = [f for f in doctor_findings if f.severity in ("warn", "error")]
+    assert problems, "the setup must make doctor complain"
+    code, out = run_init(world, monkeypatch, capsys)
+    assert code == 0  # every step is still ok
+    assert "All set." not in out
+    n = len(problems)
+    assert f"Set up, but cc-swap doctor reports {n} " in out
+    assert problems[0].detail in out
+
+    payload = json.loads(run_init(world, monkeypatch, capsys, "--json")[1])
+    assert payload["doctor"]["exitCode"] == dr.exit_code(doctor_findings)
+    assert payload["doctor"]["counts"] == dr.counts(doctor_findings)
 
 
 def test_json(world, monkeypatch, capsys):
