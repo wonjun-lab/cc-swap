@@ -100,6 +100,13 @@ class TestGate:
         verdict = pv.gate(tmp_path, _claude(tmp_path), reader=Reader(None))
         assert not verdict.ok and "--version" in verdict.reason
 
+    def test_version_output_that_is_not_utf8_is_read_not_crashed_on(self, tmp_path):
+        claude = tmp_path / "bin" / "claude"
+        claude.parent.mkdir(parents=True)
+        claude.write_text("#!/bin/sh\nprintf '\\377\\376 2.1.3 (Claude Code)\\n'\n")
+        claude.chmod(0o755)
+        assert REAL_READER(str(claude)) == "2.1.3"
+
     def test_first_verified_prime_becomes_the_baseline_but_never_overrides(self, tmp_path):
         pv.note_verified_prime(tmp_path, "2.1.3")
         assert pv.verified_version(tmp_path) == "2.1.3"
@@ -133,6 +140,49 @@ class TestPrimerGate:
         disabled = [e for e in events if isinstance(e, PrimeEvent)]
         assert [e.outcome for e in disabled] == ["disabled"]
         assert runner.calls == []
+
+    @pytest.mark.parametrize("boom", [RuntimeError("boom"), UnicodeDecodeError("utf-8", b"\xff", 0, 1, "x")])
+    def test_a_crashing_version_check_keeps_priming_paused(self, rig, monkeypatch, boom):
+        def crash(_p):
+            raise boom
+
+        monkeypatch.setattr(pv, "read_claude_version", crash)
+        runner = StubRunner(rig)
+        primer = rig.primer(runner=runner)
+        first = primer.run_due(rig.snap())
+        assert [type(e) for e in first] == [ConfigWarningEvent]
+        assert "could not read claude version" in first[0].message
+        assert primer.run_due(rig.snap()) == []  # warned once
+        assert runner.calls == []
+
+    def test_a_crashing_version_check_fails_a_manual_prime_with_the_reason(self, rig, monkeypatch):
+        def crash(_p):
+            raise RuntimeError("boom")
+
+        monkeypatch.setattr(pv, "read_claude_version", crash)
+        runner = StubRunner(rig)
+        events = rig.primer(runner=runner).prime_now(rig.snap(), sleep=rig.clock.advance)
+        disabled = [e for e in events if isinstance(e, PrimeEvent)]
+        assert [e.outcome for e in disabled] == ["disabled"]
+        assert "could not read claude version" in disabled[0].detail
+        assert runner.calls == []
+
+    def test_a_recovered_version_check_lifts_the_pause(self, rig, monkeypatch):
+        calls = []
+
+        def flaky(_p):
+            calls.append(1)
+            if len(calls) == 1:
+                raise RuntimeError("boom")
+            return "9.9.9"
+
+        monkeypatch.setattr(pv, "read_claude_version", flaky)
+        runner = StubRunner(rig)
+        primer = rig.primer(runner=runner)
+        primer.run_due(rig.snap())
+        assert runner.calls == []
+        primer.run_due(rig.snap())
+        assert len(runner.calls) == 1
 
     def test_verify_lifts_the_pause_without_a_restart(self, rig, monkeypatch):
         self._changed(rig, monkeypatch)

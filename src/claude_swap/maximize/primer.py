@@ -892,9 +892,15 @@ class Primer:
                 self.engine.switcher.backup_dir, claude,
                 reader=self._version_reader, clock=self._clock,
             )
-        except Exception as e:  # the record is ours; a broken one pauses nothing
-            _logger.debug("prime: version gate failed: %s", type(e).__name__)
-            return None
+        except Exception as e:
+            # Fail closed: a check that crashed proves nothing about the
+            # installed claude, so priming stays paused until it works again.
+            _logger.warning("prime: version gate failed: %s", type(e).__name__)
+            verdict = prime_verify.Gate(
+                False, None, None,
+                f"could not read claude version ({type(e).__name__}); "
+                f"{prime_verify.PAUSED_UNTIL}",
+            )
         self._gate_version = verdict.current
         if verdict.ok:
             self._gate_warned = None

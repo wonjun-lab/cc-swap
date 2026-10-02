@@ -153,9 +153,10 @@ def read_claude_version(claude_path: str) -> str | None:
             stdin=subprocess.DEVNULL,
             capture_output=True,
             text=True,
+            errors="replace",
             timeout=VERSION_TIMEOUT_S,
         )
-    except (OSError, subprocess.TimeoutExpired):
+    except (OSError, subprocess.SubprocessError):
         return None
     if result.returncode != 0:
         return None
