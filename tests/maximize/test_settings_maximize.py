@@ -56,6 +56,7 @@ class TestRegistry:
             "maximize.idleMaxDeltaPct", "maximize.forceEtaMin",
             "maximize.pendingPollS", "maximize.rebalanceCooldownMin",
             "maximize.tieEpsilon", "maximize.lastResort", "maximize.planOverride",
+            "maximize.loginExpiryGuardMin",
             "prime.enabled", "prime.model", "prime.jitterS", "prime.maxAttempts",
             "prime.claudePath",
         } <= keys
@@ -78,6 +79,7 @@ class TestRegistry:
             "maximize.pendingPollS": (180, 600),
             "maximize.rebalanceCooldownMin": (0, 240),
             "maximize.tieEpsilon": (0.0, 2.0),
+            "maximize.loginExpiryGuardMin": (0, 1440),
             "prime.maxAttempts": (1, 5),
         }
 
@@ -644,3 +646,11 @@ class TestConfigCli:
         rows = {spec.dotted: (value, is_set) for spec, value, is_set in effective_settings(tmp_path)}
         assert rows["maximize.hard7d"] == (98.0, False)
         assert rows["prime.jitterS"] == ("45-300", False)
+
+
+def test_login_expiry_guard_defaults_to_two_hours_and_loads(tmp_path: Path):
+    assert MaximizeSettings().login_expiry_guard_min == 120
+    _write(tmp_path, {"maximize": {"loginExpiryGuardMin": 30}})
+    assert load_maximize_settings(tmp_path).login_expiry_guard_min == 30
+    set_setting(tmp_path, "maximize.loginExpiryGuardMin", "0")
+    assert load_maximize_settings(tmp_path).login_expiry_guard_min == 0

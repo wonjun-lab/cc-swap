@@ -265,6 +265,10 @@ def skip_reason(
         return "api-key"
     if view.quarantined:
         return "quarantined"
+    if view.login_deadline is not None and now >= view.login_deadline:
+        # Past its login deadline: the next refresh is refused, so a launch
+        # would spend an access token on a login that is already gone.
+        return "login-expired"
     if view.pct5 is None or view.pct7 is None:
         return "usage-unknown"
     if view.pct7 >= 100.0:
@@ -1244,9 +1248,13 @@ def prime_snapshot(engine, usage: Mapping[str, dict | str | None], now: float) -
     records = (switcher._get_sequence_data() or {}).get("accounts", {})
     if not isinstance(records, dict):
         records = {}
+    from claude_swap.maximize.engine_hook import read_login_deadlines
+
+    active = switcher.current_account_number()
     return build_snapshot(
         now=now,
-        active=switcher.current_account_number(),
+        active=active,
+        login_deadlines=read_login_deadlines(switcher, records, active),
         usage=usage,
         records=records,
         quarantined=set(quarantine) if isinstance(quarantine, dict) else set(),

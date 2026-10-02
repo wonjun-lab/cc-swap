@@ -354,3 +354,46 @@ def test_landing_and_escape_candidates_exclude_the_active():
 def test_reasons_carry_no_email():
     for case in CASES:
         assert "@" not in decide(case.snap).reason, case.id
+
+
+# -- login expiry guard (maximize.loginExpiryGuardMin) --------------------------------
+
+
+def expiring(view: AccountView, minutes_left: float) -> AccountView:
+    from dataclasses import replace
+
+    return replace(view, login_deadline=NOW + minutes_left * 60)
+
+
+class TestLoginExpiryGuard:
+    def test_soft_switch_skips_a_target_whose_login_expires_within_the_guard(self):
+        s = snap("1", acct("1", 60, 40), expiring(acct("2", 0, 10), 90), acct("3", 0, 30),
+                 samples="idle")
+        got = decide(s)
+        assert isinstance(got, Switch) and got.trigger == "soft" and got.target == "3"
+        assert [v.number for v in landing_candidates(s)] == ["3"]
+
+    def test_soft_holds_when_the_only_target_is_inside_the_guard(self):
+        s = snap("1", acct("1", 60, 40), expiring(acct("2", 0, 10), 30), samples="idle")
+        assert isinstance(decide(s), Hold)
+
+    def test_rebalance_skips_it_too(self):
+        s = snap("1", acct("1", 10, 60), expiring(acct("2", 0, 0), 60),
+                 samples="idle", last_switch_min=120)
+        assert isinstance(decide(s), Hold)
+        fine = snap("1", acct("1", 10, 60), expiring(acct("2", 0, 0), 180),
+                    samples="idle", last_switch_min=120)
+        got = decide(fine)
+        assert isinstance(got, Switch) and got.trigger == "rebalance" and got.target == "2"
+
+    def test_at_limit_still_falls_back_to_it(self):
+        s = snap("1", acct("1", 100, 40), expiring(acct("2", 0, 10), 30), samples="busy")
+        got = decide(s)
+        assert isinstance(got, Switch) and got.trigger == "at-limit" and got.target == "2"
+
+    def test_guard_is_configurable_and_unknown_deadlines_are_not_guarded(self):
+        s = snap("1", acct("1", 60, 40), expiring(acct("2", 0, 10), 90), samples="idle",
+                 login_expiry_guard_min=60)
+        assert decide(s).target == "2"
+        unknown = snap("1", acct("1", 60, 40), acct("2", 0, 10), samples="idle")
+        assert decide(unknown).target == "2"

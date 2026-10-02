@@ -71,6 +71,7 @@ def build_snapshot(
     last_switch_at: float | None,
     settings: MaximizeSettings,
     active_changed_at: float | None = None,
+    login_deadlines: Mapping[str, float] | None = None,
 ) -> Snapshot:
     """One view per ``records`` entry, in ``records`` order (sequence order)."""
     last_resort = parse_account_list(settings.last_resort)
@@ -93,6 +94,7 @@ def build_snapshot(
                 reset7=reset7,
                 quarantined=number in quarantined,
                 api_key=number in api_key_accounts,
+                login_deadline=(login_deadlines or {}).get(number),
             )
         )
     return Snapshot(

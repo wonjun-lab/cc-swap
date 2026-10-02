@@ -670,6 +670,21 @@ class TestLoginExpiryWarning:
         assert line.startswith("Account-1 login expired ")
 
 
+class TestLoginExpiryGuardEngine:
+    def test_soft_switch_lands_past_an_account_whose_login_is_about_to_expire(
+        self, temp_home
+    ):
+        h = make(temp_home)
+        set_login_deadline(h, 2, 90 * 60)  # inside the 120-minute guard
+        usage = {"1": win(62, 40), "2": win(0, 10), "3": win(0, 50)}
+        for _ in range(3):
+            if h.tick_with_usage(usage) is TickOutcome.SWITCHED:
+                break
+            h.clock.advance(300)
+        assert h.active_number() == 3
+        assert of(h, SwitchEvent)[-1].trigger == "soft"
+
+
 def test_combined_soft_idle_last_resort_excluded_and_priming(temp_home):
     """Spec §10: the features together — the shape where separately green
     upstream PRs misbehaved once combined."""

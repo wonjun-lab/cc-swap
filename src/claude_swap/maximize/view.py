@@ -219,6 +219,11 @@ def snapshot_from_accounts(
         samples=state.samples if state.samples_account == snap.active_number else (),
         last_switch_at=state.last_switch_at,
         settings=settings,
+        login_deadlines={
+            a.number: a.login_expires_at / 1000.0
+            for a in accounts
+            if a.login_expires_at is not None
+        },
     )
 
 

@@ -437,6 +437,15 @@ def test_login_cell_counts_down_amber_in_the_last_week_red_in_the_last_day():
     assert "login" not in fleet.detail_line(rows["1"], MX, now=NOW)
 
 
+def test_land_note_names_the_login_guard():
+    snap = accounts(acc(1, active=True), _expiring(2, 30 * 60, alias="soon"),
+                    _expiring(3, 3 * H, alias="ok"))
+    rows = {r.number: r for r in fleet.fleet_rows(snap, MX, PRIME, MaximizeState(), now=NOW)}
+    assert rows["2"].land == "login<2h" and rows["2"].landable is False
+    assert rows["3"].land == "yes"
+    assert "login expires within the 120-min guard" in fleet.detail_line(rows["2"], MX, now=NOW)
+
+
 def test_attention_warns_of_logins_expiring_within_a_week():
     snap = accounts(
         acc(1, active=True),

@@ -96,6 +96,7 @@ _NUMERIC_KEYS: tuple[tuple[str, str], ...] = (
     ("pendingPollS", "pending_poll_s"),
     ("rebalanceCooldownMin", "rebalance_cooldown_min"),
     ("tieEpsilon", "tie_epsilon"),
+    ("loginExpiryGuardMin", "login_expiry_guard_min"),
 )
 
 
@@ -375,30 +376,21 @@ def _rate_limit_tiers(
     return out
 
 
-def _login_deadlines(
-    engine: aw.AutoSwitchEngine,
-    rt: MaximizeRuntime,
-    records: Mapping[str, Mapping],
-    current: str,
-    now: float,
+def read_login_deadlines(
+    switcher, records: Mapping[str, Mapping], current: str | None
 ) -> dict[str, float]:
     """Each slot's login deadline (epoch s): the live login for the active
     slot, the stored backup for the rest. Slots without one are absent.
     Only the deadline leaves this function — never a token."""
-    if (
-        rt.login_deadlines_at is not None
-        and 0 <= now - rt.login_deadlines_at < LOGIN_DEADLINE_TTL_S
-    ):
-        return rt.login_deadlines
     out: dict[str, float] = {}
     for number, record in records.items():
         if record.get("kind") == "api_key":
             continue
         try:
             if number == current:
-                creds = engine.switcher._read_credentials()
+                creds = switcher._read_credentials()
             else:
-                creds = engine.switcher.read_account_credentials(
+                creds = switcher.read_account_credentials(
                     number, str(record.get("email") or "")
                 )
         except Exception:
@@ -407,6 +399,24 @@ def _login_deadlines(
         deadline_ms = oauth.login_expires_at_ms(creds or "")
         if deadline_ms is not None:
             out[number] = deadline_ms / 1000.0
+    return out
+
+
+def _login_deadlines(
+    engine: aw.AutoSwitchEngine,
+    rt: MaximizeRuntime,
+    records: Mapping[str, Mapping],
+    current: str,
+    now: float,
+) -> dict[str, float]:
+    """:func:`read_login_deadlines`, re-read at most every
+    :data:`LOGIN_DEADLINE_TTL_S` (Keychain reads on macOS)."""
+    if (
+        rt.login_deadlines_at is not None
+        and 0 <= now - rt.login_deadlines_at < LOGIN_DEADLINE_TTL_S
+    ):
+        return rt.login_deadlines
+    out = read_login_deadlines(engine.switcher, records, current)
     rt.login_deadlines, rt.login_deadlines_at = out, now
     return out
 
@@ -878,6 +888,7 @@ def run_maximize_tick(
         ),
         settings=rt.settings,
         active_changed_at=active_changed_at,
+        login_deadlines=deadlines,
     )
     decision = policy.decide(snap)
     rt.last_snapshot, rt.last_decision = snap, decision

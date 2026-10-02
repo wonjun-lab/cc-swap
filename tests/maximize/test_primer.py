@@ -59,8 +59,10 @@ def _view(
     reset7: float | None = None,
     quarantined: bool = False,
     api_key: bool = False,
+    login_deadline: float | None = None,
 ) -> AccountView:
     return AccountView(
+        login_deadline=login_deadline,
         number=number,
         email=email or f"u{number}@example.com",
         tier=tier,
@@ -135,6 +137,8 @@ class TestSkipReasons:
             (_view("2", tier="excluded"), None, "excluded"),
             (_view("2", api_key=True), None, "api-key"),
             (_view("2", quarantined=True), None, "quarantined"),
+            (_view("2", login_deadline=NOW - 1), None, "login-expired"),
+            (_view("2", login_deadline=NOW + 60), None, None),  # not past yet
             (_view("2", pct5=None), None, "usage-unknown"),
             (_view("2", pct7=None), None, "usage-unknown"),
             (_view("2", pct7=100.0), None, "7d-exhausted"),

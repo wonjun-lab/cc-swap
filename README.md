@@ -82,6 +82,7 @@ Turn it on with `cc-swap config set autoswitch.strategy maximize`, or use `cc-sw
 | `maximize.tieEpsilon` | float 0–2 | 0.1 | Scores this close count as a tie |
 | `maximize.lastResort` | string | — | Last-resort accounts: emails or aliases, comma-separated |
 | `maximize.planOverride` | string | — | Manual plan per account: `email:20x,email:5x` |
+| `maximize.loginExpiryGuardMin` | int 0–1440 | 120 | A soft or rebalance switch never lands on an account whose login expires within this many minutes (an at-limit or hard fallback still may) |
 | `prime.enabled` | bool | false | Turn 5h priming on |
 | `prime.model` | string | claude-haiku-4-5 | Model used for the priming request |
 | `prime.jitterS` | string | 45-300 | Random delay after a reset before priming, in seconds |

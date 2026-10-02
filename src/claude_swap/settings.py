@@ -93,6 +93,9 @@ class MaximizeSettings:
     tie_epsilon: float = 0.1
     last_resort: str | None = None  # comma-separated emails/aliases
     plan_override: str | None = None  # "email:20x,email:5x"
+    # A soft/rebalance switch never lands on an account whose login expires
+    # within this many minutes (at-limit/hard fallbacks still may).
+    login_expiry_guard_min: int = 120
 
 
 @dataclass(frozen=True)
@@ -230,6 +233,10 @@ SETTING_SPECS: dict[str, SettingSpec] = {
         SettingSpec(
             "maximize", "tieEpsilon", "tie_epsilon", "float", 0.0, 2.0,
             help="maximize: scores this close count as a tie",
+        ),
+        SettingSpec(
+            "maximize", "loginExpiryGuardMin", "login_expiry_guard_min", "int", 0, 1440,
+            help="maximize: never soft/rebalance onto a login expiring within this many minutes",
         ),
         SettingSpec(
             "maximize", "lastResort", "last_resort", "string",

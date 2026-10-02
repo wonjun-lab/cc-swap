@@ -132,7 +132,12 @@ def plan_label(
 
 
 def land_note(
-    view: AccountView, s: MaximizeSettings, *, active: bool, login: LoginState
+    view: AccountView,
+    s: MaximizeSettings,
+    *,
+    active: bool,
+    login: LoginState,
+    now: float | None = None,
 ) -> str:
     """Whether maximize could land on this account, and if not, why."""
     if login == "relogin":
@@ -151,6 +156,8 @@ def land_note(
         return f"5h≥{s.soft_5h - s.landing_margin:g}"
     if view.pct7 >= s.soft_7d - s.landing_margin:
         return f"7d≥{s.soft_7d - s.landing_margin:g}"
+    if now is not None and policy.login_guarded(view, now, s):
+        return f"login<{minutes_text(s.login_expiry_guard_min).replace('h00m', 'h')}"
     return "yes"
 
 
@@ -167,6 +174,7 @@ _SKIP_NOTES = {
     "live-session": "live session",
     "7d-exhausted": "7d spent",
     "quarantined": "re-login",
+    "login-expired": "login exp.",
     "usage-unknown": "usage ?",
     "api-key": "api key",
     "excluded": "—",
@@ -307,8 +315,10 @@ def fleet_rows(
                 pct7=v.pct7,
                 days7=days_left(v, now) if v.pct7 is not None else None,
                 score=r.score,
-                landable=not active and landable(v, mx),
-                land=land_note(v, mx, active=active, login=login),
+                landable=(
+                    not active and landable(v, mx) and not policy.login_guarded(v, now, mx)
+                ),
+                land=land_note(v, mx, active=active, login=login, now=now),
                 state5=r.state5,
                 reset5=v.reset5 if r.state5 != "cold" else None,
                 prime=prime_cell(v, entry, msnap.active, prime, now),
@@ -989,6 +999,11 @@ def detail_line(row: FleetRow, mx: MaximizeSettings, *, now: float | None = None
         "usage ?": "usage unknown",
         "api key": "API key (no quota)",
     }.get(row.land)
+    if land is None and row.land.startswith("login<"):
+        land = (
+            f"not landable (login expires within the {mx.login_expiry_guard_min}-min "
+            "guard; at-limit fallback only)"
+        )
     if land is None:
         land = f"not landable ({row.land}: under both soft marks minus {mx.landing_margin:g})"
     parts.append(land)
