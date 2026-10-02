@@ -7,9 +7,13 @@
    scrollbar goes when the accounts scroll; the tags on the right line up
    with the status note above them either way. */
 
+/* The screen itself never scrolls (Textual's default is overflow-y: auto):
+   on a terminal too short for everything, the status line stays pinned and
+   the rest is clipped. Only #fx-scroll scrolls. */
 FleetScreen {
     layout: vertical;
     background: $background;
+    overflow-y: hidden;
 }
 
 #fx-status {

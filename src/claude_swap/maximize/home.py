@@ -221,6 +221,16 @@ def switching_live(sit: Situation) -> bool:
     return sit in ("live", "waiting")
 
 
+def priming_runs(
+    enabled: bool, es: fx.EngineStatus, sit: Situation, guard: str | None = None
+) -> bool:
+    """Whether an engine primes idle accounts now, so the next prime time is
+    worth showing: priming on, switching live, not paused after a Claude
+    Code update (``guard``), and not a dry run here (it never primes, and
+    while it holds the lease no other engine runs)."""
+    return enabled and switching_live(sit) and es.holder != "here-dry" and not guard
+
+
 def next_number(dv: fx.DecisionView, picks: Sequence[str], sit: Situation) -> str | None:
     """The account automatic switching goes to next: the decision's target
     while it is moving, else the engine's first pick. None while nothing

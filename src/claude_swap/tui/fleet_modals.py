@@ -415,7 +415,8 @@ class MenuItem(ListItem):
 
 class MenuModal(ModalScreen["str | None"]):
     """The home screen's ``m`` menu: every item with its key, its state and
-    a short note. A letter picks its item at once; ↑↓ and enter work too.
+    a short note. A letter picks its item at once; ↑↓ then enter work too
+    (it opens with nothing highlighted, so enter alone does nothing).
     Dismisses with the item's action, or None (esc / b)."""
 
     DEFAULT_CSS = """
@@ -452,9 +453,12 @@ class MenuModal(ModalScreen["str | None"]):
         title_w = min(max((len(r.title) for r in self._rows), default=0) + 3, 40)
         with Vertical(id="fx-menu-box"):
             yield Label("Menu", classes="modal-title")
+            # Nothing highlighted until ↑/↓: a stray enter (the home
+            # screen's switch key) must not run the first item, which turns
+            # automatic switching off.
             yield ListView(
                 *(MenuItem(r, menu_row_text(r, title_w, palette)) for r in self._rows),
-                id="fx-menu-list",
+                id="fx-menu-list", initial_index=None,
             )
             yield Static(MENU_KEYS, classes="modal-hint", markup=False)
 

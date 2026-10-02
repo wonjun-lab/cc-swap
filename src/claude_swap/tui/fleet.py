@@ -568,7 +568,7 @@ class FleetScreen(Screen):
             ticks=mxview.window_ticks(self._mx),
             now=now,
             next_no=home.next_number(dv, picks, sit),
-            priming=self._priming(sit),
+            priming=self._priming(es, sit),
         )
         rows = home.ordered_rows(self._rows, picks)
         self._order = [r.number for r in rows]
@@ -580,9 +580,9 @@ class FleetScreen(Screen):
         self._render_accounts(rows, ctx, layout, width, palette)
         self.query_one("#fx-keys", Static).update(render.keys_text(width, palette))
 
-    def _priming(self, sit: home.Situation) -> bool:
+    def _priming(self, es: fx.EngineStatus, sit: home.Situation) -> bool:
         """Whether priming runs now (the next prime time is worth showing)."""
-        return self._prime.enabled and home.switching_live(sit) and not self._prime_guard
+        return home.priming_runs(self._prime.enabled, es, sit, self._prime_guard)
 
     def _render_top(
         self, es: fx.EngineStatus, dv: fx.DecisionView, sit: home.Situation,
@@ -651,15 +651,21 @@ class FleetScreen(Screen):
     def _fit_scroll(self, layout: home.HomeLayout, expanded_lines: int) -> None:
         """Cap the account area at the rows the fixed lines leave: the
         status line, the attention line, the blank lines, the narrow
-        layout's expanded account and the footer always stay on screen."""
+        layout's expanded account and the footer always stay on screen.
+        When even that does not fit, the expanded account gives up rows
+        first (the list keeps two)."""
         fixed = 1 + 1  # status line, footer
         if self.query_one("#fx-attention").display:
             fixed += 1
         if layout.blanks:
             fixed += 2  # above the status line and above the accounts
-        fixed += expanded_lines
-        height = self.size.height or 36
-        self.query_one("#fx-scroll", VerticalScroll).styles.max_height = max(height - fixed, 2)
+        rest = (self.size.height or 36) - fixed
+        expanded = min(expanded_lines, max(rest - 2, 0))
+        detail = self.query_one("#fx-expanded")
+        detail.styles.max_height = expanded if expanded_lines else None
+        if expanded_lines and not expanded:
+            detail.display = False
+        self.query_one("#fx-scroll", VerticalScroll).styles.max_height = max(rest - expanded, 2)
 
     def _scroll_selected_into_view(self) -> None:
         if not self.is_attached:

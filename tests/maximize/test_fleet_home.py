@@ -181,6 +181,16 @@ def test_situation_never_calls_an_old_or_foreign_decision_live():
     assert _sit(replace(SERVICE, auto_off=True), paused) == "paused"
 
 
+def test_prime_times_show_only_while_an_engine_primes():
+    assert home.priming_runs(True, SERVICE, "live")
+    assert home.priming_runs(True, HERE_LIVE, "waiting")
+    assert not home.priming_runs(False, SERVICE, "live")
+    assert not home.priming_runs(True, HERE_DRY, "live")  # a dry run never primes
+    assert not home.priming_runs(True, SERVICE, "live", guard="paused: claude 2.1.3 -> 2.1.4")
+    for sit in ("stale", "no-engine", "auto-off", "paused"):
+        assert not home.priming_runs(True, SERVICE, sit)
+
+
 def test_next_is_only_named_while_switching_is_live():
     dv = _pending()
     assert home.next_number(dv, ["4", "6"], "live") == "2"  # the decision's target

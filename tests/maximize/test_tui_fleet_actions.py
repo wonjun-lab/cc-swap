@@ -97,7 +97,7 @@ def _tag(app, number: str) -> str:
     screen = app.screen
     row = next(r for r in screen._rows if r.number == number)
     ctx = Ctx(screen._palette(), {}, time.time(), next_no=None,
-              priming=screen._priming(screen._situation))
+              priming=screen._priming(screen._engine_status(), screen._situation))
     tag = home.tag_for(row, is_next=False, now=ctx.now, priming=ctx.priming)
     first = screen.query_one("#fx-body").layout_map.spans[number][0]
     line = screen.query_one("#fx-body", Static).render().plain.splitlines()[first]

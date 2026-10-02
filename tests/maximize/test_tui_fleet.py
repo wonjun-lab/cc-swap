@@ -524,6 +524,27 @@ async def test_the_layout_follows_a_live_resize(tmp_path, held_by_service):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("height", [14, 10, 8, 6])
+async def test_a_very_short_terminal_clips_but_never_scrolls_the_header(
+    tmp_path, held_by_service, height
+):
+    app = make_app(_six(tmp_path))
+    async with app.run_test(size=(80, height)) as pilot:
+        await _open(pilot)
+        screen = app.screen
+        status = screen.query_one("#fx-status")
+        keys = screen.query_one("#fx-keys")
+        expanded = screen.query_one("#fx-expanded")
+        # The mouse wheel never moves the screen itself, only the accounts.
+        assert not screen.allow_vertical_scroll and screen.scroll_offset.y == 0
+        assert status.region.y == 0 and status.region.height == 1  # no blank lines
+        assert keys.region.y == height - 1
+        assert screen.query_one("#fx-scroll").region.height >= 2
+        if expanded.display:
+            assert expanded.region.bottom <= keys.region.y
+
+
+@pytest.mark.asyncio
 async def test_80x24_with_many_accounts_scrolls_the_list_but_never_the_header(tmp_path):
     _settings(tmp_path)
     accounts = [make_account(1, active=True, entry=make_entry(30.0, 20.0), alias="main")]
@@ -611,8 +632,13 @@ class TestKeys:
                 await pilot.pause()
                 assert isinstance(app.screen, FleetScreen), entry
             assert seen == [e.action for e in menus.MAIN_MENU]
-            # ↑↓ and enter work too; esc closes without doing anything.
-            await pilot.press("m", "down", "down", "enter")
+            # Nothing is highlighted when it opens: a stray enter runs nothing
+            # (the first item turns automatic switching off).
+            await pilot.press("m", "enter")
+            await pilot.pause()
+            assert isinstance(app.screen, MenuModal) and len(seen) == len(menus.MAIN_MENU)
+            # ↑↓ then enter work; esc closes without doing anything.
+            await pilot.press("down", "down", "down", "enter")
             await pilot.pause()
             assert seen[-1] == "strategy"
             await pilot.press("m", "escape")
