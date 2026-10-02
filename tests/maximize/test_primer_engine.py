@@ -297,6 +297,38 @@ class TestPrimer:
         assert runner.calls == []
 
 
+def _pending(rig, outcome: str, age_s: float, attempts: int = 2) -> None:
+    rig.engine._mutate_state(lambda s: s.setdefault("primes", {}).update({
+        "b@example.com": {"windowKey": "cold", "attempts": attempts,
+                          "lastAttemptAt": rig.clock() - age_s, "lastOutcome": outcome},
+    }))
+
+
+class TestStaleVerification:
+    """A launch still pending after a whole window (the machine slept through
+    it) cannot be told apart from anything since: it is dropped as
+    unverified, not judged, and does not count against the account."""
+
+    @pytest.mark.parametrize("pending", ["launched", "timeout", "exit-error"])
+    def test_stale_pending_is_dropped_and_the_account_primed_again(self, rig, pending):
+        _pending(rig, pending, age_s=5 * H + 60)
+        runner = StubRunner(rig)
+        events = rig.primer(runner=runner).run_due(rig.snap(nums=("1", "2")))
+        assert events == []  # no late "unverified"/"failed" verdict
+        assert runner.tokens() == ["sk-2"]  # eligible again on this tick
+        assert rig.primes()["b@example.com"]["attempts"] == 1  # the stale one did not count
+
+    def test_stale_pending_without_a_reading_does_not_stay_pending(self, rig):
+        _pending(rig, "launched", age_s=6 * H)
+        snap = rig.snap(nums=("1", "2"))
+        del rig.usage.server["2"]  # no reading can be fetched now
+        primer = rig.primer(runner=StubRunner(rig))
+        primer.run_due(snap)
+        assert primer.pending_accounts(snap) == []
+        entry = rig.primes()["b@example.com"]
+        assert (entry["lastOutcome"], entry["attempts"]) == ("unverified", 0)
+
+
 class TestForcedRefresh:
     """The retry after a 401 spends exactly one refresh grant, and that grant
     gets the same identity check as the engine's ``_freshen_target``."""

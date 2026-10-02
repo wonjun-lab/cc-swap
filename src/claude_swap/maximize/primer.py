@@ -752,12 +752,18 @@ class Primer:
             pending = entry.get("lastOutcome")
             prime_at = _num(entry.get("lastAttemptAt"))
             view = by_email.get(email)
-            if (
-                pending not in PENDING_OUTCOMES
-                or view is None
-                or prime_at is None
-                or now < prime_at + VERIFY_DELAY_S
-            ):
+            if pending not in PENDING_OUTCOMES or view is None or prime_at is None:
+                continue
+            if now - prime_at >= WINDOW_S:
+                # A whole window later (the machine slept): no reading can
+                # tell our prime from anything since. Drop it unjudged; it
+                # does not count against the account, which is eligible again.
+                self._record(email, lastOutcome="unverified", attempts=0)
+                _logger.info(
+                    "prime: account %s's launch went unverified for 5h; dropped", view.number
+                )
+                continue
+            if now < prime_at + VERIFY_DELAY_S:
                 continue
             usage = self._fresh_usage(view.number, since=prime_at + VERIFY_DELAY_S)
             if usage is None:
