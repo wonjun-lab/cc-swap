@@ -124,6 +124,16 @@ def resolve_program() -> list[str]:
     return [sys.executable, "-m", "claude_swap"]
 
 
+def reinstall_command() -> list[str]:
+    """Argv that runs ``cc-swap service install`` from the *installed* build.
+
+    ``cc-swap upgrade`` runs in the old build's process; shelling out through
+    the console script (the path survives a reinstall) is what makes the
+    service pick up the new code and the new ``prime.claudePath`` detection.
+    """
+    return [*resolve_program(), "service", "install"]
+
+
 def detect_claude_path(configured: str | None, *, home: Path | None = None) -> str | None:
     """The ``claude`` executable the service should prime with.
 

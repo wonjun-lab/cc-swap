@@ -1426,6 +1426,7 @@ Commands:
   %(prog)s menubar                    macOS menu bar app
   %(prog)s menubar --install-service  keep the menu bar running via launchd
   %(prog)s upgrade                    self-upgrade to latest
+  %(prog)s upgrade --check            show what a newer release changes (exit 10 if there is one)
   %(prog)s purge                      remove all claude-swap data
 
 cc-swap:
@@ -1657,6 +1658,15 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
         action="store_true",
         help=argparse.SUPPRESS,
     )
+    parser.add_argument(
+        "--check",
+        action="store_true",
+        help=(
+            "With 'upgrade': only report the installed and latest release and "
+            "what changed between them; exit 0 when up to date, 10 when an "
+            "update is available"
+        ),
+    )
     group.add_argument(
         "--add-token",
         metavar="TOKEN|-",
@@ -1732,6 +1742,12 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
             "or 'upgrade'"
         )
 
+    if args.check and not args.upgrade:
+        parser.error("--check can only be used with 'upgrade'")
+
+    if args.check and args.force:
+        parser.error("--check only reports; it cannot be combined with --force")
+
     if args.full and not args.export:
         parser.error("--full can only be used with 'export'")
 
@@ -1752,9 +1768,11 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
     # Self-upgrade runs before switcher init so we don't touch config/keychain
     # just to upgrade the tool itself.
     if args.upgrade:
-        from claude_swap.update_check import run_self_upgrade
+        from claude_swap.update_check import run_self_upgrade, run_upgrade_check
 
         try:
+            if args.check:
+                sys.exit(run_upgrade_check())
             sys.exit(run_self_upgrade(force=args.force))
         except KeyboardInterrupt:
             print(f"\n{dimmed('Upgrade cancelled')}")

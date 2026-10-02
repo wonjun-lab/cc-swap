@@ -26,11 +26,19 @@ from claude_swap.cache import CACHE_DIR, MISSING, read_cache, write_cache
 # here as the fork's latest release.
 CACHE_PATH = CACHE_DIR / "cc_swap_update_check.json"
 CACHE_TTL = 24 * 3600  # 24 hours
-RELEASES_URL = "https://api.github.com/repos/wonjun-lab/cc-swap/releases/latest"
+_API_URL = "https://api.github.com/repos/wonjun-lab/cc-swap"
+RELEASES_URL = f"{_API_URL}/releases/latest"
+RELEASES_LIST_URL = f"{_API_URL}/releases?per_page=30"
 INSTALL_URL = "git+https://github.com/wonjun-lab/cc-swap"
 # Seconds `cc-swap upgrade` waits for GitHub to name the latest release; the
 # passive update notice keeps its 2s so that it never slows a command down.
 UPGRADE_LOOKUP_TIMEOUT = 10
+# `upgrade --check` exit code when a newer release exists (0 = up to date,
+# 1 = could not tell), so a timer or script can branch on it.
+EXIT_UPDATE_AVAILABLE = 10
+# How much of the change list `upgrade --check` prints.
+_NOTES_MAX_LINES = 15
+_COMMITS_MAX = 30
 _NO_RELEASE_NOTE = (
     "No published cc-swap release could be found (there may be none yet, or "
     "GitHub could not be reached), so this installs the default branch "
@@ -155,6 +163,22 @@ def _upgrade_command(method: str | None, tag: str | None = None) -> list[str] | 
     }.get(method or "")
 
 
+def _get_json(url: str, timeout: float) -> object | None:
+    """GET ``url`` from the GitHub API and decode it; None on any failure."""
+    req = urllib.request.Request(
+        url,
+        headers={
+            "Accept": "application/vnd.github+json",
+            "User-Agent": "cc-swap-update-check",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return json.loads(resp.read().decode())
+    except Exception:
+        return None
+
+
 def _fetch_latest_tag(timeout: float = 2) -> str | None:
     """The fork's latest published release tag, as published (``v0.4.0``).
 
@@ -165,18 +189,7 @@ def _fetch_latest_tag(timeout: float = 2) -> str | None:
     suffix is treated as no tag: it comes off the network and ends up in a
     URL handed to the package manager.
     """
-    req = urllib.request.Request(
-        RELEASES_URL,
-        headers={
-            "Accept": "application/vnd.github+json",
-            "User-Agent": "cc-swap-update-check",
-        },
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            data = json.loads(resp.read().decode())
-    except Exception:
-        return None
+    data = _get_json(RELEASES_URL, timeout)
     tag = data.get("tag_name") if isinstance(data, dict) else None
     if not isinstance(tag, str):
         return None
@@ -322,6 +335,8 @@ def run_self_upgrade(force: bool = False) -> int:
         print(f"Installing cc-swap release {tag} ...")
     try:
         result = subprocess.run(cmd, check=False)
+        if result.returncode == 0:
+            _refresh_service()
         return result.returncode
     except FileNotFoundError:
         error(
@@ -329,3 +344,147 @@ def run_self_upgrade(force: bool = False) -> int:
             "Run the upgrade manually from a shell where it is available."
         )
         return 1
+
+
+def _refresh_service() -> None:
+    """Re-run ``cc-swap service install`` when the service is installed.
+
+    The service keeps running the build it was started with, so without this
+    an upgrade leaves a stale engine behind. It shells out to the console
+    script rather than calling :func:`service.install` because this process
+    still holds the old code. Never fails the upgrade: the reinstall already
+    happened, so a problem here is a warning with the command to run.
+    """
+    from claude_swap.printer import warning
+
+    try:
+        from claude_swap.maximize import service
+
+        if not service.status().get("installed"):
+            return
+        cmd = service.reinstall_command()
+    except Exception:
+        # No service for this platform, or launchctl/systemctl is absent.
+        return
+    print("Refreshing the cc-swap service so it runs the new build ...")
+    try:
+        rc = subprocess.run(cmd, check=False).returncode
+    except OSError:
+        rc = 1
+    if rc != 0:
+        warning(
+            "Could not restart the cc-swap service on the new build; run "
+            "`cc-swap service install` yourself.",
+            file=sys.stderr,
+        )
+
+
+def _release_notes_between(installed: str, latest: str) -> list[tuple[str, str]]:
+    """``(tag, notes)`` of each published release after ``installed`` up to
+    ``latest``, newest first. Empty on any failure (best effort)."""
+    data = _get_json(RELEASES_LIST_URL, UPGRADE_LOOKUP_TIMEOUT)
+    if not isinstance(data, list):
+        return []
+    try:
+        low, high = _parse_version(installed), _parse_version(latest)
+    except ValueError:
+        return []
+    found: list[tuple[_Version, str, str]] = []
+    for item in data:
+        if not isinstance(item, dict) or item.get("draft") or item.get("prerelease"):
+            continue
+        tag = item.get("tag_name")
+        if not isinstance(tag, str) or not _TAG_RE.fullmatch(tag):
+            continue
+        try:
+            version = _parse_version(_tag_version(tag))
+        except ValueError:
+            continue
+        if not low < version <= high:
+            continue
+        body = item.get("body")
+        found.append((version, tag, body.strip() if isinstance(body, str) else ""))
+    found.sort(key=lambda entry: entry[0], reverse=True)
+    return [(tag, body) for _, tag, body in found]
+
+
+def _commit_subjects_between(installed: str, tag: str) -> list[str]:
+    """First lines of the commits between the installed release and ``tag``
+    (GitHub compare API), oldest first. Empty on any failure."""
+    base = f"v{installed}"
+    if not (_TAG_RE.fullmatch(base) and _TAG_RE.fullmatch(tag)):
+        return []
+    data = _get_json(f"{_API_URL}/compare/{base}...{tag}", UPGRADE_LOOKUP_TIMEOUT)
+    commits = data.get("commits") if isinstance(data, dict) else None
+    subjects: list[str] = []
+    for item in commits if isinstance(commits, list) else []:
+        message = (item.get("commit") or {}).get("message") if isinstance(item, dict) else None
+        if isinstance(message, str) and message.strip():
+            subjects.append(message.strip().splitlines()[0])
+    return subjects
+
+
+def run_upgrade_check() -> int:
+    """``cc-swap upgrade --check``: report, never install.
+
+    Prints the installed and the latest release, and when the latter is newer
+    the release notes and commit subjects in between. Exit codes: 0 up to
+    date, 10 update available, 1 the latest release could not be determined.
+    """
+    from claude_swap.printer import accent, dimmed, error, warning
+
+    tag, from_cache = _latest_tag_for_upgrade()
+    if tag is None:
+        error(
+            "Could not determine the latest cc-swap release (GitHub could not "
+            "be reached, or no release is published yet)."
+        )
+        return 1
+    if from_cache:
+        warning(
+            "Could not reach GitHub; using the cached release tag "
+            f"{tag}, which may be out of date.",
+            file=sys.stderr,
+        )
+    latest = _tag_version(tag)
+    print(f"Installed: {__version__}")
+    print(f"Latest:    {latest}")
+    try:
+        newer = _is_newer(latest, __version__)
+    except ValueError:
+        newer = not _is_installed(tag)
+    if not newer:
+        print(f"cc-swap is up to date ({__version__}).")
+        return 0
+
+    for note_tag, body in _release_notes_between(__version__, latest):
+        print(f"\n{accent(note_tag)}")
+        lines = body.splitlines()
+        for line in lines[:_NOTES_MAX_LINES]:
+            print(f"  {line}")
+        if len(lines) > _NOTES_MAX_LINES:
+            print(dimmed(f"  ... ({len(lines) - _NOTES_MAX_LINES} more lines)"))
+    subjects = _commit_subjects_between(__version__, tag)
+    if subjects:
+        print(f"\nChanges since {__version__}:")
+        for subject in subjects[:_COMMITS_MAX]:
+            print(f"  - {subject}")
+        if len(subjects) > _COMMITS_MAX:
+            print(dimmed(f"  ... and {len(subjects) - _COMMITS_MAX} more commits"))
+
+    print()
+    direct = _upgrade_command(_detect_install_method(), tag)
+    if direct and sys.platform != "win32":
+        print(f"Update with: {accent('cc-swap upgrade')}")
+    elif direct:
+        print(f"Update with: {accent(shlex.join(direct))}")
+    else:
+        url = _install_url(tag)
+        print(
+            "Could not detect a uv tool / pipx install. Update manually with one of:\n"
+            f"  uv tool install --force {url}\n"
+            f"  pipx install --force {url}\n"
+            f"  {sys.executable} -m pip install --upgrade {url}\n"
+            "If you installed with `pip install -e .`, use `git pull` instead."
+        )
+    return EXIT_UPDATE_AVAILABLE
