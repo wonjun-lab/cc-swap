@@ -29,6 +29,7 @@ from datetime import datetime, timezone
 from typing import Any, Protocol
 
 from claude_swap import autoswitch as aw
+from claude_swap import poll_policy
 from claude_swap.exceptions import ConfigError
 from claude_swap.maximize import idle, policy
 from claude_swap.maximize.model import (
@@ -523,14 +524,18 @@ def _pull_active_poll(
 ) -> None:
     """Pending soft switch: poll the active account every ``pending_poll_s``.
 
-    Only ever pulls the next poll earlier; a token that 429'd recently keeps
-    the planner's post-429 cadence (spec §5.6), and the collector still
-    enforces any live backoff.
+    Only ever pulls the next poll earlier, and never sooner than
+    ``fetchedAt + poll_policy.MIN_INTERVAL_S`` whatever the settings say (a
+    session override skips the loader's clamp): the per-account poll budget
+    is shared by every machine. A token that 429'd recently keeps the
+    planner's post-429 cadence (spec §5.6), and the collector still enforces
+    any live backoff.
     """
     fetched_at = getattr(entry, "fetched_at", None)
     if fetched_at is None or entry.recent_429(now):
         return
-    deadline = max(now, fetched_at + rt.settings.pending_poll_s)
+    interval = max(float(rt.settings.pending_poll_s), poll_policy.MIN_INTERVAL_S)
+    deadline = max(now, fetched_at + interval)
     if entry.next_poll_at is not None and entry.next_poll_at <= deadline:
         return
     identity = engine.switcher.account_identity(current)

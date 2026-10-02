@@ -88,7 +88,7 @@ class MaximizeSettings:
     idle_window_min: int = 10
     idle_max_delta_pct: float = 1.0
     force_eta_min: int = 10
-    pending_poll_s: int = 120
+    pending_poll_s: int = 180
     rebalance_cooldown_min: int = 30
     tie_epsilon: float = 0.1
     last_resort: str | None = None  # comma-separated emails/aliases
@@ -217,8 +217,10 @@ SETTING_SPECS: dict[str, SettingSpec] = {
             "maximize", "forceEtaMin", "force_eta_min", "int", 0, 60,
             help="maximize: switch now when a hard cap is this many minutes away (0 = off)",
         ),
+        # Floor = poll_policy.MIN_INTERVAL_S: the per-account poll budget is
+        # shared by every machine; the engine enforces it again regardless.
         SettingSpec(
-            "maximize", "pendingPollS", "pending_poll_s", "int", 60, 600,
+            "maximize", "pendingPollS", "pending_poll_s", "int", 180, 600,
             help="maximize: active-account poll seconds while a switch waits",
         ),
         SettingSpec(

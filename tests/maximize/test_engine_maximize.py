@@ -163,7 +163,23 @@ class TestSoftAndHard:
         h = make(temp_home)
         h.tick_with_usage({"1": win(62, 40), "2": win(0, 10), "3": win(0, 50)})
         entry = h.switcher._usage_store.entries({"1": (EMAILS[1], "")})["1"]
-        assert entry.next_poll_at == pytest.approx(h.clock.now + 120)
+        assert entry.next_poll_at == pytest.approx(h.clock.now + 180)
+
+    def test_pending_pull_never_beats_the_poll_floor(self, temp_home):
+        # A session override (no clamp) below upstream's MIN_INTERVAL_S must
+        # not schedule the active poll sooner than fetchedAt + 180 s.
+        h = make(temp_home)
+        apply_maximize_settings(h.engine, MaximizeSettings(pending_poll_s=60))
+        now = h.clock.now
+        entries = {
+            "1": UsageEntry(last_good=win(62, 40), fetched_at=now - 100, age_s=100.0),
+            "2": UsageEntry(last_good=win(0, 10), fetched_at=now, age_s=0.0),
+            "3": UsageEntry(last_good=win(0, 50), fetched_at=now, age_s=0.0),
+        }
+        assert h.tick_with_entries(entries) is TickOutcome.NO_ACTION
+        assert no_switch_reasons(h) == ["maximize-pending"]
+        entry = h.switcher._usage_store.entries({"1": (EMAILS[1], "")})["1"]
+        assert entry.next_poll_at == pytest.approx(now - 100 + 180)
 
     def test_pending_hold_respects_a_recent_429(self, temp_home):
         h = make(temp_home)
@@ -261,10 +277,10 @@ class TestSettings:
         assert "maximize.soft5h (99) must not exceed maximize.hard5h (95)" in warning.message
         assert warning.message.endswith("keeping the previous maximize settings")
         assert runtime_for(h.engine).settings.soft_5h == 40.0
-        write_settings(h, {"maximize": {"soft5h": 40, "pendingPollS": 5}})  # range 60-600
+        write_settings(h, {"maximize": {"soft5h": 40, "pendingPollS": 5}})  # range 180-600
         h.tick_with_usage(usage)
         assert "invalid maximize.pendingPollS" in of(h, ConfigWarningEvent)[-1].message
-        assert runtime_for(h.engine).settings.pending_poll_s == 120
+        assert runtime_for(h.engine).settings.pending_poll_s == 180
         path = h.switcher.backup_dir / "settings.json"
         path.write_text("{not json")
         os.utime(path, ns=(1, 1))
