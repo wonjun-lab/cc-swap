@@ -20,6 +20,13 @@ The principles are ``launch_agent.py``'s (the menu bar's LaunchAgent):
   ``~/.local/bin/claude`` symlink is likewise kept unresolved: Claude Code's
   installer repoints it at every new version.
 
+The service sees only the environment the manager gives it, so install forwards
+``CLAUDE_CONFIG_DIR`` and ``CLAUDE_SECURESTORAGE_CONFIG_DIR`` from the installing
+shell (and says which): a user who keeps their login in a custom profile
+would otherwise get a service reading the default one. Installing from inside a
+``cswap run`` session is refused — that profile belongs to one account and one
+terminal, and a service pinned to it would auto-switch the wrong store.
+
 A second engine is refused by the engine lease (``maximize/lease.py``):
 ``cc-swap auto`` then exits with ``EXIT_ENGINE_BUSY`` (4). Both managers
 count that as a failure and retry after ``RESTART_DELAY_S``, so the service
@@ -36,10 +43,12 @@ import plistlib
 import shutil
 import subprocess
 import sys
+from collections.abc import Mapping
 from pathlib import Path
 
 from claude_swap import launch_agent, paths
 from claude_swap.exceptions import ClaudeSwitchError
+from claude_swap.session import session_profile_containing
 from claude_swap.settings import load_prime_settings, set_setting
 
 LABEL = "com.wonjun-lab.cc-swap"
@@ -47,6 +56,8 @@ UNIT_NAME = "cc-swap.service"
 CONSOLE_SCRIPT = "cc-swap"
 RESTART_DELAY_S = 60
 DOCS_URL = "https://github.com/wonjun-lab/cc-swap"
+#: Profile-selecting variables the installing shell hands on to the service.
+FORWARDED_ENV_VARS = ("CLAUDE_CONFIG_DIR", "CLAUDE_SECURESTORAGE_CONFIG_DIR")
 
 _MAC_SYSTEM_DIRS = (
     "/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin", "/usr/sbin", "/sbin",
@@ -156,6 +167,7 @@ def service_env(
     platform: str,
     home: Path | None = None,
     xdg_data_home: str | None = None,
+    forward_env: Mapping[str, str] | None = None,
 ) -> dict[str, str]:
     env = {
         "PATH": service_path(program, claude_path, platform=platform, home=home),
@@ -165,6 +177,7 @@ def service_env(
         # The Linux backup root follows $XDG_DATA_HOME (paths.get_backup_root);
         # a user manager started without it would read a different store.
         env["XDG_DATA_HOME"] = xdg_data_home
+    env.update(forward_env or {})
     return env
 
 
@@ -174,10 +187,46 @@ def _xdg_data_home() -> str | None:
     return expanded if expanded and os.path.isabs(expanded) else None
 
 
+def forwarded_env() -> dict[str, str]:
+    """The profile-selecting variables set in this process, verbatim.
+
+    Verbatim because Claude hashes the raw ``CLAUDE_CONFIG_DIR`` string into
+    its keychain service name (``session.keychain_service_name``). Empty
+    ``CLAUDE_CONFIG_DIR`` is "unset" to Claude and is skipped;
+    ``CLAUDE_SECURESTORAGE_CONFIG_DIR`` defined-but-empty selects the default
+    secure store, so it is kept.
+    """
+    env: dict[str, str] = {}
+    for name in FORWARDED_ENV_VARS:
+        value = os.environ.get(name)
+        if value is None or (not value and name == "CLAUDE_CONFIG_DIR"):
+            continue
+        env[name] = value
+    return env
+
+
+def _refuse_session_profile(forward: Mapping[str, str], backup_root: Path) -> None:
+    config_dir = forward.get("CLAUDE_CONFIG_DIR")
+    profile = session_profile_containing(config_dir, backup_root) if config_dir else None
+    if profile is not None:
+        raise ClaudeSwitchError(
+            f"CLAUDE_CONFIG_DIR points at a `cswap run` session profile ({profile}); "
+            "a service installed from here would be pinned to that one account's "
+            "profile instead of your login. Install from a terminal outside the "
+            "session, or run: unset CLAUDE_CONFIG_DIR"
+        )
+
+
 # --- service files -----------------------------------------------------------------
 
 
-def build_plist(program: list[str], *, claude_path: str | None, home: Path | None = None) -> bytes:
+def build_plist(
+    program: list[str],
+    *,
+    claude_path: str | None,
+    home: Path | None = None,
+    forward_env: Mapping[str, str] | None = None,
+) -> bytes:
     out_log, err_log = log_paths(home)
     return plistlib.dumps(
         {
@@ -193,7 +242,7 @@ def build_plist(program: list[str], *, claude_path: str | None, home: Path | Non
             # pending-switch polls the idle detection depends on.
             "ProcessType": "Standard",
             "EnvironmentVariables": service_env(
-                program, claude_path, platform="darwin", home=home
+                program, claude_path, platform="darwin", home=home, forward_env=forward_env
             ),
             "StandardOutPath": str(out_log),
             "StandardErrorPath": str(err_log),
@@ -216,9 +265,15 @@ def build_unit(
     claude_path: str | None,
     home: Path | None = None,
     xdg_data_home: str | None = None,
+    forward_env: Mapping[str, str] | None = None,
 ) -> str:
     env = service_env(
-        program, claude_path, platform="linux", home=home, xdg_data_home=xdg_data_home
+        program,
+        claude_path,
+        platform="linux",
+        home=home,
+        xdg_data_home=xdg_data_home,
+        forward_env=forward_env,
     )
     exec_start = " ".join(_systemd_quote(arg, exec_arg=True) for arg in [*program, "auto"])
     lines = [
@@ -306,6 +361,8 @@ def install(
     """
     platform = _platform()
     root = backup_root or paths.get_backup_root()
+    forward = forwarded_env()
+    _refuse_session_profile(forward, root)
     if claude_path is not None and not _is_executable(Path(os.path.expanduser(claude_path))):
         raise ClaudeSwitchError(f"--claude-path {claude_path} is not an executable file")
     configured = load_prime_settings(root).claude_path
@@ -320,19 +377,27 @@ def install(
         saved = True
     program = program or resolve_program()
     if platform == "darwin":
-        result = _install_darwin(program, resolved, home, uid)
+        result = _install_darwin(program, resolved, home, uid, forward)
     else:
-        result = _install_linux(program, resolved, home, user)
-    result.update(claude_path=resolved, claude_path_saved=saved)
+        result = _install_linux(program, resolved, home, user, forward)
+    result.update(claude_path=resolved, claude_path_saved=saved, forwarded_env=forward)
     return result
 
 
-def _install_darwin(program: list[str], claude_path: str | None, home: Path | None, uid: int | None) -> dict:
+def _install_darwin(
+    program: list[str],
+    claude_path: str | None,
+    home: Path | None,
+    uid: int | None,
+    forward: Mapping[str, str],
+) -> dict:
     target = plist_path(home)
     out_log, err_log = log_paths(home)
     target.parent.mkdir(parents=True, exist_ok=True)
     out_log.parent.mkdir(parents=True, exist_ok=True)
-    target.write_bytes(build_plist(program, claude_path=claude_path, home=home))
+    target.write_bytes(
+        build_plist(program, claude_path=claude_path, home=home, forward_env=forward)
+    )
     # launch_agent.install's reload dance: boot the old job out and wait until
     # launchd has dropped it, or bootstrap fails with EEXIST / "in progress".
     settled = True
@@ -358,12 +423,24 @@ def _install_darwin(program: list[str], claude_path: str | None, home: Path | No
     }
 
 
-def _install_linux(program: list[str], claude_path: str | None, home: Path | None, user: str | None) -> dict:
+def _install_linux(
+    program: list[str],
+    claude_path: str | None,
+    home: Path | None,
+    user: str | None,
+    forward: Mapping[str, str],
+) -> dict:
     unit = unit_path(home)
     was_active = _is_active()
     unit.parent.mkdir(parents=True, exist_ok=True)
     unit.write_text(
-        build_unit(program, claude_path=claude_path, home=home, xdg_data_home=_xdg_data_home()),
+        build_unit(
+            program,
+            claude_path=claude_path,
+            home=home,
+            xdg_data_home=_xdg_data_home(),
+            forward_env=forward,
+        ),
         encoding="utf-8",
     )
     _checked("daemon-reload")

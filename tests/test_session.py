@@ -38,6 +38,7 @@ from claude_swap.session import (
     scan_live_sessions,
     session_dir_for,
     session_identity_drifted,
+    session_profile_containing,
     slugify_email,
     stale_marker_for,
 )
@@ -213,6 +214,32 @@ class TestHelpers:
     def test_session_dir_naming(self, tmp_path):
         d = session_dir_for(tmp_path, "2", "user@example.com")
         assert d == tmp_path / "sessions" / "2-user_example.com"
+
+    def test_session_profile_containing_matches_the_profile_and_anything_inside(self, tmp_path):
+        profile = session_dir_for(tmp_path, "2", "user@example.com")
+        assert session_profile_containing(profile, tmp_path) == profile
+        assert session_profile_containing(str(profile) + "/", tmp_path) == profile
+        assert session_profile_containing(profile / "sessions" / "1", tmp_path) == profile
+
+    def test_session_profile_containing_ignores_everything_else(self, tmp_path):
+        assert session_profile_containing(tmp_path / "sessions", tmp_path) is None
+        assert session_profile_containing(tmp_path / "sessions" / "scratch", tmp_path) is None
+        assert session_profile_containing(tmp_path / "elsewhere" / "2-a_x.com", tmp_path) is None
+        assert session_profile_containing(tmp_path.parent / "other-root" / "sessions" / "2-a_x.com", tmp_path) is None
+        assert session_profile_containing(tmp_path, tmp_path) is None
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="symlinks need privileges on Windows")
+    def test_session_profile_containing_sees_through_symlinks(self, tmp_path):
+        root = tmp_path / "root"
+        target = tmp_path / "leased" / "profile"
+        target.mkdir(parents=True)
+        link = session_dir_for(root, "3", "lease@example.com")
+        link.parent.mkdir(parents=True)
+        link.symlink_to(target)
+        assert session_profile_containing(link, root) == link  # by its own name
+        alias = tmp_path / "alias"
+        alias.symlink_to(root)
+        assert session_profile_containing(alias / "sessions" / link.name, root) == link
 
     def test_keychain_service_name_known_vector(self, tmp_path):
         d = tmp_path / "profile"

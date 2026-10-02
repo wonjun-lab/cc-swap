@@ -1250,6 +1250,10 @@ def _print_service_install(result: dict) -> None:
     print(f"  runs:   {' '.join(result['program'])}")
     print(f"  file:   {result['path']}")
     print(f"  logs:   {', '.join(result['logs'])}")
+    forwarded = result.get("forwarded_env") or {}
+    if forwarded:
+        shown = ", ".join(f"{name}={value or '(empty)'}" for name, value in forwarded.items())
+        print(f"  env:    {shown} (forwarded from this shell)")
     if result["claude_path"]:
         saved = " (saved as prime.claudePath)" if result["claude_path_saved"] else ""
         print(f"  claude: {result['claude_path']}{saved}")

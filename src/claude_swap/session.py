@@ -39,6 +39,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -65,6 +66,11 @@ from claude_swap.settings import atomic_write_json
 
 if TYPE_CHECKING:
     from claude_swap.switcher import ClaudeAccountSwitcher
+
+# Where session profiles live under the backup root, and how one is named
+# (``<num>-<email-slug>``, see session_dir_for).
+SESSIONS_DIRNAME = "sessions"
+_PROFILE_DIRNAME = re.compile(r"\d+-")
 
 # Items mirrored from ~/.claude into session profiles when sharing is on.
 # Deliberately excludes anything account- or instance-scoped: plugins/,
@@ -226,7 +232,29 @@ def session_dir_for(backup_dir: Path, account_num: str, email: str) -> Path:
     PID files, so full paths look like
     ``<backup>/sessions/2-user_x.com/sessions/1234.json`` — intentional.
     """
-    return backup_dir / "sessions" / f"{account_num}-{slugify_email(email)}"
+    return backup_dir / SESSIONS_DIRNAME / f"{account_num}-{slugify_email(email)}"
+
+
+def session_profile_containing(path: str | Path, backup_dir: Path) -> Path | None:
+    """The ``cswap run`` session profile that ``path`` is, or lies inside.
+
+    ``backup_dir/sessions/<num>-<slug>`` (see :func:`session_dir_for`), as the
+    canonical path under ``backup_dir``; ``None`` for any other location.
+    Pure path logic, nothing is read from the profile. Both the path as given
+    and its fully resolved form are tried, and only the *parents* of a
+    candidate are resolved: a leased profile is a symlink named like a profile
+    that points elsewhere, and is a session profile by its name.
+    """
+    sessions = (backup_dir / SESSIONS_DIRNAME).resolve()
+    given = os.path.abspath(os.path.expanduser(path))
+    for candidate in (Path(given), Path(given).resolve()):
+        for ancestor in (candidate, *candidate.parents):
+            if (
+                _PROFILE_DIRNAME.match(ancestor.name)
+                and ancestor.parent.resolve() == sessions
+            ):
+                return backup_dir / SESSIONS_DIRNAME / ancestor.name
+    return None
 
 
 def keychain_service_name(config_dir: Path | str) -> str:

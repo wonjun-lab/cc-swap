@@ -146,6 +146,45 @@ def test_unit_quotes_spaces_percent_and_dollar():
     assert "/opt/50%%:" in unit
 
 
+FORWARDED = {
+    "CLAUDE_CONFIG_DIR": "/Users/u/alt claude",
+    "CLAUDE_SECURESTORAGE_CONFIG_DIR": "/Users/u/secure",
+}
+
+
+def test_plist_forwards_the_claude_profile_env():
+    parsed = plistlib.loads(
+        service.build_plist(MAC_PROGRAM, claude_path=None, home=Path("/Users/u"), forward_env=FORWARDED)
+    )
+    env = parsed["EnvironmentVariables"]
+    assert env["CLAUDE_CONFIG_DIR"] == "/Users/u/alt claude"
+    assert env["CLAUDE_SECURESTORAGE_CONFIG_DIR"] == "/Users/u/secure"
+    assert env["PYTHONUNBUFFERED"] == "1" and env["PATH"]
+
+
+def test_unit_forwards_the_claude_profile_env_quoted():
+    unit = service.build_unit(
+        LINUX_PROGRAM,
+        claude_path=None,
+        home=Path("/home/u"),
+        forward_env={
+            "CLAUDE_CONFIG_DIR": '/home/u/My "Profiles"/50%/$x',
+            "CLAUDE_SECURESTORAGE_CONFIG_DIR": "/home/u/secure",
+        },
+    )
+    # `%` is a specifier in every setting; `$` means nothing in Environment=.
+    assert 'Environment="CLAUDE_CONFIG_DIR=/home/u/My \\"Profiles\\"/50%%/$x"\n' in unit
+    assert 'Environment="CLAUDE_SECURESTORAGE_CONFIG_DIR=/home/u/secure"\n' in unit
+
+
+def test_unit_forwards_a_defined_but_empty_securestorage_dir():
+    unit = service.build_unit(
+        LINUX_PROGRAM, claude_path=None, home=Path("/home/u"),
+        forward_env={"CLAUDE_SECURESTORAGE_CONFIG_DIR": ""},
+    )
+    assert 'Environment="CLAUDE_SECURESTORAGE_CONFIG_DIR="\n' in unit
+
+
 def test_service_path_puts_the_program_and_claude_first():
     path = service.service_path(
         ["/opt/tools/cc-swap"], "/srv/claude/bin/claude", platform="linux", home=Path("/home/u")
@@ -266,6 +305,89 @@ def test_install_linux_passes_xdg_data_home_into_the_unit(tmp_path, on_linux, fa
     fake_run({"systemctl is-active": _done(3)})
     result = service.install(home=tmp_path, program=LINUX_PROGRAM, backup_root=tmp_path / "root", user="u")
     assert f'Environment="XDG_DATA_HOME={tmp_path / "xdg"}"' in Path(result["path"]).read_text()
+
+
+def test_install_macos_forwards_the_claude_profile_env_into_the_plist(tmp_path, on_macos, fake_run, monkeypatch):
+    monkeypatch.setattr(service.shutil, "which", lambda name: None)
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "alt"))
+    monkeypatch.setenv("CLAUDE_SECURESTORAGE_CONFIG_DIR", str(tmp_path / "secure"))
+    fake_run({"launchctl print": _done(1)})
+    result = service.install(home=tmp_path, program=MAC_PROGRAM, uid=UID, backup_root=tmp_path / "root")
+    env = plistlib.loads(Path(result["path"]).read_bytes())["EnvironmentVariables"]
+    assert env["CLAUDE_CONFIG_DIR"] == str(tmp_path / "alt")
+    assert env["CLAUDE_SECURESTORAGE_CONFIG_DIR"] == str(tmp_path / "secure")
+    assert result["forwarded_env"] == {
+        "CLAUDE_CONFIG_DIR": str(tmp_path / "alt"),
+        "CLAUDE_SECURESTORAGE_CONFIG_DIR": str(tmp_path / "secure"),
+    }
+
+
+def test_install_linux_forwards_the_claude_profile_env_into_the_unit(tmp_path, on_linux, fake_run, monkeypatch):
+    monkeypatch.setattr(service.shutil, "which", lambda name: None)
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "alt"))
+    fake_run({"systemctl is-active": _done(3)})
+    result = service.install(home=tmp_path, program=LINUX_PROGRAM, backup_root=tmp_path / "root", user="u")
+    text = Path(result["path"]).read_text()
+    assert f'Environment="CLAUDE_CONFIG_DIR={tmp_path / "alt"}"\n' in text
+    assert "CLAUDE_SECURESTORAGE_CONFIG_DIR" not in text
+    assert result["forwarded_env"] == {"CLAUDE_CONFIG_DIR": str(tmp_path / "alt")}
+
+
+def test_install_forwards_nothing_when_the_profile_env_is_absent(tmp_path, on_macos, fake_run, monkeypatch):
+    monkeypatch.setattr(service.shutil, "which", lambda name: None)
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", "")  # empty means "unset" to claude
+    fake_run({"launchctl print": _done(1)})
+    result = service.install(home=tmp_path, program=MAC_PROGRAM, uid=UID, backup_root=tmp_path / "root")
+    env = plistlib.loads(Path(result["path"]).read_bytes())["EnvironmentVariables"]
+    assert set(env) == {"PATH", "PYTHONUNBUFFERED"}
+    assert result["forwarded_env"] == {}
+
+
+def test_install_forwards_a_defined_but_empty_securestorage_dir(tmp_path, on_macos, fake_run, monkeypatch):
+    monkeypatch.setattr(service.shutil, "which", lambda name: None)
+    monkeypatch.setenv("CLAUDE_SECURESTORAGE_CONFIG_DIR", "")
+    fake_run({"launchctl print": _done(1)})
+    result = service.install(home=tmp_path, program=MAC_PROGRAM, uid=UID, backup_root=tmp_path / "root")
+    env = plistlib.loads(Path(result["path"]).read_bytes())["EnvironmentVariables"]
+    assert env["CLAUDE_SECURESTORAGE_CONFIG_DIR"] == ""
+    assert result["forwarded_env"] == {"CLAUDE_SECURESTORAGE_CONFIG_DIR": ""}
+
+
+@pytest.mark.parametrize("platform_fixture", ["on_macos", "on_linux"])
+def test_install_refuses_when_claude_config_dir_is_a_cswap_run_session_profile(
+    tmp_path, request, fake_run, monkeypatch, platform_fixture
+):
+    request.getfixturevalue(platform_fixture)
+    root = tmp_path / "root"
+    profile = root / "sessions" / "2-user_example.com"
+    profile.mkdir(parents=True)
+    monkeypatch.setattr(service.shutil, "which", lambda name: "/opt/homebrew/bin/claude")
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(profile))
+    run = fake_run()
+    with pytest.raises(ClaudeSwitchError, match="session profile") as excinfo:
+        service.install(home=tmp_path, program=MAC_PROGRAM, uid=UID, backup_root=root)
+    assert str(profile) in str(excinfo.value)
+    assert "unset CLAUDE_CONFIG_DIR" in str(excinfo.value)
+    assert run.calls == []  # no launchctl / systemctl
+    assert not service.plist_path(tmp_path).exists() and not service.unit_path(tmp_path).exists()
+    assert load_prime_settings(root).claude_path is None  # nothing was saved either
+
+
+def test_install_refuses_a_path_inside_a_session_profile_too(tmp_path, on_linux, fake_run, monkeypatch):
+    root = tmp_path / "root"
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(root / "sessions" / "7-a_x.com" / "nested"))
+    fake_run()
+    with pytest.raises(ClaudeSwitchError, match="session profile"):
+        service.install(home=tmp_path, program=LINUX_PROGRAM, backup_root=root, user="u")
+
+
+def test_install_accepts_a_config_dir_beside_the_session_profiles(tmp_path, on_linux, fake_run, monkeypatch):
+    monkeypatch.setattr(service.shutil, "which", lambda name: None)
+    root = tmp_path / "root"
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(root / "sessions" / "scratch"))
+    fake_run({"systemctl is-active": _done(3)})
+    result = service.install(home=tmp_path, program=LINUX_PROGRAM, backup_root=root, user="u")
+    assert result["forwarded_env"] == {"CLAUDE_CONFIG_DIR": str(root / "sessions" / "scratch")}
 
 
 def test_install_linux_surfaces_a_systemctl_failure(tmp_path, on_linux, fake_run, monkeypatch):

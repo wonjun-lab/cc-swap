@@ -60,6 +60,22 @@ def test_install_with_linger_on_prints_no_hint(monkeypatch, capsys):
     assert "enable-linger" not in capsys.readouterr().out
 
 
+def test_install_names_the_forwarded_profile_env(monkeypatch, capsys):
+    forwarded = {"CLAUDE_CONFIG_DIR": "/home/u/alt", "CLAUDE_SECURESTORAGE_CONFIG_DIR": ""}
+    monkeypatch.setattr(service, "install", lambda **kw: {**LINUX_INSTALL, "forwarded_env": forwarded})
+    assert _service(["install"]) == 0
+    out = capsys.readouterr().out
+    assert "env:    CLAUDE_CONFIG_DIR=/home/u/alt" in out
+    assert "CLAUDE_SECURESTORAGE_CONFIG_DIR=(empty)" in out
+    assert "forwarded from this shell" in out
+
+
+def test_install_prints_no_env_line_when_nothing_was_forwarded(monkeypatch, capsys):
+    monkeypatch.setattr(service, "install", lambda **kw: {**LINUX_INSTALL, "forwarded_env": {}})
+    _service(["install"])
+    assert "env:" not in capsys.readouterr().out
+
+
 def test_install_without_claude_warns_about_priming(monkeypatch, capsys):
     monkeypatch.setattr(service, "install", lambda **kw: {**LINUX_INSTALL, "claude_path": None, "claude_path_saved": False})
     assert _service(["install"]) == 0
@@ -110,6 +126,18 @@ def test_errors_exit_1(monkeypatch, capsys):
     monkeypatch.setattr(service, "install", boom)
     assert _service(["install"]) == 1
     assert "launchctl bootstrap failed" in capsys.readouterr().err
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="Windows is refused before any profile check")
+def test_install_from_inside_a_session_profile_exits_1_with_the_reason(monkeypatch, capsys, tmp_path):
+    from claude_swap import paths
+
+    monkeypatch.setattr(sys, "platform", "linux")
+    monkeypatch.setattr(paths, "get_backup_root", lambda: tmp_path)
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "sessions" / "2-user_example.com"))
+    assert _service(["install"]) == 1
+    err = capsys.readouterr().err
+    assert "session profile" in err and "unset CLAUDE_CONFIG_DIR" in err
 
 
 @pytest.mark.parametrize("action", ["install", "uninstall", "status"])
