@@ -1027,7 +1027,6 @@ def check_settings(ctx: Context) -> list[Finding]:
         ("autoswitch", st.AutoSwitchSettings),
         ("ui", st.UiSettings),
         ("maximize", st.MaximizeSettings),
-        ("prime", st.PrimeSettings),
     )
     loaded = {}
     for name, cls in sections:
@@ -1037,14 +1036,12 @@ def check_settings(ctx: Context) -> list[Finding]:
             problems.append(f"{name} section has keys of the wrong shape")
     if "maximize" in loaded:
         problems += [f"{m}; using defaults for both" for *_, m in st._maximize_pair_errors(loaded["maximize"])]
-    enabled = ctx.prime_section.get("enabled")
-    if "enabled" in ctx.prime_section and not isinstance(enabled, bool):
-        problems.append(f"prime.enabled must be true or false, got {enabled!r}; priming stays off")
-    if "prime" in loaded:
-        try:
-            st.parse_jitter_range(loaded["prime"].jitter_s)
-        except ValueError as e:
-            problems.append(f"prime.jitterS {e}")
+    try:
+        # The loader's own rules (only a JSON true enables priming; a bad
+        # jitterS reverts), so doctor and the engine agree.
+        st.prime_from_raw(raw.get("prime"), problems)
+    except TypeError:
+        problems.append("prime section has keys of the wrong shape")
     out = [
         Finding("settings", "warn", f"settings.json: {m}", "cc-swap config set <key> <value> (cc-swap config lists the ranges)")
         for m in problems

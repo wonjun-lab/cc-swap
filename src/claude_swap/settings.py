@@ -332,16 +332,31 @@ def _clamp_number(spec: SettingSpec, value) -> tuple[float, str | None]:
     return number, None
 
 
+def lenient_bool(value) -> bool | None:
+    """A settings.json bool as the user meant it: a JSON bool as is, the
+    ``config set`` words (``true``/``false``, ``1``/``0``, ``yes``/``no``,
+    any case) and the numbers 1/0; None for anything else."""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return _BOOL_WORDS.get(value.strip().lower())
+    if isinstance(value, (int, float)) and value in (0, 1):
+        return bool(value)
+    return None
+
+
 def _clamped(settings, section: str = "autoswitch", repairs: list[str] | None = None):
     """Clamp values into the SETTING_SPECS ranges; bad types and non-finite
     numbers (NaN, ±inf) → the default.
 
     ``section`` selects the registry rows; the result has ``settings``' type.
     When ``repairs`` is a list, one message per number or string that had to
-    be replaced or clamped is appended to it, and an unsupported choice goes
-    there too instead of into the log (a bool is only coerced, so a loader
-    that cares about one reports it itself). An int-valued float (12.0 for an
-    int key) is not a repair: nothing the user wrote changes.
+    be replaced or clamped is appended to it, and an unsupported choice or a
+    bool that is not a JSON ``true``/``false`` goes there too instead of into
+    the log. A bool written as ``"false"``/``"0"``/``"no"`` (or ``0``) reads as
+    false and ``"true"``/``"1"``/``"yes"`` (or ``1``) as true, each reported;
+    anything else is the default. An int-valued float (12.0 for an int key)
+    is not a repair: nothing the user wrote changes.
     """
 
     kwargs = {}
@@ -362,7 +377,24 @@ def _clamped(settings, section: str = "autoswitch", repairs: list[str] | None = 
                 number = whole
             kwargs[spec.field] = number
         elif spec.kind == "bool":
-            kwargs[spec.field] = bool(value)
+            # Never bool(value): bool("false") is True.
+            parsed = lenient_bool(value)
+            if isinstance(value, bool):
+                kwargs[spec.field] = value
+            elif parsed is not None:
+                kwargs[spec.field] = parsed
+                problem = (
+                    f"must be true or false (no quotes), got {_describe(value)}; "
+                    f"read as {format_setting_value(parsed)}"
+                )
+            else:
+                kwargs[spec.field] = spec.default
+                problem = (
+                    f"must be true or false, got {_describe(value)}; "
+                    f"using default {format_setting_value(spec.default)}"
+                )
+            if problem is not None and repairs is None:
+                _logger.warning("settings.json: %s %s", spec.dotted, problem)
         elif spec.kind == "string":
             # A non-empty string keeps as-is; anything else reverts to default
             # (None) so a null/garbage settings.json value disables the filter.
@@ -801,24 +833,33 @@ def load_prime_settings(
     as one message.
     """
     raw = _read_raw(settings_path(backup_root))
-    section = raw.get("prime")
-    settings = _section_for_load(raw, "prime", PrimeSettings, problems)
+    repairs: list[str] = []
+    settings = prime_from_raw(raw.get("prime"), repairs)
+    for message in repairs:
+        _report(problems, message)
+    return settings
+
+
+def prime_from_raw(section, repairs: list[str]) -> PrimeSettings:
+    """`load_prime_settings` minus the file and the log: the ``prime``
+    section's settings from its raw JSON, each repair appended to
+    ``repairs`` (doctor reads the same rules through this)."""
+    settings = _section_from_raw(section, "prime", PrimeSettings, repairs)
     defaults = PrimeSettings()
-    if (
-        isinstance(section, dict)
-        and "enabled" in section
-        and not isinstance(section["enabled"], bool)
-    ):
-        _report(
-            problems,
-            f"prime.enabled must be true or false, got {section['enabled']!r}; "
-            "priming stays off",
+    enabled = section.get("enabled") if isinstance(section, dict) else None
+    if settings.enabled and not isinstance(enabled, bool):
+        # Only a JSON true turns priming on: it runs claude with each
+        # account's token, so a quoted "true" is reported, not obeyed.
+        repairs[:] = [m for m in repairs if not m.startswith("prime.enabled ")]
+        repairs.append(
+            f"prime.enabled must be true without quotes to turn priming on, got "
+            f"{_describe(enabled)}; priming stays off"
         )
         settings = dataclasses.replace(settings, enabled=False)
     try:
         parse_jitter_range(settings.jitter_s)
     except ValueError as e:
-        _report(problems, f"prime.jitterS {e}; using {defaults.jitter_s}")
+        repairs.append(f"prime.jitterS {e}; using {defaults.jitter_s}")
         settings = dataclasses.replace(settings, jitter_s=defaults.jitter_s)
     return settings
 

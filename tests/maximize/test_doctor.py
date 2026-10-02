@@ -479,6 +479,16 @@ def test_settings_repairs_are_warnings(world):
     assert any("prime.enabled" in d for d in details)
 
 
+def test_a_bool_written_as_a_string_is_a_settings_warning(world):
+    world.healthy()
+    world.settings(autoswitch={"strategy": "maximize", "includeApiKeyAccounts": "false"},
+                   prime={"enabled": "false"})
+    details = [f.detail for f in find(run(world), "settings", "warn")]
+    assert any("autoswitch.includeApiKeyAccounts" in d and "read as false" in d for d in details)
+    [prime] = [d for d in details if "prime.enabled" in d]  # reported once
+    assert "false" in prime
+
+
 # -- robustness, exit codes and the CLI -------------------------------------------------------
 
 
