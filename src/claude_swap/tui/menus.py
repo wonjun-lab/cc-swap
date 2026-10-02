@@ -4,6 +4,15 @@ codex-swap's convention: the menu *is* the shortcut list. Every item's key
 is its first letter (drawn bold), a state is part of the item's name
 (``Mode: service · viewing``), and the key hints list only what the menu
 does not. The menu keys and the row keys never collide; a test pins that.
+
+Keys are unique per menu level: the main menu, the row keys and the reserved
+keys never share a letter, and a sub-screen's items (Account settings) never
+share one with each other or with its ``b``/``q``. A sub-screen may reuse a
+main-menu letter (``a`` Add current login) as codex-swap does, but the items
+added in 0.3.0 do not: ``v`` is only *View switch history* and ``u`` only
+*Update Claude Code* (main menu), ``i`` only *Inspect all logins* (Account
+settings). Every title starts with its key, and every short name (the folded
+menu) contains it.
 """
 
 from __future__ import annotations
@@ -26,6 +35,8 @@ MAIN_MENU: tuple[MenuEntry, ...] = (
     MenuEntry("f", "Fetch latest usage", "fetch", "Fetch"),
     MenuEntry("a", "Account settings", "accounts", "Accounts"),
     MenuEntry("e", "Engine log", "engine", "Engine"),
+    MenuEntry("v", "View switch history", "history", "View swaps"),
+    MenuEntry("u", "Update Claude Code", "update", "Update"),
     MenuEntry("c", "Classic dashboard", "classic", "Classic"),
     MenuEntry("q", "Quit", "quit", "Quit"),
 )
@@ -44,9 +55,11 @@ ACCOUNT_ITEMS: tuple[tuple[str, str, str], ...] = (
     ("r", "Re-login…", "relogin"),
     ("n", "Name (alias)…", "alias"),
     ("d", "Delete account…", "delete"),
+    ("i", "Inspect all logins (doctor)", "verify"),
 )
 ACCOUNT_KEYS = (
-    "enter select · a add · t token · r re-login · n name · d delete · b back · q quit"
+    "enter select · a add · t token · r re-login · n name · d delete · i inspect · "
+    "b back · q quit"
 )
 KEY_HINTS = (
     "enter switch · l last resort · x exclude · r re-login · w watch · ? help · q quit · ↑↓ move"
@@ -74,11 +87,13 @@ def menu_title(
     mode_label: str | None = None,
     relogin: int = 0,
     fetching: bool = False,
+    auto_off: bool = False,
 ) -> str:
     """An item's title with its state in the name."""
     entry = BY_ACTION[action]
     if action == "mode":
-        return f"Mode: {mode_label or 'off'}"
+        tail = " · AUTO OFF" if auto_off else ""
+        return f"Mode: {mode_label or 'off'}{tail}"
     if action == "accounts" and relogin:
         return f"{entry.title} · {relogin} need{'s' if relogin == 1 else ''} re-login"
     if action == "fetch" and fetching:
@@ -215,8 +230,10 @@ def help_entries() -> list[tuple[str, str]]:
         ("next prime", "≤HH:MM due now · HH:MM–HH:MM after its reset · or why it is not primed"),
         ("", ""),
         ("", "Status lines"),
-        ("engine", "who switches: the service, another process, this TUI, or nothing"),
+        ("engine", "who switches: the service, another process, this TUI, or nothing; "
+                   "AUTO OFF = cc-swap auto off (m → o turns it back on)"),
         ("now", "the engine's last decision (or computed here when none is fresh)"),
-        ("prime", "accounts due for priming, upcoming windows, blockers"),
+        ("prime", "accounts due for priming, upcoming windows, blockers; paused after "
+                  "a claude update until cc-swap prime verify passes"),
     ]
     return rows

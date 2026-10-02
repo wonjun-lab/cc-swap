@@ -18,6 +18,7 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Literal
 
+from claude_swap.maximize.auto_off_flag import read_flag
 from claude_swap.maximize.model import AccountView, Sample, Snapshot
 from claude_swap.maximize.score import landable, rank, score
 from claude_swap.maximize.snapshot import build_snapshot
@@ -51,6 +52,8 @@ TIER_LABELS = {"normal": "normal", "last_resort": "last resort", "excluded": "ex
 #: ``engine_hook.DECISION_KEY`` (pinned by a test, like STATE_FILENAME).
 DECISION_KEY = "maximizeDecision"
 DECISION_KINDS = frozenset({"switch", "hold", "indeterminate", "exhausted"})
+#: ``pause.AUTO_OFF_KEY`` (pinned by a test, like STATE_FILENAME).
+AUTO_OFF_KEY = "autoOff"
 
 
 @dataclass(frozen=True)
@@ -81,6 +84,10 @@ class MaximizeState:
     # A TUI re-login's pause marker (maximize/pause.py), as written.
     paused_until: float | None = None
     paused_reason: str | None = None
+    # `cc-swap auto off` (maximize/pause.py ``autoOff``; same reading).
+    auto_off: bool = False
+    auto_off_since: float | None = None
+    auto_off_by: str | None = None
 
 
 @dataclass(frozen=True)
@@ -150,11 +157,23 @@ def read_state(backup_root: Path) -> MaximizeState:
     No lock needed: the engine replaces the file atomically, so a reader
     sees the old or the new version, never half of one.
     """
+    # The flag file is authoritative for "auto off" and survives a state file
+    # that cannot be parsed (maximize/auto_off_flag.py).
+    flag = read_flag(Path(backup_root))
+    flag_off = flag is not None
+    flag_map = flag if flag else {}
     try:
         raw = json.loads((Path(backup_root) / STATE_FILENAME).read_text(encoding="utf-8"))
     except (OSError, ValueError):
-        return MaximizeState()
+        raw = None
     if not isinstance(raw, dict):
+        if flag_off:
+            by = flag_map.get("by")
+            return MaximizeState(
+                auto_off=True,
+                auto_off_since=_num(flag_map.get("since")),
+                auto_off_by=by if isinstance(by, str) and by else None,
+            )
         return MaximizeState()
     account: str | None = None
     found: list[Sample] = []
@@ -173,7 +192,14 @@ def read_state(backup_root: Path) -> MaximizeState:
     quarantine = raw.get("quarantine")
     decision, plans = _published(raw.get(DECISION_KEY))
     reason = raw.get("pausedReason")
+    off = raw.get(AUTO_OFF_KEY)
+    off_set = flag_off or (AUTO_OFF_KEY in raw and off is not None and off is not False)
+    off_map = flag_map if flag_off and flag_map else (off if isinstance(off, dict) else {})
+    off_by = off_map.get("by")
     return MaximizeState(
+        auto_off=off_set,
+        auto_off_since=_num(off_map.get("since")) if off_set else None,
+        auto_off_by=off_by if off_set and isinstance(off_by, str) and off_by else None,
         samples_account=account,
         samples=tuple(found),
         primes=primes if isinstance(primes, dict) else {},

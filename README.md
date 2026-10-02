@@ -24,7 +24,9 @@ Where the upstream sections below install, upgrade or remove `claude-swap` from 
 uv tool install git+https://github.com/wonjun-lab/cc-swap
 ```
 
-To upgrade, run `uv tool install --force git+https://github.com/wonjun-lab/cc-swap`, then re-run `cc-swap service install` so the service restarts on the new build.
+To upgrade, run `cc-swap upgrade`. If the service is installed, `cc-swap upgrade` re-runs `cc-swap service install` for you after a successful reinstall, so the service restarts on the new build. (Reinstalling by hand with `uv tool install --force git+https://github.com/wonjun-lab/cc-swap` leaves the service on the old build until you run `cc-swap service install`.)
+
+`cc-swap upgrade --check` only reports: it prints the installed and the latest release, then the release notes and commit subjects in between. It exits `0` when you are up to date, `10` when an update is available and `1` when the latest release could not be determined (offline with no cached tag), so a timer can run it daily.
 
 ### Migrating from cswap
 
@@ -35,6 +37,8 @@ cc-swap reads and writes the same data as claude-swap: the backup directory (`~/
 3. `uv tool install git+https://github.com/wonjun-lab/cc-swap`
 4. `cc-swap config set autoswitch.strategy maximize`. The service runs plain `cc-swap auto`, which reads its strategy from the settings.
 5. `cc-swap service install`
+
+`cc-swap init` checks these steps for you, and `cc-swap doctor` explains anything left (see [Diagnostics](#diagnostics-doctor-init-why)).
 
 To go back, run `cc-swap service uninstall`, `uv tool uninstall cc-swap` and `uv tool install claude-swap`. Upstream warns about the unknown `maximize` strategy, falls back to `best`, and ignores the `maximize`/`prime` settings.
 
@@ -116,50 +120,40 @@ Each priming run is built so it cannot disturb your login:
 
 > **Terms of service.** Anthropic's consumer terms treat subscription OAuth access as being for ordinary use and allow Anthropic to act without notice. Priming makes one automated request per idle account after every 5-hour reset. With several accounts that is a steady, machine-like pattern, even though it goes through the official `claude` CLI. The jitter blurs the timing but does not remove the risk. Priming is **off by default**. Turn it on with `cc-swap config set prime.enabled true` only if you accept that risk for your accounts.
 
-### After every Claude Code upgrade: check priming's isolation
+### After every Claude Code update: `cc-swap prime verify`
 
-Priming depends on how the `claude` CLI handles `CLAUDE_CODE_OAUTH_TOKEN` and its Keychain fallback, and that can change between Claude Code versions. Whenever `claude --version` changes, set `prime.enabled` to `false` and run this check before turning priming back on:
+Priming depends on how the `claude` CLI handles `CLAUDE_CODE_OAUTH_TOKEN` and its Keychain fallback, and that can change between Claude Code versions. So priming remembers the Claude Code version its isolation was last verified with (`verifiedClaudeVersion` in `<backup root>/prime_verify.json`) and **pauses itself** as soon as the installed `claude` reports a different one. Fleet's `prime` line then reads `paused: claude 2.1.3 -> 2.1.4 (cc-swap prime verify)`, the engine log warns once, `cc-swap prime` fails with the reason, and `cc-swap doctor` warns. Run:
 
-1. **Fingerprint the active login.** These commands print hashes only, never secrets:
+```bash
+cc-swap prime verify            # zero-cost checks; records the version when they pass
+cc-swap prime verify --live     # also one real prime of an idle account (or --live 3)
+cc-swap prime verify --json     # the same report for scripts
+```
 
-   ```bash
-   # macOS
-   security find-generic-password -s "Claude Code-credentials" -w | shasum -a 256
-   security dump-keychain 2>/dev/null | grep '"svce"<blob>="Claude Code-credentials' | sort
-   # Linux
-   sha256sum ~/.claude/.credentials.json
-   # both
-   python3 -c 'import json,hashlib,os; a=json.load(open(os.path.expanduser("~/.claude.json"))).get("oauthAccount"); print(hashlib.sha256(json.dumps(a,sort_keys=True).encode()).hexdigest())'
-   ```
+It replaces the manual checklist earlier releases asked for. Without `--live` it costs nothing: it runs `claude` once in a throwaway profile with an invalid token and checks that the run fails with a clean 401, leaves no Keychain item and no `.credentials.json` behind, and leaves the active login unchanged: the Keychain item's attributes (never its secret), `~/.claude/.credentials.json` and the account in `~/.claude.json` are compared by hash before and after. `--live` then primes one idle account for real and checks the same things again. When every check passes it records the version and priming resumes on the engine's next tick, with no restart; otherwise it exits 1 and priming stays paused. If a check fails, keep priming off (`cc-swap config set prime.enabled false`) and open an issue that includes your `claude --version`.
 
-2. **Prime one idle account.** Pick an inactive, non-excluded account whose 5h window is off; `cc-swap prime --dry-run` lists them:
+The engine reads `claude --version` only when the executable changed (it caches the answer by the file's identity). An install that never ran `prime verify` takes the first prime the usage endpoint confirms as its baseline. `cc-swap claude-update` feeds the same guard: a run that changes the version pauses priming even before any baseline exists, and prints the exact command to run.
 
-   ```bash
-   cc-swap prime 3
-   cc-swap list            # account 3 now shows a 5h reset time
-   ```
+### Updating Claude Code
 
-3. **Check that a bad token fails cleanly.** You should get no reply, no login prompt, and no fallback to your own login:
+```bash
+cc-swap claude-update --check   # report only: exit 0 up to date, 10 update available, 1 error
+cc-swap claude-update           # run Claude Code's own `claude update`, then show the version before -> after
+cc-swap claude-update --json    # one JSON document on stdout (claude's own output goes to stderr)
+```
 
-   ```bash
-   tmp="$(mktemp -d)"
-   ( cd "$tmp" && env -u ANTHROPIC_API_KEY -u ANTHROPIC_AUTH_TOKEN -u ANTHROPIC_BASE_URL \
-       CLAUDE_CONFIG_DIR="$tmp" CLAUDE_CODE_OAUTH_TOKEN="sk-ant-oat01-invalid" \
-       claude -p --model claude-haiku-4-5 --safe-mode --tools "" --no-session-persistence \
-         --max-turns 1 --output-format json "Reply OK" </dev/null ); echo "exit=$?"
-   rm -rf "$tmp"
-   ```
+`cc-swap claude-update` does not reimplement any install method: it runs the built-in `claude update`, which knows how Claude Code was installed. It finds the real binary the way priming does: `prime.claudePath`, then `~/.local/bin/claude`, then `PATH` as a last resort. A shell alias is never used. Pass `--timeout SECONDS` (default 600) to change when a stuck update is killed. Only one update runs at a time (a lock file in the backup root); a second one exits with status 1.
 
-   Expected: a non-zero exit with an authentication error within seconds. If the command answers, the CLI used some other credential, so keep priming off.
+`--check` never changes anything. It reads the latest version from the npm registry's dist-tags document, `https://registry.npmjs.org/-/package/@anthropic-ai/claude-code/dist-tags`, because `claude update` has no dry-run mode. It reads the `stable` tag when Claude Code's `autoUpdatesChannel` setting is `stable` and the `latest` tag otherwise, so it does not announce a version that `claude update` would not install. If the registry cannot be reached, `--check` exits 1 rather than claim you are up to date. An installed version newer than the registry's (a pre-release or a build ahead of the tag) is never reported as an update.
 
-4. **Fingerprint again** (step 1). Every hash and the Keychain item list must be unchanged. Priming must never touch the active login or the account in `~/.claude.json`, and must not leave a Keychain item behind.
+When a run sees a Claude Code version other than the recorded one, it writes `claudeVersion`, `claudeVersionPrevious` and `claudeVersionChangedAt` into `autoswitch_state.json` in the backup root, so other parts of cc-swap can react to an upgrade. A run that **changes** the version pauses priming until `cc-swap prime verify` passes (see above); with priming enabled it ends with `Priming is paused for Claude Code <version> until its isolation is verified again. Run: cc-swap prime verify` (`--json`: `primeVerifyAdvised`, `primeVerifyCommand`). Only `prime verify` records a version as verified; `claude-update` never does. Claude Code can also update itself in the background; the priming guard notices that on its own (the `claude` file changed), while `autoswitch_state.json` is only updated on the next `claude-update` run.
 
-If any step fails, run `cc-swap config set prime.enabled false` and open an issue that includes your `claude --version`.
+In Fleet, `u` (*Update Claude Code*) runs the same check in a modal, asks before it runs `claude update` (`y`), and shows its output, the version before and after, and the `prime verify` reminder.
 
 ## Always-on service
 
 ```bash
-cc-swap service install     # install (or refresh) and start it; re-run after every upgrade
+cc-swap service install     # install (or refresh) and start it; `cc-swap upgrade` re-runs it for you
 cc-swap service status      # installed? running? pid?
 cc-swap service uninstall   # stop it and remove it
 ```
@@ -168,13 +162,35 @@ cc-swap service uninstall   # stop it and remove it
 - **Linux**: a systemd user unit (`~/.config/systemd/user/cc-swap.service`, `Restart=on-failure`) that is enabled and started for you. Read its logs with `journalctl --user -u cc-swap -f`. To keep it running after you log out, enable lingering once with `loginctl enable-linger $USER`; `install` tells you when lingering is off.
 - **Windows**: not supported. Run `cc-swap auto` in a terminal instead.
 
-`install` forwards `CLAUDE_CONFIG_DIR` and `CLAUDE_SECURESTORAGE_CONFIG_DIR` from the shell you run it in to the service, and prints which ones it forwarded, so a custom profile is read by the service too. It refuses to install while `CLAUDE_CONFIG_DIR` points at a `cswap run` session profile; run it from a terminal outside the session.
+`install` forwards `CLAUDE_CONFIG_DIR` and `CLAUDE_SECURESTORAGE_CONFIG_DIR` from the shell you run it in to the service, and prints which ones it forwarded, so a custom profile is read by the service too. The refresh after `cc-swap upgrade` instead keeps the profile variables already in the installed service file (`--reuse-installed-env`), whatever the upgrading shell has set. If launchd boots the old service out but cannot start the new one, `install` says "the service is now STOPPED - run: cc-swap service install" and exits 1. It refuses to install while `CLAUDE_CONFIG_DIR` points at a `cswap run` session profile; run it from a terminal outside the session.
 
 **An unreadable login holds the engine.** If the live credential cannot be read cleanly (for example, the macOS Keychain answers `rc=36` for a few minutes after a `/login`, or only the plaintext fallback is readable), the engine logs `Keychain unreadable; holding` once and makes no switch for any trigger until a read succeeds. These ticks do not count toward failover. Switching then would overwrite a login cc-swap cannot see, possibly one that has not been backed up yet. Once the Keychain answers again (re-checked every 60 s), switching resumes on its own. A hold that lasts more than 15 minutes logs what to do every 15 minutes (unlock the login keychain, or restart cc-swap); the service exits with code 75 at that point so launchd or systemd restarts it.
 
 **A new login on a dead active slot is adopted.** When the active slot's stored login is dead (quarantined, `re-login needed`, or `login expired`) and you have just run `/login` as that same account, the engine backs the new login up into the slot before doing anything else. It checks the config identity (email, organization, account id) and the token's own identity, as `cc-swap add` does. It then lifts the quarantine and logs `adopted new login for #N`. Until the backup is written, the engine makes no switch. A live login that belongs to no slot, or to a different account than the slot's, holds the engine with the warning `unmanaged login, run cc-swap add`.
 
 **One engine per machine.** Whatever runs the engine (the service, a terminal `cc-swap auto`, the TUI's auto screen, or the menu bar's auto-switch) holds a lock, `<backup root>/.engine.lock`, for as long as it runs. The OS frees the lock when the process exits, even after a crash. While another process holds it, `cc-swap auto` refuses to start and exits with code `4`, and the TUI's auto screen (badge **VIEWER**) and the menu bar only show what the running engine is doing. `cc-swap auto --once --dry-run` needs no lock and always works. If another engine held the lease when the service started, the service retries every minute and takes over once that engine stops. To run an engine in a terminal instead, run `cc-swap service uninstall` first.
+
+## Switch history: `cc-swap history`
+
+Every account switch on this machine is appended to `<backup root>/switches.jsonl`, whoever makes it: the engine (with its trigger: `hard`, `soft`, `rebalance`, …), `cc-swap switch`, the TUI, the menu bar, or a Fleet re-login switching back. A live login that changed outside cc-swap (a `/login` inside a Claude Code session) is recorded too, as `external`. Entries hold slot numbers, the host and versions, never an email or a token. The file is private (0600) and rotates at 1 MiB into three generations.
+
+```bash
+cc-swap history            # the last 20 switches: when, #from -> #to, trigger, who
+cc-swap history -n 0       # all of them
+cc-swap history --json     # for scripts
+```
+
+When the live login is not where the last recorded switch went, it says so. In Fleet, `v` (*View switch history*) shows the newest 50 entries.
+
+## Turning automatic switching off: `cc-swap auto off`
+
+```bash
+cc-swap auto off           # stop switching and priming, until you turn it back on
+cc-swap auto on            # resume
+cc-swap auto status        # on or off, who turned it off and when (--json for scripts)
+```
+
+`off` is persistent and applies to whichever engine runs (the service, a terminal `cc-swap auto`, the TUI or the menu bar): it is stored as `autoOff` in `autoswitch_state.json` and mirrored in its own file, `auto_off.json` in the backup root, so a damaged state file cannot switch it back on (the file is authoritative, and an unreadable or damaged `auto_off.json` reads as off; `cc-swap auto on` removes it), survives restarts, and is picked up on the next tick without a restart. The engine keeps polling and deciding (Fleet's `now` line reads `AUTO OFF` and what it *would* do; the engine log says `no switch: auto-off` at most once an hour), but it never switches and never primes; manual switches still work. In Fleet, Mode (`m`) → `o` turns it off and on.
 
 ## Fleet: the TUI home for maximize
 
@@ -190,7 +206,7 @@ prime   #2 #6 due ≤14:35 · #5 15:06–15:10 · #3 needs re-login
 
 - **Status lines.** `engine` says who switches: the service (recognised by its pid), another process, this TUI, or nothing. `now` is the decision the engine last published to its state file (slot numbers only), or `computed here` when none is fresh. `prime` lists accounts due for priming, upcoming windows and blockers.
 - **Table**, one row per account in slot order: `*` active · `plan` (`20x`/`5x` from the engine, `team` for an organization account, `?` unknown) · `tier` (`normal`, `last-r`, `excl`) · `rank` (the order maximize would pick) · `5h`/`7d` coloured against the soft/hard marks (`~` = stale) · `7d in` · `pace` (remaining 7d share over an even daily allotment) · `land` (`yes`, or why not: `5h≥45`, `excluded`, `login<2h`, `re-login`…) · `login` (time left on the login) · `5h window` (`cold`, `running → 16:20`, `primed → 17:50`) · `next prime`. A narrow or short terminal drops the detail card, then folds the menu, then the `prime` line.
-- **Menu** (first letter = key): `s` Swap strategy · `m` Mode · `p` Prime now · `f` Fetch latest usage · `a` Account settings · `e` Engine log (the auto screen; also `g`) · `c` Classic dashboard · `q` Quit. **Row keys:** `enter` switch (asks first only when maximize would not land there) · `l` last resort on/off · `x` exclude/include · `r` re-login · `w` watch · `?` help.
+- **Menu** (first letter = key): `s` Swap strategy · `m` Mode · `p` Prime now · `f` Fetch latest usage · `a` Account settings · `e` Engine log (the auto screen; also `g`) · `v` View switch history · `u` Update Claude Code · `c` Classic dashboard · `q` Quit. **Account settings:** `a` Add current login · `t` Token or API key · `r` Re-login · `n` Name (alias) · `d` Delete account · `i` Inspect all logins (doctor) · `b` back. **Mode:** `d`/`l` run an engine here (dry-run/live), `s` stop it, `o` automatic switching off/on. Keys are unique on each screen, and `v`, `u` and `i` mean one thing anywhere in Fleet. **Row keys:** `enter` switch (asks first only when maximize would not land there) · `l` last resort on/off · `x` exclude/include · `r` re-login · `w` watch · `?` help.
 - **Viewer by default.** Fleet never takes the engine lease by itself, so it never pushes the service aside. `m` (Mode) runs an engine in this TUI on request — dry-run, or live after a confirmation — and quitting asks first while a live one runs. The auto screen attaches to that engine instead of starting a second one.
 - **Re-login.** A dead refresh token turns the row red and names it in the attention line. `r` on it (or Account settings → Re-login) first backs up the active account's current login into its slot (and refuses to start, saying why, if that backup cannot be verified), then shows the steps; cc-swap launches nothing itself, so it works the same over SSH: in another terminal run `claude` (the path in `prime.claudePath`, else `~/.local/bin/claude`), type `/login` and sign in as that account's email (over SSH, open the printed URL anywhere and paste the code back), quit `claude`, then press `enter`. cc-swap stores the live login into the slot only if its email, organization and account id match that slot — it refuses a login that belongs to another slot — and switches back to the account that was active. While the guide is open the engine is paused (`pausedUntil` in `autoswitch_state.json`, at most 10 minutes): no switch and no priming. Other machines keep their own logins; repeat the re-login on each machine that needs it rather than copying one login between machines.
 - `CC_SWAP_FETCH_ON_OPEN=0` stops Fleet from fetching stale rows once when it opens as a viewer.
@@ -204,6 +220,55 @@ A Claude Code login has a fixed deadline. The token endpoint sets it at `/login`
 - **No landing on a dying login.** `maximize` never makes a soft or rebalance switch onto an account whose login expires within `maximize.loginExpiryGuardMin` minutes (default 120). An at-limit or hard fallback can still use it while it works, but never once its deadline has passed. Priming skips accounts past their deadline.
 - **Re-login.** Use Fleet's `r` (see above), or run `claude`, `/login` as that account, then `cc-swap add`. The Fleet guide stores the login only once the live refresh token has changed, so pressing `enter` before logging in stores nothing.
 - **Refresh audit.** Every refresh POST cc-swap makes logs one INFO line to the engine log (`refresh POST caller=… slot=… active=… source=live|backup|profile rt=<8 hex>-><8 hex> accessExp=… login=… result=… latency=…`). It holds fingerprint prefixes only, never tokens or emails, so it is safe to paste into an issue when you need to know which machine spent a token.
+
+## Diagnostics: `doctor`, `init`, `why`
+
+`cc-swap doctor` checks this machine and every stored login in one read-only pass and prints one fix line per problem. It never refreshes a token, writes nothing, and runs no `claude` other than `claude --version`. Accounts appear by slot number and logins by an 8-hex fingerprint prefix, never a token or an email, so the output is safe to paste into an issue. `--json` prints the same findings for scripts. The exit status is 0 when everything is fine, 1 with warnings and 2 with errors.
+
+| Check | What it looks at |
+|---|---|
+| `claude` | `prime.claudePath`, then PATH, then `~/.local/bin/claude`; whether `claude --version` answers |
+| `keychain` | macOS: whether the live login's Keychain item reads cleanly. `rc=36` (errSecInteractionNotAllowed): the login keychain is locked, the session cannot reach it (SSH, launchd before login), or a `/login` is still writing. `rc=51` (errSecAuthFailed): the item's access control refuses `/usr/bin/security`. `rc=44`: no item |
+| `plaintext` | `~/.claude/.credentials.json`: on macOS, a duplicate or a stale copy of the Keychain login (fingerprint prefixes compared); on Linux, readable by other users |
+| `live-login` | the live login (`~/.claude.json` and its token) belongs to a slot, and its token is not another slot's |
+| `upstream` | upstream `claude-swap` still installed (uv or pipx), running, or its menu bar LaunchAgent installed |
+| `service` | installed and running; its file written by cc-swap 0.2.0 or later (`CC_SWAP_SERVICE`); pinned to this `cc-swap` and version; its process started after the last install; the same `CLAUDE_CONFIG_DIR` as this shell |
+| `lease` | who holds the engine lease (the service, another engine, nobody) and whether a re-login paused switching |
+| `settings` | `settings.json` parses and every value is in range |
+| `priming` | while priming is on: paused after a Claude Code update until `cc-swap prime verify` passes (a warning), or the version its isolation was verified for |
+| per slot | stored login present and readable, login deadline (expired, or under 7 days), quarantine, two slots holding the same login |
+
+In Fleet, Account settings → `i` (*Inspect all logins*) runs the same checks in a modal; `r` runs them again.
+
+`cc-swap init` is the onboarding and migration checklist. It prints `ok`, `FIX` or `TODO` for each step: Claude Code installed → logged in → the live login saved in a slot → two or more accounts → upstream claude-swap gone → strategy `maximize` → service running on this build → priming off unless verified. It exits 1 until every step is ok, so re-run it after each one. Without `--apply` it writes nothing; `cc-swap init --apply` does the two idempotent steps (`cc-swap config set autoswitch.strategy maximize`, and `cc-swap service install` once the login, slot and upstream steps are ok).
+
+### Why didn't it switch?
+
+`cc-swap why` prints the decision the running engine last published to its state file, if it is fresh (the rule Fleet's `now` line uses) and about the account that is live now, and explains its reason code with the table below. Otherwise it runs `cc-swap auto --once --dry-run` to show what a tick would decide now (`--no-fallback` skips that, `--json` is for scripts). The same codes appear as `no switch: <code>` in `cc-swap auto` output and the engine log.
+
+| Code | Meaning | What to do |
+|---|---|---|
+| `below-threshold` | The active account is below autoswitch.threshold (strategies best and consume-first). | Nothing; lower autoswitch.threshold to switch earlier. |
+| `cooldown` | A proactive switch happened less than autoswitch.cooldownSeconds ago. | Wait, or lower autoswitch.cooldownSeconds. |
+| `no-candidates` | No other account can take you: every other one is disabled, excluded, quarantined or an API key. | cc-swap add another account, cc-swap enable one, or re-login a quarantined one (cc-swap doctor). |
+| `no-qualifying-candidate` | Other accounts exist, but none is far enough below the thresholds, or their usage is unreadable this tick. | Wait for a reset (cc-swap list shows when), or loosen the thresholds. |
+| `no-comparison` | No candidate's usage could be read this tick. | Check the network and cc-swap list; if it persists, cc-swap doctor. |
+| `no-viable-target` | Every candidate failed the last-moment check (dead token, another account's login, live session). | cc-swap doctor names the broken slots; re-login them. |
+| `reset-unknown` | consume-first: the active account's weekly reset time is unknown, so it cannot compare. | Nothing; it resumes once usage reports the reset. |
+| `already-consuming-soonest` | consume-first: no account with room resets sooner than the active one. | Nothing; this is the strategy working. |
+| `stale-usage` | consume-first: the target's usage could not be refreshed this tick (backoff or another poller). | Nothing; it retries next tick. |
+| `active-usage-unknown` | The active account's usage could not be read; failover follows after autoswitch.unhealthyTicks misses in a row. | Check the network and cc-swap list; if it persists, cc-swap doctor. |
+| `active-idle` | The active access token expired while Claude Code is idle; it refreshes on next use. | Nothing. |
+| `active-api-key` | The live login is a managed API key, which has no quota to watch. | cc-swap switch to a subscription account. |
+| `active-credential-unreadable` | The live login could not be read cleanly (Keychain rc=36/51, or only a stale plaintext copy), so switching would overwrite a login cc-swap cannot see. | cc-swap doctor; unlock the login keychain. Switching resumes by itself once a read succeeds. |
+| `unmanaged-active-account` | The live login belongs to no slot, or to a different account than the slot it claims. | cc-swap add (after checking which account you are logged in as). |
+| `new-login-not-backed-up` | A new /login on the active slot is not backed up yet; the engine waits until it is. | Wait a tick; if it persists, cc-swap add --slot N. |
+| `no-active-account` | Nobody is logged in to Claude Code. | Run claude and /login, then cc-swap add. |
+| `already-active` | The chosen target was already the live login when the switch ran. | Nothing. |
+| `maximize-paused` | A Fleet re-login paused switching (pausedUntil, at most 10 minutes). | Finish or cancel the re-login; the pause also ends by itself. |
+| `auto-off` | Automatic switching is off (cc-swap auto off, or Fleet Mode → o): the engine keeps deciding but never switches or primes. | cc-swap auto on (or Fleet Mode → o); cc-swap auto status shows who turned it off and when. |
+| `maximize-pending` | A soft mark is crossed; maximize waits for an idle moment (idleWindowMin) before switching. | Nothing; a hard ceiling switches at once. Lower maximize.idleWindowMin to switch sooner. |
+| `maximize-hold` | maximize sees no reason to move: below every soft mark and no better-scored account (or within rebalanceCooldownMin). | Nothing. |
 
 ---
 

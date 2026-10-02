@@ -96,13 +96,15 @@ def manual_prime(
     sleep: Callable[[float], None] = time.sleep,
     clock: Callable[[], float] = time.time,
     on_plan: Callable[[list[tuple[str, str, bool]]], None] | None = None,
+    check_version: bool = True,
 ) -> PrimeReport:
     """One manual priming pass (``cc-swap prime``; the TUI's Prime now).
 
     Blocking: reads usage, may refresh tokens and run ``claude``. ``emit``
     receives the engine's own events (a quarantine); the primer's events come
     back in the report. ``on_plan`` sees the plan before anything launches,
-    so a caller can show the skips while the launches run."""
+    so a caller can show the skips while the launches run. ``check_version``
+    False skips the Claude Code version guard (``prime verify --live`` only)."""
     engine = AutoSwitchEngine(
         switcher,
         load_settings(switcher.backup_dir),
@@ -110,7 +112,10 @@ def manual_prime(
         dry_run=dry_run,
         clock=clock,
     )
-    primer = Primer(engine, load_prime_settings(switcher.backup_dir), clock=clock)
+    primer = Primer(
+        engine, load_prime_settings(switcher.backup_dir), clock=clock,
+        version_gate=check_version,
+    )
     entries = switcher.usage_entries_by_account(fetch=None)
     usage = {num: entry.decision_value() for num, entry in entries.items()}
     snap = prime_snapshot(engine, usage, clock())
@@ -134,13 +139,20 @@ def manual_prime(
 
 
 def prime_command(argv: list[str]) -> None:
+    if argv and argv[0] == "verify":
+        from claude_swap.maximize.prime_verify import verify_command
+
+        verify_command(argv[1:])
+        return
     parser = argparse.ArgumentParser(
         prog="cc-swap prime",
         description=(
             "Open idle accounts' 5-hour windows now: one tiny request each "
             "through the official claude CLI, with only the access token, in "
             "an isolated profile. Same safety checks as automatic priming; "
-            "works even when prime.enabled is false."
+            "works even when prime.enabled is false. After a Claude Code "
+            "update, run `cc-swap prime verify` first (priming pauses until "
+            "it passes)."
         ),
     )
     parser.add_argument(

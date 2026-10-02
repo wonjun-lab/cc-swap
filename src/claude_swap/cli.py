@@ -76,9 +76,14 @@ _SUBCOMMAND_FLAGS = {
 # attribute (``patch("claude_swap.cli._last_resort_command")``). New fork
 # commands (prime, service) register here; main() has a single hook for all.
 _FORK_COMMANDS: dict[str, str] = {
+    "claude-update": "_claude_update_command",
     "last-resort": "_last_resort_command",
     "prime": "_prime_command",
     "service": "_service_command",
+    "doctor": "_doctor_command",
+    "init": "_init_command",
+    "why": "_why_command",
+    "history": "_history_command",
 }
 
 
@@ -612,6 +617,12 @@ def _auto_command(argv: list[str]) -> None:
     import signal
     import time as _time
 
+    if argv and argv[0] in ("on", "off", "status"):  # cc-swap: persistent auto on/off
+        from claude_swap.maximize.pause import auto_command
+
+        auto_command(argv)
+        return
+
     parser = argparse.ArgumentParser(
         prog="cswap auto",
         description=(
@@ -1133,6 +1144,41 @@ def _prime_command(argv: list[str]) -> None:
     prime_command(argv)
 
 
+def _claude_update_command(argv: list[str]) -> None:
+    """Handle `cc-swap claude-update` (maximize/claude_update.py)."""
+    from claude_swap.maximize.claude_update import claude_update_command
+
+    claude_update_command(argv)
+
+
+def _doctor_command(argv: list[str]) -> None:
+    """Handle `cc-swap doctor` (maximize/doctor_cli.py), imported lazily."""
+    from claude_swap.maximize.doctor_cli import doctor_command
+
+    doctor_command(argv)
+
+
+def _init_command(argv: list[str]) -> None:
+    """Handle `cc-swap init` (maximize/doctor_cli.py), imported lazily."""
+    from claude_swap.maximize.doctor_cli import init_command
+
+    init_command(argv)
+
+
+def _why_command(argv: list[str]) -> None:
+    """Handle `cc-swap why` (maximize/doctor_cli.py), imported lazily."""
+    from claude_swap.maximize.doctor_cli import why_command
+
+    why_command(argv)
+
+
+def _history_command(argv: list[str]) -> None:
+    """Handle `cc-swap history` (maximize/history_cli.py), imported lazily."""
+    from claude_swap.maximize.history_cli import history_command
+
+    history_command(argv)
+
+
 def _use_native_tls() -> None:
     """Route TLS trust decisions through the OS-native verifier.
 
@@ -1224,7 +1270,12 @@ def _print_service_install(result: dict) -> None:
     forwarded = result.get("forwarded_env") or {}
     if forwarded:
         shown = ", ".join(f"{name}={value or '(empty)'}" for name, value in forwarded.items())
-        print(f"  env:    {shown} (forwarded from this shell)")
+        origin = (
+            "kept from the installed service"
+            if result.get("env_source") == "installed"
+            else "forwarded from this shell"
+        )
+        print(f"  env:    {shown} ({origin})")
     if result["claude_path"]:
         saved = " (saved as prime.claudePath)" if result["claude_path_saved"] else ""
         print(f"  claude: {result['claude_path']}{saved}")
@@ -1299,6 +1350,15 @@ menu bar only display. Re-run `cc-swap service install` after upgrading.
             "else found on PATH or at ~/.local/bin/claude); saved as prime.claudePath"
         ),
     )
+    p_install.add_argument(
+        "--reuse-installed-env",
+        action="store_true",
+        help=(
+            "keep CLAUDE_CONFIG_DIR / CLAUDE_SECURESTORAGE_CONFIG_DIR from the "
+            "installed service file instead of this shell (used by the refresh "
+            "after `cc-swap upgrade`)"
+        ),
+    )
     sub.add_parser("uninstall", help="Stop the service and remove it")
     sub.add_parser("status", help="Report whether the service is installed and running")
     args = parser.parse_args(argv)
@@ -1313,7 +1373,10 @@ menu bar only display. Re-run `cc-swap service install` after upgrading.
 
     try:
         if args.action == "install":
-            _print_service_install(service.install(claude_path=args.claude_path))
+            kwargs = {"claude_path": args.claude_path}
+            if args.reuse_installed_env:
+                kwargs["reuse_installed_env"] = True
+            _print_service_install(service.install(**kwargs))
         elif args.action == "uninstall":
             result = service.uninstall()
             if result["was_running"] or result["removed"]:
@@ -1343,6 +1406,12 @@ def main() -> None:
         printer.set_theme(name)
     except Exception:
         pass  # theme is cosmetic; never block the CLI on it
+    try:  # cc-swap: record every switch this process makes (maximize/ledger.py)
+        from claude_swap.maximize import ledger
+
+        ledger.install(source=ledger.process_source(argv))
+    except Exception:
+        pass
 
     # `run` and `auto` keep their dedicated pre-dispatch parsers.
     if argv and argv[0] == "run":
@@ -1426,6 +1495,7 @@ Commands:
   %(prog)s menubar                    macOS menu bar app
   %(prog)s menubar --install-service  keep the menu bar running via launchd
   %(prog)s upgrade                    self-upgrade to latest
+  %(prog)s upgrade --check            show what a newer release changes (exit 10 if there is one)
   %(prog)s purge                      remove all claude-swap data
 
 cc-swap:
@@ -1433,7 +1503,14 @@ cc-swap:
   %(prog)s last-resort add|remove <a> use an account only as a last resort
   %(prog)s last-resort list           list last-resort accounts
   %(prog)s prime [N ...] [--dry-run]  open idle accounts' 5h windows now
+  %(prog)s prime verify [--live]      re-check priming isolation after a claude update
   %(prog)s service install            run auto-switch as a background service
+  %(prog)s doctor [--json]            check logins, Keychain, service; say what to fix
+  %(prog)s init [--apply]             onboarding/migration checklist (ok/FIX/TODO)
+  %(prog)s why                        why the engine did or didn't switch
+  %(prog)s auto off|on|status         stop / resume automatic switching (persistent)
+  %(prog)s history [-n N] [--json]    recent account switches (who, why)
+  %(prog)s claude-update [--check]    update Claude Code via `claude update` (exit 10 = available)
 
 Aliases: ls=list  rm=remove  update=upgrade""",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -1657,6 +1734,15 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
         action="store_true",
         help=argparse.SUPPRESS,
     )
+    parser.add_argument(
+        "--check",
+        action="store_true",
+        help=(
+            "With 'upgrade': only report the installed and latest release and "
+            "what changed between them; exit 0 when up to date, 10 when an "
+            "update is available"
+        ),
+    )
     group.add_argument(
         "--add-token",
         metavar="TOKEN|-",
@@ -1732,6 +1818,12 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
             "or 'upgrade'"
         )
 
+    if args.check and not args.upgrade:
+        parser.error("--check can only be used with 'upgrade'")
+
+    if args.check and args.force:
+        parser.error("--check only reports; it cannot be combined with --force")
+
     if args.full and not args.export:
         parser.error("--full can only be used with 'export'")
 
@@ -1752,9 +1844,11 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
     # Self-upgrade runs before switcher init so we don't touch config/keychain
     # just to upgrade the tool itself.
     if args.upgrade:
-        from claude_swap.update_check import run_self_upgrade
+        from claude_swap.update_check import run_self_upgrade, run_upgrade_check
 
         try:
+            if args.check:
+                sys.exit(run_upgrade_check())
             sys.exit(run_self_upgrade(force=args.force))
         except KeyboardInterrupt:
             print(f"\n{dimmed('Upgrade cancelled')}")

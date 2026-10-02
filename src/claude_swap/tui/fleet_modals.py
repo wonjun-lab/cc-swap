@@ -374,7 +374,7 @@ class ModeModal(ModalScreen["str | None"]):
     def __init__(self, status: fx.EngineStatus) -> None:
         super().__init__()
         self._status = status
-        self._actions = fx.mode_transitions(status.holder)
+        self._actions = fx.mode_transitions(status.holder, auto_off=status.auto_off)
 
     def compose(self) -> ComposeResult:
         with Vertical(classes="modal-box modal-box-wide fx-modal"):
