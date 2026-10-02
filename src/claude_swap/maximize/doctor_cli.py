@@ -462,8 +462,8 @@ REASONS: dict[str, tuple[str, str]] = {
         "Finish or cancel the re-login; the pause also ends by itself.",
     ),
     "auto-off": (
-        "Automatic switching is off (cc-swap auto off, or Fleet Mode → o): the engine keeps deciding but never switches or primes.",
-        "cc-swap auto on (or Fleet Mode → o); cc-swap auto status shows who turned it off and when.",
+        "Automatic switching is off (cc-swap auto off, or Fleet: m → o): the engine keeps deciding but never switches or primes.",
+        "cc-swap auto on (or Fleet: m → o); cc-swap auto status shows who turned it off and when.",
     ),
     "maximize-pending": (
         "A soft mark is crossed; maximize waits for an idle moment (idleWindowMin) before switching.",

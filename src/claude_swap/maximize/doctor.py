@@ -1007,7 +1007,7 @@ def check_lease(ctx: Context) -> list[Finding]:
         out.append(Finding(
             "lease", "info",
             f"auto-switching is OFF{since}{by}: the engine decides but never switches or primes",
-            "cc-swap auto on (or Fleet Mode → o)",
+            "cc-swap auto on (or Fleet: m → o)",
         ))
     return out
 

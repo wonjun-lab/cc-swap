@@ -82,9 +82,28 @@ def test_readme_describes_the_service_takeover_as_a_retry_not_a_wait_for_termina
     "it refuses a login that belongs to another slot",
     "`pausedUntil`",
     "CC_SWAP_FETCH_ON_OPEN=0",
+    "assets/fleet-wide.png",
+    "assets/fleet-narrow.png",
+    "nothing below is live",
 ])
 def test_readme_documents_the_fleet_screen_and_relogin(snippet):
     assert snippet in README.read_text(encoding="utf-8")
+
+
+def test_readme_fleet_screenshots_exist():
+    root = README.parent
+    for name in ("fleet-wide.png", "fleet-narrow.png"):
+        assert (root / "assets" / name).stat().st_size > 10_000, name
+
+
+def test_readme_names_every_fleet_footer_key():
+    from claude_swap.maximize import home
+
+    text = _readme_text()
+    start = text.index("## Fleet: the TUI home for maximize")
+    section = text[start:text.index("### Logins expire", start)]
+    for key, what in home.KEY_HINTS:
+        assert f"`{key}` {what}" in section, key
 
 
 # --- README <-> code contracts ----------------------------------------------
@@ -169,7 +188,11 @@ def test_every_fleet_key_the_readme_names_is_bound():
 
     bound = {"?" if k == "question_mark" else k for b in FleetScreen.BINDINGS for k in b.key.split(",")}
     bound |= {k for b in CswapApp.BINDINGS for k in b.key.split(",")}
-    # Sub-screens the section documents: Account settings and the Mode modal.
+    # Sub-screens the section documents: the menu, Account settings and the
+    # Mode modal.
+    from claude_swap.tui import menus
+
+    bound |= set(menus.MAIN_KEYS)
     bound |= {k for b in AccountsScreen.BINDINGS for k in b.key.split(",")}
     bound |= {
         a.key
