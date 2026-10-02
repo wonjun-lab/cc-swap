@@ -2256,6 +2256,23 @@ class TestDryRunAndNoOp:
         assert outcome is TickOutcome.NO_ACTION
         assert "lastSwitchAt" not in harness.state()
 
+    def test_a_dead_target_login_is_no_viable_target(self, harness):
+        # switch_to's last-moment check refused the target (login expired).
+        with patch.object(
+            harness.switcher,
+            "switch_to",
+            return_value={"switched": False, "reason": "login-dead",
+                          "loginProblem": "login expired Oct 2 20:04 (1h 0m ago)"},
+        ):
+            outcome = harness.tick_with_usage({
+                "1": _usage(95), "2": _usage(10), "3": _usage(50),
+            })
+        assert outcome is TickOutcome.NO_ACTION
+        [event] = [e for e in harness.events if isinstance(e, NoSwitchEvent)]
+        assert event.reason == "no-viable-target"
+        assert "login expired" in event.detail
+        assert "lastSwitchAt" not in harness.state()
+
 
 class TestEventsShape:
     def test_every_event_has_envelope(self, harness):

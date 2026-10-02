@@ -24,6 +24,7 @@ from claude_swap.exceptions import (
     LockError,
     SessionError,
     SwitchError,
+    SwitchRefusedError,
     ValidationError,
 )
 from claude_swap import oauth, pace
@@ -210,6 +211,10 @@ ERROR_NOTES = {
 # deadline Claude Code stamped at login, that search finds nothing and costs
 # an afternoon. ``dead_token_sentinel`` picks between the two.
 _RELOGIN_REMEDY = "log in with Claude Code, then run: cswap add"
+
+#: ``switch --json`` no-op reasons that mean "refused": the CLI exits 1 for
+#: them, as it does when the human path raises ``SwitchRefusedError``.
+SWITCH_REFUSED_REASONS = frozenset({"login-dead", "no-candidates"})
 
 SENTINEL_NOTES = {
     USAGE_TOKEN_EXPIRED: "token expired — refresh deferred this pass; retries automatically",
@@ -1003,6 +1008,62 @@ class ClaudeAccountSwitcher:
         if not self._read_account_config(str(account_num), email):
             return False
         return True
+
+    _QUARANTINE_REASONS = {
+        "invalid_grant": "refresh token dead",
+        "login_expired": "login expired",
+        "identity-conflict": "stored login belongs to another account",
+    }
+
+    def dead_login_reason(self, account_num: str) -> str | None:
+        """Why slot ``account_num``'s stored login can no longer be used, or
+        None when it can (or nothing proves otherwise).
+
+        Dead means: its recorded login deadline has passed, the auto-switch
+        engine quarantined it and its login was not replaced since, or the
+        usage store struck its refresh token dead. Switching onto such a slot
+        leaves Claude Code logged out, so rotation skips it and a manual
+        switch asks for --force. API-key slots have no login to lapse.
+        Asked about switch targets only, never the live account (whose
+        stored sources differ; see :meth:`_slot_token_dead`).
+        """
+        num = str(account_num)
+        data = self._get_sequence_data() or {}
+        record = data.get("accounts", {}).get(num) or {}
+        email = record.get("email", "")
+        if not email or record.get("kind") == "api_key":
+            return None
+        creds = self._read_account_credentials(num, email)
+        if not creds:
+            return None  # not switchable at all; reported as such elsewhere
+        deadline_ms = oauth.login_expires_at_ms(creds)
+        if deadline_ms is not None and oauth.is_login_expired(creds):
+            return f"login expired {oauth.deadline_text(deadline_ms / 1000.0)}"
+        try:
+            state = json.loads(
+                (self.backup_dir / "autoswitch_state.json").read_text(encoding="utf-8")
+            )
+        except (OSError, ValueError):
+            state = {}
+        quarantine = state.get("quarantine") if isinstance(state, dict) else None
+        entry = quarantine.get(num) if isinstance(quarantine, dict) else None
+        if (
+            isinstance(entry, dict)
+            and entry.get("email") == email
+            and entry.get("refreshTokenFingerprint") == oauth.credential_fingerprint(creds)
+        ):
+            why = str(entry.get("reason") or "")
+            return self._QUARANTINE_REASONS.get(why, why or "quarantined")
+        try:
+            # As an idle slot: its backup is the one stored source (callers
+            # never ask about the live account, which needs no activation).
+            org = record.get("organizationUuid", "") or ""
+            entry = self._usage_store.entries({num: (email, org)}).get(num)
+            if entry is not None and self._entry_token_dead(entry, num, email, creds, False):
+                return "refresh token dead"
+        except Exception:  # a display-grade check never blocks a switch
+            pass
+        return None
 
     def _write_account_config(
         self, account_num: str, email: str, config: str
@@ -6389,15 +6450,21 @@ class ClaudeAccountSwitcher:
 
         next_account: str | None = None
         skipped_exhausted: list[str] = []
+        # Skips that leave the user nothing to switch to but are their own
+        # choice (disabled) or a known dead login: "slot -> why".
+        skipped_out: dict[str, str] = {}
+        skipped_unusable = False
         for offset in range(1, len(sequence)):
             candidate = str(sequence[(current_index + offset) % len(sequence)])
             if self._disabled_from_data(data, candidate):
+                skipped_out[candidate] = f"Account-{candidate} is disabled"
                 if json_output:
                     warnings.append(f"Skipped Account-{candidate} (disabled)")
                 else:
                     print(f"{accent('Skipping')} Account-{candidate} (disabled)")
                 continue
             if not self._account_is_switchable(candidate):
+                skipped_unusable = True
                 if json_output:
                     warnings.append(
                         f"Skipped Account-{candidate} (no stored credentials/config)"
@@ -6406,7 +6473,20 @@ class ClaudeAccountSwitcher:
                     print(
                         f"{accent('Skipping')} Account-{candidate} "
                         f"(no stored credentials/config, re-add with "
-                        f"cswap --add-account --slot {candidate})"
+                        f"cc-swap add --slot {candidate})"
+                    )
+                continue
+            dead = self.dead_login_reason(candidate)
+            if dead is not None and candidate != str(current_num):
+                skipped_out[candidate] = f"Account-{candidate} cannot be used ({dead})"
+                if json_output:
+                    warnings.append(
+                        f"Skipped Account-{candidate} ({dead}; {oauth.relogin_fix(candidate)})"
+                    )
+                else:
+                    print(
+                        f"{accent('Skipping')} Account-{candidate} "
+                        f"({dead}; {oauth.relogin_fix(candidate)})"
                     )
                 continue
             if strategy == "next-available":
@@ -6457,6 +6537,30 @@ class ClaudeAccountSwitcher:
             )
             return None
 
+        if next_account is None and skipped_out and not skipped_unusable:
+            # Every other account is out by the user's choice (disabled) or
+            # has a dead login: say which, and that nothing switched (exit 1).
+            fixes = []
+            if any(why.endswith("is disabled") for why in skipped_out.values()):
+                fixes.append("re-enable one with: cc-swap enable <num|email>")
+            fixes += [
+                oauth.relogin_fix(num)
+                for num, why in skipped_out.items()
+                if not why.endswith("is disabled")
+            ]
+            message = (
+                "No other account is in rotation: "
+                + ", ".join(skipped_out.values())
+                + f". Staying on Account-{current_num}; "
+                + "; or ".join(fixes) + "."
+            )
+            if json_output:
+                return self._switch_noop(
+                    strategy=strategy_label, reason="no-candidates",
+                    to_ref=current_ref, warnings=warnings, message=message,
+                )
+            raise SwitchRefusedError(message, reason="no-candidates")
+
         if next_account is None:
             if json_output:
                 return self._switch_noop(
@@ -6466,7 +6570,7 @@ class ClaudeAccountSwitcher:
                 )
             print(dimmed(
                 "No other accounts have valid stored credentials/config.\n"
-                "Re-add a skipped slot with: cswap --add-account --slot <number>"
+                "Re-add a skipped slot with: cc-swap add --slot <number>"
             ))
             return None
 
@@ -6605,6 +6709,9 @@ class ClaudeAccountSwitcher:
                         to_ref=ref,
                         message=f"Already on Account-{target_account} ({email})",
                     )
+            refused = self._refuse_dead_target(target_account, identity, json_output)
+            if refused is not None:
+                return refused
 
         op = self._perform_switch(
             target_account,
@@ -6624,6 +6731,43 @@ class ClaudeAccountSwitcher:
                 f"Activated Account-{to['number']} ({to['email']}) from stored backup"
             )
         return result
+
+    def _refuse_dead_target(
+        self, target: str, identity: tuple[str, str] | None, json_output: bool
+    ) -> dict | None:
+        """Refuse a manual switch onto a slot whose stored login is dead
+        (:meth:`dead_login_reason`): it would leave Claude Code logged out.
+        Raises :class:`SwitchRefusedError` (exit 1); with ``json_output``
+        returns the no-op payload (``reason: login-dead``) instead. None when
+        the target is fine, or is the live account (nothing to activate)."""
+        data = self._get_sequence_data() or {}
+        current = (
+            self._find_account_slot(data, identity[0], identity[1])
+            if identity is not None else None
+        )
+        if current == target:
+            return None
+        dead = self.dead_login_reason(target)
+        if dead is None:
+            return None
+        message = (
+            f"Not switching to Account-{target}: its stored login cannot be used "
+            f"({dead}), so Claude Code would be logged out. "
+            f"Fix: {oauth.relogin_fix(target)}. "
+            f"To switch anyway: cc-swap switch {target} --force"
+        )
+        if not json_output:
+            raise SwitchRefusedError(message, reason="login-dead")
+        email = (data.get("accounts", {}).get(str(current), {}) or {}).get("email", "")
+        ref = account_ref(int(current), email) if current else None
+        payload = self._switch_noop(
+            strategy="direct", reason="login-dead", to_ref=ref, message=message,
+        )
+        payload["target"] = account_ref(
+            int(target), data.get("accounts", {}).get(target, {}).get("email", "")
+        )
+        payload["loginProblem"] = dead
+        return payload
 
     def _live_matches_slot_backup(self, slot: str, email: str) -> bool:
         """Whether the live credential is provably the slot's stored lineage.

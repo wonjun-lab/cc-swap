@@ -42,6 +42,18 @@ class SwitchError(ClaudeSwitchError):
     pass
 
 
+class SwitchRefusedError(SwitchError):
+    """A switch cc-swap declined to make (nothing was changed).
+
+    ``reason`` is the machine-readable code the ``--json`` payload carries
+    (``login-dead``: the target's stored login can no longer be used;
+    ``no-candidates``: no other account is in rotation)."""
+
+    def __init__(self, message: str, *, reason: str) -> None:
+        super().__init__(message)
+        self.reason = reason
+
+
 class SessionError(ClaudeSwitchError):
     """Error setting up or launching a session-mode profile."""
 

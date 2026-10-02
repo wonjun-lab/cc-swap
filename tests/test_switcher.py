@@ -21,6 +21,7 @@ from claude_swap.exceptions import (
     CredentialReadError,
     SessionError,
     SwitchError,
+    SwitchRefusedError,
     ValidationError,
 )
 from claude_swap.usage_store import FetchRecord, UsageEntry, UsageStore
@@ -6095,6 +6096,145 @@ class TestUsageAwareSwitch:
         with patch.object(s, "list_accounts"):
             s.switch()
         assert s._get_sequence_data()["activeAccountNumber"] == 1  # wraps around
+
+
+class TestSwitchSkipsDeadLogins:
+    """A slot whose stored login is dead (deadline passed, quarantined, or
+    refresh token struck dead) is never a rotation target, and a manual
+    `switch N` onto it is refused unless --force."""
+
+    _setup = TestUsageAwareSwitch._setup
+    _make_live = TestUsageAwareSwitch._make_live
+
+    def _seed(self, s, num: int, email: str, *, login_expires_s: float | None = None) -> None:
+        TestUsageAwareSwitch._seed(self, s, num, email)
+        if login_expires_s is not None:
+            creds = json.loads(s._read_account_credentials(str(num), email))
+            creds["claudeAiOauth"]["refreshTokenExpiresAt"] = int(
+                (time.time() + login_expires_s) * 1000
+            )
+            s._write_account_credentials(str(num), email, json.dumps(creds))
+
+    def _three(self, temp_home, **expire) -> ClaudeAccountSwitcher:
+        s = self._setup(temp_home)
+        self._seed(s, 1, "a@example.com")
+        self._seed(s, 2, "b@example.com", login_expires_s=expire.get("s2"))
+        self._seed(s, 3, "c@example.com", login_expires_s=expire.get("s3"))
+        self._make_live(temp_home, "a@example.com", 1)
+        return s
+
+    def test_dead_login_reason(self, temp_home):
+        s = self._three(temp_home, s2=-3600, s3=20 * 86400)
+        assert s.dead_login_reason("1") is None
+        assert s.dead_login_reason("3") is None
+        reason = s.dead_login_reason("2")
+        assert reason is not None and reason.startswith("login expired")
+
+    def test_quarantined_slot_is_dead_until_its_login_changes(self, temp_home):
+        s = self._three(temp_home)
+        fp = oauth.credential_fingerprint(s._read_account_credentials("3", "c@example.com"))
+        (s.backup_dir / "autoswitch_state.json").write_text(json.dumps({"quarantine": {
+            "3": {"email": "c@example.com", "reason": "invalid_grant",
+                  "refreshTokenFingerprint": fp},
+        }}))
+        assert "refresh token dead" in s.dead_login_reason("3")
+        TestUsageAwareSwitch._seed(self, s, 3, "c@example.com")  # same lineage
+        s._write_account_credentials("3", "c@example.com", json.dumps(
+            {"claudeAiOauth": {"accessToken": "sk-new", "refreshToken": "rt-new"}}
+        ))
+        assert s.dead_login_reason("3") is None
+
+    @pytest.mark.parametrize("strategy", [None, "next-available"])
+    def test_rotation_skips_an_expired_login(self, temp_home, capsys, strategy):
+        s = self._three(temp_home, s2=-3600)
+        usage = {"1": {"five_hour": {"pct": 0.0}}, "2": None, "3": {"five_hour": {"pct": 0.0}}}
+        with patch.object(s, "_usage_by_account", return_value=usage), \
+             patch.object(s, "list_accounts"):
+            s.switch(strategy=strategy)
+        assert s._get_sequence_data()["activeAccountNumber"] == 3
+        out = capsys.readouterr().out
+        assert "Skipping Account-2 (login expired" in out
+        assert "re-login #2: Fleet → select → r, or claude → /login → cc-swap add" in out
+
+    def test_rotation_json_names_the_skip(self, temp_home):
+        s = self._three(temp_home, s2=-3600)
+        with patch.object(s, "list_accounts"):
+            result = s.switch(json_output=True)
+        assert result["to"]["number"] == 3
+        assert any(
+            w.startswith("Skipped Account-2 (login expired") for w in result["warnings"]
+        )
+
+    def test_switch_to_a_dead_login_is_refused(self, temp_home):
+        s = self._three(temp_home, s2=-3600)
+        with pytest.raises(SwitchRefusedError) as exc:
+            s.switch_to("2")
+        message = str(exc.value)
+        assert "Account-2" in message and "login expired" in message
+        assert "--force" in message and "re-login #2" in message
+        assert exc.value.reason == "login-dead"
+        assert s._get_sequence_data()["activeAccountNumber"] == 1
+
+    def test_switch_to_a_dead_login_json_carries_the_reason(self, temp_home):
+        s = self._three(temp_home, s2=-3600)
+        result = s.switch_to("2", json_output=True)
+        assert result["switched"] is False
+        assert result["reason"] == "login-dead"
+        assert "login expired" in result["message"]
+        assert result["to"]["number"] == 1
+        assert s._get_sequence_data()["activeAccountNumber"] == 1
+
+    def test_switch_to_a_dead_login_with_force_goes_through(self, temp_home):
+        s = self._three(temp_home, s2=-3600)
+        with patch.object(s, "list_accounts"):
+            s.switch_to("2", force=True)
+        assert s._get_sequence_data()["activeAccountNumber"] == 2
+
+    def test_all_others_disabled_says_so_and_refuses(self, temp_home):
+        s = self._three(temp_home)
+        s.set_account_disabled("2", True)
+        s.set_account_disabled("3", True)
+        with pytest.raises(SwitchRefusedError) as exc:
+            s.switch()
+        message = str(exc.value)
+        assert "disabled" in message and "cc-swap enable" in message
+        assert "credentials" not in message and "cswap" not in message
+        assert exc.value.reason == "no-candidates"
+
+    def test_all_others_disabled_json(self, temp_home):
+        s = self._three(temp_home)
+        s.set_account_disabled("2", True)
+        s.set_account_disabled("3", True)
+        result = s.switch(json_output=True)
+        assert result["switched"] is False and result["reason"] == "no-candidates"
+        assert "disabled" in result["message"]
+
+    def test_others_disabled_or_dead(self, temp_home):
+        s = self._three(temp_home, s3=-60)
+        s.set_account_disabled("2", True)
+        with pytest.raises(SwitchRefusedError) as exc:
+            s.switch()
+        message = str(exc.value)
+        assert "Account-2 is disabled" in message
+        assert "Account-3" in message and "login expired" in message
+
+
+class TestSwitchRefusalExitCodes:
+    """The CLI exits 1 for a refused switch, in both output modes."""
+
+    def test_json_refusal_exits_1_with_the_payload(self, temp_home, monkeypatch, capsys):
+        from claude_swap import cli
+
+        payload = {"schemaVersion": 1, "switched": False, "reason": "login-dead",
+                   "message": "m", "warnings": []}
+        monkeypatch.setattr(
+            ClaudeAccountSwitcher, "switch_to", lambda self, *a, **k: payload
+        )
+        monkeypatch.setattr(sys, "argv", ["cswap", "--switch-to", "2", "--json"])
+        with pytest.raises(SystemExit) as exc:
+            cli.main()
+        assert exc.value.code == 1
+        assert json.loads(capsys.readouterr().out)["reason"] == "login-dead"
 
 
 class TestClaudeCodeLockCooperation:

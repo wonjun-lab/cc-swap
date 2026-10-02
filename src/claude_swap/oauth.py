@@ -233,6 +233,27 @@ def login_expiry_note(credentials: str, now_ms: int | None = None) -> str | None
     return login_expiry_note_ms(login_expires_at_ms(credentials), now_ms)
 
 
+def local_clock(epoch_s: float) -> str:
+    """Local time with the date, ``"Oct 2 20:04"``: the one format for a login
+    deadline wherever cc-swap shows one (doctor, list, the auto log, Fleet)."""
+    when = datetime.fromtimestamp(epoch_s, tz=timezone.utc).astimezone()
+    return when.strftime(f"%b {when.day} %H:%M")
+
+
+def deadline_text(epoch_s: float, now_s: float | None = None) -> str:
+    """:func:`local_clock` plus how far away it is: ``"Oct 2 20:04 (in 3d 4h)"``
+    ahead of it, ``"Oct 2 20:04 (3d 4h ago)"`` once it has passed."""
+    now = now_s if now_s is not None else _now_ms() / 1000.0
+    if epoch_s > now:
+        return f"{local_clock(epoch_s)} (in {login_countdown(epoch_s - now)})"
+    return f"{local_clock(epoch_s)} ({login_countdown(now - epoch_s)} ago)"
+
+
+def relogin_fix(number: str | int) -> str:
+    """The one re-login instruction every surface prints for slot ``number``."""
+    return f"re-login #{number}: Fleet → select → r, or claude → /login → cc-swap add"
+
+
 def is_oauth_token_expired(expires_at: object) -> bool:
     """Return whether an OAuth token is expired or about to expire."""
     if not isinstance(expires_at, (int, float)):

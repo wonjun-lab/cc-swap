@@ -2379,6 +2379,16 @@ class AutoSwitchEngine:
                     )
                 )
                 return TickOutcome.NO_ACTION
+            if result and result.get("reason") == "login-dead" and not result.get("switched"):
+                # switch_to's last-moment check: the target's stored login
+                # is dead (expired / quarantined), so it was not activated.
+                self._emit(
+                    NoSwitchEvent(
+                        reason="no-viable-target",
+                        detail=str(result.get("loginProblem") or result.get("message") or ""),
+                    )
+                )
+                return TickOutcome.NO_ACTION
             if not result or not result.get("switched"):
                 self._emit(
                     NoSwitchEvent(

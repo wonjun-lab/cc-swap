@@ -21,7 +21,7 @@ from claude_swap.printer import (
     warning,
 )
 from claude_swap.settings import load_ui_settings
-from claude_swap.switcher import ClaudeAccountSwitcher
+from claude_swap.switcher import SWITCH_REFUSED_REASONS, ClaudeAccountSwitcher
 
 
 def _prog_name() -> str:
@@ -1969,6 +1969,9 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
 
     if args.json and payload is not None:
         print(json.dumps(payload, indent=2))
+        if (args.switch or args.switch_to) and payload.get("reason") in SWITCH_REFUSED_REASONS:
+            # The human path raises SwitchRefusedError (exit 1); keep JSON in step.
+            sys.exit(1)
 
     # Passive update notification (never fails). Skipped after --purge so we
     # don't immediately recreate <backup_root>/cache/update_check.json inside
