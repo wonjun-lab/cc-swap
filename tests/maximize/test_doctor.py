@@ -365,6 +365,22 @@ def test_service_installed_but_stopped(world):
     assert "not running" in find(findings, "service", "warn")[0].detail
 
 
+def test_service_file_present_but_not_loaded_uses_the_status_wording(world, monkeypatch, capsys):
+    """`service status` said "stopped" while doctor said "state unknown"."""
+    from claude_swap import cli
+    from claude_swap.maximize import service
+
+    world.healthy()
+    world.service_installed(running=False)
+    world.service.update(loaded=False, state=None)
+    world.lease = (False, None)
+    [f] = find(run(world), "service", "warn")
+    assert "(stopped (not loaded))" in f.detail
+    cli._print_service_status({**world.service, "logs": []})
+    assert "cc-swap service: stopped (not loaded)" in capsys.readouterr().out
+    assert service.state_text(world.service) == "stopped (not loaded)"
+
+
 def test_linux_unit_file_is_parsed(tmp_path):
     world = World(tmp_path, platform="linux")
     world.healthy()

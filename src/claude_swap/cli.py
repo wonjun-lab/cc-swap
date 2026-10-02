@@ -1322,9 +1322,10 @@ def _print_service_status(result: dict) -> None:
         print("cc-swap service is not installed.")
         print(dimmed("Install it with: cc-swap service install"))
         return
-    state = result["state"] or ("running" if result["running"] else "stopped")
+    from claude_swap.maximize.service import state_text
+
     pid = f" (pid {result['pid']})" if result["pid"] else ""
-    print(f"cc-swap service: {state}{pid}")
+    print(f"cc-swap service: {state_text(result)}{pid}")
     print(f"  file: {result['path']}")
     print(f"  logs: {', '.join(result['logs'])}")
     if not result["installed"]:

@@ -633,8 +633,9 @@ def engine_parts(es: EngineStatus) -> tuple[list[tuple[str, int]], Tone]:
         tone = "accent"
     else:
         if service is not None and service.get("installed"):
-            state = service.get("state") or "not running"
-            why = f"service stopped ({_manager(service)}: {state})"
+            from claude_swap.maximize.service import state_text
+
+            why = f"service stopped ({_manager(service)}: {state_text(service)})"
         elif service is not None:
             why = "no service (cc-swap service install)"
         else:
@@ -1283,7 +1284,9 @@ def _holder_facts(es: EngineStatus) -> list[str]:
         return [f"This TUI runs the engine ({mode}). Quitting the TUI stops it."]
     lines = ["Nothing is switching accounts on this machine."]
     if service.get("installed"):
-        lines.append(f"The service is installed but not running ({service.get('state') or 'stopped'}).")
+        from claude_swap.maximize.service import state_text
+
+        lines.append(f"The service is installed but not running ({state_text(service)}).")
     else:
         lines.append("For an always-on engine: cc-swap service install")
     if service.get("linger") is False:

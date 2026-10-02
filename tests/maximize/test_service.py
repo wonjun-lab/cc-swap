@@ -503,6 +503,60 @@ def test_bootstrap_failure_without_a_bootout_does_not_claim_stopped(
     assert "STOPPED" not in str(excinfo.value)
 
 
+def test_a_failed_first_install_leaves_no_plist_and_no_claude_path(
+    tmp_path, on_macos, fake_run, monkeypatch
+):
+    """The RunAtLoad plist stayed behind after a failed bootstrap, so launchd
+    started the "failed" service at the next login anyway."""
+    claude = _executable(tmp_path / "brew" / "claude")
+    monkeypatch.setattr(service.shutil, "which", lambda name: str(claude))
+    root = tmp_path / "root"
+    fake_run({"launchctl print": _done(1), "launchctl bootstrap": _done(5, stderr="boom")})
+    with pytest.raises(ClaudeSwitchError) as excinfo:
+        service.install(home=tmp_path, program=MAC_PROGRAM, uid=UID, backup_root=root)
+    assert not service.plist_path(tmp_path).exists()
+    assert "nothing was installed" in str(excinfo.value)
+    assert load_prime_settings(root).claude_path is None
+
+
+def test_a_failed_reinstall_says_the_file_stays_and_starts_at_login(
+    tmp_path, on_macos, fake_run, monkeypatch
+):
+    monkeypatch.setattr(service.shutil, "which", lambda name: None)
+    plist = service.plist_path(tmp_path)
+    plist.parent.mkdir(parents=True)
+    plist.write_bytes(service.build_plist(MAC_PROGRAM, claude_path=None, home=tmp_path))
+    fake_run({"launchctl print": _done(1), "launchctl bootstrap": _done(5, stderr="boom")})
+    with pytest.raises(ClaudeSwitchError) as excinfo:
+        service.install(home=tmp_path, program=MAC_PROGRAM, uid=UID, backup_root=tmp_path / "root")
+    assert plist.exists()
+    assert "starts it at the next login" in str(excinfo.value)
+
+
+def test_a_failed_first_linux_install_removes_the_unit(tmp_path, on_linux, fake_run, monkeypatch):
+    monkeypatch.setattr(service.shutil, "which", lambda name: None)
+    run = fake_run({
+        "systemctl is-active": _done(3),
+        "systemctl enable": _done(1, stderr="Failed to enable"),
+    })
+    with pytest.raises(ClaudeSwitchError) as excinfo:
+        service.install(home=tmp_path, program=LINUX_PROGRAM, backup_root=tmp_path / "root", user="u")
+    assert not service.unit_path(tmp_path).exists()
+    assert "nothing was installed" in str(excinfo.value)
+    assert run.calls[-1] == ["systemctl", "--user", "daemon-reload"]
+
+
+@pytest.mark.parametrize("status, expected", [
+    ({"installed": True, "loaded": True, "running": True, "state": "running"}, "running"),
+    ({"installed": True, "loaded": True, "running": False, "state": None}, "loaded, not running"),
+    ({"installed": True, "loaded": False, "running": False, "state": None},
+     "stopped (not loaded)"),
+    ({"installed": True, "loaded": False, "running": False, "state": "inactive"}, "inactive"),
+])
+def test_state_text_is_one_wording(status, expected):
+    assert service.state_text(status) == expected
+
+
 def test_reinstall_command_asks_for_the_installed_env(monkeypatch):
     monkeypatch.setattr(service, "resolve_program", lambda: ["/x/cc-swap"])
     assert service.reinstall_command() == [

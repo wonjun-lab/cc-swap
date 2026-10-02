@@ -890,9 +890,11 @@ def check_service(ctx: Context) -> list[Finding]:
     out: list[Finding] = []
     pid = status.get("pid") if isinstance(status.get("pid"), int) else None
     if not running:
+        from claude_swap.maximize.service import state_text
+
         out.append(Finding(
             "service", "warn",
-            f"service installed but not running (state {status.get('state') or 'unknown'})",
+            f"service installed but not running ({state_text(status)})",
             "cc-swap service install (restarts it); then cc-swap service status",
         ))
     parsed = service_file(p)

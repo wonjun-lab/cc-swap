@@ -53,7 +53,11 @@ from claude_swap import launch_agent, paths
 from claude_swap.exceptions import ClaudeSwitchError
 from claude_swap.maximize.logrotate import SERVICE_ENV
 from claude_swap.session import session_profile_containing
-from claude_swap.settings import load_prime_settings, set_setting
+from claude_swap.settings import load_prime_settings, set_setting, unset_setting
+
+
+class _FreshInstallFailed(ClaudeSwitchError):
+    """A first install failed and its service file was removed again."""
 
 LABEL = "com.wonjun-lab.cc-swap"
 UNIT_NAME = "cc-swap.service"
@@ -481,10 +485,22 @@ def install(
         set_setting(root, "prime.claudePath", resolved)
         saved = True
     program = program or resolve_program()
-    if platform == "darwin":
-        result = _install_darwin(program, resolved, home, uid, forward)
-    else:
-        result = _install_linux(program, resolved, home, user, forward, xdg_data_home)
+    try:
+        if platform == "darwin":
+            result = _install_darwin(program, resolved, home, uid, forward)
+        else:
+            result = _install_linux(program, resolved, home, user, forward, xdg_data_home)
+    except _FreshInstallFailed as e:
+        # Nothing was installed: put prime.claudePath back as it was too.
+        if saved:
+            try:
+                if configured:
+                    set_setting(root, "prime.claudePath", configured)
+                else:
+                    unset_setting(root, "prime.claudePath")
+            except (ClaudeSwitchError, OSError):
+                pass
+        raise ClaudeSwitchError(str(e)) from e
     result.update(
         claude_path=resolved,
         claude_path_saved=saved,
@@ -503,6 +519,7 @@ def _install_darwin(
 ) -> dict:
     target = plist_path(home)
     out_log, err_log = log_paths(home)
+    fresh = not target.exists()
     target.parent.mkdir(parents=True, exist_ok=True)
     out_log.parent.mkdir(parents=True, exist_ok=True)
     target.write_bytes(
@@ -513,6 +530,7 @@ def _install_darwin(
     settled = True
     stopped = False
     if launch_agent.is_loaded(LABEL, uid):
+        fresh = False  # a reinstall over a loaded job, file or not
         booted_out = launch_agent._launchctl("bootout", launch_agent.service_target(LABEL, uid))
         stopped = booted_out.returncode == 0
         settled = launch_agent._wait_until_unloaded(LABEL, uid)
@@ -521,10 +539,25 @@ def _install_darwin(
         detail = (booted.stderr or booted.stdout or "").strip()
         if not settled:
             detail = f"{detail}; the previous instance was still shutting down".lstrip("; ")
+        message = f"launchctl bootstrap failed (exit {booted.returncode})" + (
+            f": {detail}" if detail else ""
+        )
+        if fresh:
+            # A RunAtLoad plist left behind would start the "failed" service
+            # at the next login anyway: a failed first install installs nothing.
+            try:
+                target.unlink()
+            except OSError:
+                pass
+            else:
+                raise _FreshInstallFailed(
+                    f"{message}; nothing was installed (the service file was removed)"
+                )
         raise ClaudeSwitchError(
-            f"launchctl bootstrap failed (exit {booted.returncode})"
-            + (f": {detail}" if detail else "")
-            + ("; the service is now STOPPED - run: cc-swap service install" if stopped else "")
+            message
+            + ("; the service is now STOPPED" if stopped else "")
+            + f"; the service file stays at {target} and launchd starts it at the next "
+            "login - run: cc-swap service install (or cc-swap service uninstall)"
         )
     return {
         "platform": "darwin",
@@ -546,6 +579,7 @@ def _install_linux(
 ) -> dict:
     unit = unit_path(home)
     was_active = _is_active()
+    fresh = not unit.exists() and not was_active
     unit.parent.mkdir(parents=True, exist_ok=True)
     unit.write_text(
         build_unit(
@@ -557,11 +591,29 @@ def _install_linux(
         ),
         encoding="utf-8",
     )
-    _checked("daemon-reload")
-    _checked("enable", "--now", UNIT_NAME)
-    if was_active:
-        # enable --now leaves a running unit alone; move it onto the new build.
-        _checked("restart", UNIT_NAME)
+    try:
+        _checked("daemon-reload")
+        _checked("enable", "--now", UNIT_NAME)
+        if was_active:
+            # enable --now leaves a running unit alone; move it onto the new build.
+            _checked("restart", UNIT_NAME)
+    except ClaudeSwitchError as e:
+        if not fresh:
+            raise ClaudeSwitchError(
+                f"{e}; the unit file stays at {unit} - run: cc-swap service install "
+                "(or cc-swap service uninstall)"
+            ) from e
+        # A failed first install installs nothing (an enabled-but-failed unit
+        # would start at the next login).
+        _systemctl("disable", UNIT_NAME)
+        try:
+            unit.unlink()
+        except OSError:
+            raise e from None
+        _systemctl("daemon-reload")
+        raise _FreshInstallFailed(
+            f"{e}; nothing was installed (the unit file was removed)"
+        ) from e
     return {
         "platform": "linux",
         "name": UNIT_NAME,
@@ -596,6 +648,20 @@ def uninstall(*, home: Path | None = None, uid: int | None = None) -> dict:
         unit.unlink()
     _systemctl("daemon-reload")
     return {"platform": "linux", "name": UNIT_NAME, "was_running": was_active, "removed": existed}
+
+
+def state_text(status: Mapping) -> str:
+    """The one wording for a :func:`status` result's state, shared by
+    ``cc-swap service status``, doctor and Fleet: the service manager's own
+    word when it gave one, else what loaded/running say."""
+    state = status.get("state")
+    if state:
+        return str(state)
+    if status.get("running"):
+        return "running"
+    if status.get("loaded"):
+        return "loaded, not running"
+    return "stopped (not loaded)"
 
 
 def status(*, home: Path | None = None, uid: int | None = None) -> dict:
