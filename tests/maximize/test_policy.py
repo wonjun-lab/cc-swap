@@ -397,3 +397,27 @@ class TestLoginExpiryGuard:
         assert decide(s).target == "2"
         unknown = snap("1", acct("1", 60, 40), acct("2", 0, 10), samples="idle")
         assert decide(unknown).target == "2"
+
+
+class TestFallbacksSkipLapsedLogins:
+    """The at-limit/hard fallbacks may use an account inside the guard, but
+    never one already past its login deadline (its next refresh is refused)."""
+
+    def test_escape_candidates_skip_a_lapsed_login(self):
+        s = snap("1", acct("1", 100, 40), expiring(acct("2", 0, 10), -5), acct("3", 80, 10))
+        assert [v.number for v in escape_candidates(s)] == ["3"]
+        got = decide(s)
+        assert isinstance(got, Switch) and got.target == "3"
+
+    def test_limit_candidates_skip_a_lapsed_login(self):
+        from claude_swap.maximize.policy import limit_candidates
+
+        s = snap("1", acct("1", 100, 40), expiring(acct("2", 96, 10), -5), acct("3", 99, 10))
+        assert [v.number for v in limit_candidates(s)] == ["3"]
+        only = snap("1", acct("1", 100, 40), expiring(acct("2", 96, 10), -5))
+        assert isinstance(decide(only), Exhausted)
+
+    def test_inside_the_guard_but_not_lapsed_is_still_a_fallback(self):
+        s = snap("1", acct("1", 100, 40), expiring(acct("2", 0, 10), 30))
+        got = decide(s)
+        assert isinstance(got, Switch) and got.target == "2"

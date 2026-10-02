@@ -67,6 +67,12 @@ def login_guarded(v: AccountView, now: float, s) -> bool:
     return v.login_deadline - now < s.login_expiry_guard_min * 60.0
 
 
+def login_lapsed(v: AccountView, now: float) -> bool:
+    """Past its recorded login deadline: the next refresh is refused, so no
+    switch — not even a forced fallback — should land there."""
+    return v.login_deadline is not None and now >= v.login_deadline
+
+
 def landing_candidates(snap: Snapshot) -> list[AccountView]:
     """Every non-active landable account, best first (spec §5.2 + §5.4).
 
@@ -99,6 +105,7 @@ def escape_candidates(snap: Snapshot) -> list[AccountView]:
             and v.tier != "excluded"
             and not v.quarantined
             and not v.api_key
+            and not login_lapsed(v, snap.now)
             and below_hard(v, s)
         ],
         snap.now,
@@ -164,6 +171,7 @@ def limit_candidates(snap: Snapshot) -> list[AccountView]:
         and v.tier != "excluded"
         and not v.quarantined
         and not v.api_key
+        and not login_lapsed(v, snap.now)
         and v.pct5 is not None
         and v.pct7 is not None
         and v.pct5 < LIMIT_PCT
