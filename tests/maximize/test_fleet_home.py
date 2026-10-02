@@ -153,6 +153,9 @@ def test_cold_tag_shows_the_prime_time_only_while_priming_runs():
     assert home.tag_for(late, is_next=False, now=NOW) == ("5h off · prime now", "dim")
     window = replace(row, prime=fx.PrimeCell("window", NOW + H, NOW + H + 60, ""))
     assert home.tag_for(window, is_next=False, now=NOW)[0] == f"5h off · prime {fx.hhmm(NOW + H)}"
+    # No window to speak of: an API key, a login cc-swap cannot read.
+    for login in ("api", "keychain", "foreign", "expired"):
+        assert home.tag_for(replace(row, login=login), is_next=False, now=NOW) is None
 
 
 # -- situation ---------------------------------------------------------------------------------

@@ -162,7 +162,7 @@ def tag_for(
         return (f"login {short_left(left)} left" if left > 0 else "login expired"), tone
     if row.tier == "last_resort":
         return "last resort", "dim"
-    if row.state5 == "cold":
+    if row.state5 == "cold" and row.login == "ok":  # an API key has no 5h window
         when = None
         cell = row.prime
         if priming and cell.kind == "due":
