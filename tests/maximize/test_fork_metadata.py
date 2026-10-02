@@ -7,7 +7,9 @@ Reads the installed (editable) distribution's metadata, the same source
 
 from __future__ import annotations
 
-from importlib.metadata import distribution, version
+import importlib
+import importlib.metadata
+from importlib.metadata import PackageNotFoundError, distribution, version
 
 import claude_swap
 
@@ -33,6 +35,26 @@ def test_distribution_is_named_cc_swap():
 
 
 def test_version_comes_from_the_cc_swap_distribution():
+    assert claude_swap.__version__ == version("cc-swap")
+
+
+def test_import_survives_missing_distribution_metadata(monkeypatch):
+    """Running from a source tree nobody installed (PYTHONPATH=src, a vendored
+    copy, a stale uninstall) has no cc-swap metadata: `import claude_swap`
+    must not die on PackageNotFoundError before any command can run."""
+
+    def not_installed(name):
+        raise PackageNotFoundError(name)
+
+    monkeypatch.setattr(importlib.metadata, "version", not_installed)
+    try:
+        reloaded = importlib.reload(claude_swap)
+        assert reloaded.__version__ == "0+unknown"
+        # The rest of the package surface is intact.
+        assert reloaded.ClaudeAccountSwitcher is not None
+    finally:
+        monkeypatch.undo()
+        importlib.reload(claude_swap)
     assert claude_swap.__version__ == version("cc-swap")
 
 
