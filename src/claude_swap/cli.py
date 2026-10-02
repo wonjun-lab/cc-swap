@@ -79,6 +79,9 @@ _FORK_COMMANDS: dict[str, str] = {
     "last-resort": "_last_resort_command",
     "prime": "_prime_command",
     "service": "_service_command",
+    "doctor": "_doctor_command",
+    "init": "_init_command",
+    "why": "_why_command",
 }
 
 
@@ -1133,6 +1136,27 @@ def _prime_command(argv: list[str]) -> None:
     prime_command(argv)
 
 
+def _doctor_command(argv: list[str]) -> None:
+    """Handle `cc-swap doctor` (maximize/doctor_cli.py), imported lazily."""
+    from claude_swap.maximize.doctor_cli import doctor_command
+
+    doctor_command(argv)
+
+
+def _init_command(argv: list[str]) -> None:
+    """Handle `cc-swap init` (maximize/doctor_cli.py), imported lazily."""
+    from claude_swap.maximize.doctor_cli import init_command
+
+    init_command(argv)
+
+
+def _why_command(argv: list[str]) -> None:
+    """Handle `cc-swap why` (maximize/doctor_cli.py), imported lazily."""
+    from claude_swap.maximize.doctor_cli import why_command
+
+    why_command(argv)
+
+
 def _use_native_tls() -> None:
     """Route TLS trust decisions through the OS-native verifier.
 
@@ -1434,6 +1458,9 @@ cc-swap:
   %(prog)s last-resort list           list last-resort accounts
   %(prog)s prime [N ...] [--dry-run]  open idle accounts' 5h windows now
   %(prog)s service install            run auto-switch as a background service
+  %(prog)s doctor [--json]            check logins, Keychain, service; say what to fix
+  %(prog)s init [--apply]             onboarding/migration checklist (ok/FIX/TODO)
+  %(prog)s why                        why the engine did or didn't switch
 
 Aliases: ls=list  rm=remove  update=upgrade""",
         formatter_class=argparse.RawDescriptionHelpFormatter,
