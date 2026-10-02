@@ -627,6 +627,49 @@ class TestPause:
         assert h.tick_with_usage(usage) is TickOutcome.SWITCHED
 
 
+def set_login_deadline(h: EngineHarness, num: int, seconds_left: float) -> None:
+    """Rewrite slot ``num``'s backup with a login deadline ``seconds_left`` away."""
+    blob = {"accessToken": f"sk-{num}", "refreshToken": f"rt-{num}",
+            "refreshTokenExpiresAt": int((h.clock.now + seconds_left) * 1000)}
+    h.switcher._write_account_credentials(
+        str(num), EMAILS[num], json.dumps({"claudeAiOauth": blob})
+    )
+
+
+def login_warnings(h: EngineHarness) -> list[str]:
+    return [e.message for e in of(h, ConfigWarningEvent) if " login expire" in e.message]
+
+
+class TestLoginExpiryWarning:
+    def test_one_engine_log_line_per_account_per_day_inside_the_last_week(self, temp_home):
+        h = make(temp_home)
+        set_login_deadline(h, 2, 2 * 86400)
+        set_login_deadline(h, 3, 20 * 86400)       # outside the week: silent
+        usage = {"1": win(10, 30), "2": win(0, 10), "3": win(0, 50)}
+        h.tick_with_usage(usage)
+        [line] = login_warnings(h)
+        assert line.startswith("Account-2 login expires ") and " in 2d 0h" in line
+        assert "cc-swap add" in line
+        assert "@" not in line and "rt-2" not in line and "sk-2" not in line
+        h.clock.advance(3600)
+        h.tick_with_usage(usage)
+        assert len(login_warnings(h)) == 1          # once a day
+        h.clock.advance(86400)
+        h.tick_with_usage(usage)
+        assert len(login_warnings(h)) == 2
+
+    def test_the_active_slot_is_read_from_the_live_login(self, temp_home):
+        h = make(temp_home)
+        live = {"accessToken": "sk-live", "refreshToken": "rt-live",
+                "refreshTokenExpiresAt": int((h.clock.now - 60) * 1000)}
+        (h.temp_home / ".claude" / ".credentials.json").write_text(
+            json.dumps({"claudeAiOauth": live})
+        )
+        h.tick_with_usage({"1": win(10, 30), "2": win(0, 10), "3": win(0, 50)})
+        [line] = login_warnings(h)
+        assert line.startswith("Account-1 login expired ")
+
+
 def test_combined_soft_idle_last_resort_excluded_and_priming(temp_home):
     """Spec §10: the features together — the shape where separately green
     upstream PRs misbehaved once combined."""

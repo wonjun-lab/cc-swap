@@ -165,6 +165,11 @@ def yellowed(text: str) -> str:
     return _style(text, _pal("yellow"))
 
 
+def reddened(text: str) -> str:
+    """Red for urgent text (string form; ``error()`` prints to stderr)."""
+    return _style(text, _pal("red"))
+
+
 # --- Line printers (call print() internally) ---
 
 

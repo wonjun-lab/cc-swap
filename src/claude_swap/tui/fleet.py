@@ -189,7 +189,9 @@ def open_relogin(app: "CswapApp", number: str) -> None:
         host=host_name(),
         claude_path=claude,
         return_to=rows.get(previous) if previous else None,
+        now=time.time(),
     )
+
     def store(before: str | None):
         return run_action(
             partial(relogin_store, app.switcher, number, return_to=previous, before=before)
@@ -513,7 +515,7 @@ class FleetScreen(Screen):
         size = self.size
         self._layout = fx.fit_layout(
             size.height or 32, size.width or 112, len(self._rows),
-            attention=fx.attention(self._rows) is not None,
+            attention=fx.attention(self._rows, now=time.time()) is not None,
         )
         self._render_status()
         self._render_table()
@@ -530,7 +532,9 @@ class FleetScreen(Screen):
         self.query_one("#fx-detail").display = plan.detail
         self.query_one("#fx-menu").display = plan.menu == "full"
         self.query_one("#fx-menu-folded").display = plan.menu == "folded"
-        self.query_one("#fx-attention").display = fx.attention(self._rows) is not None
+        self.query_one("#fx-attention").display = (
+            fx.attention(self._rows, now=time.time()) is not None
+        )
         self.set_class(not plan.blanks, "-compact")
         if plan.menu == "folded" and self.focused is self.query_one("#fx-menu"):
             self.focus_table()
@@ -552,9 +556,11 @@ class FleetScreen(Screen):
             line = Text(text[:8], style=palette.muted)
             line.append(text[8:], style=tone_style(tone, palette))
             self.query_one(widget_id, Static).update(line)
-        warning = fx.attention(self._rows) or ""
+        warning = fx.attention(self._rows, now=now) or ""
+        tone = fx.attention_tone(self._rows, now=now)
+        color = palette.sev_crit if tone == "crit" else palette.sev_warn
         self.query_one("#fx-attention", Static).update(
-            Text(warning, style=f"bold {palette.sev_crit}")
+            Text(warning, style=f"bold {color}")
         )
 
     def _cells(self, row: fx.FleetRow, palette: Palette) -> list[Text]:
@@ -619,7 +625,7 @@ class FleetScreen(Screen):
                 palette=palette, window_ticks=getattr(self.app, "window_ticks", None),
             ))
         text.append("\n    ")
-        text.append(fx.detail_line(row, self._mx), style=palette.muted)
+        text.append(fx.detail_line(row, self._mx, now=time.time()), style=palette.muted)
         widget.update(text)
 
     def _menu_title(self, entry: menus.MenuEntry) -> tuple[str, str]:
@@ -849,7 +855,7 @@ class FleetScreen(Screen):
         row = self.current_row()
         if row is None:
             return
-        if row.login != "relogin":
+        if row.login != "relogin" and not fx.login_due(row, time.time()):
             self.notify(f"#{row.number} login works — nothing to fix", timeout=3)
             return
         open_relogin(self.app, row.number)

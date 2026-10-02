@@ -75,6 +75,7 @@ from claude_swap.printer import (
     ide_short_name,
     muted,
     warning,
+    reddened,
     yellowed,
 )
 from claude_swap.paths import (
@@ -5647,7 +5648,12 @@ class ClaudeAccountSwitcher:
                 accounts_info[i][5], entries[str(num)]
             )
             if expiry_line is not None:
-                print(f"     {yellowed(expiry_line)}")
+                # Amber inside the last week, red inside the last day.
+                urgent = oauth.login_expiring_soon(
+                    accounts_info[i][5], within_ms=86_400_000
+                )
+                paint = reddened if urgent else yellowed
+                print(f"     {paint(expiry_line)}")
 
             if show_token_status:
                 for line in self._token_status_lines(accounts_info[i]):

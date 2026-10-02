@@ -343,6 +343,30 @@ class TestRelogin:
             await _open(pilot)
             assert "pausedUntil" not in json.loads(state.read_text())
 
+    async def test_expiring_login_is_flagged_and_r_renews_it_early(self, tmp_path):
+        from claude_swap.tui.fleet_modals import ReloginModal
+
+        _settings(tmp_path)
+        accounts = _accounts()
+        deadline_ms = (time.time() + 2 * 86400 + 600) * 1000
+        accounts[1] = dataclasses.replace(accounts[1], login_expires_at=deadline_ms)
+        app = make_app(IdentitySwitcher(accounts, tmp_path))
+        async with app.run_test(size=(160, 40)) as pilot:
+            await _open(pilot)
+            attention = app.screen.query_one("#fx-attention", Static).render().plain
+            assert "#2" in attention and "login expires in 2d 0h" in attention
+            table = app.screen.query_one("#fx-table", DataTable)
+            login_col = [c.plain for c in table.get_row("2")]
+            assert "2d 0h" in login_col
+            await _to_row(pilot, "2")
+            await pilot.press("r")
+            await _open(pilot)
+            assert isinstance(app.screen, ReloginModal)
+            steps = app.screen.query_one("#fx-relogin-steps", Static).render().plain
+            assert "login expires in 2d 0h" in steps and "new ~30-day deadline" in steps
+            await pilot.press("escape")
+            await _open(pilot)
+
     async def test_quit_while_the_relogin_modal_is_open_lifts_the_pause(self, tmp_path):
         from claude_swap.tui.fleet_modals import ReloginModal
 

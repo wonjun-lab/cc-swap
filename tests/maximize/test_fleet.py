@@ -367,8 +367,8 @@ def test_login_expired_is_a_relogin_named_by_its_cause():
     (140, set()),
     (112, set()),
     (100, {"rank", "7d in"}),
-    (80, {"rank", "7d in", "plan", "tier"}),
-    (60, {"rank", "7d in", "plan", "tier", "next prime"}),
+    (80, {"rank", "7d in", "plan", "tier", "login"}),
+    (60, {"rank", "7d in", "plan", "tier", "login", "next prime"}),
 ])
 def test_columns_for_widths(width, missing):
     cols = fleet.columns_for(width)
@@ -407,6 +407,70 @@ def test_row_cells_colour_against_maximize_thresholds():
     narrow = fleet.columns_for(80)
     team = dict(zip(narrow, fleet.row_cells(rows["6"], narrow, now=NOW, mx=mx)))
     assert team["account"][0] == "team·LR"
+
+
+def _expiring(number, seconds_left, **kw):
+    return replace(acc(number, **kw), login_expires_at=(NOW + seconds_left) * 1000)
+
+
+def test_login_cell_counts_down_amber_in_the_last_week_red_in_the_last_day():
+    snap = accounts(
+        acc(1, active=True),
+        _expiring(2, DAY + 9 * H, alias="side"),
+        _expiring(3, 20 * H, alias="soon"),
+        _expiring(4, -60, alias="gone"),
+        _expiring(5, 20 * DAY, alias="fine"),
+    )
+    rows = {r.number: r for r in fleet.fleet_rows(snap, MX, PRIME, MaximizeState(), now=NOW)}
+    assert rows["2"].login_deadline == NOW + DAY + 9 * H
+    assert rows["1"].login_deadline is None
+    assert fleet.login_cell(rows["1"], NOW) == ("—", "dim")
+    assert fleet.login_cell(rows["2"], NOW) == ("1d 9h", "warn")
+    assert fleet.login_cell(rows["3"], NOW) == ("20h 0m", "crit")
+    assert fleet.login_cell(rows["4"], NOW) == ("expired", "crit")
+    assert fleet.login_cell(rows["5"], NOW) == ("20d", "dim")
+    cols = fleet.columns_for(140)
+    assert "login" in cols
+    cells = dict(zip(cols, fleet.row_cells(rows["2"], cols, now=NOW, mx=MX)))
+    assert cells["login"] == ("1d 9h", "warn")
+    assert "login expires in 1d 9h" in fleet.detail_line(rows["2"], MX, now=NOW)
+    assert "login" not in fleet.detail_line(rows["1"], MX, now=NOW)
+
+
+def test_attention_warns_of_logins_expiring_within_a_week():
+    snap = accounts(
+        acc(1, active=True),
+        _expiring(2, DAY + 9 * H, alias="side"),
+        _expiring(5, 20 * DAY, alias="fine"),
+    )
+    rows = fleet.fleet_rows(snap, MX, PRIME, MaximizeState(), now=NOW)
+    assert fleet.attention(rows, now=NOW) == (
+        "⚠ #2 side login expires in 1d 9h — re-login before then: select it and press r"
+    )
+    assert fleet.attention_tone(rows, now=NOW) == "warn"
+    assert fleet.attention(rows) is None  # no clock: only dead logins
+    soon = fleet.fleet_rows(
+        accounts(acc(1, active=True), _expiring(3, 20 * H, alias="soon"),
+                 _expiring(4, 2 * DAY, alias="next")),
+        MX, PRIME, MaximizeState(), now=NOW,
+    )
+    assert fleet.attention(soon, now=NOW) == (
+        "⚠ logins expire: #3 soon in 20h 0m, #4 next in 2d 0h — "
+        "re-login before then: select one and press r"
+    )
+    assert fleet.attention_tone(soon, now=NOW) == "crit"
+    assert fleet.login_due(soon[1], NOW) and not fleet.login_due(rows[2], NOW)
+    # A dead login leads; an expiring one rides along.
+    mixed = fleet.fleet_rows(
+        accounts(acc(1, active=True), _expiring(2, DAY + 9 * H, alias="side"),
+                 acc(3, sentinel=USAGE_RELOGIN_REQUIRED, alias="old")),
+        MX, PRIME, MaximizeState(), now=NOW,
+    )
+    assert fleet.attention(mixed, now=NOW) == (
+        "⚠ #3 old needs re-login (refresh token dead) — select it and press r"
+        " · #2 login expires in 1d 9h"
+    )
+    assert fleet.attention_tone(mixed, now=NOW) == "crit"
 
 
 def test_detail_line_explains_rank_pace_and_landing():

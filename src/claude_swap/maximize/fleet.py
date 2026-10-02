@@ -20,6 +20,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
 from typing import Literal
 
+from claude_swap import oauth
 from claude_swap.json_output import (
     USAGE_API_KEY,
     USAGE_FOREIGN_CREDENTIAL,
@@ -42,6 +43,12 @@ from claude_swap.usage_store import STALE_OK_S
 LoginState = Literal["ok", "relogin", "expired", "foreign", "keychain", "api"]
 Tone = str
 Cell = tuple[str, Tone]
+
+#: Warn about a login's deadline this long before it (Claude Code nudges its
+#: own session at 3 days; a parked slot has no session to show that in).
+LOGIN_WARN_S = 7 * 86400.0
+#: Inside this the warning turns red.
+LOGIN_URGENT_S = 86400.0
 
 #: The engine rewrites an unchanged decision this often
 #: (``engine_hook.PUBLISH_REFRESH_S``; pinned by a test).
@@ -232,6 +239,9 @@ class FleetRow:
     # The re-login is needed because the login reached its recorded deadline
     # (``login expired`` sentinel), not because the refresh token died.
     login_expired: bool = False
+    # When the stored login lapses (epoch seconds, ``refreshTokenExpiresAt``);
+    # None when the login records no deadline.
+    login_deadline: float | None = None
 
 
 def fleet_snapshot(
@@ -306,6 +316,11 @@ def fleet_rows(
                 stale=acc.usage.age_s is not None and acc.usage.age_s > STALE_OK_S,
                 fetched_at=acc.usage.fetched_at,
                 login_expired=acc.usage.sentinel == USAGE_LOGIN_EXPIRED,
+                login_deadline=(
+                    acc.login_expires_at / 1000.0
+                    if acc.login_expires_at is not None
+                    else None
+                ),
             )
         )
     return out
@@ -703,12 +718,43 @@ def _dead_cause(row: FleetRow, *, plural: bool = False) -> str:
     return "refresh tokens dead" if plural else "refresh token dead"
 
 
-def attention(rows: Sequence[FleetRow]) -> str | None:
-    """One crit line naming every account whose login only a re-login fixes,
-    and why (the login reached its deadline, or the refresh token died)."""
-    dead = [r for r in rows if r.login == "relogin"]
-    if not dead:
-        return None
+def login_left(row: FleetRow, now: float) -> float | None:
+    """Seconds until the row's login deadline (negative once past)."""
+    return None if row.login_deadline is None else row.login_deadline - now
+
+
+def login_due(row: FleetRow, now: float) -> bool:
+    """The login still reads usable but expires within :data:`LOGIN_WARN_S`
+    (or already passed): worth a re-login now."""
+    left = login_left(row, now)
+    return (
+        row.login not in ("relogin", "api")
+        and left is not None
+        and left < LOGIN_WARN_S
+    )
+
+
+def login_cell(row: FleetRow, now: float) -> Cell:
+    """The ``login`` column: time left on the login — amber inside the last
+    week, red inside the last day and once past; dim otherwise."""
+    left = login_left(row, now)
+    if left is None:
+        return "—", "dim"
+    if left <= 0:
+        return "expired", "crit"
+    if left >= LOGIN_WARN_S:
+        return f"{int(left // 86400)}d", "dim"
+    return oauth.login_countdown(left), "crit" if left < LOGIN_URGENT_S else "warn"
+
+
+def _expiring_text(row: FleetRow, now: float) -> str:
+    left = login_left(row, now) or 0.0
+    if left <= 0:
+        return "login expired"
+    return f"login expires in {oauth.login_countdown(left)}"
+
+
+def _dead_line(dead: Sequence[FleetRow]) -> str:
     if len(dead) == 1:
         r = dead[0]
         return (
@@ -721,6 +767,44 @@ def attention(rows: Sequence[FleetRow]) -> str | None:
         return f"⚠ {names} need re-login ({cause}) — select one and press r"
     names = ", ".join(f"#{r.number} {r.name} ({_dead_cause(r)})" for r in dead)
     return f"⚠ {names} need re-login — select one and press r"
+
+
+def attention(rows: Sequence[FleetRow], *, now: float | None = None) -> str | None:
+    """One line naming every account whose login only a re-login fixes, and
+    why (the login reached its deadline, or the refresh token died); with
+    ``now``, also the logins that expire within a week."""
+    dead = [r for r in rows if r.login == "relogin"]
+    due = [r for r in rows if now is not None and login_due(r, now)]
+    if dead:
+        line = _dead_line(dead)
+        for r in due:
+            line += f" · #{r.number} {_expiring_text(r, now)}"
+        return line
+    if not due or now is None:
+        return None
+    if len(due) == 1:
+        r = due[0]
+        return (
+            f"⚠ #{r.number} {r.name} {_expiring_text(r, now)} — "
+            "re-login before then: select it and press r"
+        )
+
+    def when(r: FleetRow) -> str:
+        left = login_left(r, now) or 0.0
+        return "expired" if left <= 0 else f"in {oauth.login_countdown(left)}"
+
+    parts = ", ".join(f"#{r.number} {r.name} {when(r)}" for r in due)
+    return f"⚠ logins expire: {parts} — re-login before then: select one and press r"
+
+
+def attention_tone(rows: Sequence[FleetRow], *, now: float) -> Tone:
+    """crit for a dead login or one inside its last day; warn otherwise."""
+    if any(r.login == "relogin" for r in rows):
+        return "crit"
+    urgent = any(
+        login_due(r, now) and (login_left(r, now) or 0.0) < LOGIN_URGENT_S for r in rows
+    )
+    return "crit" if urgent else "warn"
 
 
 def login_text(row: FleetRow) -> Cell:
@@ -744,12 +828,13 @@ _LOGIN_TEXT: dict[str, Cell] = {
 
 ALL_COLUMNS: tuple[str, ...] = (
     "mark", "#", "account", "plan", "tier", "rank",
-    "5h", "7d", "7d in", "pace", "land", "5h window", "next prime",
+    "5h", "7d", "7d in", "pace", "land", "login",
+    "5h window", "next prime",
 )
 COLUMN_LABELS = {
     "mark": "", "#": "#", "account": "account", "plan": "plan", "tier": "tier",
     "rank": "rank", "5h": "5h", "7d": "7d", "7d in": "7d in", "pace": "pace",
-    "land": "land", "5h window": "5h window", "5h win": "5h", "next prime": "next prime",
+    "land": "land", "login": "login", "5h window": "5h window", "5h win": "5h", "next prime": "next prime",
 }
 
 
@@ -761,7 +846,7 @@ def columns_for(width: int) -> tuple[str, ...]:
     if width < 112:
         drop |= {"rank", "7d in"}
     if width < 100:
-        drop |= {"plan", "tier"}
+        drop |= {"plan", "tier", "login"}
     if width < 64:
         drop |= {"next prime"}
     cols = [c for c in ALL_COLUMNS if c not in drop]
@@ -862,6 +947,8 @@ def row_cells(
                 cell = ("active", "bold")
             else:
                 cell = (row.land, "dim")
+        elif col == "login":
+            cell = ("re-login", "crit") if dead else login_cell(row, now)
         elif col in ("5h window", "5h win"):
             cell = _window_cell(row, short=col == "5h win")
         elif col == "next prime":
@@ -879,9 +966,10 @@ def row_cells(
     return tuple(cells)
 
 
-def detail_line(row: FleetRow, mx: MaximizeSettings) -> str:
+def detail_line(row: FleetRow, mx: MaximizeSettings, *, now: float | None = None) -> str:
     """The fork line under the detail card: rank, plan, pace explained, the
-    landing verdict in words and the 5h window."""
+    landing verdict in words, the 5h window and (with ``now``) the time left
+    on the login."""
     parts: list[str] = []
     if row.tier == "excluded":
         parts.append("excluded from rotation")
@@ -912,6 +1000,10 @@ def detail_line(row: FleetRow, mx: MaximizeSettings) -> str:
         parts.append(f"5h running → {hhmm(row.reset5)}")
     else:
         parts.append("5h cold")
+    left = login_left(row, now) if now is not None else None
+    if left is not None and now is not None and row.login != "relogin":
+        hint = " (r re-logs in)" if left < LOGIN_WARN_S else ""
+        parts.append(_expiring_text(row, now) + hint)
     return " · ".join(parts)
 
 
@@ -952,8 +1044,11 @@ def relogin_steps(
     host: str | None,
     claude_path: str | None,
     return_to: FleetRow | None,
+    now: float | None = None,
 ) -> list[str]:
-    """What to do to re-login ``row`` — cc-swap launches nothing itself."""
+    """What to do to re-login ``row`` — cc-swap launches nothing itself.
+    With ``now``, a login still in use but near its deadline is explained
+    as an early renewal."""
     where = f"on this machine ({host or 'this host'}{', over SSH' if ssh else ''})"
     claude = claude_path or "claude"
     back = (
@@ -961,14 +1056,24 @@ def relogin_steps(
         if return_to is not None and return_to.number != row.number
         else "stays on it"
     )
-    why = (
-        "its login expired (Claude Code logins expire about a month after login)"
-        if row.login_expired
-        else "its refresh token is dead"
-    )
+    if row.login != "relogin" and now is not None and login_due(row, now):
+        headline = (
+            f"Re-login #{row.number} {row.name} ({row.email}) — its "
+            f"{_expiring_text(row, now)}; a fresh login now starts a new "
+            "~30-day deadline (refreshing never extends it)."
+        )
+    else:
+        why = (
+            "its login expired (Claude Code logins expire about a month after login)"
+            if row.login_expired
+            else "its refresh token is dead"
+        )
+        headline = (
+            f"Re-login #{row.number} {row.name} ({row.email}) — {why}; "
+            "only a fresh login fixes it."
+        )
     lines = [
-        f"Re-login #{row.number} {row.name} ({row.email}) — {why}; "
-        "only a fresh login fixes it.",
+        headline,
         "",
         f"{where}, in another terminal:",
         f"  1. run  {claude}",

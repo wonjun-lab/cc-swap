@@ -164,17 +164,21 @@ def login_expiry_note_ms(deadline_ms: float | None, now_ms: int | None = None) -
     clock = reset_clock_string(deadline_utc, now_utc)
     if now >= deadline_ms:
         return f"login expired {clock}"
-    remaining = max(0, int((deadline_ms - now) / 1000))
+    countdown = login_countdown((deadline_ms - now) / 1000)
+    return f"login expires {clock} in {countdown}"
+
+
+def login_countdown(remaining_s: float) -> str:
+    """``2d 3h`` / ``5h 12m`` / ``40m`` for a login deadline's time left."""
+    remaining = max(0, int(remaining_s))
     days, rest = divmod(remaining, 86400)
     hours, rest = divmod(rest, 3600)
     minutes = rest // 60
     if days > 0:
-        countdown = f"{days}d {hours}h"
-    elif hours > 0:
-        countdown = f"{hours}h {minutes}m"
-    else:
-        countdown = f"{minutes}m"
-    return f"login expires {clock} in {countdown}"
+        return f"{days}d {hours}h"
+    if hours > 0:
+        return f"{hours}h {minutes}m"
+    return f"{minutes}m"
 
 
 def login_expiry_note(credentials: str, now_ms: int | None = None) -> str | None:

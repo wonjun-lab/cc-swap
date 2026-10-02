@@ -12575,6 +12575,32 @@ class TestLoginExpiry:
         assert output.count("login expires ") == 1
         assert "re-login before then: log in with Claude Code, then run: cswap add" in output
 
+    def test_list_warning_turns_red_inside_the_last_day(
+        self, temp_home: Path, mock_claude_config: Path, sample_sequence_data: dict, capsys
+    ):
+        from claude_swap import printer
+
+        sample_sequence_data["accounts"]["1"]["email"] = "test@example.com"
+        now_ms = int(time.time() * 1000)
+        active_creds = self._creds(access="sk-active", refresh="rt-active")
+        backup_creds = self._creds(now_ms + 20 * 3600 * 1000)
+
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        switcher._write_json(switcher.sequence_file, sample_sequence_data)
+
+        with patch.object(switcher, "_read_credentials", return_value=active_creds), \
+             patch.object(switcher, "_read_account_credentials", return_value=backup_creds), \
+             patch("claude_swap.oauth.try_fetch_usage_for_account", return_value=oauth.UsageOutcome(None)), \
+             patch("claude_swap.session.read_session_credentials", return_value=None), \
+             printer.force_color():
+            switcher.list_accounts()
+            red_prefix = printer.reddened("x").split("x")[0]
+
+        output = capsys.readouterr().out
+        line = next(ln for ln in output.splitlines() if "login expires " in ln)
+        assert red_prefix and red_prefix in line
+
     def test_list_names_a_lapsed_login_when_the_server_refuses_it(
         self, temp_home: Path, mock_claude_config: Path, sample_sequence_data: dict, capsys
     ):

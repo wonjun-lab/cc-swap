@@ -32,7 +32,7 @@ from datetime import datetime, timezone
 from typing import Any, Protocol
 
 from claude_swap import autoswitch as aw
-from claude_swap import poll_policy
+from claude_swap import oauth, poll_policy
 from claude_swap.exceptions import ConfigError
 from claude_swap.maximize import idle, pause, policy
 from claude_swap.maximize.model import (
@@ -67,6 +67,13 @@ CHANGED_KEY = "activeChangedAt"
 # rateLimitTier only changes with a plan change; re-read the stored
 # credential (a Keychain read on macOS) at most hourly per slot.
 TIER_CACHE_TTL_S = 3600.0
+# A login's deadline (``refreshTokenExpiresAt``) only moves with a re-login:
+# re-read the stored credentials at most this often.
+LOGIN_DEADLINE_TTL_S = 600.0
+# Warn in the engine log from this long before a login's deadline ...
+LOGIN_WARN_S = 7 * 86400.0
+# ... once per account per this long.
+LOGIN_WARN_EVERY_S = 86400.0
 # The decision this engine last made, for TUI viewers (``_publish_decision``).
 DECISION_KEY = "maximizeDecision"
 # An unchanged decision is rewritten this often, so a reader can tell a
@@ -108,6 +115,10 @@ class MaximizeRuntime:
     tier_cache: dict[str, tuple[str, str | None, float]] = field(default_factory=dict)
     last_snapshot: Snapshot | None = None
     last_decision: Decision | None = None
+    # Login deadlines (epoch s) by slot, read at ``login_deadlines_at``.
+    login_deadlines: dict[str, float] = field(default_factory=dict)
+    login_deadlines_at: float | None = None
+    login_warned: dict[str, float] = field(default_factory=dict)
 
 
 # -- settings ------------------------------------------------------------------
@@ -362,6 +373,67 @@ def _rate_limit_tiers(
         rt.tier_cache[number] = (email, tier, now)
         out[number] = tier
     return out
+
+
+def _login_deadlines(
+    engine: aw.AutoSwitchEngine,
+    rt: MaximizeRuntime,
+    records: Mapping[str, Mapping],
+    current: str,
+    now: float,
+) -> dict[str, float]:
+    """Each slot's login deadline (epoch s): the live login for the active
+    slot, the stored backup for the rest. Slots without one are absent.
+    Only the deadline leaves this function — never a token."""
+    if (
+        rt.login_deadlines_at is not None
+        and 0 <= now - rt.login_deadlines_at < LOGIN_DEADLINE_TTL_S
+    ):
+        return rt.login_deadlines
+    out: dict[str, float] = {}
+    for number, record in records.items():
+        if record.get("kind") == "api_key":
+            continue
+        try:
+            if number == current:
+                creds = engine.switcher._read_credentials()
+            else:
+                creds = engine.switcher.read_account_credentials(
+                    number, str(record.get("email") or "")
+                )
+        except Exception:
+            _logger.debug("login deadline unreadable for account %s", number)
+            continue
+        deadline_ms = oauth.login_expires_at_ms(creds or "")
+        if deadline_ms is not None:
+            out[number] = deadline_ms / 1000.0
+    rt.login_deadlines, rt.login_deadlines_at = out, now
+    return out
+
+
+def _warn_login_expiry(
+    engine: aw.AutoSwitchEngine,
+    rt: MaximizeRuntime,
+    deadlines: Mapping[str, float],
+    now: float,
+) -> None:
+    """One ``ConfigWarningEvent`` per account per day from a week before its
+    login deadline: a parked slot has no Claude Code session to warn in."""
+    for number, deadline in deadlines.items():
+        if deadline - now >= LOGIN_WARN_S:
+            continue
+        last = rt.login_warned.get(number)
+        if last is not None and 0 <= now - last < LOGIN_WARN_EVERY_S:
+            continue
+        rt.login_warned[number] = now
+        note = oauth.login_expiry_note_ms(deadline * 1000.0, int(now * 1000))
+        then = "re-login needed" if now >= deadline else "re-login before then"
+        engine._emit(aw.ConfigWarningEvent(
+            message=(
+                f"Account-{number} {note} — {then}: log in with Claude Code as "
+                f"that account, then run: cc-swap add (or Fleet → r)"
+            )
+        ))
 
 
 def _stored_samples(source: Mapping, current: str) -> list[Sample]:
@@ -783,6 +855,8 @@ def run_maximize_tick(
         ))
         return aw.TickOutcome.NO_ACTION
     records = _records(engine, current)
+    deadlines = _login_deadlines(engine, rt, records, current, now)
+    _warn_login_expiry(engine, rt, deadlines, now)
     samples, active_changed_at = _update_samples(
         engine, rt, state, current, entries.get(current), usage.get(current), now
     )
