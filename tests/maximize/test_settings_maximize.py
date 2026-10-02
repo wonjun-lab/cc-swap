@@ -1,0 +1,344 @@
+"""cc-swap settings sections: ``maximize`` and ``prime`` (spec §8)."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import logging
+import sys
+from pathlib import Path
+from unittest.mock import patch
+
+import pytest
+
+from claude_swap import cli
+from claude_swap.exceptions import ConfigError
+from claude_swap.settings import (
+    SETTING_SPECS,
+    MaximizeSettings,
+    PrimeSettings,
+    effective_settings,
+    load_maximize_settings,
+    load_prime_settings,
+    load_settings,
+    merge_maximize_cli,
+    parse_jitter_range,
+    set_setting,
+    settings_path,
+    unset_setting,
+)
+
+
+def _write(tmp_path: Path, payload: dict) -> None:
+    settings_path(tmp_path).write_text(json.dumps(payload))
+
+
+def _flags(**kwargs) -> argparse.Namespace:
+    values = {"soft5h": None, "hard5h": None, "soft7d": None, "hard7d": None}
+    values.update(kwargs)
+    return argparse.Namespace(**values)
+
+
+class TestRegistry:
+    def test_maximize_and_prime_fields_are_all_registered(self):
+        by_section: dict[str, set[str]] = {}
+        for spec in SETTING_SPECS.values():
+            by_section.setdefault(spec.section, set()).add(spec.field)
+        assert by_section["maximize"] == set(MaximizeSettings.__dataclass_fields__)
+        assert by_section["prime"] == set(PrimeSettings.__dataclass_fields__)
+
+    def test_json_keys_match_the_contract(self):
+        keys = {spec.dotted for spec in SETTING_SPECS.values()}
+        assert {
+            "maximize.soft5h", "maximize.hard5h", "maximize.soft7d",
+            "maximize.hard7d", "maximize.landingMargin", "maximize.idleWindowMin",
+            "maximize.idleMaxDeltaPct", "maximize.forceEtaMin",
+            "maximize.pendingPollS", "maximize.rebalanceCooldownMin",
+            "maximize.tieEpsilon", "maximize.lastResort", "maximize.planOverride",
+            "prime.enabled", "prime.model", "prime.jitterS", "prime.maxAttempts",
+            "prime.claudePath",
+        } <= keys
+
+    def test_ranges_match_the_spec(self):
+        bounds = {
+            spec.dotted: (spec.lo, spec.hi)
+            for spec in SETTING_SPECS.values()
+            if spec.section in ("maximize", "prime") and spec.lo is not None
+        }
+        assert bounds == {
+            "maximize.soft5h": (1.0, 99.9),
+            "maximize.hard5h": (1.0, 99.9),
+            "maximize.soft7d": (1.0, 99.9),
+            "maximize.hard7d": (1.0, 99.9),
+            "maximize.landingMargin": (0.0, 30.0),
+            "maximize.idleWindowMin": (3, 60),
+            "maximize.idleMaxDeltaPct": (0.0, 10.0),
+            "maximize.forceEtaMin": (0, 60),
+            "maximize.pendingPollS": (60, 600),
+            "maximize.rebalanceCooldownMin": (0, 240),
+            "maximize.tieEpsilon": (0.0, 2.0),
+            "prime.maxAttempts": (1, 5),
+        }
+
+    def test_maximize_is_an_autoswitch_strategy(self, tmp_path: Path):
+        assert "maximize" in SETTING_SPECS["autoswitch.strategy"].choices
+        set_setting(tmp_path, "autoswitch.strategy", "maximize")
+        assert load_settings(tmp_path).strategy == "maximize"
+
+
+class TestLoadMaximize:
+    def test_missing_file_gives_defaults(self, tmp_path: Path):
+        assert load_maximize_settings(tmp_path) == MaximizeSettings()
+
+    def test_partial_section_fills_defaults(self, tmp_path: Path):
+        _write(tmp_path, {"maximize": {"soft5h": 40, "lastResort": "a@x.com"}})
+        loaded = load_maximize_settings(tmp_path)
+        assert loaded.soft_5h == 40.0
+        assert loaded.last_resort == "a@x.com"
+        assert loaded.hard_5h == MaximizeSettings().hard_5h
+
+    def test_values_are_clamped(self, tmp_path: Path):
+        _write(tmp_path, {"maximize": {
+            "soft5h": 0, "hard5h": 150, "idleWindowMin": 1,
+            "pendingPollS": 9999, "tieEpsilon": -1,
+        }})
+        loaded = load_maximize_settings(tmp_path)
+        assert loaded.soft_5h == 1.0
+        assert loaded.hard_5h == 99.9
+        assert loaded.idle_window_min == 3
+        assert loaded.pending_poll_s == 600
+        assert loaded.tie_epsilon == 0.0
+
+    def test_int_keys_truncate_floats(self, tmp_path: Path):
+        _write(tmp_path, {"maximize": {"idleWindowMin": 12.7}})
+        assert load_maximize_settings(tmp_path).idle_window_min == 12
+
+    def test_bad_types_fall_back_to_defaults(self, tmp_path: Path):
+        _write(tmp_path, {"maximize": {
+            "soft7d": "high", "hard7d": True, "lastResort": 5,
+        }})
+        loaded = load_maximize_settings(tmp_path)
+        assert loaded.soft_7d == MaximizeSettings().soft_7d
+        assert loaded.hard_7d == MaximizeSettings().hard_7d
+        assert loaded.last_resort is None
+
+    def test_soft_above_hard_resets_that_window_only(self, tmp_path: Path):
+        _write(tmp_path, {"maximize": {
+            "soft5h": 96, "hard5h": 90, "soft7d": 80,
+        }})
+        problems: list[str] = []
+        loaded = load_maximize_settings(tmp_path, problems=problems)
+        assert (loaded.soft_5h, loaded.hard_5h) == (50.0, 95.0)
+        assert loaded.soft_7d == 80.0  # the valid window keeps its value
+        assert len(problems) == 1
+        assert "maximize.soft5h (96) must not exceed maximize.hard5h (90)" in problems[0]
+
+    def test_both_windows_broken_reports_both(self, tmp_path: Path):
+        _write(tmp_path, {"maximize": {
+            "soft5h": 96, "hard5h": 90, "soft7d": 99, "hard7d": 91,
+        }})
+        problems: list[str] = []
+        loaded = load_maximize_settings(tmp_path, problems=problems)
+        assert loaded == MaximizeSettings()
+        assert len(problems) == 2
+
+    def test_soft_equal_to_hard_is_valid(self, tmp_path: Path):
+        _write(tmp_path, {"maximize": {"soft5h": 80, "hard5h": 80}})
+        problems: list[str] = []
+        loaded = load_maximize_settings(tmp_path, problems=problems)
+        assert (loaded.soft_5h, loaded.hard_5h) == (80.0, 80.0)
+        assert problems == []
+
+    def test_load_soft_above_hard_reverts_pair(self, tmp_path: Path, caplog):
+        # Header Review Focus 5: a hand-edited file with soft > hard, a string
+        # in a numeric key and an unknown strategy still loads, pair by pair,
+        # with a warning instead of an exception.
+        _write(tmp_path, {
+            "autoswitch": {"strategy": "fastest"},
+            "maximize": {"soft7d": 99, "hard7d": 95, "hard5h": "high"},
+        })
+        with caplog.at_level(logging.WARNING, logger="claude-swap"):
+            loaded = load_maximize_settings(tmp_path)
+        assert (loaded.soft_7d, loaded.hard_7d) == (90.0, 98.0)  # pair reverted
+        assert (loaded.soft_5h, loaded.hard_5h) == (50.0, 95.0)  # "high" -> default
+        assert "maximize.soft7d (99) must not exceed maximize.hard7d (95)" in caplog.text
+        assert load_settings(tmp_path).strategy == "best"
+
+
+class TestLoadPrime:
+    def test_missing_file_gives_defaults(self, tmp_path: Path):
+        assert load_prime_settings(tmp_path) == PrimeSettings()
+        assert PrimeSettings().enabled is False
+
+    def test_reads_values(self, tmp_path: Path):
+        _write(tmp_path, {"prime": {
+            "enabled": True, "model": "haiku", "jitterS": "60-120",
+            "maxAttempts": 3, "claudePath": "/opt/claude",
+        }})
+        assert load_prime_settings(tmp_path) == PrimeSettings(
+            enabled=True, model="haiku", jitter_s="60-120",
+            max_attempts=3, claude_path="/opt/claude",
+        )
+
+    def test_only_json_true_enables_priming(self, tmp_path: Path):
+        _write(tmp_path, {"prime": {"enabled": "false"}})
+        problems: list[str] = []
+        assert load_prime_settings(tmp_path, problems=problems).enabled is False
+        assert "prime.enabled" in problems[0]
+
+    def test_malformed_jitter_reverts_to_default(self, tmp_path: Path):
+        _write(tmp_path, {"prime": {"jitterS": "300-45"}})
+        problems: list[str] = []
+        assert load_prime_settings(tmp_path, problems=problems).jitter_s == "45-300"
+        assert "prime.jitterS" in problems[0]
+
+    def test_empty_model_reverts_to_default(self, tmp_path: Path):
+        _write(tmp_path, {"prime": {"model": ""}})
+        assert load_prime_settings(tmp_path).model == "claude-haiku-4-5"
+
+    def test_max_attempts_clamped(self, tmp_path: Path):
+        _write(tmp_path, {"prime": {"maxAttempts": 9}})
+        assert load_prime_settings(tmp_path).max_attempts == 5
+
+
+class TestParseJitterRange:
+    @pytest.mark.parametrize("value,expected", [
+        ("45-300", (45, 300)),
+        (" 0 - 599 ", (0, 599)),
+        ("120-120", (120, 120)),
+    ])
+    def test_valid(self, value, expected):
+        assert parse_jitter_range(value) == expected
+
+    @pytest.mark.parametrize("value", ["300-45", "45-600", "abc", "45", "-5-10", "1.5-3"])
+    def test_invalid(self, value):
+        with pytest.raises(ValueError):
+            parse_jitter_range(value)
+
+
+class TestStrictSet:
+    def test_soft_above_default_hard_is_rejected_without_writing(self, tmp_path: Path):
+        with pytest.raises(
+            ConfigError,
+            match=r"maximize\.soft5h \(96\) must not exceed maximize\.hard5h \(95\); "
+                  r"change maximize\.hard5h first",
+        ):
+            set_setting(tmp_path, "maximize.soft5h", "96")
+        assert not settings_path(tmp_path).exists()
+
+    def test_hard_below_soft_is_rejected(self, tmp_path: Path):
+        with pytest.raises(ConfigError, match="change maximize.soft5h first"):
+            set_setting(tmp_path, "maximize.hard5h", "40")
+
+    def test_raising_hard_first_then_soft_is_accepted(self, tmp_path: Path):
+        assert set_setting(tmp_path, "maximize.hard5h", "99") == 99.0
+        assert set_setting(tmp_path, "maximize.soft5h", "96") == 96.0
+        loaded = load_maximize_settings(tmp_path)
+        assert (loaded.soft_5h, loaded.hard_5h) == (96.0, 99.0)
+
+    def test_broken_pair_in_file_is_judged_raw_not_masked(self, tmp_path: Path):
+        # Lenient load shows 50/95 for this pair; the check must use 55.
+        _write(tmp_path, {"maximize": {"soft5h": 60, "hard5h": 55}})
+        with pytest.raises(ConfigError, match=r"\(58\) must not exceed maximize\.hard5h \(55\)"):
+            set_setting(tmp_path, "maximize.soft5h", "58")
+        assert set_setting(tmp_path, "maximize.hard5h", "70") == 70.0
+
+    def test_other_window_broken_does_not_block_an_edit(self, tmp_path: Path):
+        _write(tmp_path, {"maximize": {"soft7d": 99, "hard7d": 90}})
+        assert set_setting(tmp_path, "maximize.soft5h", "40") == 40.0
+
+    def test_unset_that_would_break_the_pair_is_rejected(self, tmp_path: Path):
+        set_setting(tmp_path, "maximize.hard5h", "98")
+        set_setting(tmp_path, "maximize.soft5h", "96")
+        before = settings_path(tmp_path).read_text()
+        with pytest.raises(ConfigError, match="change maximize.soft5h first"):
+            unset_setting(tmp_path, "maximize.hard5h")
+        assert settings_path(tmp_path).read_text() == before
+
+    def test_range_is_enforced(self, tmp_path: Path):
+        with pytest.raises(ConfigError, match="between 3 and 60"):
+            set_setting(tmp_path, "maximize.idleWindowMin", "2")
+
+    def test_jitter_format_is_enforced(self, tmp_path: Path):
+        with pytest.raises(ConfigError, match="prime.jitterS"):
+            set_setting(tmp_path, "prime.jitterS", "abc")
+        assert set_setting(tmp_path, "prime.jitterS", "30-200") == "30-200"
+
+    def test_plan_override_format_is_enforced(self, tmp_path: Path):
+        assert set_setting(
+            tmp_path, "maximize.planOverride", "a@x.com:20x,b@y.com:5x"
+        ) == "a@x.com:20x,b@y.com:5x"
+        with pytest.raises(ConfigError, match="a@x.com:10x"):
+            set_setting(tmp_path, "maximize.planOverride", "a@x.com:10x")
+
+    def test_prime_enabled_bool_words(self, tmp_path: Path):
+        assert set_setting(tmp_path, "prime.enabled", "yes") is True
+        assert load_prime_settings(tmp_path).enabled is True
+
+    def test_set_writes_only_that_key(self, tmp_path: Path):
+        set_setting(tmp_path, "maximize.soft5h", "40")
+        raw = json.loads(settings_path(tmp_path).read_text())
+        assert raw == {"schemaVersion": 1, "maximize": {"soft5h": 40.0}}
+
+
+class TestMergeMaximizeCli:
+    def test_no_flags_returns_settings_unchanged(self):
+        base = MaximizeSettings(soft_5h=40.0)
+        assert merge_maximize_cli(base, _flags()) is base
+        assert merge_maximize_cli(base, None) is base
+
+    def test_flags_beat_settings(self):
+        merged = merge_maximize_cli(
+            MaximizeSettings(soft_5h=40.0, hard_7d=97.0), _flags(hard5h=90.0, soft7d=85.0)
+        )
+        assert (merged.soft_5h, merged.hard_5h) == (40.0, 90.0)
+        assert (merged.soft_7d, merged.hard_7d) == (85.0, 97.0)
+
+    def test_flags_are_clamped(self):
+        merged = merge_maximize_cli(MaximizeSettings(), _flags(soft5h=0.5))
+        assert merged.soft_5h == 1.0
+
+    def test_soft_above_hard_after_merge_raises(self):
+        with pytest.raises(ConfigError, match="maximize.soft5h"):
+            merge_maximize_cli(MaximizeSettings(), _flags(soft5h=97.0))
+
+    def test_accepts_objects_missing_some_attributes(self):
+        merged = merge_maximize_cli(MaximizeSettings(), argparse.Namespace(soft7d=80.0))
+        assert merged.soft_7d == 80.0
+
+
+class TestConfigCli:
+    def _run(self, argv, capsys):
+        with patch("os.geteuid", return_value=1000, create=True), \
+             patch.object(sys, "argv", ["cc-swap", "config", *argv]):
+            code = 0
+            try:
+                cli.main()
+            except SystemExit as e:
+                code = e.code or 0
+        captured = capsys.readouterr()
+        return code, captured.out, captured.err
+
+    def test_list_includes_new_sections(self, temp_home, capsys):
+        code, out, _ = self._run([], capsys)
+        assert code == 0
+        assert "maximize.soft5h" in out
+        assert "prime.enabled" in out
+
+    def test_set_get_unset_round_trip(self, temp_home, capsys):
+        assert self._run(["set", "maximize.soft5h", "40"], capsys)[0] == 0
+        code, out, _ = self._run(["get", "maximize.soft5h"], capsys)
+        assert (code, out.strip()) == (0, "40")
+        code, out, _ = self._run(["unset", "maximize.soft5h"], capsys)
+        assert code == 0
+        assert "default: 50" in out
+
+    def test_set_soft_above_hard_exits_1(self, temp_home, capsys):
+        code, _, err = self._run(["set", "maximize.soft7d", "99"], capsys)
+        assert code == 1
+        assert "must not exceed maximize.hard7d (98)" in err
+
+    def test_effective_settings_rows_cover_new_sections(self, tmp_path: Path):
+        rows = {spec.dotted: (value, is_set) for spec, value, is_set in effective_settings(tmp_path)}
+        assert rows["maximize.hard7d"] == (98.0, False)
+        assert rows["prime.jitterS"] == ("45-300", False)

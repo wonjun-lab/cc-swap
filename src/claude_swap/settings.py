@@ -15,6 +15,7 @@ import dataclasses
 import json
 import logging
 import os
+import re
 import sys
 import tempfile
 from dataclasses import dataclass
@@ -67,7 +68,49 @@ class UiSettings:
     theme: str = "auto"
 
 
-_SECTION_DEFAULT_SOURCES = {"autoswitch": AutoSwitchSettings, "ui": UiSettings}
+@dataclass(frozen=True)
+class MaximizeSettings:
+    """Knobs for cc-swap's ``maximize`` strategy (``maximize`` section).
+
+    A section of its own rather than fields on ``AutoSwitchSettings``:
+    upstream adds fields there, and fork fields beside them would conflict on
+    every merge. Each window has a soft mark (switch at the next idle moment)
+    and a hard cap (switch now); ``soft <= hard`` per window is enforced by
+    `load_maximize_settings` (lenient) and `set_setting` (strict).
+    """
+
+    soft_5h: float = 50.0
+    hard_5h: float = 95.0
+    soft_7d: float = 90.0
+    hard_7d: float = 98.0
+    landing_margin: float = 5.0
+    idle_window_min: int = 10
+    idle_max_delta_pct: float = 1.0
+    force_eta_min: int = 10
+    pending_poll_s: int = 120
+    rebalance_cooldown_min: int = 30
+    tie_epsilon: float = 0.1
+    last_resort: str | None = None  # comma-separated emails/aliases
+    plan_override: str | None = None  # "email:20x,email:5x"
+
+
+@dataclass(frozen=True)
+class PrimeSettings:
+    """cc-swap 5h-window priming (``prime`` section); off unless enabled."""
+
+    enabled: bool = False
+    model: str = "claude-haiku-4-5"
+    jitter_s: str = "45-300"  # "LO-HI" seconds after a reset, see parse_jitter_range
+    max_attempts: int = 2
+    claude_path: str | None = None
+
+
+_SECTION_DEFAULT_SOURCES = {
+    "autoswitch": AutoSwitchSettings,
+    "ui": UiSettings,
+    "maximize": MaximizeSettings,
+    "prime": PrimeSettings,
+}
 
 
 @dataclass(frozen=True)
@@ -120,7 +163,7 @@ SETTING_SPECS: dict[str, SettingSpec] = {
         ),
         SettingSpec(
             "autoswitch", "strategy", "strategy", "choice",
-            choices=("best", "consume-first"),
+            choices=("best", "consume-first", "maximize"),
             help="How auto-switch picks the target account",
         ),
         SettingSpec(
@@ -138,6 +181,80 @@ SETTING_SPECS: dict[str, SettingSpec] = {
         SettingSpec(
             "ui", "theme", "theme", "choice", choices=("dark", "light", "auto"),
             help="Color theme; auto follows the terminal background",
+        ),
+        # cc-swap sections (spec §8). Kept after upstream's rows so an
+        # upstream key addition lands above without touching these lines.
+        SettingSpec(
+            "maximize", "soft5h", "soft_5h", "float", 1.0, 99.9,
+            help="maximize: 5h soft mark, switch at the next idle moment",
+        ),
+        SettingSpec(
+            "maximize", "hard5h", "hard_5h", "float", 1.0, 99.9,
+            help="maximize: 5h hard cap, switch now (>= soft5h)",
+        ),
+        SettingSpec(
+            "maximize", "soft7d", "soft_7d", "float", 1.0, 99.9,
+            help="maximize: 7d soft mark, switch at the next idle moment",
+        ),
+        SettingSpec(
+            "maximize", "hard7d", "hard_7d", "float", 1.0, 99.9,
+            help="maximize: 7d hard cap, switch now (>= soft7d)",
+        ),
+        SettingSpec(
+            "maximize", "landingMargin", "landing_margin", "float", 0.0, 30.0,
+            help="maximize: a target must sit this many pct below both soft marks",
+        ),
+        SettingSpec(
+            "maximize", "idleWindowMin", "idle_window_min", "int", 3, 60,
+            help="maximize: minutes of usage samples that decide idle",
+        ),
+        SettingSpec(
+            "maximize", "idleMaxDeltaPct", "idle_max_delta_pct", "float", 0.0, 10.0,
+            help="maximize: max pct growth inside the idle window",
+        ),
+        SettingSpec(
+            "maximize", "forceEtaMin", "force_eta_min", "int", 0, 60,
+            help="maximize: switch now when a hard cap is this many minutes away (0 = off)",
+        ),
+        SettingSpec(
+            "maximize", "pendingPollS", "pending_poll_s", "int", 60, 600,
+            help="maximize: active-account poll seconds while a switch waits",
+        ),
+        SettingSpec(
+            "maximize", "rebalanceCooldownMin", "rebalance_cooldown_min", "int", 0, 240,
+            help="maximize: minimum minutes between rebalance switches",
+        ),
+        SettingSpec(
+            "maximize", "tieEpsilon", "tie_epsilon", "float", 0.0, 2.0,
+            help="maximize: scores this close count as a tie",
+        ),
+        SettingSpec(
+            "maximize", "lastResort", "last_resort", "string",
+            help="maximize: last-resort accounts (emails/aliases, comma-separated)",
+        ),
+        SettingSpec(
+            "maximize", "planOverride", "plan_override", "string",
+            help="maximize: plan per account, e.g. a@x.com:20x,b@x.com:5x",
+        ),
+        SettingSpec(
+            "prime", "enabled", "enabled", "bool",
+            help="prime: keep idle accounts' 5h windows started",
+        ),
+        SettingSpec(
+            "prime", "model", "model", "string",
+            help="prime: model for the priming call",
+        ),
+        SettingSpec(
+            "prime", "jitterS", "jitter_s", "string",
+            help="prime: wait LO-HI seconds after a reset before priming",
+        ),
+        SettingSpec(
+            "prime", "maxAttempts", "max_attempts", "int", 1, 5,
+            help="prime: attempts per 5h window",
+        ),
+        SettingSpec(
+            "prime", "claudePath", "claude_path", "string",
+            help="prime: claude executable (default: auto-detect)",
         ),
     )
 }
@@ -167,8 +284,11 @@ def parse_model_names(value: str | None) -> tuple[str, ...]:
     return tuple(seen.values())
 
 
-def _clamped(settings: AutoSwitchSettings) -> AutoSwitchSettings:
-    """Clamp values into the SETTING_SPECS ranges; bad types → the default."""
+def _clamped(settings, section: str = "autoswitch"):
+    """Clamp values into the SETTING_SPECS ranges; bad types → the default.
+
+    ``section`` selects the registry rows; the result has ``settings``' type.
+    """
 
     def num(value, default: float, lo: float, hi: float) -> float:
         if isinstance(value, bool) or not isinstance(value, (int, float)):
@@ -177,7 +297,7 @@ def _clamped(settings: AutoSwitchSettings) -> AutoSwitchSettings:
 
     kwargs = {}
     for spec in SETTING_SPECS.values():
-        if spec.section != "autoswitch":
+        if spec.section != section:
             continue
         value = getattr(settings, spec.field)
         if spec.kind in ("float", "int"):
@@ -197,7 +317,7 @@ def _clamped(settings: AutoSwitchSettings) -> AutoSwitchSettings:
                 )
                 value = spec.default
             kwargs[spec.field] = value
-    return AutoSwitchSettings(**kwargs)
+    return type(settings)(**kwargs)
 
 
 def _read_raw(path: Path) -> dict:
@@ -375,6 +495,7 @@ def set_setting(backup_root: Path, dotted_key: str, raw_value: str):
     value = parse_setting_value(spec, raw_value)
     path = settings_path(backup_root)
     raw = _read_raw_for_write(path)
+    _check_fork_setting(raw, spec, value)
     raw["schemaVersion"] = raw.get("schemaVersion", SETTINGS_SCHEMA_VERSION)
     section = raw.get(spec.section)
     if not isinstance(section, dict):
@@ -393,6 +514,7 @@ def unset_setting(backup_root: Path, dotted_key: str) -> bool:
     section = raw.get(spec.section)
     if not isinstance(section, dict) or spec.json_key not in section:
         return False
+    _check_fork_setting(raw, spec, spec.default)
     raw["schemaVersion"] = raw.get("schemaVersion", SETTINGS_SCHEMA_VERSION)
     del section[spec.json_key]
     if not section:
@@ -412,6 +534,8 @@ def effective_settings(backup_root: Path) -> list[tuple[SettingSpec, object, boo
     loaded = {
         "autoswitch": load_settings(backup_root),
         "ui": load_ui_settings(backup_root),
+        "maximize": load_maximize_settings(backup_root),
+        "prime": load_prime_settings(backup_root),
     }
     rows = []
     for spec in SETTING_SPECS.values():
@@ -438,6 +562,211 @@ def merged_with_cli(settings: AutoSwitchSettings, args) -> AutoSwitchSettings:
     if not overrides:
         return settings
     return _clamped(dataclasses.replace(settings, **overrides))
+
+
+# -- cc-swap: maximize / prime sections -------------------------------------
+# Fork-only code lives in this block so upstream merges touch it rarely; the
+# upstream functions above gained only one-line hooks (`_clamped`'s section,
+# `effective_settings`' loaders, `set_setting`/`unset_setting`'s
+# `_check_fork_setting`).
+
+_SPEC_BY_FIELD: dict[tuple[str, str], SettingSpec] = {
+    (spec.section, spec.field): spec for spec in SETTING_SPECS.values()
+}
+_MAXIMIZE_PAIRS = (("soft_5h", "hard_5h"), ("soft_7d", "hard_7d"))
+# `auto` flag attribute -> MaximizeSettings field (see merge_maximize_cli).
+MAXIMIZE_CLI_FLAGS = (
+    ("soft5h", "soft_5h"),
+    ("hard5h", "hard_5h"),
+    ("soft7d", "soft_7d"),
+    ("hard7d", "hard_7d"),
+)
+JITTER_MAX_S = 599
+_JITTER_RE = re.compile(r"\s*(\d+)\s*-\s*(\d+)\s*")
+_PLAN_ENTRY_RE = re.compile(r"[^\s:,]+:(?:20x|5x)", re.IGNORECASE)
+
+
+def _dotted(section: str, field: str) -> str:
+    return _SPEC_BY_FIELD[(section, field)].dotted
+
+
+def parse_jitter_range(value: str) -> tuple[int, int]:
+    """Parse ``prime.jitterS`` ("LO-HI", whole seconds) into ``(lo, hi)``.
+
+    HI stays under 600: a 5h window starts at its first request floored to
+    10 minutes (spec §3.1), so priming anywhere in [R, R+10min) after a reset
+    R lands the same next reset; later would start the window a slot late.
+
+    Raises:
+        ValueError: malformed, LO > HI, or HI > JITTER_MAX_S.
+    """
+    m = _JITTER_RE.fullmatch(value) if isinstance(value, str) else None
+    if m is None:
+        raise ValueError(
+            f"expects LO-HI in whole seconds (e.g. 45-300), got {value!r}"
+        )
+    lo, hi = int(m.group(1)), int(m.group(2))
+    if not lo <= hi <= JITTER_MAX_S:
+        raise ValueError(
+            f"needs 0 <= LO <= HI <= {JITTER_MAX_S}, got {value!r}"
+        )
+    return lo, hi
+
+
+def _plan_override_error(value: str) -> str | None:
+    parts = [part.strip() for part in value.split(",") if part.strip()]
+    bad = [part for part in parts if not _PLAN_ENTRY_RE.fullmatch(part)]
+    if parts and not bad:
+        return None
+    return (
+        "maximize.planOverride expects comma-separated EMAIL:20x or EMAIL:5x "
+        f"entries, got {', '.join(bad) or repr(value)}"
+    )
+
+
+def _maximize_pair_errors(
+    settings: MaximizeSettings,
+) -> list[tuple[str, str, str]]:
+    """``(soft_field, hard_field, message)`` for each window with soft > hard."""
+    errors = []
+    for soft, hard in _MAXIMIZE_PAIRS:
+        lo, hi = getattr(settings, soft), getattr(settings, hard)
+        if lo > hi:
+            errors.append((
+                soft,
+                hard,
+                f"{_dotted('maximize', soft)} ({format_setting_value(lo)}) must "
+                f"not exceed {_dotted('maximize', hard)} ({format_setting_value(hi)})",
+            ))
+    return errors
+
+
+def _section_from_raw(section, name: str, cls):
+    """One section's dataclass from its raw JSON dict: per-key lenient
+    (missing → default, bad type → default, out of range → clamped)."""
+    if not isinstance(section, dict):
+        return cls()
+    kwargs = {
+        spec.field: section[spec.json_key]
+        for spec in SETTING_SPECS.values()
+        if spec.section == name and spec.json_key in section
+    }
+    return _clamped(cls(**kwargs), name)
+
+
+def _report(problems: list[str] | None, message: str) -> None:
+    _logger.warning("settings.json: %s", message)
+    if problems is not None:
+        problems.append(message)
+
+
+def load_maximize_settings(
+    backup_root: Path, *, problems: list[str] | None = None
+) -> MaximizeSettings:
+    """Load the ``maximize`` section; never raises.
+
+    Per key as `load_settings`. Per window, a soft mark above its hard cap
+    resets BOTH to their defaults: moving one toward the other would invent
+    a threshold nobody chose. Every repair is logged and, when ``problems``
+    is given, appended to it — the engine's hot reload uses that to keep its
+    previous values and raise a ConfigWarningEvent instead (spec §8.1).
+    """
+    raw = _read_raw(settings_path(backup_root))
+    settings = _section_from_raw(raw.get("maximize"), "maximize", MaximizeSettings)
+    defaults = MaximizeSettings()
+    for soft, hard, message in _maximize_pair_errors(settings):
+        _report(problems, f"{message}; using defaults for both")
+        settings = dataclasses.replace(
+            settings,
+            **{soft: getattr(defaults, soft), hard: getattr(defaults, hard)},
+        )
+    return settings
+
+
+def load_prime_settings(
+    backup_root: Path, *, problems: list[str] | None = None
+) -> PrimeSettings:
+    """Load the ``prime`` section; never raises.
+
+    Stricter than the shared clamp in two places, both toward "off": only a
+    JSON ``true`` enables priming (the shared bool clamp would read the
+    string "false" as true), and a malformed ``jitterS`` reverts to the
+    default so `parse_jitter_range` on a loaded value cannot fail.
+    """
+    raw = _read_raw(settings_path(backup_root))
+    section = raw.get("prime")
+    settings = _section_from_raw(section, "prime", PrimeSettings)
+    defaults = PrimeSettings()
+    if (
+        isinstance(section, dict)
+        and "enabled" in section
+        and not isinstance(section["enabled"], bool)
+    ):
+        _report(
+            problems,
+            f"prime.enabled must be true or false, got {section['enabled']!r}; "
+            "priming stays off",
+        )
+        settings = dataclasses.replace(settings, enabled=False)
+    try:
+        parse_jitter_range(settings.jitter_s)
+    except ValueError as e:
+        _report(problems, f"prime.jitterS {e}; using {defaults.jitter_s}")
+        settings = dataclasses.replace(settings, jitter_s=defaults.jitter_s)
+    return settings
+
+
+def merge_maximize_cli(settings: MaximizeSettings, args) -> MaximizeSettings:
+    """Overlay ``auto --soft5h/--hard5h/--soft7d/--hard7d`` onto settings.
+
+    Flags beat settings.json (spec §8.1) and clamp into the registry ranges
+    like `merged_with_cli`. A soft mark above its hard cap after the merge
+    raises ConfigError: flags are an explicit request, so the contradiction
+    is reported rather than silently reset. ``args`` is any object with
+    those attributes (None = not given), or None; the engine re-applies the
+    same object after each hot reload.
+    """
+    overrides = {}
+    for attr, field in MAXIMIZE_CLI_FLAGS:
+        value = getattr(args, attr, None)
+        if value is not None:
+            overrides[field] = value
+    if not overrides:
+        return settings
+    merged = _clamped(dataclasses.replace(settings, **overrides), "maximize")
+    errors = _maximize_pair_errors(merged)
+    if errors:
+        raise ConfigError(errors[0][2])
+    return merged
+
+
+def _check_fork_setting(raw: dict, spec: SettingSpec, value) -> None:
+    """Strict checks `config set`/`unset` add for the cc-swap sections.
+
+    Single-key bounds already passed `parse_setting_value`. This covers the
+    two structured strings and what one key cannot know alone: a soft mark
+    against its hard cap, judged against the file's other key per-key
+    clamped but NOT pair-repaired, so an already-broken pair is reported
+    instead of being masked by the defaults the lenient load would show.
+    Only the window being edited is checked.
+    """
+    if spec.dotted == "prime.jitterS":
+        try:
+            parse_jitter_range(value)
+        except ValueError as e:
+            raise ConfigError(f"prime.jitterS {e}") from None
+    elif spec.dotted == "maximize.planOverride" and value is not None:
+        message = _plan_override_error(value)
+        if message is not None:
+            raise ConfigError(message)
+    if spec.section != "maximize":
+        return
+    current = _section_from_raw(raw.get("maximize"), "maximize", MaximizeSettings)
+    candidate = dataclasses.replace(current, **{spec.field: value})
+    for soft, hard, message in _maximize_pair_errors(candidate):
+        if spec.field in (soft, hard):
+            other = hard if spec.field == soft else soft
+            raise ConfigError(f"{message}; change {_dotted('maximize', other)} first")
 
 
 def atomic_write_json(path: Path, data: dict) -> None:
