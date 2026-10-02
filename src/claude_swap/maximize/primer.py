@@ -467,6 +467,16 @@ PRECHECK_MAX_AGE_S = 60.0      # the pre-launch reading must be at most this old
 BOUNDARY_GUARD_S = 15.0        # never launch in a bucket's last seconds
 TOKEN_MIN_LIFETIME_S = 120.0   # an access token must outlive the run by this much
 Runner = Callable[[Sequence[str], Mapping[str, str], Path, float], PrimeRunResult]
+Sleep = Callable[[float], None]
+
+
+def guard_wait(now: float) -> float:
+    """Seconds to hold a launch at ``now`` so its request cannot slip into
+    the next 10-minute bucket (and so miss the reset verification expects):
+    0 outside a bucket's last ``BOUNDARY_GUARD_S`` seconds, else until 1 s
+    past the next boundary."""
+    left = BUCKET_S - (now % BUCKET_S)
+    return left + 1.0 if left < BOUNDARY_GUARD_S else 0.0
 
 
 def request_fetch(switcher, number: str, at: float) -> None:
@@ -515,12 +525,14 @@ class Primer:
         runner: Runner = run_prime,
         rng: random.Random | None = None,
         clock: Callable[[], float] = time.time,
+        sleep: Callable[[float], None] = time.sleep,
     ):
         self.engine = engine
         self.settings = settings
         self._runner = runner
         self._rng = rng if rng is not None else random.Random()
         self._clock = clock
+        self._sleep = sleep
         self._disabled: str | None = None
 
     @property
@@ -537,12 +549,12 @@ class Primer:
             return events
         events.extend(self._verify_pending(snap))
         now = self._clock()
-        if BUCKET_S - (now % BUCKET_S) < BOUNDARY_GUARD_S:
+        if guard_wait(now):
             return events  # a launch now could land in the next bucket
         state = self._prime_state()
         for target in due_targets(snap, state, self.settings, now, self._rng):
-            if target.due_at > now:
-                break
+            if target.due_at > now or guard_wait(self._clock()):
+                break  # the guard: an earlier target's slow checks ran into it
             new_events, launched = self._attempt(target, state.get(target.email), claude)
             events.extend(new_events)
             if launched:
@@ -558,7 +570,8 @@ class Primer:
     ) -> list[AutoSwitchEvent]:
         """Manual priming (``cc-swap prime``): every eligible target now, no
         jitter, then one verification pass. Same safety checks as ``run_due``;
-        ignores ``prime.enabled``."""
+        ignores ``prime.enabled``. A launch that would fall in a bucket's last
+        seconds waits for the next bucket instead of deferring to a tick."""
         claude, events = self._claude_or_disable()
         if claude is None:
             return events
@@ -569,7 +582,9 @@ class Primer:
         for target in due_targets(snap, state, self.settings, now, self._rng):
             if numbers is not None and target.number not in numbers:
                 continue
-            new_events, did = self._attempt(target, state.get(target.email), claude)
+            new_events, did = self._attempt(
+                target, state.get(target.email), claude, wait=sleep
+            )
             events.extend(new_events)
             launched = launched or did
         if launched:
@@ -667,8 +682,16 @@ class Primer:
         return events
 
     def _attempt(
-        self, target: PrimeTarget, entry: Mapping | None, claude: str
+        self,
+        target: PrimeTarget,
+        entry: Mapping | None,
+        claude: str,
+        *,
+        wait: Sleep | None = None,
     ) -> tuple[list[PrimeEvent], bool]:
+        """Pre-check, claim and launch one target. ``wait`` is how a launch
+        that would fall in a bucket's last seconds is handled: ``None``
+        defers it to a later tick (the engine), a sleep waits it out (CLI)."""
         switcher = self.engine.switcher
         num, email = target.number, target.email
         now = self._clock()
@@ -703,11 +726,25 @@ class Primer:
         if token is None:
             _logger.info("prime: account %s token not ready (%s); retrying next tick", num, status)
             return [], False
-        attempts = attempts_used(entry, target.window_key, now) + 1
-        if not self._claim(email, target.window_key, attempts, now, entry):
+        # The checks above can take a while (usage fetch, token refresh). The
+        # launch instant is read here, guarded here, and recorded as the
+        # prime time verification measures against.
+        launch_at = self._clock()
+        pause = guard_wait(launch_at)
+        if pause:
+            if wait is None:
+                _logger.info(
+                    "prime: account %s deferred: a launch now could land in the "
+                    "next 10-minute bucket", num,
+                )
+                return [], False
+            wait(pause)
+            launch_at = self._clock()
+        attempts = attempts_used(entry, target.window_key, launch_at) + 1
+        if not self._claim(email, target.window_key, attempts, launch_at, entry):
             _logger.info("prime: account %s was claimed by another cc-swap process", num)
             return [], False
-        return self._launch(target, claude, token), True
+        return self._launch(target, claude, token, wait or self._sleep), True
 
     def _access_token(
         self, num: str, email: str, *, force_refresh: bool
@@ -737,7 +774,9 @@ class Primer:
             return None, "transient"
         return token, "ok"
 
-    def _launch(self, target: PrimeTarget, claude: str, token: str) -> list[PrimeEvent]:
+    def _launch(
+        self, target: PrimeTarget, claude: str, token: str, sleep: Sleep
+    ) -> list[PrimeEvent]:
         profile = self._prepare_profile()
         env = build_prime_env(os.environ, profile, token)
         result = self._runner(
@@ -753,6 +792,12 @@ class Primer:
                 "prime: model %s not found; retrying account %s with %s",
                 self.settings.model, target.number, FALLBACK_MODEL,
             )
+            # Same attempt (already claimed), new launch instant: guard it and
+            # make it the prime time verification measures against.
+            pause = guard_wait(self._clock())
+            if pause:
+                sleep(pause)
+            self._record(target.email, lastAttemptAt=self._clock())
             result = self._runner(
                 build_prime_argv(claude, FALLBACK_MODEL), env, profile, PRIME_TIMEOUT_S
             )

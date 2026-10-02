@@ -239,3 +239,107 @@ class TestPrimer:
         runner = StubRunner(rig)
         rig.primer(runner=runner).run_due(rig.snap())
         assert runner.calls == []
+
+
+def _bucket_end(rig) -> float:
+    return (rig.clock.now // BUCKET_S + 1) * BUCKET_S
+
+
+class TestLaunchTiming:
+    """Verification compares against the launch instant (spec §6.2 step 5),
+    so that instant is read right before the claim — after every slow step —
+    and the bucket-boundary guard is applied to it, not to the tick's start."""
+
+    @pytest.fixture(params=["usage-fetch", "token"])
+    def slow_step(self, request, rig, monkeypatch):
+        """``slow_step(s)``: account 2's next pre-launch step takes ``s`` seconds."""
+
+        def make(seconds: float) -> None:
+            if request.param == "usage-fetch":
+                pending = [seconds]
+
+                def on_fetch(num):
+                    if num == "2" and pending:
+                        rig.clock.advance(pending.pop())
+
+                rig.usage.on_fetch = on_fetch
+            else:
+                original = rig.engine._freshen_target
+
+                def slow(num, email):
+                    rig.clock.advance(seconds)
+                    return original(num, email)
+
+                monkeypatch.setattr(rig.engine, "_freshen_target", slow)
+
+        return make
+
+    def test_slow_step_records_the_actual_launch_time(self, rig, slow_step):
+        end = _bucket_end(rig)
+        rig.clock.now = end - 20      # the tick-start guard lets this through
+        slow_step(25)                 # ...but the launch lands in the next bucket
+        runner = StubRunner(rig)
+        primer = rig.primer(runner=runner)
+        snap = rig.snap(nums=("1", "2"))
+        primer.run_due(snap)
+        assert len(runner.calls) == 1
+        assert rig.primes()["b@example.com"]["lastAttemptAt"] == end + 5
+        rig.clock.advance(31)
+        events = primer.run_due(snap)
+        assert [(e.outcome, e.resets_at) for e in events] == [
+            ("primed", _iso_at(expected_reset(end + 5)))
+        ]
+
+    def test_slow_step_into_the_guard_defers_without_spending_an_attempt(self, rig, slow_step):
+        end = _bucket_end(rig)
+        rig.clock.now = end - 40
+        slow_step(30)                 # now 10 s before the boundary
+        runner = StubRunner(rig)
+        primer = rig.primer(runner=runner)
+        snap = rig.snap(nums=("1", "2"))
+        assert primer.run_due(snap) == []
+        assert runner.calls == []
+        assert "b@example.com" not in rig.primes()
+        rig.clock.now = end + 301     # next bucket, past the widest jitter
+        primer.run_due(snap)
+        assert len(runner.calls) == 1
+        entry = rig.primes()["b@example.com"]
+        assert entry["attempts"] == 1
+        assert entry["lastAttemptAt"] >= end + 301
+
+    def test_prime_now_waits_out_the_guard_instead_of_launching(self, rig):
+        end = _bucket_end(rig)
+        rig.clock.now = end - 5
+        sleeps: list[float] = []
+
+        def sleep(seconds: float) -> None:
+            sleeps.append(seconds)
+            rig.clock.advance(seconds)
+
+        runner = StubRunner(rig)
+        events = rig.primer(runner=runner).prime_now(rig.snap(nums=("1", "2")), {"2"}, sleep=sleep)
+        assert sleeps[0] == 6.0       # until 1 s past the boundary
+        assert len(runner.calls) == 1
+        assert rig.primes()["b@example.com"]["lastAttemptAt"] == end + 1
+        assert [e.outcome for e in events] == ["primed"]
+
+    def test_model_fallback_relaunch_is_guarded_and_timed(self, rig):
+        end = _bucket_end(rig)
+        rig.clock.now = end - 20
+        missing = PrimeRunResult(1, False, 'API Error: 404 {"error":{"type":"not_found_error"}}', "", True)
+        stub = StubRunner(rig, [missing])
+
+        def runner(argv, env, cwd, timeout_s=90.0):
+            result = stub(argv, env, cwd, timeout_s)
+            if len(stub.calls) == 1:
+                rig.clock.advance(10)  # the 404 run took 10 s: now inside the guard
+            return result
+
+        primer = rig.primer(runner=runner)
+        snap = rig.snap(nums=("1", "2"))
+        primer.run_due(snap)
+        assert len(stub.calls) == 2
+        entry = rig.primes()["b@example.com"]
+        assert (entry["attempts"], entry["lastAttemptAt"]) == (1, end + 1)
+        rig.clock.advance(31)
+        assert [e.outcome for e in primer.run_due(snap)] == ["primed"]

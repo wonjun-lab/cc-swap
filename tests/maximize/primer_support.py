@@ -149,6 +149,7 @@ class Rig:
             runner=runner if runner is not None else run_prime,
             rng=random.Random(0),
             clock=self.clock,
+            sleep=self.clock.advance,
         )
 
     def primes(self) -> dict:
