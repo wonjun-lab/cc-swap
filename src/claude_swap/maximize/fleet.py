@@ -977,6 +977,78 @@ def fit_layout(height: int, width: int, n_rows: int, *, attention: bool) -> Layo
     )
 
 
+# -- Mode -----------------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class ModeAction:
+    key: str
+    label: str
+    action: Literal["start-dry", "start-live", "go-live", "go-dry", "stop"]
+
+
+def mode_transitions(holder: str) -> list[ModeAction]:
+    """What the Mode modal offers for an engine holder. A viewer gets facts
+    only: the service (or another process) owns switching."""
+    if holder == "none":
+        return [
+            ModeAction("d", "Run an engine here · dry-run (watch only)", "start-dry"),
+            ModeAction("l", "Run an engine here · live (switches accounts)", "start-live"),
+        ]
+    if holder == "here-dry":
+        return [
+            ModeAction("l", "Go live (switches accounts)", "go-live"),
+            ModeAction("s", "Stop the engine here", "stop"),
+        ]
+    if holder == "here-live":
+        return [
+            ModeAction("d", "Back to dry-run (watch only)", "go-dry"),
+            ModeAction("s", "Stop the engine here", "stop"),
+        ]
+    return []
+
+
+def mode_facts(es: EngineStatus) -> list[str]:
+    """The Mode modal's text: who switches, and how to change that."""
+    service = es.service or {}
+    linux = service.get("platform") == "linux"
+    stop = (
+        "systemctl --user stop cc-swap.service"
+        if linux
+        else "launchctl bootout gui/$(id -u)/com.wonjun-lab.cc-swap"
+    )
+    logs = [f"  logs: {path}" for path in service.get("logs") or []]
+    if es.holder == "service":
+        return [
+            f"The cc-swap service (pid {es.pid}) owns switching; this TUI is a viewer.",
+            "To run an engine here instead, stop the service first:",
+            "  cc-swap service uninstall",
+            f"  (or for now: {stop})",
+            *logs,
+        ]
+    if es.holder == "other":
+        who = f"pid {es.pid}" if es.pid else "another process"
+        return [
+            f"{who} holds the engine lease: a terminal `cc-swap auto`, another TUI, "
+            "or the menu bar's auto-switch. This TUI is a viewer.",
+            "Stop that engine to run one here.",
+        ]
+    if es.holder in ("here-dry", "here-live"):
+        mode = "LIVE: it switches accounts" if es.holder == "here-live" else (
+            "DRY-RUN: it decides but never switches"
+        )
+        return [f"This TUI runs the engine ({mode}). Quitting the TUI stops it."]
+    lines = ["Nothing is switching accounts on this machine."]
+    if service.get("installed"):
+        lines.append(f"The service is installed but not running ({service.get('state') or 'stopped'}).")
+    else:
+        lines.append("For an always-on engine: cc-swap service install")
+    if service.get("linger") is False:
+        lines.append("Linux lingering is off: the service stops at logout "
+                     "(loginctl enable-linger $USER).")
+    return lines + logs
+
+
 # -- Swap strategy editing ------------------------------------------------------------------
 
 _THRESHOLD_KEYS = {dotted: knob for knob, dotted in mxview.KNOB_KEYS.items()}

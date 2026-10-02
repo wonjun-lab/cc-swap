@@ -231,6 +231,51 @@ def _resume(root: Path) -> None:
         pass  # the marker expires on its own within 10 minutes
 
 
+class ModeModal(ModalScreen["str | None"]):
+    """Who switches accounts on this machine, and the choices this TUI has:
+    run an engine here (dry-run or live), go live / back, stop it. A viewer
+    gets the facts only. Dismisses with a ``ModeAction.action`` or None."""
+
+    DEFAULT_CSS = """
+    ModeModal { align: center middle; background: $background 60%; }
+    ModeModal #fx-mode-actions { margin-top: 1; }
+    """
+    BINDINGS = [Binding("escape,b", "close", "Close", show=False)]
+
+    def __init__(self, status: fx.EngineStatus) -> None:
+        super().__init__()
+        self._status = status
+        self._actions = fx.mode_transitions(status.holder)
+
+    def compose(self) -> ComposeResult:
+        with Vertical(classes="modal-box modal-box-wide fx-modal"):
+            yield Label("Mode", classes="modal-title")
+            yield Static("\n".join(fx.mode_facts(self._status)), id="fx-mode-facts", markup=False)
+            yield Static("", id="fx-mode-actions", markup=False)
+            keys = " · ".join(a.key for a in self._actions)
+            yield Static(f"{keys + ' · ' if keys else ''}esc close", classes="modal-hint")
+
+    def on_mount(self) -> None:
+        palette = Palette.from_theme(self.app.current_theme)
+        text = Text()
+        for i, action in enumerate(self._actions):
+            if i:
+                text.append("\n")
+            text.append(f"  {action.key}  ", style=f"bold {palette.accent}")
+            text.append(action.label, style=palette.foreground)
+        self.query_one("#fx-mode-actions", Static).update(text)
+
+    def on_key(self, event) -> None:
+        for action in self._actions:
+            if event.key == action.key:
+                event.stop()
+                self.dismiss(action.action)
+                return
+
+    def action_close(self) -> None:
+        self.dismiss(None)
+
+
 class TextInputModal(ModalScreen["str | None"]):
     """One line of text (alias, a typed setting value). Enter submits, Esc
     cancels."""

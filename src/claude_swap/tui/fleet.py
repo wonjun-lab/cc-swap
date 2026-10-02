@@ -44,6 +44,7 @@ from claude_swap.settings import (
     load_settings,
 )
 from claude_swap.tui import menus
+from claude_swap.tui.engine_host import EngineHost  # noqa: F401 (app.py imports it here)
 from claude_swap.tui.theme import Palette
 from claude_swap.tui.widgets import account_card_text
 
@@ -103,7 +104,29 @@ def menu_text(title: str, key: str, palette: Palette, *, tone: str = "plain") ->
 
 
 def request_quit(app: "CswapApp") -> None:
-    """``q`` anywhere in the Fleet screens."""
+    """``q`` anywhere in the Fleet screens: asks first only while this TUI
+    runs a LIVE engine (quitting stops it)."""
+    host = getattr(app, "engine_host", None)
+    if host is None or not host.running or host.dry_run:
+        _quit(app)
+        return
+    from claude_swap.tui.modals import ConfirmModal
+
+    app.push_screen(
+        ConfirmModal(
+            "Quit? The LIVE engine running in this TUI stops with it; nothing "
+            "switches accounts until the service or another engine runs.",
+            title="Quit",
+            yes_label="Quit",
+        ),
+        lambda confirmed: _quit(app) if confirmed else None,
+    )
+
+
+def _quit(app: "CswapApp") -> None:
+    host = getattr(app, "engine_host", None)
+    if host is not None:
+        host.stop()
     app.exit()
 
 
@@ -274,7 +297,7 @@ class FleetScreen(Screen):
         self._flash_until: dict[str, float] = {}
         self._fetched_on_open = False
         self._layout: fx.LayoutPlan | None = None
-        self._host = host_name()
+        self._hostname = host_name()
         self._ssh = fx.over_ssh()
         self._fx_timers: list = []
 
@@ -302,7 +325,15 @@ class FleetScreen(Screen):
         ]
         self._probe_lease()
         self._probe_service()
+        if self._host is not None:
+            self._host.subscribe(self._on_host_event)
         self.focus_table()
+
+    def on_unmount(self) -> None:
+        # The app is closing: an engine run here stops with it.
+        if self._host is not None:
+            self._host.unsubscribe(self._on_host_event)
+            self._host.stop()
 
     def on_screen_resume(self) -> None:
         for timer in self._fx_timers:
@@ -356,15 +387,23 @@ class FleetScreen(Screen):
         self._maybe_fetch_on_open()
         self._render_all()
 
+    @property
+    def _host(self) -> EngineHost | None:
+        return getattr(self.app, "engine_host", None)
+
     def _own_mode(self) -> str | None:
-        """``"live"``/``"dry"`` while this TUI runs the engine (Task 4)."""
-        return None
+        """``"live"``/``"dry"`` while this TUI runs the engine."""
+        host = self._host
+        if host is None or not host.running:
+            return None
+        return "dry" if host.dry_run else "live"
 
     def _engine_status(self) -> fx.EngineStatus:
+        own = self._own_mode()
         return fx.engine_status(
             held_elsewhere=bool(self._held_elsewhere),
-            holder_pid=self._holder_pid,
-            own=self._own_mode(),
+            holder_pid=os.getpid() if own else self._holder_pid,
+            own=own,
             service=self._service,
         )
 
@@ -374,7 +413,20 @@ class FleetScreen(Screen):
         if snap is None:
             return fx.DecisionView("none", None, None, None, "")
         msnap = fx.fleet_snapshot(snap, self._mx, self._state, now=now)
-        return fx.decision_view(self._state, msnap, now=now, poll_s=self._poll_s)
+        host = self._host
+        own = host.last_decision if host is not None and host.running else None
+        return fx.decision_view(
+            self._state, msnap, now=now, poll_s=self._poll_s,
+            own=own, own_at=host.last_decision_at if own is not None else None,
+        )
+
+    def _on_host_event(self, event) -> None:
+        """The engine this TUI runs started, stopped, or decided."""
+        if event is None:
+            self._apply_store_only()
+            self._render_all()
+        elif event.kind == "maximize" and self.is_attached:
+            self._render_status()
 
     def current_row(self) -> fx.FleetRow | None:
         table = self.query_one("#fx-table", FleetTable)
@@ -484,7 +536,7 @@ class FleetScreen(Screen):
         width = self._width()
         now = time.time()
         head = fx.header_line(
-            self._mx, self._prime, self._rows, host=self._host, ssh=self._ssh,
+            self._mx, self._prime, self._rows, host=self._hostname, ssh=self._ssh,
             now=now, width=width,
         )
         self.query_one("#fx-head", Static).update(Text(head, style=f"bold {palette.foreground}"))
@@ -631,6 +683,7 @@ class FleetScreen(Screen):
 
     def dispatch_menu(self, action: str) -> None:
         handler = {
+            "mode": self.open_mode,
             "strategy": self.open_strategy,
             "prime": self.open_prime,
             "accounts": self.open_accounts,
@@ -646,6 +699,54 @@ class FleetScreen(Screen):
 
     def action_menu(self, action: str) -> None:
         self.dispatch_menu(action)
+
+    def open_mode(self) -> None:
+        from claude_swap.tui.fleet_modals import ModeModal
+
+        self.app.push_screen(ModeModal(self._engine_status()), self._on_mode)
+
+    def _on_mode(self, action: str | None) -> None:
+        """Carry out a Mode choice. Going live always asks first (the auto
+        screen's wording); Fleet never takes the lease without a choice."""
+        host = self._host
+        if action is None or host is None:
+            return
+        if action == "start-dry":
+            if not host.start(dry_run=True, by="fleet"):
+                self.notify("Another engine holds the lease — this TUI stays a viewer",
+                            severity="warning")
+        elif action in ("start-live", "go-live"):
+            from claude_swap.tui.modals import ConfirmModal
+
+            self.app.push_screen(
+                ConfirmModal(
+                    "Go live? cc-swap will switch your active account by the maximize "
+                    "strategy (and prime idle accounts when priming is on).\n\n"
+                    "(Same behavior as running `cc-swap auto` in a terminal; quitting "
+                    "this TUI stops it.)",
+                    title="Go live",
+                    yes_label="Go live",
+                ),
+                partial(self._on_go_live, action),
+            )
+        elif action == "go-dry":
+            host.set_dry_run(True)
+        elif action == "stop":
+            host.stop()
+        self._apply_store_only()
+        self._render_all()
+
+    def _on_go_live(self, action: str, confirmed: bool | None) -> None:
+        host = self._host
+        if not confirmed or host is None:
+            return
+        if action == "go-live":
+            host.set_dry_run(False)
+        elif not host.start(dry_run=False, by="fleet"):
+            self.notify("Another engine holds the lease — this TUI stays a viewer",
+                        severity="warning")
+        self._apply_store_only()
+        self._render_all()
 
     def open_strategy(self) -> None:
         from claude_swap.tui.fleet_strategy import StrategyScreen

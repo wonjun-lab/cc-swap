@@ -96,7 +96,7 @@ The four thresholds (`soft5h`, `hard5h`, `soft7d`, `hard7d`) can change at any t
 
 - **Persistent**: `cc-swap config set maximize.soft5h 60`. The range and soft ≤ hard are both validated.
 - **One run**: `cc-swap auto --soft5h 60 --hard5h 95 --soft7d 90 --hard7d 98`. Flags override the file.
-- **TUI**: open the auto screen (`g`) and press `t` to select 5h soft. Press `t` again to move to 5h hard, 7d soft and 7d hard. `←`/`→` move the selected value by 1, `enter` saves to `settings.json`, and `esc` discards. The 5h and 7d bars show the soft threshold as a yellow tick and the hard ceiling as a red one. Saving works even when the screen is only a viewer of the service's engine.
+- **TUI**: on the Fleet home screen press `s` (Swap strategy) to edit every `maximize.*` and `prime.*` knob with a live preview (see [Fleet](#fleet-the-tui-home-for-maximize)). Or open the auto screen (`g`) and press `t` to select 5h soft. Press `t` again to move to 5h hard, 7d soft and 7d hard. `←`/`→` move the selected value by 1, `enter` saves to `settings.json`, and `esc` discards. The 5h and 7d bars show the soft threshold as a yellow tick and the hard ceiling as a red one. Saving works even when the screen is only a viewer of the service's engine.
 - The engine checks the modification time of `settings.json` every tick. If the new values fail validation, it keeps the old ones and logs a configuration warning.
 
 ## 5h window priming
@@ -170,6 +170,25 @@ cc-swap service uninstall   # stop it and remove it
 `install` forwards `CLAUDE_CONFIG_DIR` and `CLAUDE_SECURESTORAGE_CONFIG_DIR` from the shell you run it in to the service, and prints which ones it forwarded, so a custom profile is read by the service too. It refuses to install while `CLAUDE_CONFIG_DIR` points at a `cswap run` session profile; run it from a terminal outside the session.
 
 **One engine per machine.** Whatever runs the engine (the service, a terminal `cc-swap auto`, the TUI's auto screen, or the menu bar's auto-switch) holds a lock, `<backup root>/.engine.lock`, for as long as it runs. The OS frees the lock when the process exits, even after a crash. While another process holds it, `cc-swap auto` refuses to start and exits with code `4`, and the TUI's auto screen (badge **VIEWER**) and the menu bar only show what the running engine is doing. `cc-swap auto --once --dry-run` needs no lock and always works. If another engine held the lease when the service started, the service retries every minute and takes over once that engine stops. To run an engine in a terminal instead, run `cc-swap service uninstall` first.
+
+## Fleet: the TUI home for maximize
+
+With `autoswitch.strategy` set to `maximize`, the TUI (`cc-swap` on its own, or `cc-swap tui`) opens on **Fleet** instead of the upstream dashboard; `cc-swap watch` still opens the watch view. `c` shows the classic dashboard; `ctrl+f` comes back from any screen. Other strategies keep the upstream TUI unchanged.
+
+```
+cc-swap @ studio (ssh) · maximize · 5h 50/95 · 7d 90/98 · margin 5 · priming on      Fri 14:33
+engine  ● service · launchd · pid 4121 · holds the lease — this TUI is a viewer
+now     HOLD — waiting for idle → #2 · #1 5h 62% >= soft 50% · +3%p/10m · hard in ~1h50m · 14:32 · engine
+prime   #2 #6 due ≤14:35 · #5 15:06–15:10 · #3 needs re-login
+⚠ #3 old needs re-login (refresh token dead) — select it and press r
+```
+
+- **Status lines.** `engine` says who switches: the service (recognised by its pid), another process, this TUI, or nothing. `now` is the decision the engine last published to its state file (slot numbers only), or `computed here` when none is fresh. `prime` lists accounts due for priming, upcoming windows and blockers.
+- **Table**, one row per account in slot order: `*` active · `plan` (`20x`/`5x` from the engine, `team` for an organization account, `?` unknown) · `tier` (`normal`, `last-r`, `excl`) · `rank` (the order maximize would pick) · `5h`/`7d` coloured against the soft/hard marks (`~` = stale) · `7d in` · `pace` (remaining 7d share over an even daily allotment) · `land` (`yes`, or why not: `5h≥45`, `excluded`, `re-login`…) · `5h window` (`cold`, `running → 16:20`, `primed → 17:50`) · `next prime`. A narrow or short terminal drops the detail card, then folds the menu, then the `prime` line.
+- **Menu** (first letter = key): `s` Swap strategy · `m` Mode · `p` Prime now · `f` Fetch latest usage · `a` Account settings · `e` Engine log (the auto screen; also `g`) · `c` Classic dashboard · `q` Quit. **Row keys:** `enter` switch (asks first only when maximize would not land there) · `l` last resort on/off · `x` exclude/include · `r` re-login · `w` watch · `?` help.
+- **Viewer by default.** Fleet never takes the engine lease by itself, so it never pushes the service aside. `m` (Mode) runs an engine in this TUI on request — dry-run, or live after a confirmation — and quitting asks first while a live one runs. The auto screen attaches to that engine instead of starting a second one.
+- **Re-login.** A dead refresh token turns the row red and names it in the attention line. `r` on it (or Account settings → Re-login) shows the steps; cc-swap launches nothing itself, so it works the same over SSH: in another terminal run `claude` (the path in `prime.claudePath`, else `~/.local/bin/claude`), type `/login` and sign in as that account's email (over SSH, open the printed URL anywhere and paste the code back), quit `claude`, then press `enter`. cc-swap stores the live login into the slot only if its email, organization and account id match that slot — it refuses a login that belongs to another slot — and switches back to the account that was active. While the guide is open the engine is paused (`pausedUntil` in `autoswitch_state.json`, at most 10 minutes): no switch and no priming. Other machines keep their own logins; repeat the re-login on each machine that needs it rather than copying one login between machines.
+- `CC_SWAP_FETCH_ON_OPEN=0` stops Fleet from fetching stale rows once when it opens as a viewer.
 
 ---
 

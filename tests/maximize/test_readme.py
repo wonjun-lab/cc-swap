@@ -67,6 +67,18 @@ def test_readme_describes_the_service_takeover_as_a_retry_not_a_wait_for_termina
     assert "run `cc-swap service uninstall` first" in text
 
 
+@pytest.mark.parametrize("snippet", [
+    "## Fleet: the TUI home for maximize",
+    "`ctrl+f`",
+    "cc-swap launches nothing itself",
+    "it refuses a login that belongs to another slot",
+    "`pausedUntil`",
+    "CC_SWAP_FETCH_ON_OPEN=0",
+])
+def test_readme_documents_the_fleet_screen_and_relogin(snippet):
+    assert snippet in README.read_text(encoding="utf-8")
+
+
 def test_readme_warns_that_the_macos_error_log_is_not_rotated():
     text = README.read_text(encoding="utf-8")
     assert "auto.err.log" in text

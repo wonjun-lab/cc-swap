@@ -145,12 +145,40 @@ class AutoScreen(Screen):
         self._update_summary()
         self.watch(self.app, "snapshot", self._on_snapshot)
         self.watch(self.app, "theme", self._on_theme_change)
-        if self.app.engine_keeper.claim():
+        host = getattr(self.app, "engine_host", None)
+        if host is not None and host.running:
+            self._attach_host(host)  # cc-swap: one engine per app (tui/engine_host.py)
+        elif self.app.engine_keeper.claim():
             self._start_engine(dry_run=True)
         else:
             self._enter_viewer()
 
+    def _attach_host(self, host) -> None:
+        """cc-swap: show the engine Fleet runs here; never start a second."""
+        self._host = host
+        self._engine = host.engine
+        log = self.query_one("#event-log", RichLog)
+        palette = Palette.from_theme(self.app.current_theme)
+        for event in list(host.events):
+            log.write(event_text(event, palette=palette))
+        log.write(Text("— attached to the engine this TUI runs —", style=palette.muted))
+        host.subscribe(self._on_host_event)
+        self._update_badge()
+
+    def _on_host_event(self, event) -> None:
+        self._engine = self._host.engine if self._host is not None else None
+        if event is None:
+            self._update_badge()
+        else:
+            self._on_engine_event(event)
+
     def on_unmount(self) -> None:
+        if getattr(self, "_host", None) is not None:
+            # cc-swap: the host's engine keeps running; Fleet owns it.
+            self._host.unsubscribe(self._on_host_event)
+            if self._configured_threshold is not None:
+                self.app.threshold_pct = self._configured_threshold
+            return
         if self._engine is not None:
             self._engine.stop()
         # Released now, or by the engine thread that finishes its tick last.
@@ -348,6 +376,11 @@ class AutoScreen(Screen):
             self._restart_engine(dry_run=False)
 
     def _restart_engine(self, *, dry_run: bool) -> None:
+        if getattr(self, "_host", None) is not None:  # cc-swap: the host's engine
+            self._host.set_dry_run(dry_run)
+            self._engine = self._host.engine
+            self._update_badge()
+            return
         if self._engine is not None:
             self._engine.stop()
         self._start_engine(dry_run=dry_run)

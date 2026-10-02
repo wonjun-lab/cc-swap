@@ -223,6 +223,9 @@ class StrategyScreen(Screen):
         if failure is not None:
             self.notify(f"Could not save: {failure}", severity="error")
             return
+        host = getattr(self.app, "engine_host", None)
+        if host is not None:
+            host.wake()  # an engine run here re-reads settings.json at once
         self.notify(
             f"Saved {len(writes)} setting{'s' if len(writes) != 1 else ''} — the engine "
             "re-reads settings.json on its next tick",
