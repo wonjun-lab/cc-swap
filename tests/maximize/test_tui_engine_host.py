@@ -195,6 +195,24 @@ class TestEngineHost:
             assert await _eventually(lambda: not probe.held_elsewhere())
             assert "nothing is switching" in _engine_line(app)
 
+    async def test_classic_dashboard_keeps_the_engine_running(self, tmp_path, fake_engine):
+        from claude_swap.tui.dashboard import DashboardScreen
+        from claude_swap.tui.fleet import FleetScreen
+
+        _settings(tmp_path)
+        app = make_app(_fleet(tmp_path))
+        async with app.run_test(size=(140, 40)) as pilot:
+            await _open(pilot)
+            await _mode(pilot, "d")
+            await pilot.press("c")
+            await settle(pilot)
+            assert isinstance(app.screen, DashboardScreen)
+            assert app.engine_host.running and not fake_engine.instances[0].stopped
+            await pilot.press("ctrl+f")
+            await settle(pilot)
+            assert isinstance(app.screen, FleetScreen)
+            assert "● here · DRY-RUN" in _engine_line(app)
+
     async def test_viewer_mode_offers_facts_only(self, tmp_path, fake_engine):
         from claude_swap.tui.fleet import FleetScreen
 
