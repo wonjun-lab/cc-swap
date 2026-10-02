@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import json
+import re
 import time
 import urllib.error
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -662,3 +664,52 @@ class TestNoticeAnnouncesTheTagItInstalls:
         assert result is not None
         assert "(0.5.0)" in result
         assert f"pipx install --force {FORK}@v0.5.0" in result
+
+
+class TestInstallHintsNameTheFork:
+    """The PyPI ``claude-swap`` project is upstream: any hint that tells the
+    user to install it would replace the fork with upstream."""
+
+    SRC = Path(__file__).resolve().parents[1] / "src" / "claude_swap"
+
+    # `claude-swap` as a requirement name, not as part of a path or log name
+    # (``~/.claude-swap-backup``, ``claude-swap.log``).
+    _UPSTREAM_DIST = r"(?<![\w.-])claude-swap(?![\w./-])"
+    _FORBIDDEN = {
+        "upstream extra": re.compile(r"claude-swap\["),
+        "pypi url": re.compile(r"pypi\.(?:org|python\.org)", re.IGNORECASE),
+        "installer line": re.compile(
+            rf"\b(?:pip3?|pipx|uv)\b[^\n]*\b(?:install|upgrade)\b[^\n]*{_UPSTREAM_DIST}"
+        ),
+    }
+
+    def test_no_source_line_installs_upstream(self):
+        offenders = []
+        for path in sorted(self.SRC.rglob("*.py")):
+            for lineno, line in enumerate(path.read_text().splitlines(), 1):
+                for name, pattern in self._FORBIDDEN.items():
+                    if pattern.search(line):
+                        offenders.append(f"{path.name}:{lineno} ({name}): {line.strip()}")
+        assert not offenders, "\n".join(offenders)
+
+    def test_scan_would_catch_the_old_hints(self):
+        # Guard the guard: the exact lines this test replaced must trip it.
+        old = [
+            "uv tool install --managed-python --force 'claude-swap[menubar]'",
+            "pipx install --force --python <that python> 'claude-swap[menubar]'",
+            "Install with: pip install 'claude-swap[menubar]'",
+            "pip install claude-swap",
+            "uv tool upgrade claude-swap",
+        ]
+        for line in old:
+            assert any(p.search(line) for p in self._FORBIDDEN.values()), line
+        for fine in ["~/.claude-swap-backup", "claude-swap.log", "uv tool upgrade rebuilds"]:
+            assert not any(p.search(fine) for p in self._FORBIDDEN.values()), fine
+
+    def test_menubar_install_spec_is_the_fork_from_git(self):
+        from claude_swap.update_check import _install_spec
+
+        assert _install_spec(menubar=True) == (
+            "cc-swap[menubar] @ git+https://github.com/wonjun-lab/cc-swap"
+        )
+        assert _install_spec(menubar=False) == INSTALL_URL

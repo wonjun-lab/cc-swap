@@ -11,6 +11,7 @@ from __future__ import annotations
 import datetime as _dt
 import json
 import plistlib
+import re
 import sys
 from pathlib import Path
 
@@ -19,6 +20,10 @@ import pytest
 from claude_swap import menubar
 from claude_swap.exceptions import ClaudeSwitchError
 from claude_swap.switcher import USAGE_API_KEY
+
+# What the install hints must hand the package manager: the fork, from git.
+# Upstream's PyPI ``claude-swap`` would replace the fork with upstream.
+FORK_MENUBAR_SPEC = "cc-swap[menubar] @ git+https://github.com/wonjun-lab/cc-swap"
 
 
 # --- notification identity -----------------------------------------------------
@@ -554,8 +559,31 @@ def test_run_without_rumps_raises_clean_error(monkeypatch):
     it into the error type the CLI renders with the install hint.
     """
     monkeypatch.setitem(sys.modules, "rumps", None)
-    with pytest.raises(ClaudeSwitchError, match=r"claude-swap\[menubar\]"):
+    with pytest.raises(ClaudeSwitchError, match=re.escape(FORK_MENUBAR_SPEC)):
         menubar.run(switcher=None)
+
+
+@pytest.mark.parametrize(
+    "method, command",
+    [
+        ("uv", "uv tool install --force"),
+        ("pipx", "pipx install --force"),
+        (None, "pip install"),
+    ],
+)
+def test_run_without_rumps_installs_the_fork_with_the_right_tool(
+    monkeypatch, method, command
+):
+    """The missing-extra hint names the fork, via the tool that owns this
+    install: pip cannot add the extra to a uv/pipx tool environment."""
+    monkeypatch.setitem(sys.modules, "rumps", None)
+    monkeypatch.setattr(
+        "claude_swap.update_check._detect_install_method", lambda: method
+    )
+    with pytest.raises(ClaudeSwitchError) as excinfo:
+        menubar.run(switcher=None)
+    assert f"{command} '{FORK_MENUBAR_SPEC}'" in str(excinfo.value)
+    assert "claude-swap" not in str(excinfo.value)
 
 
 class TestFrameworkBuildWarning:
@@ -602,6 +630,21 @@ class TestFrameworkBuildWarning:
     def test_uv_gets_a_uv_remedy(self):
         msg = menubar.framework_build_warning("Python", "uv", "26.6.2")
         assert "--managed-python" in msg
+
+    def test_uv_remedy_reinstalls_the_fork_not_upstream(self):
+        msg = menubar.framework_build_warning("Python", "uv", "26.6.2")
+        assert (
+            f"uv tool install --managed-python --force '{FORK_MENUBAR_SPEC}'" in msg
+        )
+        assert "claude-swap" not in msg
+
+    def test_pipx_remedy_reinstalls_the_fork_not_upstream(self):
+        msg = menubar.framework_build_warning("Python", "pipx", "26.6.2")
+        assert (
+            f"pipx install --force --python <that python> '{FORK_MENUBAR_SPEC}'"
+            in msg
+        )
+        assert "claude-swap" not in msg
 
     def test_pipx_is_not_handed_a_uv_command(self):
         # `uv tool install --force` would overwrite pipx's own executable.
