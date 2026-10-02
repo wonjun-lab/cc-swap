@@ -54,6 +54,33 @@ def test_install_prints_paths_claude_and_the_linger_hint(monkeypatch, capsys):
     assert "loginctl enable-linger" in out
 
 
+def test_install_reuse_installed_env_flag_is_passed_through(monkeypatch, capsys):
+    calls = []
+    monkeypatch.setattr(service, "install", lambda **kw: calls.append(kw) or dict(LINUX_INSTALL))
+    assert _service(["install", "--reuse-installed-env"]) == 0
+    assert calls == [{"claude_path": None, "reuse_installed_env": True}]
+
+
+def test_install_names_the_installed_env_source(monkeypatch, capsys):
+    monkeypatch.setattr(service, "install", lambda **kw: {
+        **LINUX_INSTALL, "forwarded_env": {"CLAUDE_CONFIG_DIR": "/a"}, "env_source": "installed",
+    })
+    _service(["install", "--reuse-installed-env"])
+    assert "kept from the installed service" in capsys.readouterr().out
+
+
+def test_a_stopped_service_after_a_failed_bootstrap_exits_nonzero_with_the_hint(monkeypatch, capsys):
+    def boom(**kw):
+        raise ClaudeSwitchError(
+            "launchctl bootstrap failed (exit 5); the service is now STOPPED "
+            "- run: cc-swap service install"
+        )
+
+    monkeypatch.setattr(service, "install", boom)
+    assert _service(["install"]) == 1
+    assert "the service is now STOPPED" in capsys.readouterr().err
+
+
 def test_install_with_linger_on_prints_no_hint(monkeypatch, capsys):
     monkeypatch.setattr(service, "install", lambda **kw: {**LINUX_INSTALL, "linger": True})
     _service(["install"])

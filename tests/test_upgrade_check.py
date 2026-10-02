@@ -289,7 +289,7 @@ class TestUpgradeRefreshesTheService:
 
         assert calls == [
             ["uv", "tool", "install", "--force", PINNED],
-            ["/bin/cc-swap", "service", "install"],
+            ["/bin/cc-swap", "service", "install", "--reuse-installed-env"],
         ]
         assert "service" in capsys.readouterr().out.lower()
 
@@ -344,4 +344,6 @@ class TestUpgradeRefreshesTheService:
 
     def test_the_command_is_the_resolved_console_script(self, mock_detect):
         with patch.object(service, "resolve_program", return_value=["/x/cc-swap"]):
-            assert service.reinstall_command() == ["/x/cc-swap", "service", "install"]
+            assert service.reinstall_command() == [
+                "/x/cc-swap", "service", "install", "--reuse-installed-env",
+            ]

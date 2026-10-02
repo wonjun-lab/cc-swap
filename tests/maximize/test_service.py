@@ -355,6 +355,161 @@ def test_install_forwards_a_defined_but_empty_securestorage_dir(tmp_path, on_mac
     assert result["forwarded_env"] == {"CLAUDE_SECURESTORAGE_CONFIG_DIR": ""}
 
 
+# --- refresh keeps the installed environment ---------------------------------------
+
+
+def _seed_installed_plist(home: Path, env: dict) -> Path:
+    path = service.plist_path(home)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(
+        plistlib.dumps({"ProgramArguments": [*MAC_PROGRAM, "auto"], "EnvironmentVariables": env})
+    )
+    return path
+
+
+def test_read_installed_reads_a_plist(tmp_path, on_macos):
+    _seed_installed_plist(tmp_path, {"CLAUDE_CONFIG_DIR": "/alt", "CC_SWAP_SERVICE": "1"})
+    argv, env = service.read_installed(platform="darwin", home=tmp_path)
+    assert argv == MAC_PROGRAM
+    assert env == {"CLAUDE_CONFIG_DIR": "/alt", "CC_SWAP_SERVICE": "1"}
+
+
+def test_read_installed_reads_a_unit(tmp_path, on_linux):
+    unit = service.unit_path(tmp_path)
+    unit.parent.mkdir(parents=True)
+    unit.write_text(
+        service.build_unit(
+            LINUX_PROGRAM, claude_path=None, home=tmp_path,
+            forward_env={"CLAUDE_CONFIG_DIR": "/a b/c"},
+        )
+    )
+    argv, env = service.read_installed(platform="linux", home=tmp_path)
+    assert argv == LINUX_PROGRAM
+    assert env["CLAUDE_CONFIG_DIR"] == "/a b/c"
+
+
+def test_read_installed_is_none_without_a_file(tmp_path, on_macos):
+    assert service.read_installed(platform="darwin", home=tmp_path) is None
+
+
+def test_refresh_macos_keeps_the_installed_profile_env_not_the_shells(
+    tmp_path, on_macos, fake_run, monkeypatch
+):
+    monkeypatch.setattr(service.shutil, "which", lambda name: None)
+    _seed_installed_plist(tmp_path, {"CLAUDE_CONFIG_DIR": "/installed"})
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", "/shell")
+    monkeypatch.setenv("CLAUDE_SECURESTORAGE_CONFIG_DIR", "/shell-secure")
+    fake_run({"launchctl print": _done(1)})
+    result = service.install(
+        home=tmp_path, program=MAC_PROGRAM, uid=UID, backup_root=tmp_path / "root",
+        reuse_installed_env=True,
+    )
+    env = plistlib.loads(Path(result["path"]).read_bytes())["EnvironmentVariables"]
+    assert env["CLAUDE_CONFIG_DIR"] == "/installed"
+    assert "CLAUDE_SECURESTORAGE_CONFIG_DIR" not in env
+    assert result["forwarded_env"] == {"CLAUDE_CONFIG_DIR": "/installed"}
+    assert result["env_source"] == "installed"
+
+
+def test_refresh_macos_installed_without_profile_env_forwards_nothing(
+    tmp_path, on_macos, fake_run, monkeypatch
+):
+    monkeypatch.setattr(service.shutil, "which", lambda name: None)
+    _seed_installed_plist(tmp_path, {"CC_SWAP_SERVICE": "1"})
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", "/shell")
+    fake_run({"launchctl print": _done(1)})
+    result = service.install(
+        home=tmp_path, program=MAC_PROGRAM, uid=UID, backup_root=tmp_path / "root",
+        reuse_installed_env=True,
+    )
+    env = plistlib.loads(Path(result["path"]).read_bytes())["EnvironmentVariables"]
+    assert "CLAUDE_CONFIG_DIR" not in env
+    assert result["forwarded_env"] == {}
+
+
+def test_refresh_keeps_an_empty_securestorage_dir(tmp_path, on_macos, fake_run, monkeypatch):
+    monkeypatch.setattr(service.shutil, "which", lambda name: None)
+    _seed_installed_plist(tmp_path, {"CLAUDE_SECURESTORAGE_CONFIG_DIR": ""})
+    fake_run({"launchctl print": _done(1)})
+    result = service.install(
+        home=tmp_path, program=MAC_PROGRAM, uid=UID, backup_root=tmp_path / "root",
+        reuse_installed_env=True,
+    )
+    assert result["forwarded_env"] == {"CLAUDE_SECURESTORAGE_CONFIG_DIR": ""}
+
+
+def test_refresh_linux_keeps_the_installed_env_and_xdg(tmp_path, on_linux, fake_run, monkeypatch):
+    monkeypatch.setattr(service.shutil, "which", lambda name: None)
+    unit = service.unit_path(tmp_path)
+    unit.parent.mkdir(parents=True)
+    unit.write_text(
+        service.build_unit(
+            LINUX_PROGRAM, claude_path=None, home=tmp_path, xdg_data_home="/data/installed",
+            forward_env={"CLAUDE_CONFIG_DIR": "/installed"},
+        )
+    )
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", "/shell")
+    monkeypatch.setenv("XDG_DATA_HOME", "/data/shell")
+    fake_run({"systemctl is-active": _done(3)})
+    result = service.install(
+        home=tmp_path, program=LINUX_PROGRAM, backup_root=tmp_path / "root", user="u",
+        reuse_installed_env=True,
+    )
+    text = unit.read_text()
+    assert 'Environment="CLAUDE_CONFIG_DIR=/installed"' in text
+    assert "/shell" not in text
+    assert 'Environment="XDG_DATA_HOME=/data/installed"' in text
+    assert result["forwarded_env"] == {"CLAUDE_CONFIG_DIR": "/installed"}
+
+
+def test_refresh_without_a_readable_installed_file_refuses_rather_than_use_the_shell(
+    tmp_path, on_macos, fake_run, monkeypatch
+):
+    monkeypatch.setattr(service.shutil, "which", lambda name: None)
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", "/shell")
+    run = fake_run({"launchctl print": _done(1)})
+    with pytest.raises(ClaudeSwitchError, match="cc-swap service install"):
+        service.install(
+            home=tmp_path, program=MAC_PROGRAM, uid=UID, backup_root=tmp_path / "root",
+            reuse_installed_env=True,
+        )
+    assert not run.calls
+
+
+def test_bootstrap_failure_after_a_successful_bootout_says_the_service_is_stopped(
+    tmp_path, on_macos, fake_run, monkeypatch
+):
+    monkeypatch.setattr(service.shutil, "which", lambda name: None)
+    fake_run({
+        "launchctl print": [_done(0), _done(1)],
+        "launchctl bootout": _done(0),
+        "launchctl bootstrap": _done(5, stderr="Input/output error"),
+    })
+    with pytest.raises(ClaudeSwitchError) as excinfo:
+        service.install(home=tmp_path, program=MAC_PROGRAM, uid=UID, backup_root=tmp_path / "root")
+    message = str(excinfo.value)
+    assert "the service is now STOPPED" in message
+    assert "run: cc-swap service install" in message
+    assert "Input/output error" in message
+
+
+def test_bootstrap_failure_without_a_bootout_does_not_claim_stopped(
+    tmp_path, on_macos, fake_run, monkeypatch
+):
+    monkeypatch.setattr(service.shutil, "which", lambda name: None)
+    fake_run({"launchctl print": _done(1), "launchctl bootstrap": _done(5, stderr="boom")})
+    with pytest.raises(ClaudeSwitchError) as excinfo:
+        service.install(home=tmp_path, program=MAC_PROGRAM, uid=UID, backup_root=tmp_path / "root")
+    assert "STOPPED" not in str(excinfo.value)
+
+
+def test_reinstall_command_asks_for_the_installed_env(monkeypatch):
+    monkeypatch.setattr(service, "resolve_program", lambda: ["/x/cc-swap"])
+    assert service.reinstall_command() == [
+        "/x/cc-swap", "service", "install", "--reuse-installed-env",
+    ]
+
+
 @pytest.mark.parametrize("platform_fixture", ["on_macos", "on_linux"])
 def test_install_refuses_when_claude_config_dir_is_a_cswap_run_session_profile(
     tmp_path, request, fake_run, monkeypatch, platform_fixture

@@ -42,6 +42,7 @@ from __future__ import annotations
 import getpass
 import os
 import plistlib
+import re
 import shutil
 import subprocess
 import sys
@@ -61,6 +62,9 @@ RESTART_DELAY_S = 60
 DOCS_URL = "https://github.com/wonjun-lab/cc-swap"
 #: Profile-selecting variables the installing shell hands on to the service.
 FORWARDED_ENV_VARS = ("CLAUDE_CONFIG_DIR", "CLAUDE_SECURESTORAGE_CONFIG_DIR")
+#: ``service install`` flag: keep the installed file's environment (the
+#: post-upgrade refresh) instead of reading it from the invoking shell.
+REUSE_ENV_FLAG = "--reuse-installed-env"
 
 _MAC_SYSTEM_DIRS = (
     "/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin", "/usr/sbin", "/sbin",
@@ -130,8 +134,11 @@ def reinstall_command() -> list[str]:
     ``cc-swap upgrade`` runs in the old build's process; shelling out through
     the console script (the path survives a reinstall) is what makes the
     service pick up the new code and the new ``prime.claudePath`` detection.
+    ``REUSE_ENV_FLAG`` makes the rewrite keep the profile variables the
+    installed file already has: the upgrading shell is not the shell the
+    service was installed from, and its ``CLAUDE_CONFIG_DIR`` may differ.
     """
-    return [*resolve_program(), "service", "install"]
+    return [*resolve_program(), "service", "install", REUSE_ENV_FLAG]
 
 
 def detect_claude_path(configured: str | None, *, home: Path | None = None) -> str | None:
@@ -314,6 +321,68 @@ def build_unit(
     return "\n".join(lines) + "\n"
 
 
+# --- reading the installed file ------------------------------------------------------
+
+
+def _plist_data(path: Path) -> dict | None:
+    try:
+        with open(path, "rb") as fh:
+            data = plistlib.load(fh)
+    except (OSError, plistlib.InvalidFileException, ValueError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _unit_words(value: str) -> list[str]:
+    """The words of one unit-file value, undoing :func:`_systemd_quote`."""
+    words = re.findall(r'"((?:[^"\\]|\\.)*)"|(\S+)', value)
+    return [
+        (quoted or bare).replace('\\"', '"').replace("\\\\", "\\").replace("$$", "$").replace("%%", "%")
+        for quoted, bare in words
+    ]
+
+
+def read_installed(
+    *, platform: str | None = None, home: Path | None = None
+) -> tuple[list[str] | None, dict[str, str]] | None:
+    """``(program argv minus 'auto', environment)`` from the installed service
+    file, or None when there is none (or it cannot be parsed).
+
+    The one reader behind ``cc-swap doctor`` and the post-upgrade refresh, so
+    both see exactly what the service manager will start.
+    """
+    platform = platform or _platform()
+    if platform == "darwin":
+        data = _plist_data(plist_path(home))
+        if data is None:
+            return None
+        program = data.get("ProgramArguments")
+        env = data.get("EnvironmentVariables")
+        argv = list(program) if isinstance(program, list) else None
+        return (
+            argv[:-1] if argv and argv[-1] == "auto" else argv,
+            {str(k): str(v) for k, v in env.items()} if isinstance(env, dict) else {},
+        )
+    if platform == "linux":
+        try:
+            text = unit_path(home).read_text(encoding="utf-8")
+        except OSError:
+            return None
+        argv = None
+        env: dict[str, str] = {}
+        for line in text.splitlines():
+            if line.startswith("ExecStart="):
+                argv = _unit_words(line.removeprefix("ExecStart="))
+            elif line.startswith("Environment="):
+                for word in _unit_words(line.removeprefix("Environment=")):
+                    key, _, value = word.partition("=")
+                    env[key] = value
+        if argv and argv[-1] == "auto":
+            argv = argv[:-1]
+        return argv, env
+    return None
+
+
 # --- systemd helpers -----------------------------------------------------------------
 
 
@@ -369,16 +438,35 @@ def install(
     uid: int | None = None,
     backup_root: Path | None = None,
     user: str | None = None,
+    reuse_installed_env: bool = False,
 ) -> dict:
     """Write the service file, (re)start the service, and save ``prime.claudePath``.
 
     Idempotent: re-running after an upgrade reloads a running service onto
     the new build. ``claude_path`` (``--claude-path``) must be executable;
     without it the path is detected (see :func:`detect_claude_path`).
+
+    ``reuse_installed_env`` (the post-upgrade refresh) takes the profile
+    variables and ``XDG_DATA_HOME`` from the *installed* service file rather
+    than this shell, so a refresh preserves exactly what was installed; with
+    no readable file it refuses instead of guessing from the shell.
     """
     platform = _platform()
     root = backup_root or paths.get_backup_root()
-    forward = forwarded_env()
+    xdg_data_home = _xdg_data_home()
+    if reuse_installed_env:
+        installed = read_installed(platform=platform, home=home)
+        if installed is None:
+            raise ClaudeSwitchError(
+                "could not read the installed service file to keep its environment; "
+                "run `cc-swap service install` from the shell whose CLAUDE_CONFIG_DIR "
+                "you want the service to use"
+            )
+        installed_env = installed[1]
+        forward = {n: installed_env[n] for n in FORWARDED_ENV_VARS if n in installed_env}
+        xdg_data_home = installed_env.get("XDG_DATA_HOME") or None
+    else:
+        forward = forwarded_env()
     _refuse_session_profile(forward, root)
     if claude_path is not None and not _is_executable(Path(os.path.expanduser(claude_path))):
         raise ClaudeSwitchError(f"--claude-path {claude_path} is not an executable file")
@@ -396,8 +484,13 @@ def install(
     if platform == "darwin":
         result = _install_darwin(program, resolved, home, uid, forward)
     else:
-        result = _install_linux(program, resolved, home, user, forward)
-    result.update(claude_path=resolved, claude_path_saved=saved, forwarded_env=forward)
+        result = _install_linux(program, resolved, home, user, forward, xdg_data_home)
+    result.update(
+        claude_path=resolved,
+        claude_path_saved=saved,
+        forwarded_env=forward,
+        env_source="installed" if reuse_installed_env else "shell",
+    )
     return result
 
 
@@ -418,8 +511,10 @@ def _install_darwin(
     # launch_agent.install's reload dance: boot the old job out and wait until
     # launchd has dropped it, or bootstrap fails with EEXIST / "in progress".
     settled = True
+    stopped = False
     if launch_agent.is_loaded(LABEL, uid):
-        launch_agent._launchctl("bootout", launch_agent.service_target(LABEL, uid))
+        booted_out = launch_agent._launchctl("bootout", launch_agent.service_target(LABEL, uid))
+        stopped = booted_out.returncode == 0
         settled = launch_agent._wait_until_unloaded(LABEL, uid)
     booted = launch_agent._launchctl("bootstrap", launch_agent.domain_target(uid), str(target))
     if booted.returncode != 0:
@@ -429,6 +524,7 @@ def _install_darwin(
         raise ClaudeSwitchError(
             f"launchctl bootstrap failed (exit {booted.returncode})"
             + (f": {detail}" if detail else "")
+            + ("; the service is now STOPPED - run: cc-swap service install" if stopped else "")
         )
     return {
         "platform": "darwin",
@@ -446,6 +542,7 @@ def _install_linux(
     home: Path | None,
     user: str | None,
     forward: Mapping[str, str],
+    xdg_data_home: str | None,
 ) -> dict:
     unit = unit_path(home)
     was_active = _is_active()
@@ -455,7 +552,7 @@ def _install_linux(
             program,
             claude_path=claude_path,
             home=home,
-            xdg_data_home=_xdg_data_home(),
+            xdg_data_home=xdg_data_home,
             forward_env=forward,
         ),
         encoding="utf-8",

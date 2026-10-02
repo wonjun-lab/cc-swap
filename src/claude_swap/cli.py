@@ -1270,7 +1270,12 @@ def _print_service_install(result: dict) -> None:
     forwarded = result.get("forwarded_env") or {}
     if forwarded:
         shown = ", ".join(f"{name}={value or '(empty)'}" for name, value in forwarded.items())
-        print(f"  env:    {shown} (forwarded from this shell)")
+        origin = (
+            "kept from the installed service"
+            if result.get("env_source") == "installed"
+            else "forwarded from this shell"
+        )
+        print(f"  env:    {shown} ({origin})")
     if result["claude_path"]:
         saved = " (saved as prime.claudePath)" if result["claude_path_saved"] else ""
         print(f"  claude: {result['claude_path']}{saved}")
@@ -1345,6 +1350,15 @@ menu bar only display. Re-run `cc-swap service install` after upgrading.
             "else found on PATH or at ~/.local/bin/claude); saved as prime.claudePath"
         ),
     )
+    p_install.add_argument(
+        "--reuse-installed-env",
+        action="store_true",
+        help=(
+            "keep CLAUDE_CONFIG_DIR / CLAUDE_SECURESTORAGE_CONFIG_DIR from the "
+            "installed service file instead of this shell (used by the refresh "
+            "after `cc-swap upgrade`)"
+        ),
+    )
     sub.add_parser("uninstall", help="Stop the service and remove it")
     sub.add_parser("status", help="Report whether the service is installed and running")
     args = parser.parse_args(argv)
@@ -1359,7 +1373,10 @@ menu bar only display. Re-run `cc-swap service install` after upgrading.
 
     try:
         if args.action == "install":
-            _print_service_install(service.install(claude_path=args.claude_path))
+            kwargs = {"claude_path": args.claude_path}
+            if args.reuse_installed_env:
+                kwargs["reuse_installed_env"] = True
+            _print_service_install(service.install(**kwargs))
         elif args.action == "uninstall":
             result = service.uninstall()
             if result["was_running"] or result["removed"]:

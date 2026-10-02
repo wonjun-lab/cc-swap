@@ -26,7 +26,6 @@ import base64
 import binascii
 import json
 import os
-import plistlib
 import re
 import shutil
 import subprocess
@@ -845,12 +844,9 @@ def _realpath(path: str) -> str:
 
 
 def _plist_data(path: Path) -> dict | None:
-    try:
-        with open(path, "rb") as fh:
-            data = plistlib.load(fh)
-    except (OSError, plistlib.InvalidFileException, ValueError):
-        return None
-    return data if isinstance(data, dict) else None
+    from claude_swap.maximize import service
+
+    return service._plist_data(path)
 
 
 def _plist_program(path: Path) -> list[str] | None:
@@ -861,47 +857,12 @@ def _plist_program(path: Path) -> list[str] | None:
     return None
 
 
-def _unit_words(value: str) -> list[str]:
-    words = re.findall(r'"((?:[^"\\]|\\.)*)"|(\S+)', value)
-    return [
-        (quoted or bare).replace('\\"', '"').replace("\\\\", "\\").replace("$$", "$").replace("%%", "%")
-        for quoted, bare in words
-    ]
-
-
 def service_file(p: Probes) -> tuple[list[str] | None, dict[str, str]] | None:
     """``(program argv minus 'auto', environment)`` from the installed service
     file, or None when there is none."""
-    if p.platform == "darwin":
-        data = _plist_data(p.home / "Library" / "LaunchAgents" / "com.wonjun-lab.cc-swap.plist")
-        if data is None:
-            return None
-        program = data.get("ProgramArguments")
-        env = data.get("EnvironmentVariables")
-        argv = list(program) if isinstance(program, list) else None
-        return (
-            argv[:-1] if argv and argv[-1] == "auto" else argv,
-            {str(k): str(v) for k, v in env.items()} if isinstance(env, dict) else {},
-        )
-    if p.platform == "linux":
-        unit = p.home / ".config" / "systemd" / "user" / "cc-swap.service"
-        try:
-            text = unit.read_text(encoding="utf-8")
-        except OSError:
-            return None
-        argv: list[str] | None = None
-        env: dict[str, str] = {}
-        for line in text.splitlines():
-            if line.startswith("ExecStart="):
-                argv = _unit_words(line.removeprefix("ExecStart="))
-            elif line.startswith("Environment="):
-                for word in _unit_words(line.removeprefix("Environment=")):
-                    key, _, value = word.partition("=")
-                    env[key] = value
-        if argv and argv[-1] == "auto":
-            argv = argv[:-1]
-        return argv, env
-    return None
+    from claude_swap.maximize import service
+
+    return service.read_installed(platform=p.platform, home=p.home)
 
 
 def check_service(ctx: Context) -> list[Finding]:
