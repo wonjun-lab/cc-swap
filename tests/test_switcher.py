@@ -4070,7 +4070,7 @@ class TestSwitchToSelfSlotAndForce:
         assert live["creds"] == self.LIVE_1
         out = capsys.readouterr().out
         assert "Already on" in out and "Account-1" in out
-        assert "cswap --switch-to 1 --force" in out
+        assert "cc-swap switch 1 --force" in out
 
     def test_force_self_activation_restores_imported_creds(
         self,
@@ -12867,7 +12867,10 @@ class TestLoginExpiry:
 
         output = capsys.readouterr().out
         assert output.count("login expires ") == 1
-        assert "re-login before then: log in with Claude Code, then run: cswap add" in output
+        assert (
+            "re-login before then: Fleet → select → r, or claude → /login → cc-swap add"
+            in output
+        )
 
     def test_list_warning_turns_red_inside_the_last_day(
         self, temp_home: Path, mock_claude_config: Path, sample_sequence_data: dict, capsys

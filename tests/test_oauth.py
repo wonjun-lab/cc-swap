@@ -864,14 +864,14 @@ class TestFetchUsageForAccount:
         assert len(warning_records) == 1
         msg = warning_records[0].getMessage()
         assert "failed to persist" in msg
-        assert "cswap --add-account" in msg
+        assert "cc-swap add" in msg
         assert "1" in msg
         assert "test@example.com" in msg
 
         # Also verify the user-visible printed warning, and that stdout stays clean
         captured = capsys.readouterr()
         assert "failed to save refreshed token" in captured.err
-        assert "cswap --add-account" in captured.err
+        assert "cc-swap add" in captured.err
         assert captured.out == ""
 
 
@@ -1565,10 +1565,24 @@ class TestLoginExpiry:
             self._creds(now + 2 * self.DAY_MS + 3 * 3600 * 1000), now_ms=now
         )
         assert before.startswith("login expires ")
-        assert before.endswith(" in 2d 3h")
-        after = oauth.login_expiry_note(self._creds(now - 1000), now_ms=now)
+        assert before.endswith(" (in 2d 3h)")
+        after = oauth.login_expiry_note(self._creds(now - 3600 * 1000), now_ms=now)
         assert after.startswith("login expired ")
-        assert " in " not in after
+        assert after.endswith(" (1h 0m ago)")
+
+    def test_note_shows_local_time_with_the_date(self, monkeypatch):
+        import time as _time
+
+        monkeypatch.setenv("TZ", "Asia/Seoul")
+        _time.tzset()
+        try:
+            deadline_ms = 1_790_000_000_000  # 2026-09-21 14:13:20 UTC
+            note = oauth.login_expiry_note_ms(deadline_ms, deadline_ms - 1000)
+            assert note.startswith("login expires Sep 21 23:13 (in ")  # KST, same day too
+            assert oauth.local_clock(deadline_ms / 1000) == "Sep 21 23:13"
+        finally:
+            monkeypatch.delenv("TZ")
+            _time.tzset()
 
     @pytest.mark.parametrize("stored_days, kept", [(5, True), (40, False)])
     def test_refresh_never_extends_a_known_deadline(self, stored_days, kept):
@@ -1678,4 +1692,4 @@ class TestLoginExpiry:
     def test_login_expired_has_a_remedy_note(self):
         from claude_swap.switcher import ERROR_NOTES
 
-        assert "cswap add" in ERROR_NOTES["login_expired"]
+        assert oauth.RELOGIN_STEPS in ERROR_NOTES["login_expired"]

@@ -201,7 +201,7 @@ ERROR_NOTES = {
     ),
     "login_expired": (
         "the stored login has expired (Claude Code logins expire about a "
-        "month after login) — log in with Claude Code, then run: cswap add"
+        f"month after login) — re-login: {oauth.RELOGIN_STEPS}"
     ),
 }
 
@@ -210,7 +210,7 @@ ERROR_NOTES = {
 # (another machine, a torn write) — when the login simply reached the
 # deadline Claude Code stamped at login, that search finds nothing and costs
 # an afternoon. ``dead_token_sentinel`` picks between the two.
-_RELOGIN_REMEDY = "log in with Claude Code, then run: cswap add"
+_RELOGIN_REMEDY = oauth.RELOGIN_STEPS
 
 #: ``switch --json`` no-op reasons that mean "refused": the CLI exits 1 for
 #: them, as it does when the human path raises ``SwitchRefusedError``.
@@ -221,10 +221,10 @@ SENTINEL_NOTES = {
     USAGE_FOREIGN_CREDENTIAL: "live credential belongs to another account — a switch repairs it",
     USAGE_API_KEY: "API key (no quota)",
     USAGE_KEYCHAIN_UNAVAILABLE: "keychain unavailable — locked or in use; try again",
-    USAGE_RELOGIN_REQUIRED: f"re-login needed — refresh token dead; {_RELOGIN_REMEDY}",
+    USAGE_RELOGIN_REQUIRED: f"re-login needed — refresh token dead: {_RELOGIN_REMEDY}",
     USAGE_LOGIN_EXPIRED: (
         "re-login needed — login expired (Claude Code logins expire about a "
-        f"month after login); {_RELOGIN_REMEDY}"
+        f"month after login): {_RELOGIN_REMEDY}"
     ),
 }
 
@@ -1436,7 +1436,7 @@ class ClaudeAccountSwitcher:
                             f"Found leftover staging from an interrupted swap: "
                             f"{path}. It holds that slot's pre-swap credentials "
                             f"and may be the only surviving copy. Verify both "
-                            f"accounts still work (`cswap list`), then delete "
+                            f"accounts still work (`cc-swap list`), then delete "
                             f"the file and retry."
                         )
                     fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
@@ -2042,7 +2042,7 @@ class ClaudeAccountSwitcher:
                 warning(
                     "  No accounts remain in rotation — auto-switch and bare "
                     "switch have nothing to pick. Re-enable one with "
-                    "cswap enable <num|email>."
+                    "cc-swap enable <num|email>."
                 )
         else:
             print(dimmed("  It is back in the rotation."))
@@ -2706,7 +2706,7 @@ class ClaudeAccountSwitcher:
                 self._logger.error(
                     "Account %s's consumed successor could not be persisted "
                     "or stashed — it survives only for this pass. Fix the "
-                    "storage failure, then re-login and `cswap add` if the "
+                    "storage failure, then re-login and `cc-swap add` if the "
                     "slot strikes.", account_num, exc_info=True,
                 )
         if stashed_reason in _DEMOTING_STASH_REASONS:
@@ -3721,7 +3721,7 @@ class ClaudeAccountSwitcher:
         )
         raise ConfigError(
             f"Email '{identifier}' is ambiguous — matches accounts: {details}. "
-            f"Use account number instead (e.g., cswap --switch-to 1)."
+            f"Use account number instead (e.g., cc-swap switch 1)."
         )
 
     def _get_sequence_data_migrated(self) -> dict | None:
@@ -5782,7 +5782,7 @@ class ClaudeAccountSwitcher:
                         f"Account-{other} and Account-{snum} hold the same "
                         f"credential ({email}) — one slot's backup was "
                         "overwritten. Log in with the missing account and "
-                        "re-add it: cswap add --slot N"
+                        "re-add it: cc-swap add --slot N"
                     )
                 else:
                     by_fp[fp] = snum
@@ -5849,7 +5849,7 @@ class ClaudeAccountSwitcher:
                     f"Account-{other} and Account-{snum} report identical "
                     "usage and reset times — they may be the same account "
                     "(issue #117). If it persists, log in with the missing "
-                    "account and re-add it: cswap add --slot N"
+                    "account and re-add it: cc-swap add --slot N"
                 )
             else:
                 seen[key] = snum
@@ -6146,7 +6146,7 @@ class ClaudeAccountSwitcher:
             f"({current_email}) to managed list? [Y/n] "
         )
         if response.lower() == "n":
-            print(dimmed("Setup cancelled. You can run 'cswap --add-account' later."))
+            print(dimmed("Setup cancelled. You can run 'cc-swap add' later."))
             return
 
         self.add_account()
@@ -6283,7 +6283,7 @@ class ClaudeAccountSwitcher:
                     reason = "(no stored credentials/config)"
                     console_reason = (
                         "(no stored credentials/config, re-add with "
-                        f"cswap --add-account --slot {target})"
+                        f"cc-swap add --slot {target})"
                     )
                 if json_output:
                     warnings.append(f"Skipped Account-{target} {reason}")
@@ -6302,11 +6302,11 @@ class ClaudeAccountSwitcher:
                     ):
                         raise ConfigError(
                             "No accounts remain in rotation. Re-enable one with: "
-                            "cswap enable <num|email>"
+                            "cc-swap enable <num|email>"
                         )
                     raise ConfigError(
                         "No managed accounts have valid stored credentials/config. "
-                        "Re-add a slot with: cswap --add-account --slot <number>"
+                        "Re-add a slot with: cc-swap add --slot <number>"
                     )
                 target = fallback
             op = self._perform_switch(target, emit_output=not json_output)
@@ -6328,7 +6328,7 @@ class ClaudeAccountSwitcher:
                     reason="unmanaged-account",
                     from_ref=ref,
                     to_ref=ref,
-                    message="Active account is not managed; run cswap --add-account",
+                    message="Active account is not managed; run cc-swap add",
                 )
             print(f"{accent('Notice:')} Active account '{current_email}' was not managed.")
             self.add_account()
@@ -6392,7 +6392,7 @@ class ClaudeAccountSwitcher:
                     )
                 print(dimmed(
                     f"Current account usage is unavailable — staying on "
-                    f"Account-{current_num}. Run cswap --switch to rotate."
+                    f"Account-{current_num}. Run cc-swap switch to rotate."
                 ))
                 return None
             if note == "no-comparison":
@@ -6407,7 +6407,7 @@ class ClaudeAccountSwitcher:
                     )
                 print(dimmed(
                     f"No other account has usage data to compare — staying on "
-                    f"Account-{current_num}. Run cswap --switch to rotate."
+                    f"Account-{current_num}. Run cc-swap switch to rotate."
                 ))
                 return None
             if note == "incomplete-comparison":
@@ -6735,7 +6735,7 @@ class ClaudeAccountSwitcher:
                         print(dimmed(
                             "To rewrite the live login from the stored backup "
                             "(e.g. after --import), run: "
-                            f"cswap --switch-to {target_account} --force"
+                            f"cc-swap switch {target_account} --force"
                         ))
                         return None
                     return self._switch_noop(
@@ -7137,7 +7137,7 @@ class ClaudeAccountSwitcher:
             )
         raise SwitchError(
             f"Account-{account_num} has no stored credentials. "
-            f"Re-add with: cswap --add-account --slot {account_num}"
+            f"Re-add with: cc-swap add --slot {account_num}"
         )
 
     def _refuse_session_shell(self) -> None:
@@ -7326,7 +7326,7 @@ class ClaudeAccountSwitcher:
                 if not target_config:
                     raise SwitchError(
                         f"Account-{target_account} has no stored config backup. "
-                        f"Re-add with: cswap --add-account --slot {target_account}"
+                        f"Re-add with: cc-swap add --slot {target_account}"
                     )
                 try:
                     target_config_data = json.loads(target_config)
@@ -7555,7 +7555,7 @@ class ClaudeAccountSwitcher:
                             "credential was preserved and was not written "
                             f"into Account-{current_account}. If Account-"
                             f"{foreign_slot} later cannot authenticate, log "
-                            "in as it and run: cswap add --slot "
+                            "in as it and run: cc-swap add --slot "
                             f"{foreign_slot}"
                         )
                     elif kind == "known-foreign":
@@ -7564,14 +7564,14 @@ class ClaudeAccountSwitcher:
                             "as another account's. It was preserved and not "
                             f"written into Account-{current_account}. If the "
                             "owning account later cannot authenticate, log "
-                            "in as it and run: cswap add"
+                            "in as it and run: cc-swap add"
                         )
                     else:
                         msg = (
                             "The live login does not match a managed "
                             "account. It was preserved and not written into "
                             f"Account-{current_account}. If you need that "
-                            "account, log in as it and run: cswap add"
+                            "account, log in as it and run: cc-swap add"
                         )
                     if emit_output:
                         warning(msg)
@@ -7608,7 +7608,7 @@ class ClaudeAccountSwitcher:
                         f"Account-{current_account}'s stored backup was "
                         "kept. If the account cannot authenticate after "
                         "switching back, log in with Claude Code and run: "
-                        "cswap add"
+                        "cc-swap add"
                     )
                     if emit_output:
                         warning(msg)
@@ -7674,7 +7674,7 @@ class ClaudeAccountSwitcher:
                 if not target_config:
                     raise SwitchError(
                         f"Account-{target_account} has no stored config backup. "
-                        f"Re-add with: cswap --add-account --slot {target_account}"
+                        f"Re-add with: cc-swap add --slot {target_account}"
                     )
 
                 # Step 3: Activate target account - credentials
@@ -7751,7 +7751,7 @@ class ClaudeAccountSwitcher:
                 self.list_accounts()
             except Exception as e:
                 self._logger.warning(f"Post-switch usage display failed: {e!r}")
-                print(dimmed("  (usage display unavailable — run `cswap --list` to retry)"))
+                print(dimmed("  (usage display unavailable — run `cc-swap list` to retry)"))
             print()
             self._print_switch_followup()
             print()

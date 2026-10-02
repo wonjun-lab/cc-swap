@@ -19,6 +19,7 @@ from claude_swap.maximize import fleet
 from claude_swap.maximize.model import AccountView, Sample
 from claude_swap.maximize.view import MaximizeState, PublishedDecision
 from claude_swap.models import AccountSnapshot, AccountsSnapshot
+from claude_swap.oauth import local_clock
 from claude_swap.settings import MaximizeSettings, PrimeSettings
 from claude_swap.usage_store import UsageEntry
 
@@ -433,7 +434,10 @@ def test_login_cell_counts_down_amber_in_the_last_week_red_in_the_last_day():
     assert "login" in cols
     cells = dict(zip(cols, fleet.row_cells(rows["2"], cols, now=NOW, mx=MX)))
     assert cells["login"] == ("1d 9h", "warn")
-    assert "login expires in 1d 9h" in fleet.detail_line(rows["2"], MX, now=NOW)
+    assert (
+        f"login expires {local_clock(NOW + DAY + 9 * H)} (in 1d 9h)"
+        in fleet.detail_line(rows["2"], MX, now=NOW)
+    )
     assert "login" not in fleet.detail_line(rows["1"], MX, now=NOW)
 
 
@@ -453,8 +457,9 @@ def test_attention_warns_of_logins_expiring_within_a_week():
         _expiring(5, 20 * DAY, alias="fine"),
     )
     rows = fleet.fleet_rows(snap, MX, PRIME, MaximizeState(), now=NOW)
+    side = f"login expires {local_clock(NOW + DAY + 9 * H)} (in 1d 9h)"
     assert fleet.attention(rows, now=NOW) == (
-        "⚠ #2 side login expires in 1d 9h — re-login before then: select it and press r"
+        f"⚠ #2 side {side} — re-login before then: select it and press r"
     )
     assert fleet.attention_tone(rows, now=NOW) == "warn"
     assert fleet.attention(rows) is None  # no clock: only dead logins
@@ -477,7 +482,7 @@ def test_attention_warns_of_logins_expiring_within_a_week():
     )
     assert fleet.attention(mixed, now=NOW) == (
         "⚠ #3 old needs re-login (refresh token dead) — select it and press r"
-        " · #2 login expires in 1d 9h"
+        f" · #2 {side}"
     )
     assert fleet.attention_tone(mixed, now=NOW) == "crit"
 

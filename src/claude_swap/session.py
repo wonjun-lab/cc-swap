@@ -696,7 +696,7 @@ class SessionManager:
             raise SessionError(
                 f"Account-{account_num} ({email}) is an API-key account; "
                 "'cswap run' (session mode) does not support API-key accounts yet. "
-                "Use 'cswap --switch-to' to make it your default login instead."
+                "Use 'cc-swap switch' to make it your default login instead."
             )
 
     # -- bootstrap -------------------------------------------------------
@@ -782,7 +782,7 @@ class SessionManager:
                     f"spent grant and the successor is gone. Fix the storage "
                     f"failure first; retrying before that spends nothing but "
                     f"earns a strike. If the slot strikes, log in again and "
-                    f"re-add it: cswap --add-account --slot {account_num}"
+                    f"re-add it: cc-swap add --slot {account_num}"
                 )
             if outcome.error is not None:
                 warning(
@@ -856,7 +856,7 @@ class SessionManager:
                 raise SessionError(
                     f"Session profile for Account-{account_num} ({email}) failed "
                     f"validation. Log in with that account and re-add it: "
-                    f"cswap --add-account --slot {account_num}"
+                    f"cc-swap add --slot {account_num}"
                 )
         # Lock released here, before any exec.
 
@@ -907,7 +907,7 @@ class SessionManager:
                 )
             raise SessionError(
                 f"Account-{account_num} has no stored credentials. "
-                f"Re-add with: cswap --add-account --slot {account_num}"
+                f"Re-add with: cc-swap add --slot {account_num}"
             )
 
         # The pre-lock refresh (see run(): the consume gate must not run
@@ -924,7 +924,7 @@ class SessionManager:
         if not oauth_account:
             raise SessionError(
                 f"Account-{account_num} has no stored config backup. "
-                f"Re-add with: cswap --add-account --slot {account_num}"
+                f"Re-add with: cc-swap add --slot {account_num}"
             )
 
         session_dir.mkdir(parents=True, exist_ok=True)

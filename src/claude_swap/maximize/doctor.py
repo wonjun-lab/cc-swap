@@ -33,7 +33,6 @@ import sys
 import time
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Literal
 
@@ -267,7 +266,7 @@ def duration(seconds: float) -> str:
 
 
 def _clock(epoch_s: float) -> str:
-    return datetime.fromtimestamp(epoch_s, tz=timezone.utc).strftime("%b %d %H:%M UTC")
+    return oauth.local_clock(epoch_s)
 
 
 def _read_json(path: Path) -> tuple[dict | None, str | None]:
@@ -1103,10 +1102,7 @@ _QUARANTINE_WHY = {
 
 
 def _relogin_fix(number: str) -> str:
-    return (
-        f"re-login #{number}: Fleet → select it → r, or claude → /login as that "
-        f"account → cc-swap add --slot {number}"
-    )
+    return oauth.relogin_fix(number)
 
 
 def check_slots(ctx: Context) -> list[Finding]:
@@ -1173,13 +1169,13 @@ def check_slots(ctx: Context) -> list[Finding]:
             if left <= 0:
                 out.append(Finding(
                     "login-deadline", "error",
-                    f"login expired {_clock(deadline_ms / 1000.0)}",
+                    oauth.login_expiry_note_ms(deadline_ms, int(p.now * 1000)) or "login expired",
                     _relogin_fix(slot.number), scope,
                 ))
             elif left < LOGIN_WARN_S:
                 out.append(Finding(
                     "login-deadline", "warn",
-                    f"login expires in {duration(left)} ({_clock(deadline_ms / 1000.0)})",
+                    oauth.login_expiry_note_ms(deadline_ms, int(p.now * 1000)) or "login expires soon",
                     _relogin_fix(slot.number) + " (a new login starts a new ~30-day deadline)",
                     scope,
                 ))

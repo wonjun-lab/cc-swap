@@ -224,10 +224,11 @@ def test_expired_and_expiring_logins(world):
     world.store(4, creds(4, login_in_s=10 * DAY))
     findings = run(world)
     [expired] = find(findings, "login-deadline", "error", "#2")
-    assert expired.detail.startswith("login expired")
-    assert "cc-swap add --slot 2" in expired.fix and "r" in expired.fix
+    assert expired.detail.startswith("login expired") and "(1h 0m ago)" in expired.detail
+    assert "UTC" not in expired.detail  # local time, like list / the auto log / Fleet
+    assert expired.fix == "re-login #2: Fleet → select → r, or claude → /login → cc-swap add"
     [soon] = find(findings, "login-deadline", "warn", "#3")
-    assert "expires in 2d 1h" in soon.detail
+    assert soon.detail.startswith("login expires ") and "(in 2d 1h)" in soon.detail
     assert not find(findings, "login-deadline", scope="#4")
 
 
@@ -250,7 +251,7 @@ def test_quarantined_slot_is_an_error_until_its_login_changes(world):
     })
     findings = run(world)
     [dead] = find(findings, "quarantine", "error", "#2")
-    assert "refresh token dead" in dead.detail and "--slot 2" in dead.fix
+    assert "refresh token dead" in dead.detail and dead.fix.startswith("re-login #2: ")
     [lifting] = find(findings, "quarantine", "info", "#3")
     assert "lifts it" in lifting.detail
 

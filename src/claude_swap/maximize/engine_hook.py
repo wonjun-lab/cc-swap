@@ -440,12 +440,9 @@ def _warn_login_expiry(
             continue
         rt.login_warned[number] = now
         note = oauth.login_expiry_note_ms(deadline * 1000.0, int(now * 1000))
-        then = "re-login needed" if now >= deadline else "re-login before then"
+        then = "" if now >= deadline else "before then, "
         engine._emit(aw.ConfigWarningEvent(
-            message=(
-                f"Account-{number} {note} — {then}: log in with Claude Code as "
-                f"that account, then run: cc-swap add (or Fleet → r)"
-            )
+            message=f"Account-{number} {note} — {then}{oauth.relogin_fix(number)}"
         ))
 
 

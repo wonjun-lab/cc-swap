@@ -648,8 +648,9 @@ class TestLoginExpiryWarning:
         usage = {"1": win(10, 30), "2": win(0, 10), "3": win(0, 50)}
         h.tick_with_usage(usage)
         [line] = login_warnings(h)
-        assert line.startswith("Account-2 login expires ") and " in 2d 0h" in line
-        assert "cc-swap add" in line
+        assert line.startswith("Account-2 login expires ") and " (in 2d 0h)" in line
+        assert line.endswith("before then, re-login #2: Fleet → select → r, or claude → "
+                             "/login → cc-swap add")
         assert "@" not in line and "rt-2" not in line and "sk-2" not in line
         h.clock.advance(3600)
         h.tick_with_usage(usage)

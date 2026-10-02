@@ -817,10 +817,11 @@ def login_cell(row: FleetRow, now: float) -> Cell:
 
 
 def _expiring_text(row: FleetRow, now: float) -> str:
-    left = login_left(row, now) or 0.0
-    if left <= 0:
+    """``login expires Oct 9 20:04 (in 6d 2h)``: the deadline format doctor,
+    list and the auto log use too (``oauth.login_expiry_note_ms``)."""
+    if row.login_deadline is None:
         return "login expired"
-    return f"login expires in {oauth.login_countdown(left)}"
+    return oauth.login_expiry_note_ms(row.login_deadline * 1000.0, int(now * 1000)) or ""
 
 
 def _dead_line(dead: Sequence[FleetRow]) -> str:
