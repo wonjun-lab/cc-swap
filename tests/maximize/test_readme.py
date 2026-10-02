@@ -82,8 +82,9 @@ def test_readme_documents_the_fleet_screen_and_relogin(snippet):
     assert snippet in README.read_text(encoding="utf-8")
 
 
-def test_readme_warns_that_the_macos_error_log_is_not_rotated():
+def test_readme_says_the_service_rotates_its_macos_logs():
     text = README.read_text(encoding="utf-8")
     assert "auto.err.log" in text
-    assert "is not rotated" in text
+    assert "is not rotated" not in text
     assert "370 KiB" in text
+    assert "10 MiB" in text and "three generations" in text

@@ -147,3 +147,31 @@ def test_a_lock_that_cannot_be_taken_exits_1_not_4(temp_home, capsys, monkeypatc
     err = capsys.readouterr().err
     assert "cannot take the engine lease" in err
     assert "already running" not in err
+
+
+class TestServiceLogRotationWiring:
+    """Under the service marker the loop rotates logs at startup and hourly."""
+
+    def test_rotates_at_startup_and_hooks_the_loop_when_run_as_the_service(
+        self, temp_home, monkeypatch
+    ):
+        from claude_swap.maximize import logrotate, service
+
+        out, err = service.log_paths(temp_home)
+        out.parent.mkdir(parents=True)
+        out.write_bytes(b"a" * (logrotate.MAX_BYTES + 1))
+        monkeypatch.setattr(logrotate.sys, "platform", "darwin")
+        monkeypatch.setenv("CC_SWAP_SERVICE", "1")
+
+        assert _run([]) == 0
+
+        assert out.stat().st_size == 0
+        assert out.with_name("auto.log.1").exists()
+        assert callable(FakeEngine.instances[0].housekeeping)
+
+    def test_no_rotation_or_hook_outside_the_service(self, temp_home, monkeypatch):
+        monkeypatch.delenv("CC_SWAP_SERVICE", raising=False)
+
+        assert _run([]) == 0
+
+        assert getattr(FakeEngine.instances[0], "housekeeping", None) is None

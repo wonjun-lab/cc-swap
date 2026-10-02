@@ -740,6 +740,7 @@ Defaults live in settings.json in the backup root; flags override them.
         claim_for_auto,
     )
     from claude_swap.autoswitch import AutoSwitchEngine, AutoSwitchEvent
+    from claude_swap.maximize.logrotate import LogRotator
     from claude_swap.printer import accent, yellowed
     from claude_swap.settings import (
         MAXIMIZE_CLI_FLAGS,
@@ -812,6 +813,13 @@ Defaults live in settings.json in the backup root; flags override them.
 
         # Loop mode: SIGTERM (systemd stop) exits the loop cleanly.
         signal.signal(signal.SIGTERM, lambda *_: engine.stop())
+        # As the launchd service, keep auto.log / auto.err.log bounded: rotate
+        # now and then at most hourly from the loop (maximize/logrotate.py).
+        if not args.dry_run:
+            rotator = LogRotator()
+            if rotator.active:
+                rotator.maybe_rotate()
+                engine.housekeeping = rotator.maybe_rotate
         if not args.json:
             if maximize is not None:
                 policy = (
@@ -1521,7 +1529,8 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
         help=(
             "Overwrite existing accounts during import; with 'switch <num|email>', "
             "activate the stored credentials without backing up the current "
-            "login first"
+            "login first; with 'upgrade', reinstall even when already on the "
+            "latest release"
         ),
     )
     parser.add_argument(
@@ -1717,8 +1726,11 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
     if args.alias is not None and not args.add_account:
         parser.error("--alias can only be used with 'add'")
 
-    if args.force and not (args.import_ or args.switch_to):
-        parser.error("--force can only be used with 'import' or 'switch <num|email>'")
+    if args.force and not (args.import_ or args.switch_to or args.upgrade):
+        parser.error(
+            "--force can only be used with 'import', 'switch <num|email>' "
+            "or 'upgrade'"
+        )
 
     if args.full and not args.export:
         parser.error("--full can only be used with 'export'")
@@ -1743,7 +1755,7 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
         from claude_swap.update_check import run_self_upgrade
 
         try:
-            sys.exit(run_self_upgrade())
+            sys.exit(run_self_upgrade(force=args.force))
         except KeyboardInterrupt:
             print(f"\n{dimmed('Upgrade cancelled')}")
             sys.exit(130)

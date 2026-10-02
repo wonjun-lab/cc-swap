@@ -18,6 +18,7 @@ import urllib.request
 from pathlib import Path
 from typing import NamedTuple
 
+from claude_swap import __version__
 from claude_swap.cache import CACHE_DIR, MISSING, read_cache, write_cache
 
 # Not upstream's ``update_check.json``: the backup root (and so CACHE_DIR) is
@@ -188,6 +189,47 @@ def _tag_version(tag: str) -> str:
     return tag[1:] if tag[:1] in ("v", "V") else tag
 
 
+def _cached_tag() -> str | None:
+    """The tag in the update-check cache however old it is, or None.
+
+    Only a last resort for ``upgrade`` when GitHub is unreachable, so the
+    24 h TTL is ignored; the value is re-validated because the file is not
+    something we trust to hold a safe ref.
+    """
+    cached = read_cache(CACHE_PATH, float("inf"))
+    if isinstance(cached, str) and _TAG_RE.fullmatch(cached):
+        return cached
+    return None
+
+
+def _latest_tag_for_upgrade() -> tuple[str | None, bool]:
+    """``(tag, from_cache)`` for ``cc-swap upgrade``.
+
+    Unlike the passive notice this never trusts the cache while GitHub
+    answers: a release published after the last check would otherwise be
+    skipped for up to a day. A live answer refreshes the cache so the notice
+    agrees with what was just installed. Only when the live lookup fails does
+    the cached tag stand in.
+    """
+    tag = _fetch_latest_tag(timeout=UPGRADE_LOOKUP_TIMEOUT)
+    if tag is not None:
+        try:
+            write_cache(CACHE_PATH, tag)
+        except OSError:
+            pass
+        return tag, False
+    cached = _cached_tag()
+    return cached, cached is not None
+
+
+def _is_installed(tag: str) -> bool:
+    """Whether the running version is exactly the release ``tag`` names."""
+    try:
+        return _parse_version(_tag_version(tag)) == _parse_version(__version__)
+    except ValueError:
+        return False
+
+
 def check_for_update(current_version: str) -> str | None:
     """Return a notification string if a newer version exists, else None."""
     try:
@@ -223,12 +265,15 @@ def check_for_update(current_version: str) -> str | None:
         return None
 
 
-def run_self_upgrade() -> int:
+def run_self_upgrade(force: bool = False) -> int:
     """Run the appropriate upgrade command for the current install method.
 
     Installs the latest published release (the one the update notice
-    announces), pinned by its git tag. When no release can be determined it
-    falls back to the default branch and says so.
+    announces), pinned by its tag, looked up live rather than from the 24 h
+    cache. If GitHub cannot be reached the cached tag is used, with a
+    warning. When no release can be determined at all it falls back to the
+    default branch and says so. Already being on the latest release is a
+    no-op unless ``force``.
 
     Returns the subprocess exit code, or 1 if detection failed or the package
     manager is missing from PATH.
@@ -237,7 +282,10 @@ def run_self_upgrade() -> int:
 
     method = _detect_install_method()
     # Unlike the passive check, the user asked for this, so wait for GitHub.
-    tag = _fetch_latest_tag(timeout=UPGRADE_LOOKUP_TIMEOUT)
+    tag, from_cache = _latest_tag_for_upgrade()
+    if tag is not None and not force and _is_installed(tag):
+        print(f"cc-swap is already on {tag}; nothing to do (use --force to reinstall).")
+        return 0
     cmd = _upgrade_command(method, tag)
     url = _install_url(tag)
     if cmd is None:
@@ -256,6 +304,11 @@ def run_self_upgrade() -> int:
 
     if tag is None:
         warning(_NO_RELEASE_NOTE)
+    elif from_cache:
+        warning(
+            "Could not reach GitHub to look up the latest release; "
+            f"installing the cached tag {tag}, which may be out of date."
+        )
 
     # Windows: the running cc-swap.exe launcher is locked, so an in-process
     # uv/pipx reinstall fails when it tries to replace the executable even

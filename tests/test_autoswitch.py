@@ -2333,6 +2333,25 @@ class TestRunLoop:
             assert harness.engine.run_loop() == 0
         assert len(ticks) == 2
 
+    def test_housekeeping_runs_each_iteration_and_never_kills_the_loop(self, harness):
+        calls = []
+
+        def housekeeping():
+            calls.append(1)
+            raise OSError("disk full")
+
+        harness.engine.housekeeping = housekeeping
+
+        def fake_tick():
+            if len(calls) >= 2:
+                harness.engine.stop()
+            return TickOutcome.NO_ACTION
+
+        with patch.object(harness.engine, "tick", side_effect=fake_tick), \
+             patch.object(harness.engine._wake, "wait", return_value=None):
+            assert harness.engine.run_loop() == 0
+        assert len(calls) == 2
+
     def test_loop_survives_raising_tick(self, harness):
         calls = []
 

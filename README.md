@@ -164,7 +164,7 @@ cc-swap service status      # installed? running? pid?
 cc-swap service uninstall   # stop it and remove it
 ```
 
-- **macOS**: a LaunchAgent (`~/Library/LaunchAgents/com.wonjun-lab.cc-swap.plist`) that starts at login and restarts after a crash. Logs go to `~/Library/Logs/cc-swap/` (`auto.log`, `auto.err.log`). `auto.err.log` is not rotated: while another engine holds the lease it grows by about 370 KiB per day, because the service logs the refusal once a minute. Truncate it when it gets large.
+- **macOS**: a LaunchAgent (`~/Library/LaunchAgents/com.wonjun-lab.cc-swap.plist`) that starts at login and restarts after a crash. Logs go to `~/Library/Logs/cc-swap/` (`auto.log`, `auto.err.log`). While another engine holds the lease `auto.err.log` grows by about 370 KiB per day, because the service logs the refusal once a minute, so the service rotates both files itself: at startup and at most once an hour, a file over 10 MiB is copied to `<name>.1` (three generations, `.1` to `.3`) and truncated in place. On Linux the output goes to the journal, which rotates itself.
 - **Linux**: a systemd user unit (`~/.config/systemd/user/cc-swap.service`, `Restart=on-failure`) that is enabled and started for you. Read its logs with `journalctl --user -u cc-swap -f`. To keep it running after you log out, enable lingering once with `loginctl enable-linger $USER`; `install` tells you when lingering is off.
 - **Windows**: not supported. Run `cc-swap auto` in a terminal instead.
 

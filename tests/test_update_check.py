@@ -40,6 +40,21 @@ def _no_network(monkeypatch):
     monkeypatch.setattr("claude_swap.update_check.urllib.request.urlopen", _offline)
 
 
+@pytest.fixture(autouse=True)
+def _isolated_cache(tmp_path, monkeypatch):
+    """`upgrade` now refreshes the update-check cache; keep it off the real one."""
+    monkeypatch.setattr(
+        "claude_swap.update_check.CACHE_PATH", tmp_path / "isolated_cache.json"
+    )
+
+
+def _cache_path() -> Path:
+    """The (monkeypatched) cache path currently in effect."""
+    import claude_swap.update_check as uc
+
+    return uc.CACHE_PATH
+
+
 def _make_release_response(version: str) -> MagicMock:
     """A GitHub ``releases/latest`` payload for tag ``v<version>``."""
     data = json.dumps({"tag_name": f"v{version}", "prerelease": False}).encode()
@@ -564,6 +579,141 @@ class TestRunSelfUpgrade:
         assert run_self_upgrade() == 1
         err = capsys.readouterr().err
         assert "PATH" in err
+
+
+@patch("claude_swap.update_check.sys.platform", "linux")
+@patch("claude_swap.update_check._detect_install_method", return_value="uv")
+@patch("claude_swap.update_check.subprocess.run")
+class TestUpgradeIgnoresTheCache:
+    """`upgrade` asks GitHub every time; the 24 h notice cache may be stale."""
+
+    @patch("claude_swap.update_check.urllib.request.urlopen")
+    def test_fresh_stale_cache_is_bypassed_and_refreshed(
+        self, mock_urlopen, mock_run, mock_detect, monkeypatch
+    ):
+        # v0.1.1 is out, but the fresh cache still says v0.1.0.
+        monkeypatch.setattr("claude_swap.update_check.__version__", "0.1.0", raising=False)
+        _write_cache(_cache_path(), "v0.1.0")
+        mock_urlopen.return_value = _make_release_response("0.1.1")
+        mock_run.return_value = MagicMock(returncode=0)
+
+        assert run_self_upgrade() == 0
+
+        mock_urlopen.assert_called_once()
+        mock_run.assert_called_once_with(
+            ["uv", "tool", "install", "--force", f"{FORK}@v0.1.1"], check=False
+        )
+        assert json.loads(_cache_path().read_text())["data"] == "v0.1.1"
+
+    def test_live_failure_falls_back_to_cached_tag_with_warning(
+        self, mock_run, mock_detect, monkeypatch, capsys
+    ):
+        monkeypatch.setattr("claude_swap.update_check.__version__", "0.0.1", raising=False)
+        # Even an expired cache entry beats guessing the default branch.
+        _write_cache(_cache_path(), "v0.1.0", timestamp=time.time() - 10 * CACHE_TTL)
+        mock_run.return_value = MagicMock(returncode=0)
+
+        assert run_self_upgrade() == 0
+
+        mock_run.assert_called_once_with(
+            ["uv", "tool", "install", "--force", f"{FORK}@v0.1.0"], check=False
+        )
+        out = capsys.readouterr().out
+        assert "v0.1.0" in out
+        assert "cached" in out.lower()
+
+    def test_live_failure_and_no_cache_uses_default_branch(
+        self, mock_run, mock_detect, capsys
+    ):
+        mock_run.return_value = MagicMock(returncode=0)
+
+        run_self_upgrade()
+
+        mock_run.assert_called_once_with(
+            ["uv", "tool", "install", "--force", INSTALL_URL], check=False
+        )
+        assert "default branch" in capsys.readouterr().out
+
+    def test_cached_failure_marker_is_not_a_tag(
+        self, mock_run, mock_detect
+    ):
+        # check_for_update caches failures as null.
+        _write_cache(_cache_path(), None)
+        mock_run.return_value = MagicMock(returncode=0)
+
+        run_self_upgrade()
+
+        mock_run.assert_called_once_with(
+            ["uv", "tool", "install", "--force", INSTALL_URL], check=False
+        )
+
+    @patch("claude_swap.update_check.urllib.request.urlopen")
+    def test_unsafe_cached_tag_is_not_used(
+        self, mock_urlopen, mock_run, mock_detect
+    ):
+        _write_cache(_cache_path(), "v1.0@evil")
+        mock_run.return_value = MagicMock(returncode=0)
+
+        run_self_upgrade()
+
+        mock_run.assert_called_once_with(
+            ["uv", "tool", "install", "--force", INSTALL_URL], check=False
+        )
+
+
+@patch("claude_swap.update_check.sys.platform", "linux")
+@patch("claude_swap.update_check._detect_install_method", return_value="uv")
+@patch("claude_swap.update_check.subprocess.run")
+@patch("claude_swap.update_check.urllib.request.urlopen")
+class TestUpgradeAlreadyCurrent:
+    def test_skips_reinstall_when_on_latest(
+        self, mock_urlopen, mock_run, mock_detect, monkeypatch, capsys
+    ):
+        monkeypatch.setattr("claude_swap.update_check.__version__", "0.1.1", raising=False)
+        mock_urlopen.return_value = _make_release_response("0.1.1")
+
+        assert run_self_upgrade() == 0
+
+        mock_run.assert_not_called()
+        assert "already on v0.1.1" in capsys.readouterr().out
+
+    def test_force_reinstalls_anyway(
+        self, mock_urlopen, mock_run, mock_detect, monkeypatch
+    ):
+        monkeypatch.setattr("claude_swap.update_check.__version__", "0.1.1", raising=False)
+        mock_urlopen.return_value = _make_release_response("0.1.1")
+        mock_run.return_value = MagicMock(returncode=0)
+
+        assert run_self_upgrade(force=True) == 0
+
+        mock_run.assert_called_once_with(
+            ["uv", "tool", "install", "--force", f"{FORK}@v0.1.1"], check=False
+        )
+
+    def test_older_release_than_installed_still_skips_nothing_weird(
+        self, mock_urlopen, mock_run, mock_detect, monkeypatch
+    ):
+        # Not equal -> proceed (the pinned reinstall is what the user asked for).
+        monkeypatch.setattr("claude_swap.update_check.__version__", "0.2.0", raising=False)
+        mock_urlopen.return_value = _make_release_response("0.1.1")
+        mock_run.return_value = MagicMock(returncode=0)
+
+        run_self_upgrade()
+
+        mock_run.assert_called_once()
+
+    def test_unparseable_installed_version_reinstalls(
+        self, mock_urlopen, mock_run, mock_detect, monkeypatch
+    ):
+        monkeypatch.setattr(
+            "claude_swap.update_check.__version__", "0+unknown", raising=False
+        )
+        mock_urlopen.return_value = _make_release_response("0.1.1")
+        mock_run.return_value = MagicMock(returncode=0)
+
+        run_self_upgrade()
+
+        mock_run.assert_called_once()
 
 
 @patch("claude_swap.update_check.sys.platform", "win32")
