@@ -75,7 +75,7 @@ class TestRegistry:
             "maximize.idleWindowMin": (3, 60),
             "maximize.idleMaxDeltaPct": (0.0, 10.0),
             "maximize.forceEtaMin": (0, 60),
-            "maximize.pendingPollS": (60, 600),
+            "maximize.pendingPollS": (180, 600),
             "maximize.rebalanceCooldownMin": (0, 240),
             "maximize.tieEpsilon": (0.0, 2.0),
             "prime.maxAttempts": (1, 5),
@@ -109,6 +109,12 @@ class TestLoadMaximize:
         assert loaded.idle_window_min == 3
         assert loaded.pending_poll_s == 600
         assert loaded.tie_epsilon == 0.0
+
+    def test_pending_poll_never_below_the_poll_floor(self, tmp_path: Path):
+        # Upstream poll_policy.MIN_INTERVAL_S: the per-account budget floor.
+        assert MaximizeSettings().pending_poll_s == 180
+        _write(tmp_path, {"maximize": {"pendingPollS": 60}})
+        assert load_maximize_settings(tmp_path).pending_poll_s == 180
 
     def test_int_keys_truncate_floats(self, tmp_path: Path):
         _write(tmp_path, {"maximize": {"idleWindowMin": 12.7}})
@@ -308,8 +314,8 @@ class TestProblemsReportEveryRepair:
 
     def test_an_integral_float_for_an_int_key_is_not_a_repair(self, tmp_path: Path):
         # Pure int truncation: 12.0 -> 12 changes nothing the user wrote.
-        loaded, problems = self._load(tmp_path, {"idleWindowMin": 12.0, "pendingPollS": 120.0})
-        assert (loaded.idle_window_min, loaded.pending_poll_s) == (12, 120)
+        loaded, problems = self._load(tmp_path, {"idleWindowMin": 12.0, "pendingPollS": 240.0})
+        assert (loaded.idle_window_min, loaded.pending_poll_s) == (12, 240)
         assert problems == []
 
     def test_an_int_for_a_float_key_is_not_a_repair(self, tmp_path: Path):

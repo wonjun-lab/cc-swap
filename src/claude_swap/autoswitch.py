@@ -491,6 +491,52 @@ class ConfigWarningEvent(AutoSwitchEvent):
         return f"warning: {self.message}"
 
 
+@dataclass(frozen=True)
+class MaximizeDecisionEvent(AutoSwitchEvent):
+    """One ``maximize`` policy decision (cc-swap fork). Slot numbers only —
+    no emails. ``rows`` is ``maximize.report.decision_rows``; the human form
+    prints them as a table on dry runs."""
+
+    kind: ClassVar[str] = "maximize"
+    active: str | None
+    decision: str  # "switch" | "hold" | "indeterminate" | "exhausted"
+    trigger: str | None
+    reason: str
+    scores: dict[str, float] = field(default_factory=dict)
+    pending: bool = False
+    rows: list[dict] = field(default_factory=list)
+    dry_run: bool = False
+
+    def _fields(self) -> dict:
+        fields = {
+            "active": self.active,
+            "decision": self.decision,
+            "trigger": self.trigger,
+            "reason": self.reason,
+            "scores": self.scores,
+            "pending": self.pending,
+        }
+        if self.rows:
+            fields["accounts"] = self.rows
+        if self.dry_run:
+            fields["dryRun"] = True
+        return fields
+
+    def human(self) -> str:
+        head = f"maximize: {self.decision}"
+        if self.trigger:
+            head += f" ({self.trigger})"
+        who = f"Account-{self.active}" if self.active else "no active account"
+        line = f"{head} on {who}: {self.reason}"
+        if self.pending:
+            line += " [waiting for idle]"
+        if self.dry_run and self.rows:
+            from claude_swap.maximize.report import render_rows
+
+            return "\n".join([line, *render_rows(self.rows)])
+        return line
+
+
 # ---------------------------------------------------------------------------
 # Engine
 # ---------------------------------------------------------------------------
@@ -894,6 +940,25 @@ class AutoSwitchEngine:
             )
             return TickOutcome.ERROR
 
+    def _tick_maximize(
+        self,
+        current: str,
+        quarantined: set[str],
+        state: dict,
+        entries: dict,
+        usage: dict[str, dict | str | None],
+        headroom: dict[str, float | None],
+    ) -> TickOutcome | None:
+        """cc-swap: ``strategy == "maximize"`` decides in maximize/engine_hook.
+        ``None`` hands an unreadable active account back to the upstream
+        unknown-usage / failover path below."""
+        from claude_swap.maximize.engine_hook import run_maximize_tick
+
+        return run_maximize_tick(
+            self, entries, usage, headroom,
+            current=current, quarantined=quarantined, state=state,
+        )
+
     def _tick_inner(self) -> TickOutcome:
         self._sleep_until_ts = None
         self._blocked_wait_long = False
@@ -976,6 +1041,13 @@ class AutoSwitchEngine:
                 )
             )
             return TickOutcome.NO_ACTION
+
+        if settings.strategy == "maximize":
+            outcome = self._tick_maximize(
+                current, quarantined, state, entries, usage, headroom
+            )
+            if outcome is not None:
+                return outcome
 
         active_headroom = headroom.get(current)
         if active_headroom is not None:
