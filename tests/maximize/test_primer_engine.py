@@ -1,0 +1,241 @@
+"""The engine-facing Primer (Task 11, cycle B): verification, retries,
+failure table (spec §6.3), safety checks, state bookkeeping."""
+
+from __future__ import annotations
+
+import json
+import stat
+from pathlib import Path
+
+import pytest
+
+from claude_swap import oauth
+from claude_swap.autoswitch import ConfigWarningEvent, PrimeEvent
+from claude_swap.maximize import primer as primer_mod
+from claude_swap.maximize.model import Snapshot
+from claude_swap.maximize.primer import BUCKET_S, PrimeRunResult, Primer, expected_reset
+from claude_swap.settings import MaximizeSettings, PrimeSettings
+from tests.maximize.primer_support import H, Rig, StubRunner, needs_posix
+from tests.test_autoswitch import _iso_at
+
+
+@pytest.fixture
+def rig(temp_home, tmp_path, monkeypatch) -> Rig:
+    return Rig(temp_home, tmp_path, monkeypatch)
+
+
+class TestPrimer:
+    @needs_posix
+    def test_primes_cold_account_with_access_token_only(self, rig):
+        rig.fake.behave({"writeCredentials": True})
+        events = rig.primer().run_due(rig.snap(nums=("1", "2")))
+        assert events == []  # launched; verification comes later
+        [call] = rig.fake.calls()
+        profile = rig.switcher.backup_dir / "prime-profile"
+        env = call["env"]
+        assert env["CLAUDE_CODE_OAUTH_TOKEN"] == "sk-2"
+        assert env["CLAUDE_CONFIG_DIR"] == str(profile)
+        assert not any("rt-2" in v for v in env.values())
+        assert not any("rt-2" in a for a in call["argv"])
+        assert call["argv"][call["argv"].index("--model") + 1] == "claude-haiku-4-5"
+        assert call["stdinIsDevnull"] is True
+        assert stat.S_IMODE(profile.stat().st_mode) == 0o700
+        assert not (profile / ".credentials.json").exists()  # scrubbed after the run
+        entry = rig.primes()["b@example.com"]
+        assert entry["attempts"] == 1
+        assert entry["lastOutcome"] == "launched"
+        assert entry["lastAttemptAt"] == rig.clock()
+        assert entry["windowKey"] == "cold"
+
+    def test_scrubs_prime_profile_keychain_item_before_and_after(self, rig, monkeypatch):
+        scrubbed: list[Path] = []
+        monkeypatch.setattr(primer_mod, "delete_macos_keychain_entry", scrubbed.append)
+        rig.primer(runner=StubRunner(rig)).run_due(rig.snap())
+        profile = rig.switcher.backup_dir / "prime-profile"
+        assert scrubbed == [profile, profile]
+
+    def test_verification_success(self, rig):
+        runner = StubRunner(rig)
+        primer = rig.primer(runner=runner)
+        snap = rig.snap(nums=("1", "2"))  # the engine's view: still cold
+        primer.run_due(snap)
+        prime_at = rig.clock()
+        rig.clock.advance(31)
+        events = primer.run_due(snap)
+        assert [(e.account, e.outcome, e.resets_at) for e in events] == [
+            ("2", "primed", _iso_at(expected_reset(prime_at)))
+        ]
+        entry = rig.primes()["b@example.com"]
+        assert entry["lastOutcome"] == "primed"
+        assert entry["resetsAt"] == expected_reset(prime_at)
+        assert len(runner.calls) == 1  # the stale cold snapshot does not re-prime
+
+    def test_unverified_retries_once_then_gives_up(self, rig):
+        runner = StubRunner(rig, opens=False)
+        primer = rig.primer(runner=runner)
+        snap = rig.snap(nums=("1", "2"))
+        primer.run_due(snap)                       # attempt 1
+        rig.clock.advance(31)
+        events = primer.run_due(snap)              # verify: off → retry now (attempt 2)
+        assert [e.outcome for e in events] == ["unverified"]
+        assert runner.tokens() == ["sk-2", "sk-2"]
+        rig.clock.advance(31)
+        events = primer.run_due(snap)              # verify: off → attempts exhausted
+        assert [e.outcome for e in events] == ["unverified"]
+        assert len(runner.calls) == 2
+        assert rig.primes()["b@example.com"]["attempts"] == 2
+
+    def test_timeout_is_verified_before_any_retry(self, rig):
+        runner = StubRunner(rig, [PrimeRunResult(None, True, "", "")], opens=False)
+        primer = rig.primer(runner=runner)
+        snap = rig.snap(nums=("1", "2"))
+        events = primer.run_due(snap)
+        assert [e.outcome for e in events] == ["timeout"]
+        rig.clock.advance(10)
+        assert primer.run_due(snap) == []          # still inside the verify delay
+        assert len(runner.calls) == 1
+        rig.usage.reading("2", reset5=expected_reset(rig.clock() - 10))  # it did land
+        rig.clock.advance(25)
+        events = primer.run_due(snap)
+        assert [e.outcome for e in events] == ["primed"]
+        assert len(runner.calls) == 1
+
+    def test_precheck_skips_window_opened_elsewhere(self, rig):
+        runner = StubRunner(rig)
+        snap = Snapshot(  # the engine still believes slot 2 is cold
+            now=rig.clock(), active="1",
+            accounts=(rig.view("1"), rig.view("2")),
+            samples=(), last_switch_at=None, settings=MaximizeSettings(),
+        )
+        opened = rig.clock() + 4 * H
+        rig.usage.reading("2", reset5=opened)  # another machine primed it meanwhile
+        events = rig.primer(runner=runner).run_due(snap)
+        assert [(e.outcome, e.resets_at) for e in events] == [("already-on", _iso_at(opened))]
+        assert runner.calls == []
+        entry = rig.primes()["b@example.com"]
+        assert (entry["lastOutcome"], entry["resetsAt"]) == ("already-on", opened)
+
+    def test_auth_failure_refreshes_token_next_tick(self, rig, monkeypatch):
+        rejected = PrimeRunResult(1, False, "", '{"is_error":true,"result":"Invalid API key · Please run /login"}', True)
+        runner = StubRunner(rig, [rejected], opens=False)
+        refreshed = json.dumps({"claudeAiOauth": {"accessToken": "sk-2b", "refreshToken": "rt-2b"}})
+        grants: list[str] = []
+
+        def consume(num, email, snapshot):
+            grants.append(num)
+            return oauth.RefreshOutcome(refreshed, None)
+
+        monkeypatch.setattr(rig.switcher, "consume_backup_grant", consume)
+        primer = rig.primer(runner=runner)
+        snap = rig.snap(nums=("1", "2"))
+        events = primer.run_due(snap)
+        assert [(e.outcome, e.detail) for e in events] == [
+            ("failed", "token rejected (401); refreshing it next tick")
+        ]
+        primer.run_due(snap)
+        assert grants == ["2"]
+        assert runner.tokens() == ["sk-2", "sk-2b"]
+        assert not any("rt-2b" in v for v in runner.calls[1]["env"].values())
+
+    def test_invalid_grant_quarantines_without_launching(self, rig, monkeypatch):
+        monkeypatch.setattr(rig.engine, "_freshen_target", lambda num, email: "invalid_grant")
+        runner = StubRunner(rig)
+        events = rig.primer(runner=runner).run_due(rig.snap(nums=("1", "2")))
+        assert [(e.outcome, e.detail) for e in events] == [("failed", "invalid_grant")]
+        assert runner.calls == []
+        assert "2" in rig.harness.state()["quarantine"]
+        assert "account-quarantined" in rig.harness.kinds()
+
+    def test_rate_limit_waits_for_weekly_reset(self, rig):
+        limited = PrimeRunResult(1, False, "API Error: 429 rate_limit_error", "", True)
+        runner = StubRunner(rig, [limited])
+        primer = rig.primer(runner=runner)
+        rig.usage.reading("2", reset7=rig.clock() + 2 * H)
+        snap = rig.snap(nums=("1", "2"))
+        events = primer.run_due(snap)
+        assert [e.outcome for e in events] == ["failed"]
+        rig.clock.advance(H)
+        assert primer.run_due(snap) == []
+        assert len(runner.calls) == 1
+
+    def test_model_404_retries_once_with_alias(self, rig):
+        missing = PrimeRunResult(1, False, 'API Error: 404 {"error":{"type":"not_found_error"}}', "", True)
+        runner = StubRunner(rig, [missing])
+        events = rig.primer(runner=runner).run_due(rig.snap(nums=("1", "2")))
+        assert events == []
+        models = [c["argv"][c["argv"].index("--model") + 1] for c in runner.calls]
+        assert models == ["claude-haiku-4-5", "haiku"]
+        assert rig.primes()["b@example.com"]["attempts"] == 1
+
+    def test_missing_claude_disables_once(self, rig, tmp_path):
+        primer = rig.primer(claude_path=str(tmp_path / "missing" / "claude"))
+        first = primer.run_due(rig.snap())
+        assert [type(e) for e in first] == [ConfigWarningEvent, PrimeEvent]
+        assert first[1].outcome == "disabled"
+        assert primer.run_due(rig.snap()) == []  # warned once per Primer
+
+    def test_events_are_returned_not_emitted(self, rig):
+        runner = StubRunner(rig)
+        primer = rig.primer(runner=runner)
+        primer.run_due(rig.snap(nums=("1", "2")))
+        rig.clock.advance(31)
+        events = primer.run_due(rig.snap(nums=("1", "2")))
+        assert [e.outcome for e in events] == ["primed"]
+        assert not any(isinstance(e, PrimeEvent) for e in rig.harness.events)
+
+    def test_live_session_is_skipped_and_rechecked_later(self, rig, monkeypatch):
+        monkeypatch.setattr(
+            rig.switcher, "live_session_pids_for",
+            lambda num, email: [4242] if num == "2" else [],
+        )
+        runner = StubRunner(rig)
+        primer = rig.primer(runner=runner)
+        snap = rig.snap(nums=("1", "2"))
+        events = primer.run_due(snap)
+        assert [e.outcome for e in events] == ["skipped-live"]
+        assert primer.run_due(snap) == []  # no event spam on the next tick
+        assert runner.calls == []
+
+    def test_never_primes_the_account_that_just_became_active(self, rig):
+        rig.harness.make_live("b@example.com", 2)  # a switch landed this tick
+        runner = StubRunner(rig)
+        rig.primer(runner=runner).run_due(rig.snap(active="1", nums=("1", "2")))
+        assert runner.calls == []
+
+    def test_one_launch_per_tick(self, rig):
+        runner = StubRunner(rig)
+        primer = rig.primer(runner=runner)
+        primer.run_due(rig.snap())
+        assert len(runner.calls) == 1
+        primer.run_due(rig.snap())
+        assert sorted(runner.tokens()) == ["sk-2", "sk-3"]
+
+    def test_dry_run_engine_never_primes(self, rig):
+        runner = StubRunner(rig)
+        dry = Primer(
+            rig.harness._make_engine(dry_run=True),
+            PrimeSettings(enabled=True, claude_path=str(rig.fake.path)),
+            runner=runner, clock=rig.clock,
+        )
+        assert dry.run_due(rig.snap()) == []
+        assert runner.calls == []
+        assert rig.primes() == {}
+
+    def test_concurrent_claim_prevents_double_launch(self, rig):
+        def other_process_launches(num):
+            if num == "2":
+                rig.engine._mutate_state(lambda s: s.setdefault("primes", {}).update({
+                    "b@example.com": {"windowKey": "cold", "attempts": 1,
+                                      "lastAttemptAt": rig.clock() - 1, "lastOutcome": "launched"},
+                }))
+
+        rig.usage.on_fetch = other_process_launches
+        runner = StubRunner(rig)
+        rig.primer(runner=runner).run_due(rig.snap(nums=("1", "2")))
+        assert runner.calls == []
+
+    def test_no_launch_in_the_last_seconds_of_a_bucket(self, rig):
+        rig.clock.now = (rig.clock.now // BUCKET_S + 1) * BUCKET_S - 5
+        runner = StubRunner(rig)
+        rig.primer(runner=runner).run_due(rig.snap())
+        assert runner.calls == []

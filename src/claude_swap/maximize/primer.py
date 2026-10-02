@@ -461,3 +461,438 @@ def run_prime(
         mask_secrets(out, secret),
         _parse_is_error(out),
     )
+
+
+PRECHECK_MAX_AGE_S = 60.0      # the pre-launch reading must be at most this old
+BOUNDARY_GUARD_S = 15.0        # never launch in a bucket's last seconds
+TOKEN_MIN_LIFETIME_S = 120.0   # an access token must outlive the run by this much
+Runner = Callable[[Sequence[str], Mapping[str, str], Path, float], PrimeRunResult]
+
+
+def request_fetch(switcher, number: str, at: float) -> None:
+    """Make ``number`` poll-due at ``at`` so the next collect fetches it even
+    inside the store's serve TTL. Only ever pulls a plan earlier; the store
+    still enforces backoff, claims and holds. Best-effort."""
+    try:
+        ident = switcher.account_identity(number)
+        identities = {number: (ident["email"], ident["organizationUuid"])}
+        store = switcher._usage_store
+        entry = store.entries(identities).get(number)
+        if entry is not None and entry.next_poll_at is not None and entry.next_poll_at <= at:
+            return
+        interval = entry.poll_interval_s if entry is not None else None
+        store.set_poll_plan({number: (at, interval)}, identities)
+    except Exception:
+        _logger.debug("prime: could not pull account %s's poll plan", number, exc_info=True)
+
+
+def _five_hour(usage: Mapping) -> tuple[float | None, str | None]:
+    window = usage.get("five_hour")
+    raw = window.get("resets_at") if isinstance(window, dict) else None
+    return parse_reset_ts(raw), raw
+
+
+def _seven_day_pct(usage: Mapping) -> float | None:
+    window = usage.get("seven_day")
+    return _num(window.get("pct")) if isinstance(window, dict) else None
+
+
+class Primer:
+    """Engine-facing primer: verifies earlier launches, then launches at most
+    one due target per call.
+
+    Events are RETURNED, not emitted: the engine's primer slot (Task 8,
+    ``engine_hook._run_primer``) emits what ``run_due`` returns, and the CLI
+    prints what ``prime_now`` returns. The one exception is upstream's
+    ``engine._quarantine``, which emits its own ``QuarantineEvent``.
+    The engine builds a new Primer whenever ``prime.*`` changes."""
+
+    def __init__(
+        self,
+        engine,
+        settings: PrimeSettings,
+        *,
+        runner: Runner = run_prime,
+        rng: random.Random | None = None,
+        clock: Callable[[], float] = time.time,
+    ):
+        self.engine = engine
+        self.settings = settings
+        self._runner = runner
+        self._rng = rng if rng is not None else random.Random()
+        self._clock = clock
+        self._disabled: str | None = None
+
+    @property
+    def profile_dir(self) -> Path:
+        return self.engine.switcher.backup_dir / PROFILE_DIRNAME
+
+    # -- entry points ---------------------------------------------------------
+
+    def run_due(self, snap: Snapshot) -> list[AutoSwitchEvent]:
+        if not self.settings.enabled or self.engine.dry_run:
+            return []
+        claude, events = self._claude_or_disable()
+        if claude is None:
+            return events
+        events.extend(self._verify_pending(snap))
+        now = self._clock()
+        if BUCKET_S - (now % BUCKET_S) < BOUNDARY_GUARD_S:
+            return events  # a launch now could land in the next bucket
+        state = self._prime_state()
+        for target in due_targets(snap, state, self.settings, now, self._rng):
+            if target.due_at > now:
+                break
+            new_events, launched = self._attempt(target, state.get(target.email), claude)
+            events.extend(new_events)
+            if launched:
+                break  # one launch per tick bounds how long a tick can block
+        return events
+
+    def prime_now(
+        self,
+        snap: Snapshot,
+        numbers: set[str] | None = None,
+        *,
+        sleep: Callable[[float], None] = time.sleep,
+    ) -> list[AutoSwitchEvent]:
+        """Manual priming (``cc-swap prime``): every eligible target now, no
+        jitter, then one verification pass. Same safety checks as ``run_due``;
+        ignores ``prime.enabled``."""
+        claude, events = self._claude_or_disable()
+        if claude is None:
+            return events
+        events.extend(self._verify_pending(snap))
+        now = self._clock()
+        state = self._prime_state()
+        launched = False
+        for target in due_targets(snap, state, self.settings, now, self._rng):
+            if numbers is not None and target.number not in numbers:
+                continue
+            new_events, did = self._attempt(target, state.get(target.email), claude)
+            events.extend(new_events)
+            launched = launched or did
+        if launched:
+            sleep(VERIFY_DELAY_S + 5.0)
+            events.extend(self._verify_pending(snap))
+        return events
+
+    def plan_lines(self, snap: Snapshot, numbers: set[str] | None = None) -> list[str]:
+        """``cc-swap prime --dry-run`` rows: slot numbers and reasons, no emails."""
+        now = self._clock()
+        state = self._prime_state()
+        lines: list[str] = []
+        for view in sorted(snap.accounts, key=lambda v: _slot_order(v.number)):
+            if numbers is not None and view.number not in numbers:
+                continue
+            raw = state.get(view.email)
+            entry = raw if isinstance(raw, Mapping) else None
+            reason = skip_reason(view, snap.active, entry, now, self.settings.max_attempts)
+            if reason is None and self.engine.switcher.live_session_pids_for(view.number, view.email):
+                reason = "live-session"
+            if reason is not None:
+                lines.append(f"#{view.number}  skip ({reason})")
+                continue
+            key = window_key(view, entry, now)
+            attempt = attempts_used(entry, key, now) + 1
+            lines.append(
+                f"#{view.number}  would prime now "
+                f"(window {key}, attempt {attempt}/{self.settings.max_attempts})"
+            )
+        return lines
+
+    def pending_accounts(self, snap: Snapshot) -> list[str]:
+        state = self._prime_state()
+        return [
+            view.number
+            for view in snap.accounts
+            if isinstance(state.get(view.email), Mapping)
+            and state[view.email].get("lastOutcome") in PENDING_OUTCOMES
+        ]
+
+    # -- steps ----------------------------------------------------------------
+
+    def _claude_or_disable(self) -> tuple[str | None, list[AutoSwitchEvent]]:
+        """The ``claude`` path, or — once per Primer — the disable events."""
+        if self._disabled is not None:
+            return None, []
+        claude = resolve_claude_path(self.settings.claude_path)
+        if claude is not None:
+            return claude, []
+        self._disabled = "claude executable not found"
+        warning = ConfigWarningEvent(
+            message=(
+                "prime: no `claude` executable at prime.claudePath or "
+                "~/.local/bin/claude — priming is off until prime.claudePath "
+                "changes or the engine restarts"
+            )
+        )
+        return None, [warning, PrimeEvent("", "disabled", None, self._disabled)]
+
+    def _verify_pending(self, snap: Snapshot) -> list[PrimeEvent]:
+        events: list[PrimeEvent] = []
+        now = self._clock()
+        by_email = {view.email: view for view in snap.accounts}
+        for email, entry in self._prime_state().items():
+            if not isinstance(entry, Mapping):
+                continue
+            pending = entry.get("lastOutcome")
+            prime_at = _num(entry.get("lastAttemptAt"))
+            view = by_email.get(email)
+            if (
+                pending not in PENDING_OUTCOMES
+                or view is None
+                or prime_at is None
+                or now < prime_at + VERIFY_DELAY_S
+            ):
+                continue
+            usage = self._fresh_usage(view.number, since=prime_at + VERIFY_DELAY_S)
+            if usage is None:
+                continue  # no post-launch reading yet; a later tick verifies
+            reset, raw = _five_hour(usage)
+            on = reset is not None and reset > now
+            if verified(prime_at, reset):
+                outcome, stored, detail = "primed", "primed", ""
+            elif on:
+                outcome, stored, detail = "already-on", "already-on", "window open, but not at this prime's reset"
+            else:
+                outcome = "failed" if pending == "exit-error" else "unverified"
+                stored = "unverified"
+                detail = "window still off" + (" after a timeout" if pending == "timeout" else "")
+            if on:
+                self._record(email, lastOutcome=stored, resetsAt=reset)
+            else:
+                self._record(email, lastOutcome=stored)
+            events.append(PrimeEvent(view.number, outcome, raw if on else None, detail))
+        return events
+
+    def _attempt(
+        self, target: PrimeTarget, entry: Mapping | None, claude: str
+    ) -> tuple[list[PrimeEvent], bool]:
+        switcher = self.engine.switcher
+        num, email = target.number, target.email
+        now = self._clock()
+        if switcher.current_account_number() == num:
+            return [], False  # became active this tick; never prime the active login
+        if switcher.live_session_pids_for(num, email):
+            return self._skip_live(target, entry, now), False
+        usage = self._fresh_usage(num, since=now - PRECHECK_MAX_AGE_S)
+        if usage is None:
+            _logger.info("prime: account %s has no fresh usage reading; retrying next tick", num)
+            return [], False
+        reset, raw = _five_hour(usage)
+        if reset is not None and reset > now:
+            self._mark(target, entry, now, "already-on", resetsAt=reset)
+            return [PrimeEvent(num, "already-on", raw, "window opened elsewhere")], False
+        pct7 = _seven_day_pct(usage)
+        if pct7 is not None and pct7 >= 100.0:
+            self._mark(target, entry, now, "rate-limited")
+            return [PrimeEvent(num, "failed", None, "7d window exhausted")], False
+        force = (
+            isinstance(entry, Mapping)
+            and entry.get("lastOutcome") == "auth-failed"
+            and entry.get("windowKey") == target.window_key
+        )
+        token, status = self._access_token(num, email, force_refresh=force)
+        if status in ("invalid_grant", "identity-conflict"):
+            self.engine._quarantine(num, email, status)
+            self._mark(target, entry, now, status)
+            return [PrimeEvent(num, "failed", None, status)], False
+        if status == "skip-live-session":
+            return self._skip_live(target, entry, now), False
+        if token is None:
+            _logger.info("prime: account %s token not ready (%s); retrying next tick", num, status)
+            return [], False
+        attempts = attempts_used(entry, target.window_key, now) + 1
+        if not self._claim(email, target.window_key, attempts, now, entry):
+            _logger.info("prime: account %s was claimed by another cc-swap process", num)
+            return [], False
+        return self._launch(target, claude, token), True
+
+    def _access_token(
+        self, num: str, email: str, *, force_refresh: bool
+    ) -> tuple[str | None, str]:
+        """The slot's current access token, freshened through upstream's
+        consume gate when it expires within 10 minutes (``_freshen_target``)
+        or when the last launch was rejected with 401 (``force_refresh``).
+        Only the access token leaves this method."""
+        status = self.engine._freshen_target(num, email)
+        if status != "ok":
+            return None, status
+        switcher = self.engine.switcher
+        creds = switcher.read_account_credentials(num, email)
+        if force_refresh and creds:
+            outcome = switcher.consume_backup_grant(num, email, creds)
+            if outcome.error in ("invalid_grant", "no_refresh_token"):
+                return None, "invalid_grant"
+            if outcome.error is not None or not outcome.credentials:
+                return None, outcome.error or "transient"
+            creds = outcome.credentials
+        data = oauth.extract_oauth_data(creds) if creds else None
+        token = data.get("accessToken") if data else None
+        expires = _num(data.get("expiresAt")) if data else None
+        if not isinstance(token, str) or not token:
+            return None, "transient"
+        if expires is not None and expires <= (self._clock() + TOKEN_MIN_LIFETIME_S) * 1000:
+            return None, "transient"
+        return token, "ok"
+
+    def _launch(self, target: PrimeTarget, claude: str, token: str) -> list[PrimeEvent]:
+        profile = self._prepare_profile()
+        env = build_prime_env(os.environ, profile, token)
+        result = self._runner(
+            build_prime_argv(claude, self.settings.model), env, profile, PRIME_TIMEOUT_S
+        )
+        if (
+            not result.timed_out
+            and result.returncode not in (0, None)
+            and classify_failure(result) == "model-not-found"
+            and self.settings.model != FALLBACK_MODEL
+        ):
+            _logger.warning(
+                "prime: model %s not found; retrying account %s with %s",
+                self.settings.model, target.number, FALLBACK_MODEL,
+            )
+            result = self._runner(
+                build_prime_argv(claude, FALLBACK_MODEL), env, profile, PRIME_TIMEOUT_S
+            )
+        self._scrub_profile(profile)
+        return self._settle(target, result)
+
+    def _settle(self, target: PrimeTarget, result: PrimeRunResult) -> list[PrimeEvent]:
+        num, email = target.number, target.email
+        if result.timed_out:
+            self._record(email, lastOutcome="timeout")
+            return [PrimeEvent(
+                num, "timeout", None,
+                f"no answer in {PRIME_TIMEOUT_S:.0f}s; verifying before any retry",
+            )]
+        if result.returncode is None:
+            self._record(email, lastOutcome="spawn-failed")
+            return [PrimeEvent(
+                num, "failed", None, "could not start claude: " + result.stderr_tail[-200:]
+            )]
+        if result.returncode == 0 and result.is_error is not True:
+            _logger.info("prime: account %s request sent; verifying after %.0fs", num, VERIFY_DELAY_S)
+            return []  # stays "launched" until a later reading verifies it
+        kind = classify_failure(result)
+        if kind == "auth":
+            self._record(email, lastOutcome="auth-failed")
+            detail = "token rejected (401); refreshing it next tick"
+        elif kind == "rate-limited":
+            self._record(email, lastOutcome="rate-limited")
+            detail = "rate limited; skipping until the 7d reset"
+        elif kind == "model-not-found":
+            self._record(email, lastOutcome="model-not-found")
+            detail = f"model {self.settings.model} not found (also tried {FALLBACK_MODEL})"
+        else:
+            # The request may still have reached the API: verify like a timeout.
+            self._record(email, lastOutcome="exit-error")
+            _logger.warning(
+                "prime: account %s claude exited %s: %s",
+                num, result.returncode, result.stderr_tail[-200:],
+            )
+            return []
+        return [PrimeEvent(num, "failed", None, detail)]
+
+    # -- helpers --------------------------------------------------------------
+
+    def _fresh_usage(self, number: str, *, since: float) -> dict | None:
+        """A usage reading for ``number`` fetched at or after ``since``."""
+        switcher = self.engine.switcher
+        entry = switcher.usage_entries_by_account(fetch=set()).get(number)
+        if entry is None or entry.fetched_at is None or entry.fetched_at < since:
+            request_fetch(switcher, number, self._clock())
+            entry = switcher.usage_entries_by_account(fetch={number}).get(number)
+        if entry is None or entry.fetched_at is None or entry.fetched_at < since:
+            return None
+        value = entry.decision_value()
+        return value if isinstance(value, dict) else None
+
+    def _skip_live(
+        self, target: PrimeTarget, entry: Mapping | None, now: float
+    ) -> list[PrimeEvent]:
+        self._mark(target, entry, now, "skipped-live")
+        return [PrimeEvent(
+            target.number, "skipped-live", None, "a cswap run session owns this account"
+        )]
+
+    def _prepare_profile(self) -> Path:
+        profile = self.profile_dir
+        profile.mkdir(mode=0o700, parents=True, exist_ok=True)
+        if os.name == "posix":
+            os.chmod(profile, 0o700)
+        self._scrub_profile(profile)
+        return profile
+
+    def _scrub_profile(self, profile: Path) -> None:
+        """Drop any credential the child left behind: the hashed Keychain item
+        (macOS) and a plaintext ``.credentials.json``. Run before and after."""
+        delete_macos_keychain_entry(profile)
+        try:
+            (profile / ".credentials.json").unlink(missing_ok=True)
+        except OSError:
+            _logger.warning("prime: could not remove the prime profile's .credentials.json")
+
+    def _prime_state(self) -> dict:
+        primes = self.engine._read_state().get("primes")
+        return primes if isinstance(primes, dict) else {}
+
+    def _record(self, email: str, **fields) -> None:
+        def mutate(state: dict) -> None:
+            primes = state.get("primes")
+            if not isinstance(primes, dict):
+                primes = state["primes"] = {}
+            entry = primes.get(email)
+            if not isinstance(entry, dict):
+                entry = primes[email] = {}
+            entry.update(fields)
+
+        self.engine._mutate_state(mutate)
+
+    def _mark(
+        self,
+        target: PrimeTarget,
+        entry: Mapping | None,
+        now: float,
+        outcome: str,
+        **extra,
+    ) -> None:
+        """Record a non-launch outcome without disturbing the attempt count."""
+        self._record(
+            target.email,
+            windowKey=target.window_key,
+            attempts=attempts_used(entry, target.window_key, now),
+            lastAttemptAt=now,
+            lastOutcome=outcome,
+            **extra,
+        )
+
+    def _claim(
+        self, email: str, key: str, attempts: int, now: float, seen: Mapping | None
+    ) -> bool:
+        """Record the attempt before launching, under the state lock, and only
+        if nobody else recorded one since we read the state (double-spend
+        guard against a concurrent ``cc-swap prime`` or second engine)."""
+        seen_at = _num(seen.get("lastAttemptAt")) if isinstance(seen, Mapping) else None
+        won = False
+
+        def mutate(state: dict) -> None:
+            nonlocal won
+            primes = state.get("primes")
+            if not isinstance(primes, dict):
+                primes = state["primes"] = {}
+            current = primes.get(email)
+            current_at = _num(current.get("lastAttemptAt")) if isinstance(current, dict) else None
+            if current_at != seen_at:
+                return
+            primes[email] = {
+                "windowKey": key,
+                "attempts": attempts,
+                "lastAttemptAt": now,
+                "lastOutcome": "launched",
+            }
+            won = True
+
+        self.engine._mutate_state(mutate)
+        return won
