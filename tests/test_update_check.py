@@ -298,6 +298,13 @@ def _capture_requests(monkeypatch) -> list[urllib.request.Request]:
     return seen
 
 
+def _full_lookup() -> str | None:
+    """The lookup ``upgrade`` and ``upgrade --check`` make (every token
+    source, an anonymous retry after a refused token); the passive notice
+    makes a lighter one (``_fetch_latest_tag``, TestThePassiveNoticeStaysFast)."""
+    return uc._pick_latest_tag(uc._fetch_releases(uc.UPGRADE_LOOKUP_TIMEOUT))
+
+
 def _stage_gh(monkeypatch, *, stdout="gho_FROMGH\n", returncode=0, raises=None) -> list:
     """Put a fake `gh` on PATH. Returns the ``(argv, kwargs)`` of each run."""
     calls: list = []
@@ -355,7 +362,7 @@ class TestGitHubAuthentication:
         calls = _stage_gh(monkeypatch)
         seen = _capture_requests(monkeypatch)
 
-        uc._fetch_latest_tag()
+        _full_lookup()
 
         assert seen[0].get_header("Authorization") == "Bearer gho_FROMGH"
         argv, kwargs = calls[0]
@@ -392,19 +399,20 @@ class TestGitHubAuthentication:
         ids=["not-logged-in", "blank", "malformed", "timeout", "oserror"],
     )
     def test_a_gh_that_cannot_help_means_anonymous(self, monkeypatch, staging):
-        _stage_gh(monkeypatch, **staging)
+        calls = _stage_gh(monkeypatch, **staging)
         seen = _capture_requests(monkeypatch)
 
-        assert uc._fetch_latest_tag() == "cc-v0.4.0"
+        assert _full_lookup() == "cc-v0.4.0"
 
+        assert len(calls) == 1
         assert seen[0].get_header("Authorization") is None
 
     def test_gh_is_asked_once_per_process(self, monkeypatch):
         calls = _stage_gh(monkeypatch)
         _capture_requests(monkeypatch)
 
-        uc._fetch_latest_tag()
-        uc._fetch_latest_tag()
+        _full_lookup()
+        _full_lookup()
         uc._get_json(f"{uc._API_URL}/compare/a...b", 2)
 
         assert len(calls) == 1
@@ -446,7 +454,7 @@ class TestGitHubAuthentication:
 
         monkeypatch.setattr("claude_swap.update_check.urllib.request.urlopen", _urlopen)
 
-        assert uc._fetch_latest_tag() == "cc-v0.4.0"
+        assert _full_lookup() == "cc-v0.4.0"
         assert [r.get_header("Authorization") for r in seen] == ["Bearer ghp_stale", None]
 
     def test_a_forbidden_token_falls_back_to_an_anonymous_request(self, monkeypatch):
@@ -462,7 +470,7 @@ class TestGitHubAuthentication:
 
         monkeypatch.setattr("claude_swap.update_check.urllib.request.urlopen", _urlopen)
 
-        assert uc._fetch_latest_tag() == "cc-v0.4.0"
+        assert _full_lookup() == "cc-v0.4.0"
         assert len(seen) == 2
 
     def test_a_spent_token_quota_is_reported_not_retried_anonymously(self, monkeypatch):
@@ -515,6 +523,77 @@ class TestGitHubAuthentication:
 
         captured = capsys.readouterr()
         assert captured.out == "" and captured.err == ""
+
+
+class TestThePassiveNoticeStaysFast:
+    """The update notice runs before ordinary commands, so it must stay
+    cheap: one request with its 2 s timeout. Review of rel/0.4.0: with `gh
+    auth token` (3 s) and an anonymous retry after a refused token (2 s
+    more) it could take ~7 s. It uses an environment token only and never
+    retries; `upgrade` and `upgrade --check` keep the full lookup."""
+
+    def _timeouts(self, monkeypatch, answer=None) -> list:
+        """Record each request's (Authorization, timeout); answer a 0.4.0
+        release, or raise ``answer``."""
+        seen: list = []
+
+        def _urlopen(req, timeout=None):
+            seen.append((req.get_header("Authorization"), timeout))
+            if answer is not None:
+                raise answer
+            return _make_release_response("0.4.0")
+
+        monkeypatch.setattr("claude_swap.update_check.urllib.request.urlopen", _urlopen)
+        return seen
+
+    def test_it_never_asks_the_gh_cli(self, monkeypatch):
+        calls = _stage_gh(monkeypatch)
+        seen = self._timeouts(monkeypatch)
+
+        result = check_for_update("0.3.2")
+
+        assert result is not None and "0.4.0" in result
+        assert calls == []
+        assert seen == [(None, 2)]
+
+    def test_it_uses_an_environment_token(self, monkeypatch):
+        monkeypatch.setenv("GH_TOKEN", "ghp_env")
+        calls = _stage_gh(monkeypatch)
+        seen = self._timeouts(monkeypatch)
+
+        check_for_update("0.3.2")
+
+        assert calls == [] and seen == [("Bearer ghp_env", 2)]
+
+    @pytest.mark.parametrize("code", [401, 403])
+    def test_a_refused_token_is_not_retried_anonymously(self, monkeypatch, capsys, code):
+        monkeypatch.setenv("GITHUB_TOKEN", "ghp_stale")
+        seen = self._timeouts(monkeypatch, _http_error(code))
+
+        assert check_for_update("0.3.2") is None
+
+        assert seen == [("Bearer ghp_stale", 2)]  # one request, never a second
+        assert json.loads(_cache_path().read_text())["data"] is None  # not asked again soon
+        captured = capsys.readouterr()
+        assert captured.out == "" and captured.err == ""
+
+    def test_upgrade_and_check_still_ask_gh_and_retry(self, monkeypatch, capsys):
+        calls = _stage_gh(monkeypatch)
+        seen: list = []
+
+        def _urlopen(req, timeout=None):
+            seen.append(req.get_header("Authorization"))
+            if req.get_header("Authorization"):
+                raise _http_error(401)
+            return _make_release_response("0.4.0")
+
+        monkeypatch.setattr("claude_swap.update_check.urllib.request.urlopen", _urlopen)
+
+        latest = uc._latest_tag_for_upgrade()
+
+        assert latest.tag == "cc-v0.4.0" and latest.failure is None
+        assert len(calls) == 1
+        assert seen == ["Bearer gho_FROMGH", None]
 
 
 class TestWhyTheLookupFailed:

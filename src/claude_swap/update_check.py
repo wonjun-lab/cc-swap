@@ -272,17 +272,28 @@ def _gh_cli_token() -> str | None:
     return token if _TOKEN_RE.fullmatch(token) else None
 
 
-def _github_token() -> str | None:
-    """The token to authenticate API calls with, or None to go anonymous.
-
-    ``$GITHUB_TOKEN``, then ``$GH_TOKEN``, then ``gh auth token``. The value
-    only ever travels in the ``Authorization`` header: it is never printed,
-    logged or cached, and not included in any error text.
-    """
+def _env_token() -> str | None:
+    """``$GITHUB_TOKEN``, then ``$GH_TOKEN``; None when neither holds a token."""
     for name in _TOKEN_ENV_VARS:
         value = os.environ.get(name, "").strip()
         if _TOKEN_RE.fullmatch(value):
             return value
+    return None
+
+
+def _github_token(*, passive: bool = False) -> str | None:
+    """The token to authenticate API calls with, or None to go anonymous.
+
+    ``$GITHUB_TOKEN``, then ``$GH_TOKEN``, then ``gh auth token`` — except
+    for the ``passive`` update notice, which takes an environment token or
+    none: it runs before ordinary commands and must not wait up to
+    :data:`_GH_TOKEN_TIMEOUT` seconds on ``gh``. The value only ever travels
+    in the ``Authorization`` header: it is never printed, logged or cached,
+    and not included in any error text.
+    """
+    token = _env_token()
+    if token is not None or passive:
+        return token
     return _gh_cli_token()
 
 
@@ -351,10 +362,14 @@ def _request_json(url: str, timeout: float, token: str | None) -> object:
         raise _LookupFailed("unexpected response") from None
 
 
-def _fetch_json(url: str, timeout: float) -> object:
+def _fetch_json(url: str, timeout: float, *, passive: bool = False) -> object:
     """GET ``url`` from the GitHub API, authenticated when a token is
-    available. Raises :class:`_LookupFailed` (with the reason) on any failure."""
-    token = _github_token()
+    available. Raises :class:`_LookupFailed` (with the reason) on any failure.
+
+    ``passive`` (the update notice) makes exactly one request of at most
+    ``timeout`` seconds: an environment token only (:func:`_github_token`)
+    and no anonymous retry after a refused one."""
+    token = _github_token(passive=passive)
     try:
         return _request_json(url, timeout, token)
     except _LookupFailed as exc:
@@ -362,7 +377,7 @@ def _fetch_json(url: str, timeout: float) -> object:
         # must not break a lookup that works anonymously. A spent quota is
         # not a refusal: asking again without the token would only trade the
         # token's quota for the anonymous one, and lose the reason.
-        if token is None or exc.status not in (401, 403) or exc.rate_limited:
+        if passive or token is None or exc.status not in (401, 403) or exc.rate_limited:
             raise
     return _request_json(url, timeout, None)
 
@@ -410,17 +425,20 @@ def _pick_latest_tag(data: object) -> str | None:
     return releases[0][1] if releases else None
 
 
-def _fetch_releases(timeout: float) -> list:
+def _fetch_releases(timeout: float, *, passive: bool = False) -> list:
     """The fork's releases-list payload. Raises :class:`_LookupFailed` when
-    GitHub does not answer with a list."""
-    data = _fetch_json(RELEASES_URL, timeout)
+    GitHub does not answer with a list. ``passive``: see :func:`_fetch_json`."""
+    data = _fetch_json(RELEASES_URL, timeout, passive=passive)
     if not isinstance(data, list):
         raise _LookupFailed("unexpected response")
     return data
 
 
 def _fetch_latest_tag(timeout: float = 2) -> str | None:
-    """The fork's latest published release tag, as published (``cc-v0.4.0``).
+    """The fork's latest published release tag, as published (``cc-v0.4.0``),
+    for the passive update notice: one request of at most ``timeout``
+    seconds, with an environment token if one is set — never ``gh auth
+    token`` and never a second, anonymous try (see :func:`_fetch_json`).
 
     None on any failure. That includes HTTP 404 and an empty list, which is
     what GitHub answers while the fork has no published (non-draft,
@@ -429,7 +447,7 @@ def _fetch_latest_tag(timeout: float = 2) -> str | None:
     does tell the two apart; see :func:`_latest_tag_for_upgrade`.)
     """
     try:
-        return _pick_latest_tag(_fetch_releases(timeout))
+        return _pick_latest_tag(_fetch_releases(timeout, passive=True))
     except _LookupFailed:
         return None
 
