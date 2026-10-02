@@ -83,6 +83,7 @@ _FORK_COMMANDS: dict[str, str] = {
     "doctor": "_doctor_command",
     "init": "_init_command",
     "why": "_why_command",
+    "history": "_history_command",
 }
 
 
@@ -615,6 +616,12 @@ def _auto_command(argv: list[str]) -> None:
     """
     import signal
     import time as _time
+
+    if argv and argv[0] in ("on", "off", "status"):  # cc-swap: persistent auto on/off
+        from claude_swap.maximize.pause import auto_command
+
+        auto_command(argv)
+        return
 
     parser = argparse.ArgumentParser(
         prog="cswap auto",
@@ -1165,6 +1172,13 @@ def _why_command(argv: list[str]) -> None:
     why_command(argv)
 
 
+def _history_command(argv: list[str]) -> None:
+    """Handle `cc-swap history` (maximize/history_cli.py), imported lazily."""
+    from claude_swap.maximize.history_cli import history_command
+
+    history_command(argv)
+
+
 def _use_native_tls() -> None:
     """Route TLS trust decisions through the OS-native verifier.
 
@@ -1375,6 +1389,12 @@ def main() -> None:
         printer.set_theme(name)
     except Exception:
         pass  # theme is cosmetic; never block the CLI on it
+    try:  # cc-swap: record every switch this process makes (maximize/ledger.py)
+        from claude_swap.maximize import ledger
+
+        ledger.install(source=ledger.process_source(argv))
+    except Exception:
+        pass
 
     # `run` and `auto` keep their dedicated pre-dispatch parsers.
     if argv and argv[0] == "run":
@@ -1466,10 +1486,13 @@ cc-swap:
   %(prog)s last-resort add|remove <a> use an account only as a last resort
   %(prog)s last-resort list           list last-resort accounts
   %(prog)s prime [N ...] [--dry-run]  open idle accounts' 5h windows now
+  %(prog)s prime verify [--live]      re-check priming isolation after a claude update
   %(prog)s service install            run auto-switch as a background service
   %(prog)s doctor [--json]            check logins, Keychain, service; say what to fix
   %(prog)s init [--apply]             onboarding/migration checklist (ok/FIX/TODO)
   %(prog)s why                        why the engine did or didn't switch
+  %(prog)s auto off|on|status         stop / resume automatic switching (persistent)
+  %(prog)s history [-n N] [--json]    recent account switches (who, why)
 
 Aliases: ls=list  rm=remove  update=upgrade""",
         formatter_class=argparse.RawDescriptionHelpFormatter,

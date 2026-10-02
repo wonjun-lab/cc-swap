@@ -16,7 +16,9 @@ far-future value) cannot stop switching for good.
 from __future__ import annotations
 
 import math
+import time
 from collections.abc import Callable, Mapping
+from dataclasses import dataclass
 from pathlib import Path
 
 from claude_swap import autoswitch as aw
@@ -96,3 +98,153 @@ def resume(backup_root: Path) -> None:
         state.pop(PAUSED_REASON_KEY, None)
         state["schemaVersion"] = aw.STATE_SCHEMA_VERSION
         atomic_write_json(file.state_path, state)
+
+
+# -- `cc-swap auto off`: automatic switching off until turned back on -------------
+#
+# Unlike a re-login pause, ``autoOff`` has no expiry: it is the user's
+# standing choice, kept in the state file so the running service (any
+# strategy) honours it on its next tick without a restart, and so it
+# survives restarts. The engine keeps polling and publishing its decision;
+# it only never switches and never primes. ``cc-swap switch`` and the TUI's
+# manual switch still work.
+#
+# Semantics of a damaged marker: the key present with anything but
+# ``false``/``null`` means OFF (it was set on purpose; failing open would
+# switch against the user's wish). A state file that cannot be read at all
+# carries no marker, so the engine runs as usual — the same as every other
+# state-file reader.
+
+AUTO_OFF_KEY = "autoOff"
+#: An engine repeats its ``auto-off`` no-switch event at most this often.
+AUTO_OFF_EVENT_EVERY_S = 3600.0
+_AUTO_OFF_ATTR = "_auto_off_event_at"
+
+
+@dataclass(frozen=True)
+class AutoOff:
+    since: float | None
+    by: str | None
+    host: str | None
+
+
+def auto_off(state: Mapping) -> AutoOff | None:
+    """The ``autoOff`` marker, or None while automatic switching is on."""
+    if AUTO_OFF_KEY not in state:
+        return None
+    raw = state.get(AUTO_OFF_KEY)
+    if raw is None or raw is False:
+        return None
+    if not isinstance(raw, Mapping):
+        return AutoOff(None, None, None)
+    since = raw.get("since")
+    by = raw.get("by")
+    host = raw.get("host")
+    return AutoOff(
+        float(since)
+        if isinstance(since, (int, float)) and not isinstance(since, bool) and math.isfinite(since)
+        else None,
+        by if isinstance(by, str) and by else None,
+        host if isinstance(host, str) and host else None,
+    )
+
+
+def read_auto_off(backup_root: Path) -> AutoOff | None:
+    return auto_off(_StateFile(backup_root)._read_state())
+
+
+def set_auto_off(
+    backup_root: Path, off: bool, *, by: str, now: float, host: str | None = None
+) -> bool:
+    """Turn automatic switching off (``off=True``) or back on. Returns
+    whether anything changed; turning it off again keeps the first ``since``."""
+    file = _StateFile(backup_root)
+    if not off and not file.state_path.exists():
+        return False
+    with file._state_lock():
+        state = file._read_state()
+        if off:
+            if isinstance(state.get(AUTO_OFF_KEY), Mapping):
+                return False
+            state[AUTO_OFF_KEY] = {"since": now, "by": by, "host": host}
+        else:
+            if AUTO_OFF_KEY not in state:
+                return False
+            state.pop(AUTO_OFF_KEY, None)
+        state["schemaVersion"] = aw.STATE_SCHEMA_VERSION
+        atomic_write_json(file.state_path, state)
+    return True
+
+
+def auto_off_detail(off: AutoOff) -> str:
+    who = f" by {off.by}" if off.by else ""
+    if off.since is not None:
+        when = time.strftime("%Y-%m-%d %H:%M", time.localtime(off.since))
+        return f"automatic switching is off (since {when}{who}); turn it on: cc-swap auto on"
+    return f"automatic switching is off{who}; turn it on: cc-swap auto on"
+
+
+def auto_off_hold(engine, state: Mapping) -> "aw.TickOutcome | None":
+    """The engine's guard: ``NO_ACTION`` while auto switching is off, after
+    one ``auto-off`` no-switch event per :data:`AUTO_OFF_EVENT_EVERY_S`;
+    None (carry on) while it is on."""
+    off = auto_off(state)
+    if off is None:
+        if getattr(engine, _AUTO_OFF_ATTR, None) is not None:
+            setattr(engine, _AUTO_OFF_ATTR, None)
+        return None
+    now = engine.clock()
+    last = getattr(engine, _AUTO_OFF_ATTR, None)
+    if last is None or not 0 <= now - last < AUTO_OFF_EVENT_EVERY_S:
+        setattr(engine, _AUTO_OFF_ATTR, now)
+        engine._emit(aw.NoSwitchEvent(reason="auto-off", detail=auto_off_detail(off)))
+    return aw.TickOutcome.NO_ACTION
+
+
+def auto_command(argv: list[str]) -> None:
+    """``cc-swap auto on|off|status [--json]``."""
+    import argparse
+    import json
+    import socket
+    import sys
+
+    from claude_swap.paths import get_backup_root
+
+    parser = argparse.ArgumentParser(
+        prog="cc-swap auto",
+        description=(
+            "Turn automatic switching off or back on. Off is persistent: the "
+            "running engine (the service, a TUI or menu bar engine) keeps "
+            "polling and showing its decision, but never switches and never "
+            "primes until you turn it on again. Manual switches still work."
+        ),
+    )
+    parser.add_argument("action", choices=("on", "off", "status"))
+    parser.add_argument("--json", action="store_true", help="Machine-readable output")
+    args = parser.parse_args(argv)
+    root = get_backup_root()
+    now = time.time()
+    host = socket.gethostname().split(".")[0] or None
+    if args.action in ("on", "off"):
+        changed = set_auto_off(root, args.action == "off", by="cli", now=now, host=host)
+    else:
+        changed = False
+    off = read_auto_off(root)
+    if args.json:
+        print(json.dumps({
+            "schemaVersion": 1,
+            "autoSwitch": "off" if off else "on",
+            "changed": changed,
+            "since": off.since if off else None,
+            "by": off.by if off else None,
+        }))
+        sys.exit(0)
+    if off is None:
+        print("Automatic switching is ON." + ("" if changed or args.action == "status" else " (already)"))
+    else:
+        print(
+            "Automatic switching is OFF: the engine keeps polling but never "
+            "switches or primes." + ("" if changed or args.action == "status" else " (already)")
+        )
+        print(auto_off_detail(off))
+    sys.exit(0)

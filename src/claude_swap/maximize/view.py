@@ -51,6 +51,8 @@ TIER_LABELS = {"normal": "normal", "last_resort": "last resort", "excluded": "ex
 #: ``engine_hook.DECISION_KEY`` (pinned by a test, like STATE_FILENAME).
 DECISION_KEY = "maximizeDecision"
 DECISION_KINDS = frozenset({"switch", "hold", "indeterminate", "exhausted"})
+#: ``pause.AUTO_OFF_KEY`` (pinned by a test, like STATE_FILENAME).
+AUTO_OFF_KEY = "autoOff"
 
 
 @dataclass(frozen=True)
@@ -81,6 +83,10 @@ class MaximizeState:
     # A TUI re-login's pause marker (maximize/pause.py), as written.
     paused_until: float | None = None
     paused_reason: str | None = None
+    # `cc-swap auto off` (maximize/pause.py ``autoOff``; same reading).
+    auto_off: bool = False
+    auto_off_since: float | None = None
+    auto_off_by: str | None = None
 
 
 @dataclass(frozen=True)
@@ -173,7 +179,14 @@ def read_state(backup_root: Path) -> MaximizeState:
     quarantine = raw.get("quarantine")
     decision, plans = _published(raw.get(DECISION_KEY))
     reason = raw.get("pausedReason")
+    off = raw.get(AUTO_OFF_KEY)
+    off_set = AUTO_OFF_KEY in raw and off is not None and off is not False
+    off_map = off if isinstance(off, dict) else {}
+    off_by = off_map.get("by")
     return MaximizeState(
+        auto_off=off_set,
+        auto_off_since=_num(off_map.get("since")) if off_set else None,
+        auto_off_by=off_by if off_set and isinstance(off_by, str) and off_by else None,
         samples_account=account,
         samples=tuple(found),
         primes=primes if isinstance(primes, dict) else {},
