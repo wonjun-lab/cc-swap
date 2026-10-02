@@ -419,6 +419,28 @@ def test_relogin_steps_mention_ssh_code_flow_only_over_ssh():
     assert "paused" in local  # the engine pauses while this runs
 
 
+def test_strategy_step_and_writes_list_only_changes_in_a_valid_order():
+    saved = fleet.strategy_values(MX, PrimeSettings())
+    edited = fleet.strategy_step(saved, "maximize.soft5h", 1)
+    edited = fleet.strategy_step(edited, "maximize.soft5h", 1)
+    edited = fleet.strategy_step(edited, "maximize.landingMargin", 1)
+    edited = fleet.strategy_step(edited, "prime.enabled", 1)
+    edited = fleet.strategy_step(edited, "prime.maxAttempts", 10)   # clamped to 5
+    assert fleet.strategy_writes(saved, edited) == [
+        ("maximize.soft5h", "52"), ("maximize.landingMargin", "6"),
+        ("prime.enabled", "true"), ("prime.maxAttempts", "5"),
+    ]
+    # soft never steps past hard
+    capped = fleet.strategy_step({**saved, "maximize.soft5h": 95.0}, "maximize.soft5h", 1)
+    assert capped["maximize.soft5h"] == 95.0
+    # raising both above the old hard: hard is written first
+    raised = {**saved, "maximize.soft5h": 97.0, "maximize.hard5h": 98.0}
+    assert fleet.strategy_writes(saved, raised) == [
+        ("maximize.hard5h", "98"), ("maximize.soft5h", "97"),
+    ]
+    assert fleet.strategy_writes(saved, saved) == []
+
+
 def test_publish_refresh_matches_the_engine():
     from claude_swap.maximize import engine_hook
 

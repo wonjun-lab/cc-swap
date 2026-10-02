@@ -139,6 +139,51 @@ def folded_menu(
     return lines
 
 
+@dataclass(frozen=True)
+class StrategyField:
+    key: str     # dotted settings key
+    label: str
+    unit: str
+    why: str
+    step: float  # ←/→ step; 0 = not steppable (e types a value)
+    group: str
+
+
+STRATEGY_FIELDS: tuple[StrategyField, ...] = (
+    StrategyField("maximize.soft5h", "5h soft", "%",
+                  "switch at the next idle moment once the active passes this", 1,
+                  "when to leave the active account"),
+    StrategyField("maximize.hard5h", "5h hard", "%", "switch at once", 1,
+                  "when to leave the active account"),
+    StrategyField("maximize.soft7d", "7d soft", "%", "", 1, "when to leave the active account"),
+    StrategyField("maximize.hard7d", "7d hard", "%", "", 1, "when to leave the active account"),
+    StrategyField("maximize.landingMargin", "landing margin", "%p",
+                  "a target must be this far under both soft marks", 1,
+                  "when to leave the active account"),
+    StrategyField("maximize.idleWindowMin", "idle window", "min",
+                  "idle = under the max rise over this window", 1,
+                  "when to leave the active account"),
+    StrategyField("maximize.idleMaxDeltaPct", "idle max rise", "%p", "", 0.5,
+                  "when to leave the active account"),
+    StrategyField("maximize.forceEtaMin", "force ETA", "min",
+                  "switch early when a hard cap is this close at the current rate", 1,
+                  "when to leave the active account"),
+    StrategyField("maximize.rebalanceCooldownMin", "rebalance cooldown", "min", "", 5,
+                  "when to leave the active account"),
+    StrategyField("maximize.tieEpsilon", "tie epsilon", "", "scores this close count as a tie",
+                  0.05, "when to leave the active account"),
+    StrategyField("prime.enabled", "priming", "", "keep idle accounts' 5h windows started", 1,
+                  "priming idle accounts"),
+    StrategyField("prime.jitterS", "jitter", "s", "wait LO-HI seconds after a reset", 0,
+                  "priming idle accounts"),
+    StrategyField("prime.maxAttempts", "max attempts", "", "attempts per 5h window", 1,
+                  "priming idle accounts"),
+    StrategyField("prime.model", "model", "", "model for the priming call", 0,
+                  "priming idle accounts"),
+)
+STRATEGY_KEYS = "↑↓ move · ←→ adjust · e edit · s save · b back · q quit"
+
+
 def help_entries() -> list[tuple[str, str]]:
     """``(key, what it does)`` rows for the help screen, then the legend."""
     rows: list[tuple[str, str]] = [("", "Fleet — keys")]

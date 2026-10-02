@@ -95,6 +95,66 @@ FleetScreen.-compact #fx-menu-folded {
     padding-top: 0;
 }
 
+/* -- swap strategy / account settings ---------------------------------------------- */
+
+#fx-st-head, #fx-ac-head {
+    height: 1;
+    padding: 0 1;
+}
+
+#fx-st-body {
+    height: auto;
+    padding: 1 1 0 1;
+}
+
+#fx-st-preview {
+    height: auto;
+    padding: 1 2;
+}
+
+#fx-st-keys, #fx-ac-keys {
+    dock: bottom;
+    height: 1;
+    padding: 0 2;
+}
+
+#fx-ac-table {
+    height: auto;
+    max-height: 60%;
+    margin-top: 1;
+    background: $background;
+}
+
+#fx-ac-table > .datatable--header {
+    color: $secondary;
+    background: $background;
+}
+
+#fx-ac-prompt {
+    height: auto;
+    padding: 0 2;
+}
+
+#fx-ac-menu {
+    height: auto;
+    padding: 1 2 0 1;
+    background: $background;
+}
+
+#fx-ac-menu ListItem {
+    background: transparent;
+    padding: 0 1;
+    border-left: thick $background;
+}
+
+#fx-ac-menu ListItem.-highlight,
+#fx-ac-menu:focus ListItem.-highlight {
+    color: $foreground;
+    background: $surface;
+    text-style: none;
+    border-left: thick $primary;
+}
+
 /* -- help ------------------------------------------------------------------------ */
 
 #fx-help {

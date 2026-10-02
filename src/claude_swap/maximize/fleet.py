@@ -35,7 +35,7 @@ from claude_swap.maximize.model import AccountView, Hold, Snapshot, Switch
 from claude_swap.maximize.plan import parse_plan_override
 from claude_swap.maximize.score import days_left, landable
 from claude_swap.models import AccountSnapshot, AccountsSnapshot
-from claude_swap.settings import MaximizeSettings, PrimeSettings
+from claude_swap.settings import SETTING_SPECS, MaximizeSettings, PrimeSettings
 from claude_swap.usage_store import STALE_OK_S
 
 LoginState = Literal["ok", "relogin", "expired", "foreign", "keychain", "api"]
@@ -975,3 +975,80 @@ def fit_layout(height: int, width: int, n_rows: int, *, attention: bool) -> Layo
         blanks=h >= 18,
         columns=columns_for(width),
     )
+
+
+# -- Swap strategy editing ------------------------------------------------------------------
+
+_THRESHOLD_KEYS = {dotted: knob for knob, dotted in mxview.KNOB_KEYS.items()}
+
+
+def strategy_values(mx: MaximizeSettings, prime: PrimeSettings) -> dict[str, object]:
+    """Every editable ``maximize.*``/``prime.*`` value, by dotted key."""
+    out: dict[str, object] = {}
+    for dotted, spec in SETTING_SPECS.items():
+        if spec.section == "maximize":
+            out[dotted] = getattr(mx, spec.field)
+        elif spec.section == "prime":
+            out[dotted] = getattr(prime, spec.field)
+    return out
+
+
+def strategy_settings(values: Mapping[str, object]) -> MaximizeSettings:
+    """The ``MaximizeSettings`` an edited value map describes."""
+    fields = {
+        SETTING_SPECS[k].field: v
+        for k, v in values.items()
+        if k in SETTING_SPECS and SETTING_SPECS[k].section == "maximize"
+    }
+    return replace(MaximizeSettings(), **fields)
+
+
+def strategy_step(
+    values: Mapping[str, object], key: str, delta: float
+) -> dict[str, object]:
+    """One ←/→ step on ``key``: thresholds through ``view.step_knob`` (soft
+    never passes hard), numbers clamped into their ``SETTING_SPECS`` range,
+    booleans toggled; text values do not step."""
+    out = dict(values)
+    spec = SETTING_SPECS[key]
+    if key in _THRESHOLD_KEYS:
+        knob = _THRESHOLD_KEYS[key]
+        stepped = mxview.step_knob(strategy_settings(values), knob, delta)
+        out[key] = getattr(stepped, knob)
+    elif spec.kind == "bool":
+        out[key] = not bool(values.get(key))
+    elif spec.kind in ("float", "int"):
+        current = float(values.get(key) or 0.0)
+        lo = spec.lo if spec.lo is not None else -math.inf
+        hi = spec.hi if spec.hi is not None else math.inf
+        value = min(hi, max(lo, current + delta))
+        out[key] = int(round(value)) if spec.kind == "int" else round(value, 6)
+    return out
+
+
+def setting_text(value: object) -> str:
+    """A value as ``set_setting`` parses it."""
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, float) and value.is_integer():
+        return f"{value:g}"
+    return "" if value is None else str(value)
+
+
+def strategy_writes(
+    saved: Mapping[str, object], edited: Mapping[str, object]
+) -> list[tuple[str, str]]:
+    """``(dotted key, raw value)`` writes turning ``saved`` into ``edited``:
+    only changed keys; the four thresholds in ``view.threshold_writes``
+    order (the file never holds soft > hard between two writes)."""
+    writes = [
+        (key, setting_text(value))
+        for key, value in mxview.threshold_writes(
+            strategy_settings(saved), strategy_settings(edited)
+        )
+    ]
+    for key, value in edited.items():
+        if key in _THRESHOLD_KEYS or saved.get(key) == value:
+            continue
+        writes.append((key, setting_text(value)))
+    return writes

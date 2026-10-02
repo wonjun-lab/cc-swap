@@ -22,6 +22,7 @@ from __future__ import annotations
 import os
 import socket
 import time
+from functools import partial
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -33,6 +34,7 @@ from textual.widgets import DataTable, ListItem, ListView, Static
 
 from claude_swap.maximize import fleet as fx
 from claude_swap.maximize import view as mxview
+from claude_swap.maximize.primer import plan_text as mxprimer_plan_text
 from claude_swap.models import AccountsSnapshot
 from claude_swap.settings import (
     MaximizeSettings,
@@ -119,6 +121,84 @@ def open_fleet(app: "CswapApp") -> None:
         app.push_screen(fleet)
 
 
+def fleet_rows_now(app: "CswapApp", snap: AccountsSnapshot | None = None) -> list[fx.FleetRow]:
+    """``fleet_rows`` for the app's current snapshot, settings and state file."""
+    snap = snap if snap is not None else app.snapshot
+    if snap is None:
+        return []
+    root = app.switcher.backup_dir
+    try:
+        mx, prime = load_maximize_settings(root), load_prime_settings(root)
+    except Exception:
+        mx, prime = MaximizeSettings(), PrimeSettings()
+    try:
+        state = mxview.read_state(root)
+    except Exception:
+        state = mxview.MaximizeState()
+    return fx.fleet_rows(snap, mx, prime, state, now=time.time())
+
+
+def open_relogin(app: "CswapApp", number: str) -> None:
+    """The guided re-login for slot ``number`` (cc-swap launches nothing).
+
+    The steps name the real ``claude`` (``prime.claudePath``, else
+    ``~/.local/bin/claude``) and the account's email; enter then stores the
+    live login only if it is this slot's account, and switches back to the
+    account active now."""
+    from claude_swap.maximize.fleet_actions import relogin_store
+    from claude_swap.maximize.primer import resolve_claude_path
+    from claude_swap.tui.data import run_action
+    from claude_swap.tui.fleet_modals import ReloginModal
+
+    rows = {r.number: r for r in fleet_rows_now(app)}
+    row = rows.get(number)
+    if row is None:
+        return
+    root = app.switcher.backup_dir
+    previous = app.snapshot.active_number if app.snapshot is not None else None
+    try:
+        claude = resolve_claude_path(load_prime_settings(root).claude_path)
+    except Exception:
+        claude = None
+    lines = fx.relogin_steps(
+        row,
+        ssh=fx.over_ssh(),
+        host=host_name(),
+        claude_path=claude,
+        return_to=rows.get(previous) if previous else None,
+    )
+    store = partial(
+        run_action,
+        partial(relogin_store, app.switcher, number, return_to=previous),
+    )
+    app.push_screen(
+        ReloginModal(lines, backup_root=root, store=store),
+        partial(_relogin_done, app, number),
+    )
+
+
+def _relogin_done(app: "CswapApp", number: str, result) -> None:
+    from claude_swap.tui.modals import OutputModal
+
+    app.request_refresh(full=True)
+    if result is None:
+        app.notify(f"Re-login #{number} cancelled; switching resumed", timeout=3)
+        return
+    if not result.ok:
+        app.push_screen(OutputModal(f"Re-login #{number} — failed", result.output))
+        return
+    payload = result.payload or {}
+    if not payload.get("stored"):
+        app.notify(
+            str(payload.get("reason") or "nothing stored"), title=f"Re-login #{number}",
+            severity="error", timeout=10,
+        )
+        return
+    back = payload.get("returned_to")
+    tail = f"; back on #{back}" if back else ""
+    app.notify(f"#{number} login stored{tail}", title="Re-login")
+
+
 class FleetTable(DataTable):
     """The account table; ↓ past the last row moves focus to the menu."""
 
@@ -156,6 +236,13 @@ class FleetMenuItem(ListItem):
 class FleetScreen(Screen):
     CSS_PATH = "fleet.tcss"
     BINDINGS = [
+        Binding("s", "menu('strategy')", "Swap strategy", show=False),
+        Binding("m", "menu('mode')", "Mode", show=False),
+        Binding("p", "menu('prime')", "Prime now", show=False),
+        Binding("a", "menu('accounts')", "Account settings", show=False),
+        Binding("l", "last_resort", "Last resort", show=False),
+        Binding("x", "exclude", "Exclude", show=False),
+        Binding("r", "relogin", "Re-login", show=False),
         Binding("f", "fetch", "Fetch", show=False),
         Binding("e,g", "app.open_auto", "Engine log", show=False),
         Binding("c", "classic", "Classic dashboard", show=False),
@@ -544,6 +631,9 @@ class FleetScreen(Screen):
 
     def dispatch_menu(self, action: str) -> None:
         handler = {
+            "strategy": self.open_strategy,
+            "prime": self.open_prime,
+            "accounts": self.open_accounts,
             "fetch": self.action_fetch,
             "engine": self.app.action_open_auto,
             "classic": self.action_classic,
@@ -553,6 +643,111 @@ class FleetScreen(Screen):
             self.notify(f"{menus.BY_ACTION[action].title}: not available yet", timeout=3)
             return
         handler()
+
+    def action_menu(self, action: str) -> None:
+        self.dispatch_menu(action)
+
+    def open_strategy(self) -> None:
+        from claude_swap.tui.fleet_strategy import StrategyScreen
+
+        self.app.push_screen(StrategyScreen())
+
+    def open_accounts(self) -> None:
+        from claude_swap.tui.fleet_accounts import AccountsScreen
+
+        self.app.push_screen(AccountsScreen())
+
+    def open_prime(self) -> None:
+        """Pick accounts to prime now; the highlighted one is preselected."""
+        from claude_swap.maximize.primer import plan_rows
+        from claude_swap.tui.fleet_modals import PrimeChoice, PrimeModal, prime_lines
+
+        snap = self.app.snapshot
+        if snap is None:
+            return
+        now = time.time()
+        msnap = fx.fleet_snapshot(snap, self._mx, self._state, now=now)
+        names = {r.number: r.name for r in self._rows}
+        choices = []
+        for plan in plan_rows(msnap, self._state.primes, self._prime, now):
+            text = mxprimer_plan_text(plan, self._prime.max_attempts)
+            choices.append(PrimeChoice(
+                plan.number, f"#{plan.number} {names.get(plan.number, '')}  {text}",
+                plan.reason is None,
+            ))
+        row = self.current_row()
+        preselect = {row.number} if row is not None else set()
+        self.app.push_screen(
+            PrimeModal(choices, preselect, partial(prime_lines, self.app.switcher))
+        )
+
+    # -- row keys ------------------------------------------------------------------------
+
+    def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
+        """enter on a row: switch to it — asking first only when maximize
+        would not land there (switching is reversible)."""
+        number = str(event.row_key.value)
+        row = next((r for r in self._rows if r.number == number), None)
+        if row is None:
+            return
+        if row.active:
+            self.notify(f"#{number} is already the active account", timeout=2)
+            return
+        warning = fx.switch_warning(row, self._mx)
+        if warning is None:
+            self.app.do_switch(number)
+            return
+        from claude_swap.tui.modals import ConfirmModal
+
+        self.app.push_screen(
+            ConfirmModal(warning + "\n\nSwitch anyway?", title=f"Switch to #{number}",
+                         yes_label="Switch"),
+            lambda confirmed: self.app.do_switch(number) if confirmed else None,
+        )
+
+    def action_last_resort(self) -> None:
+        row = self.current_row()
+        if row is None:
+            return
+        snap = self.app.snapshot
+        accounts = {
+            a.number: {"email": a.email, "alias": a.alias}
+            for a in (snap.accounts if snap else ())
+        }
+        self.run_worker(
+            partial(self._last_resort_blocking, accounts, row.number), thread=True,
+            group="fleet-action", exit_on_error=False, name="fleet-last-resort",
+        )
+
+    def _last_resort_blocking(self, accounts: dict, number: str) -> None:
+        from claude_swap.exceptions import ClaudeSwitchError
+        from claude_swap.maximize.fleet_actions import toggle_last_resort_setting
+
+        try:
+            marked = toggle_last_resort_setting(self._root, accounts, number)
+        except ClaudeSwitchError as e:
+            self.app.call_from_thread(self.notify, str(e), severity="error", timeout=8)
+            return
+        message = f"#{number} is last resort" if marked else f"#{number} is back to normal"
+        self.app.call_from_thread(self._after_setting, message)
+
+    def _after_setting(self, message: str) -> None:
+        self.notify(message, timeout=3)
+        self._on_snapshot(self.app.snapshot)
+
+    def action_exclude(self) -> None:
+        row = self.current_row()
+        if row is not None:
+            self.app.do_toggle_disabled(row.number)
+
+    def action_relogin(self) -> None:
+        row = self.current_row()
+        if row is None:
+            return
+        if row.login != "relogin":
+            self.notify(f"#{row.number} login works — nothing to fix", timeout=3)
+            return
+        open_relogin(self.app, row.number)
 
     # -- actions -------------------------------------------------------------------------
 
