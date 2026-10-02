@@ -32,6 +32,7 @@ from claude_swap.switcher import ClaudeAccountSwitcher
 from claude_swap.tui.autoview import AutoScreen
 from claude_swap.tui.dashboard import DashboardScreen, WatchScreen
 from claude_swap.tui.data import ActionResult, SnapshotSource, format_duration, run_action
+from claude_swap.tui.fleet import FleetScreen, fork_home, open_fleet
 from claude_swap.tui.modals import AddTokenModal, ConfirmModal, OutputModal, TokenForm
 from claude_swap.tui.theme import CSWAP_DARK, CSWAP_LIGHT
 
@@ -44,7 +45,10 @@ class CswapApp(App):
     # No command palette: actions live in the dashboard's nested menu, in
     # their own context — not in a global searchable list.
     ENABLE_COMMAND_PALETTE = False
-    BINDINGS = [Binding("ctrl+t", "toggle_theme", "Theme")]
+    BINDINGS = [
+        Binding("ctrl+t", "toggle_theme", "Theme"),
+        Binding("ctrl+f", "open_fleet", "Fleet", show=False),  # cc-swap fork
+    ]
 
     POLL_INTERVAL_S = 3.0  # matches the old watch view's recapture cadence
     # Snapshot age stays hidden while polling is healthy (age never exceeds
@@ -113,6 +117,11 @@ class CswapApp(App):
         self.theme = f"cswap-{resolved}"
         printer.set_theme(resolved)
         self.push_screen(DashboardScreen())
+        if self._start == "dashboard" and fork_home(self.switcher.backup_dir):
+            # cc-swap fork: maximize opens on Fleet, stacked over the
+            # dashboard (c pops back to it, ctrl+f returns).
+            self.install_screen(FleetScreen(), "fleet")
+            self.push_screen("fleet")
         if self._start == "watch":
             # Stacked over the dashboard so Esc lands there, not on exit.
             self.push_screen(WatchScreen())
@@ -425,6 +434,10 @@ class CswapApp(App):
         if isinstance(self.screen, WatchScreen):
             return
         self.push_screen(WatchScreen())
+
+    def action_open_fleet(self) -> None:
+        """cc-swap fork: back to the Fleet home from any screen."""
+        open_fleet(self)
 
     # -- theme --------------------------------------------------------------
 

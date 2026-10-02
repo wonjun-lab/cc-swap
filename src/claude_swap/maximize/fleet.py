@@ -676,9 +676,9 @@ def header_line(
         (head, 0),
         ("maximize", 3),
         (f"5h {mx.soft_5h:g}/{mx.hard_5h:g}", 4),
-        (f"7d {mx.soft_7d:g}/{mx.hard_7d:g}", 4),
-        (f"margin {mx.landing_margin:g}", 6),
-        (f"priming {'on' if prime.enabled else 'off'}", 5),
+        (f"7d {mx.soft_7d:g}/{mx.hard_7d:g}", 5),
+        (f"margin {mx.landing_margin:g}", 7),
+        (f"priming {'on' if prime.enabled else 'off'}", 6),
     ]
     count = relogin_count(rows)
     if count:
@@ -731,6 +731,21 @@ def columns_for(width: int) -> tuple[str, ...]:
     if width < 64:
         cols = ["5h win" if c == "5h window" else c for c in cols]
     return tuple(cols)
+
+
+def account_width(width: int) -> int:
+    """The account column's width (min 8): aliases fit, long emails clip."""
+    if width >= 130:
+        return 20
+    if width >= 100:
+        return 14
+    if width >= 64:
+        return 10
+    return 8
+
+
+def clip(text: str, width: int) -> str:
+    return text if len(text) <= width else text[: max(width - 1, 0)] + "…"
 
 
 def _pct_cell(pct: float | None, soft: float, hard: float, stale: bool) -> Cell:
@@ -835,7 +850,7 @@ def detail_line(row: FleetRow, mx: MaximizeSettings) -> str:
         parts.append("excluded from rotation")
     else:
         parts.append(f"rank {row.rank}" if row.rank is not None else "rank ?")
-    parts.append(row.plan)
+    parts.append(row.plan if row.plan != "?" else "plan ?")
     if row.score is not None and row.pct7 is not None and row.days7 is not None:
         parts.append(
             f"pace {row.score:.2f} ({100 - row.pct7:.0f}% left over {row.days7:.1f}d)"
