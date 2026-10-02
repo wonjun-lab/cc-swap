@@ -2079,6 +2079,39 @@ class ClaudeAccountSwitcher:
                 data["lastUpdated"] = get_timestamp()
                 self._write_json(self.sequence_file, data)
 
+    def _audited_refresh(
+        self,
+        refresh_input: str,
+        *,
+        caller: str,
+        slot: str,
+        active: bool,
+        source: str,
+        **kwargs,
+    ) -> "oauth.RefreshOutcome":
+        """``oauth.try_refresh_oauth_credentials`` plus one INFO audit line
+        (``oauth.refresh_audit_line``: fingerprint prefixes only)."""
+        started = time.monotonic()
+        result = oauth.try_refresh_oauth_credentials(refresh_input, **kwargs)
+        try:
+            ok = result.error is None and bool(result.credentials)
+            self._logger.info(
+                "%s",
+                oauth.refresh_audit_line(
+                    caller=caller,
+                    slot=str(slot),
+                    active=active,
+                    source=source,
+                    before=refresh_input,
+                    after=result.credentials if ok else None,
+                    result="ok" if ok else (result.error or "empty"),
+                    latency_s=time.monotonic() - started,
+                ),
+            )
+        except Exception:
+            pass  # an audit line never breaks a refresh
+        return result
+
     def consume_backup_grant(
         self, account_num: str, email: str, snapshot: str
     ) -> "oauth.RefreshOutcome":
@@ -2114,6 +2147,10 @@ class ClaudeAccountSwitcher:
 
         The caller must NOT hold ``self.lock_file`` (non-reentrant).
         """
+        try:  # for the refresh audit line: who asked for this grant
+            caller = sys._getframe(1).f_code.co_name
+        except Exception:
+            caller = "?"
         # Store-resolution parity: CC ≥2.1.220 honors
         # CLAUDE_SECURESTORAGE_CONFIG_DIR for its credential store. cswap
         # mirrors that resolution on the CAPTURE path (#205 —
@@ -2160,15 +2197,17 @@ class ClaudeAccountSwitcher:
             return oauth.RefreshOutcome(None, "consume-busy")
         try:
             return self._consume_backup_grant_locked(
-                account_num, email, snapshot
+                account_num, email, snapshot, caller=caller
             )
         finally:
             consume_lock.release()
 
     def _consume_backup_grant_locked(
-        self, account_num: str, email: str, snapshot: str
+        self, account_num: str, email: str, snapshot: str, *, caller: str = "?"
     ) -> "oauth.RefreshOutcome":
-        """Body of ``consume_backup_grant``; caller holds the consume lock."""
+        """Body of ``consume_backup_grant``; caller holds the consume lock.
+        ``caller`` names who asked, for the refresh audit line."""
+        refresh_source = "backup"
         from claude_swap.session import (
             is_session_stale,
             read_session_credentials,
@@ -2285,6 +2324,7 @@ class ClaudeAccountSwitcher:
                             )
                             refresh_input = profile
                             input_oauth = prof_oauth
+                            refresh_source = "profile"
                 consumed_fp = oauth.credential_fingerprint(refresh_input)
         except LockError:
             # Nothing consumed yet — a holder (switch, collector, CC) owns
@@ -2341,9 +2381,21 @@ class ClaudeAccountSwitcher:
             # nothing. When the re-read equals the snapshot (the 401-retry
             # shape: the server just rejected these exact bytes), this
             # never fires and the POST proceeds.
+            self._logger.info(
+                "refresh: account %s already rotated past the caller's copy "
+                "(rt %s); adopted without a POST", account_num,
+                oauth.fingerprint8(refresh_input),
+            )
             return oauth.RefreshOutcome(refresh_input, None, None, consumed_fp)
 
-        result = oauth.try_refresh_oauth_credentials(refresh_input)
+        try:
+            gate_active = self.current_account_number() == str(account_num)
+        except Exception:
+            gate_active = False
+        result = self._audited_refresh(
+            refresh_input, caller=caller, slot=account_num,
+            active=gate_active, source=refresh_source,
+        )
         if result.error is not None or not result.credentials:
             # Strike binding must follow the POSTed bytes: the gate may have
             # substituted a locked re-read or the session profile for the
@@ -4428,6 +4480,13 @@ class ClaudeAccountSwitcher:
                             self._write_account_credentials(
                                 account_num, email, live
                             )
+                            self._logger.info(
+                                "refresh: adopted Claude Code's rotated "
+                                "credential for account %s into its backup "
+                                "(rt %s -> %s)", account_num,
+                                oauth.fingerprint8(backup),
+                                oauth.fingerprint8(live),
+                            )
                         except Exception:
                             self._logger.warning(
                                 "Backup resync after adopting a rotated "
@@ -4548,8 +4607,17 @@ class ClaudeAccountSwitcher:
                         # inside that budget so a slow network can't make a
                         # concurrent switch's acquire expire — the switch
                         # then waits out the tail instead of erroring.
-                        result = oauth.try_refresh_oauth_credentials(
-                            refresh_input, timeout_s=6.0
+                        result = self._audited_refresh(
+                            refresh_input,
+                            caller="_fetch_active_usage",
+                            slot=account_num,
+                            active=True,
+                            source=(
+                                "live" if refresh_input == live
+                                else "backup" if refresh_input == backup
+                                else "snapshot"
+                            ),
+                            timeout_s=6.0,
                         )
                         if result.error in (
                             "invalid_grant", "no_refresh_token"
@@ -4669,6 +4737,16 @@ class ClaudeAccountSwitcher:
                             else "; the rotated credential was NOT persisted "
                                  "anywhere — re-login may be required",
                         )
+                    self._logger.info(
+                        "refresh: account %s active %s persisted "
+                        "(rt %s; backup %s, live %s)",
+                        account_num,
+                        "restore" if restore_source is not None else "refresh",
+                        oauth.fingerprint8(working),
+                        "kept" if restore_source is not None
+                        else ("ok" if backup_ok else "FAILED"),
+                        "ok" if live_ok else "FAILED",
+                    )
                     if not live_ok:
                         # Live still holds the dead token — don't serve
                         # usage for a credential CC can't currently use.

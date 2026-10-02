@@ -60,6 +60,53 @@ def credential_fingerprint(credentials: str) -> str | None:
     return "sha256-full:" + hashlib.sha256(credentials.encode()).hexdigest()
 
 
+def fingerprint8(credentials: str | None) -> str:
+    """First 8 hex of the refresh-token fingerprint, for logs (``-`` when the
+    credential carries no refresh token). A hash prefix, never the token."""
+    fp = credential_fingerprint(credentials or "")
+    if not fp or not fp.startswith("sha256:"):
+        return "-"
+    return fp.split(":", 1)[1][:8]
+
+
+def _audit_ms(value: object) -> str:
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or value <= 0:
+        return "-"
+    return (
+        datetime.fromtimestamp(value / 1000, tz=timezone.utc)
+        .isoformat(timespec="minutes")
+        .replace("+00:00", "Z")
+    )
+
+
+def refresh_audit_line(
+    *,
+    caller: str,
+    slot: str,
+    active: bool,
+    source: str,
+    before: str | None,
+    after: str | None,
+    result: str,
+    latency_s: float,
+) -> str:
+    """One refresh POST, for the log: who asked, which slot and copy, the
+    refresh-token fingerprint prefixes before/after, the access token's
+    expiry, the login deadline, the verdict and the latency. No token, no
+    email — paste-safe."""
+    before_data = extract_oauth_data(before or "") or {}
+    after_data = extract_oauth_data(after or "") or {}
+    expires = (after_data or before_data).get("expiresAt")
+    login = (after_data or before_data).get("refreshTokenExpiresAt")
+    return (
+        f"refresh POST caller={caller} slot={slot} "
+        f"active={'yes' if active else 'no'} source={source} "
+        f"rt={fingerprint8(before)}->{fingerprint8(after)} "
+        f"accessExp={_audit_ms(expires)} login={_audit_ms(login)} "
+        f"result={result} latency={latency_s:.2f}s"
+    )
+
+
 def access_token_fingerprint(credentials: str) -> str | None:
     """Hash of the access token alone: the part that rotates within a
     lineage, so a refused token and its replacement compare unequal."""

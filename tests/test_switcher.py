@@ -2000,6 +2000,33 @@ class TestActiveAccountRefresh:
         write_live.assert_called_once_with(self._REFRESHED)
         write_backup.assert_called_once_with("1", "test@example.com", self._REFRESHED)
 
+    def test_active_refresh_post_and_persist_are_logged_without_secrets(
+        self, temp_home: Path, mock_claude_config: Path, sample_sequence_data: dict,
+        caplog,
+    ):
+        caplog.set_level("INFO", logger="claude-swap")
+        switcher = self._switcher(sample_sequence_data)
+
+        with patch.object(switcher, "_read_credentials", return_value=self._EXPIRED), \
+             patch.object(
+                 switcher, "_read_account_credentials", return_value=self._EXPIRED
+             ), \
+             patch.object(switcher, "_write_credentials"), \
+             patch.object(switcher, "_write_account_credentials"), \
+             patch("claude_swap.oauth.try_refresh_oauth_credentials",
+                   side_effect=self._refresh_ok), \
+             patch("claude_swap.oauth.try_fetch_usage_for_account",
+                   return_value=oauth.UsageOutcome({"five_hour": {"pct": 4}})):
+            switcher._fetch_active_usage("1", "test@example.com", self._EXPIRED)
+
+        messages = [r.getMessage() for r in caplog.records]
+        [post] = [m for m in messages if "refresh POST" in m]
+        assert "caller=_fetch_active_usage" in post and "slot=1" in post
+        assert "active=yes" in post and "source=live" in post and "result=ok" in post
+        assert any("persisted" in m and "account 1" in m for m in messages)
+        for secret in ("rt-orig", "rt-new", "sk-active", "sk-new", "test@example.com"):
+            assert secret not in caplog.text
+
     def test_owner_present_no_longer_blocks_the_refresh(
         self, temp_home: Path, mock_claude_config: Path, sample_sequence_data: dict
     ):
@@ -9648,6 +9675,45 @@ class TestConsumeGate:
             s.consume_backup_grant("1", "test@example.com", self._OLD)
 
         assert posted["creds"] == profile_newer
+
+    def test_gate_post_writes_one_audit_line_without_secrets(
+        self, temp_home: Path, sample_sequence_data: dict, caplog
+    ):
+        caplog.set_level("INFO", logger="claude-swap")
+        s = self._switcher(sample_sequence_data)
+        s._write_account_credentials("1", "test@example.com", self._OLD)
+
+        with patch("claude_swap.oauth.try_refresh_oauth_credentials",
+                   return_value=oauth.RefreshOutcome(None, "invalid_grant")):
+            s.consume_backup_grant("1", "test@example.com", self._OLD)
+
+        lines = [r.getMessage() for r in caplog.records if "refresh POST" in r.getMessage()]
+        assert len(lines) == 1
+        line = lines[0]
+        before8 = oauth.credential_fingerprint(self._OLD).split(":")[1][:8]
+        assert "caller=test_gate_post_writes_one_audit_line_without_secrets" in line
+        assert "slot=1" in line and "active=no" in line and "source=backup" in line
+        assert f"rt={before8}->-" in line and "result=invalid_grant" in line
+        assert "latency=" in line and "accessExp=" in line and "login=" in line
+        for secret in ("rt-old", "sk-old", "test@example.com"):
+            assert secret not in caplog.text
+
+    def test_gate_success_audit_names_both_fingerprints(
+        self, temp_home: Path, sample_sequence_data: dict, caplog
+    ):
+        caplog.set_level("INFO", logger="claude-swap")
+        s = self._switcher(sample_sequence_data)
+        s._write_account_credentials("1", "test@example.com", self._OLD)
+
+        with patch("claude_swap.oauth.try_refresh_oauth_credentials",
+                   return_value=oauth.RefreshOutcome(self._NEW, None)):
+            s.consume_backup_grant("1", "test@example.com", self._OLD)
+
+        [line] = [r.getMessage() for r in caplog.records if "refresh POST" in r.getMessage()]
+        before8 = oauth.credential_fingerprint(self._OLD).split(":")[1][:8]
+        after8 = oauth.credential_fingerprint(self._NEW).split(":")[1][:8]
+        assert f"rt={before8}->{after8}" in line and "result=ok" in line
+        assert "rt-new" not in caplog.text and "sk-new" not in caplog.text
 
     def test_gate_invalid_grant_returns_error_without_persist(
         self, temp_home: Path, sample_sequence_data: dict
