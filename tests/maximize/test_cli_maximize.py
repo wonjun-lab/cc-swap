@@ -120,3 +120,163 @@ class TestAutoMaximize:
         param = inspect.signature(AutoSwitchEngine.__init__).parameters["maximize_cli"]
         assert param.kind is inspect.Parameter.KEYWORD_ONLY
         assert param.default is None
+
+
+class TestLastResort:
+    def _seed(self, *, shared_email: bool = False):
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        switcher._init_sequence_file()
+        data = switcher._get_sequence_data()
+        team_email = "work@co.com" if shared_email else "team@co.com"
+        data["accounts"]["2"] = {
+            "email": "work@co.com", "uuid": "u2", "organizationUuid": "",
+            "organizationName": "", "added": "2024-01-01T00:00:00Z",
+        }
+        data["accounts"]["3"] = {
+            "email": team_email, "uuid": "u3", "organizationUuid": "org-3",
+            "organizationName": "Team", "added": "2024-01-01T00:00:00Z",
+            "alias": "team",
+        }
+        data["sequence"] = [2, 3]
+        switcher._write_json(switcher.sequence_file, data)
+        return switcher
+
+    def _cmd(self, argv: list[str]) -> int:
+        with patch("os.geteuid", return_value=1000, create=True):
+            try:
+                cli._last_resort_command(argv)
+            except SystemExit as e:
+                return e.code or 0
+        return 0
+
+    def _stored(self):
+        return load_maximize_settings(_backup_root()).last_resort
+
+    def test_add_by_number_stores_the_email(self, temp_home, capsys):
+        self._seed()
+        assert self._cmd(["add", "3"]) == 0
+        assert self._stored() == "team@co.com"
+        assert "Marked" in capsys.readouterr().out
+
+    def test_add_by_alias_stores_the_email(self, temp_home):
+        self._seed()
+        self._cmd(["add", "team"])
+        assert self._stored() == "team@co.com"
+
+    def test_add_appends_and_skips_duplicates(self, temp_home, capsys):
+        self._seed()
+        self._cmd(["add", "3"])
+        self._cmd(["add", "work@co.com"])
+        assert self._stored() == "team@co.com,work@co.com"
+        capsys.readouterr()
+        assert self._cmd(["add", "team"]) == 0
+        assert "already last-resort" in capsys.readouterr().out
+        assert self._stored() == "team@co.com,work@co.com"
+
+    def test_add_hints_when_strategy_is_not_maximize(self, temp_home, capsys):
+        self._seed()
+        self._cmd(["add", "3"])
+        assert "Takes effect with the maximize strategy (now best)" in (
+            capsys.readouterr().out
+        )
+
+    def test_no_hint_under_maximize(self, temp_home, capsys):
+        self._seed()
+        set_setting(_backup_root(), "autoswitch.strategy", "maximize")
+        self._cmd(["add", "3"])
+        assert "Takes effect" not in capsys.readouterr().out
+
+    def test_shared_email_stores_the_alias(self, temp_home):
+        self._seed(shared_email=True)
+        self._cmd(["add", "3"])
+        assert self._stored() == "team"
+
+    def test_shared_email_without_alias_is_refused(self, temp_home, capsys):
+        switcher = self._seed(shared_email=True)
+        data = switcher._get_sequence_data()
+        del data["accounts"]["3"]["alias"]
+        switcher._write_json(switcher.sequence_file, data)
+        assert self._cmd(["add", "3"]) == 1
+        assert "give Account-3 an alias first" in capsys.readouterr().err
+        assert self._stored() is None
+
+    def test_remove_last_entry_unsets_the_key(self, temp_home):
+        self._seed()
+        self._cmd(["add", "3"])
+        assert self._cmd(["remove", "team"]) == 0
+        raw = json.loads(settings_path(_backup_root()).read_text())
+        assert "maximize" not in raw
+
+    def test_remove_keeps_other_entries(self, temp_home):
+        self._seed()
+        self._cmd(["add", "3"])
+        self._cmd(["add", "2"])
+        self._cmd(["remove", "3"])
+        assert self._stored() == "work@co.com"
+
+    def test_remove_drops_a_hand_written_alias_entry(self, temp_home):
+        self._seed()
+        set_setting(_backup_root(), "maximize.lastResort", "TEAM")
+        self._cmd(["remove", "3"])
+        assert self._stored() is None
+
+    def test_remove_shared_email_entry_warns_about_the_other_account(
+        self, temp_home, capsys
+    ):
+        self._seed(shared_email=True)
+        set_setting(_backup_root(), "maximize.lastResort", "work@co.com")
+        self._cmd(["remove", "2"])
+        assert self._stored() is None
+        assert "Also returned Account-3" in capsys.readouterr().out
+
+    def test_remove_unmarked_account_is_a_noop(self, temp_home, capsys):
+        self._seed()
+        assert self._cmd(["remove", "2"]) == 0
+        assert "is not last-resort" in capsys.readouterr().out
+
+    def test_list_shows_entries_and_their_accounts(self, temp_home, capsys):
+        self._seed()
+        set_setting(_backup_root(), "maximize.lastResort", "team@co.com,ghost@x.com")
+        assert self._cmd(["list"]) == 0
+        out = capsys.readouterr().out
+        assert "team@co.com → Account-3" in out
+        assert "ghost@x.com → (no matching account)" in out
+
+    def test_bare_command_lists(self, temp_home, capsys):
+        self._seed()
+        assert self._cmd([]) == 0
+        assert "No last-resort accounts" in capsys.readouterr().out
+
+    def test_unknown_account_exits_1(self, temp_home, capsys):
+        self._seed()
+        assert self._cmd(["add", "9"]) == 1
+        assert "Error" in capsys.readouterr().err
+
+    def test_missing_account_argument_is_a_usage_error(self, temp_home):
+        self._seed()
+        assert self._cmd(["add"]) == 2
+
+    def test_dispatched_from_main(self, temp_home):
+        with patch("claude_swap.cli._last_resort_command") as fn, \
+             patch.object(sys, "argv", ["cc-swap", "last-resort", "add", "3"]):
+            cli.main()
+        fn.assert_called_once_with(["add", "3"])
+
+    def test_main_help_lists_the_fork_commands(self, capsys):
+        with patch.object(sys, "argv", ["cc-swap", "--help"]):
+            with pytest.raises(SystemExit):
+                cli.main()
+        out = capsys.readouterr().out
+        assert "last-resort add|remove <a>" in out
+        assert "auto --strategy maximize" in out
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="root guard is POSIX-only")
+    def test_refuses_root(self, temp_home, capsys):
+        self._seed()
+        with patch("os.geteuid", return_value=0, create=True), \
+             patch.object(ClaudeAccountSwitcher, "_is_running_in_container",
+                          return_value=False):
+            with pytest.raises(SystemExit) as exc:
+                cli._last_resort_command(["add", "3"])
+        assert exc.value.code == 1
