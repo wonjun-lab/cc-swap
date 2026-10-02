@@ -87,9 +87,18 @@ PROVIDER_ENV_VARS = (
 # Set when cc-swap itself runs inside a Claude Code session; a nested child
 # must not believe it is a sub-process of that session.
 NESTING_ENV_VARS = ("CLAUDECODE", "CLAUDE_CODE_ENTRYPOINT", "CLAUDE_CODE_SSE_PORT")
+# Further credential channels of the CLI (gateway, remote bridge, trusted
+# device) that session.py's AUTH_OVERRIDE_ENV_VARS does not list.
+EXTRA_AUTH_ENV_VARS = (
+    "CLAUDE_CODE_GATEWAY_TOKEN_FILE_DESCRIPTOR",
+    "CLAUDE_CODE_WEBSOCKET_AUTH_FILE_DESCRIPTOR",
+    "CLAUDE_BRIDGE_OAUTH_TOKEN",
+    "CLAUDE_TRUSTED_DEVICE_TOKEN",
+)
 SCRUBBED_ENV_VARS = frozenset(
     {
         *AUTH_OVERRIDE_ENV_VARS,
+        *EXTRA_AUTH_ENV_VARS,
         "CLAUDE_CONFIG_DIR",
         "CLAUDE_SECURESTORAGE_CONFIG_DIR",
         "ANTHROPIC_BASE_URL",
@@ -98,6 +107,9 @@ SCRUBBED_ENV_VARS = frozenset(
     }
 )
 SCRUBBED_PREFIXES = ("ANTHROPIC_", "CLAUDE_CODE_USE_", "CLAUDE_CODE_SKIP_")
+# Any CLAUDE* variable shaped like a credential, so channels added to the CLI
+# later are covered too (``..._MAX_OUTPUT_TOKENS`` does not match).
+SCRUBBED_CLAUDE_SUFFIXES = ("_TOKEN", "_FILE_DESCRIPTOR")
 
 
 @dataclass(frozen=True)
@@ -339,6 +351,7 @@ def _scrubbed(name: str) -> bool:
     return (
         upper in SCRUBBED_ENV_VARS
         or upper.startswith(SCRUBBED_PREFIXES)
+        or (upper.startswith("CLAUDE") and upper.endswith(SCRUBBED_CLAUDE_SUFFIXES))
         or "REFRESH_TOKEN" in upper
     )
 

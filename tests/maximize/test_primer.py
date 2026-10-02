@@ -306,6 +306,10 @@ BASE_ENV = {
     "CLAUDE_CODE_SSE_PORT": "4242",
     "CLAUDE_CODE_OAUTH_REFRESH_TOKEN": "sk-ant-ort01-never",
     "MY_REFRESH_TOKEN": "sk-ant-ort01-never",
+    "CLAUDE_CODE_GATEWAY_TOKEN_FILE_DESCRIPTOR": "5",
+    "CLAUDE_CODE_WEBSOCKET_AUTH_FILE_DESCRIPTOR": "6",
+    "CLAUDE_BRIDGE_OAUTH_TOKEN": "bridge",
+    "CLAUDE_TRUSTED_DEVICE_TOKEN": "device",
 }
 
 
@@ -327,6 +331,27 @@ class TestPrimeEnv:
             assert env[name] == "sk-ant-oat01-t"  # replaced, not inherited
         else:
             assert name not in env
+
+    @pytest.mark.parametrize(
+        "name",
+        [
+            "CLAUDE_CODE_GATEWAY_TOKEN_FILE_DESCRIPTOR",
+            "CLAUDE_CODE_WEBSOCKET_AUTH_FILE_DESCRIPTOR",
+            "CLAUDE_BRIDGE_OAUTH_TOKEN",
+            "CLAUDE_TRUSTED_DEVICE_TOKEN",
+            "CLAUDE_CODE_SOME_FUTURE_TOKEN",            # any CLAUDE*_TOKEN
+            "CLAUDE_CODE_SOME_FUTURE_FILE_DESCRIPTOR",  # any fd-passed secret
+        ],
+    )
+    def test_other_credential_channels_are_scrubbed(self, name, tmp_path):
+        env = build_prime_env({name: "x", "PATH": "/bin"}, tmp_path, "sk-ant-oat01-t")
+        assert name not in env
+
+    def test_unrelated_claude_settings_pass_through(self, tmp_path):
+        env = build_prime_env(
+            {"CLAUDE_CODE_MAX_OUTPUT_TOKENS": "100", "PATH": "/bin"}, tmp_path, "sk-ant-oat01-t"
+        )
+        assert env["CLAUDE_CODE_MAX_OUTPUT_TOKENS"] == "100"
 
     def test_never_contains_a_refresh_token(self, tmp_path):
         env = build_prime_env(BASE_ENV, tmp_path, "sk-ant-oat01-target")
