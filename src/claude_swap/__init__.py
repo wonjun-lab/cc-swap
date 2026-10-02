@@ -2,7 +2,7 @@
 
 from importlib.metadata import version
 
-__version__ = version("claude-swap")
+__version__ = version("cc-swap")
 
 from claude_swap.switcher import ClaudeAccountSwitcher
 
