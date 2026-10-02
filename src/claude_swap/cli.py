@@ -1091,8 +1091,22 @@ Examples:
                 print(f"  {entry} → {where}")
             return
 
-        num, email, _ = switcher.resolve_account(args.account)
         accounts = (switcher._get_sequence_data() or {}).get("accounts", {})
+        dangling = [
+            e for e in entries
+            if e.lower() == args.account.strip().lower() and not _last_resort_matches(accounts, e)
+        ]
+        if action == "remove" and dangling:
+            # An entry naming no account (left by an older `remove`): drop it
+            # by its text, since it resolves to no account to name.
+            kept = [e for e in entries if e not in dangling]
+            if kept:
+                set_setting(root, "maximize.lastResort", ",".join(kept))
+            else:
+                unset_setting(root, "maximize.lastResort")
+            print(f"{accent('Removed')} {dangling[0]} from last-resort (it named no account)")
+            return
+        num, email, _ = switcher.resolve_account(args.account)
 
         if action == "add":
             if num in {n for e in entries for n in _last_resort_matches(accounts, e)}:

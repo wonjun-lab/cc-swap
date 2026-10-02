@@ -8687,6 +8687,56 @@ class TestStashManifestConcurrentMutation:
         )
 
 
+class TestRemoveAccountPrunesLastResort:
+    """`remove N` left N's email in maximize.lastResort: `last-resort remove`
+    could no longer clear it, and re-adding the same login later made it
+    last-resort again without anyone asking."""
+
+    def _switcher(self, temp_home):
+        s = TestUsageAwareSwitch._setup(None, temp_home)
+        for num, email in ((1, "a@example.com"), (2, "b@example.com"), (3, "c@example.com")):
+            TestUsageAwareSwitch._seed(None, s, num, email)
+        TestUsageAwareSwitch._make_live(None, temp_home, "a@example.com", 1)
+        return s
+
+    def _last_resort(self, s):
+        from claude_swap.settings import load_maximize_settings
+
+        return load_maximize_settings(s.backup_dir).last_resort
+
+    def test_the_removed_accounts_entry_goes(self, temp_home):
+        from claude_swap.settings import set_setting
+
+        s = self._switcher(temp_home)
+        set_setting(s.backup_dir, "maximize.lastResort", "b@example.com,C@example.com")
+        s.remove_account("3", assume_yes=True)
+        assert self._last_resort(s) == "b@example.com"
+        s.remove_account("2", assume_yes=True)
+        assert self._last_resort(s) is None  # key unset, not ""
+
+    def test_an_alias_entry_goes_too(self, temp_home):
+        from claude_swap.settings import set_setting
+
+        s = self._switcher(temp_home)
+        data = s._get_sequence_data()
+        data["accounts"]["3"]["alias"] = "spare"
+        s._write_json(s.sequence_file, data)
+        set_setting(s.backup_dir, "maximize.lastResort", "spare")
+        s.remove_account("3", assume_yes=True)
+        assert self._last_resort(s) is None
+
+    def test_an_entry_that_still_names_another_account_stays(self, temp_home):
+        from claude_swap.settings import set_setting
+
+        s = self._switcher(temp_home)
+        data = s._get_sequence_data()
+        data["accounts"]["2"]["email"] = "c@example.com"  # a Team login sharing it
+        s._write_json(s.sequence_file, data)
+        set_setting(s.backup_dir, "maximize.lastResort", "c@example.com")
+        s.remove_account("3", assume_yes=True)
+        assert self._last_resort(s) == "c@example.com"
+
+
 class TestRemoveAccountPrunesMappings:
     """Removing an account drops any directory mappings pointing at it."""
 

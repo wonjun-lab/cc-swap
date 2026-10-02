@@ -4338,6 +4338,7 @@ class ClaudeAccountSwitcher:
         # Remove backup files
         self._delete_account_files(account_num, email)
 
+        accounts_before = dict(data["accounts"])
         # Update sequence.json
         del data["accounts"][account_num]
         data["sequence"] = [n for n in data["sequence"] if n != int(account_num)]
@@ -4348,6 +4349,41 @@ class ClaudeAccountSwitcher:
         print(f"{accent('Removed')} Account-{account_num} ({email})")
 
         self._prune_mappings(email, account_info.get("organizationUuid", ""))
+        self._prune_last_resort(accounts_before, account_num)
+
+    def _prune_last_resort(self, accounts_before: dict, account_num: str) -> None:
+        """Drop the ``maximize.lastResort`` entries that named only the removed
+        Account-``account_num`` (its email or alias). Left behind, such an
+        entry no longer resolves (``last-resort remove`` cannot clear it) and
+        silently marks the same login last-resort again once it is re-added.
+        An entry that still names another account (a shared email) stays."""
+        from claude_swap.maximize.tiers import last_resort_matches
+        from claude_swap.settings import (
+            load_maximize_settings,
+            parse_model_names,
+            set_setting,
+            unset_setting,
+        )
+
+        try:
+            entries = list(parse_model_names(load_maximize_settings(self.backup_dir).last_resort))
+        except Exception:
+            return
+        dropped = [
+            e for e in entries if last_resort_matches(accounts_before, e) == [account_num]
+        ]
+        if not dropped:
+            return
+        kept = [e for e in entries if e not in dropped]
+        try:
+            if kept:
+                set_setting(self.backup_dir, "maximize.lastResort", ",".join(kept))
+            else:
+                unset_setting(self.backup_dir, "maximize.lastResort")
+        except (ConfigError, OSError) as e:
+            warning(f"Could not update maximize.lastResort ({e}); remove {', '.join(dropped)} by hand")
+            return
+        print(dimmed(f"Removed {', '.join(dropped)} from maximize.lastResort"))
 
     def _build_accounts_info(self) -> list[tuple[int, str, str, str, bool, str, str]]:
         """Build per-account (num, email, org_name, org_uuid, is_active, creds, alias).
