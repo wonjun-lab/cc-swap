@@ -13,6 +13,7 @@ import importlib.util
 import json
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
@@ -37,6 +38,16 @@ def _isolation(tmp_path, monkeypatch):
         "claude_swap.update_check.subprocess.run",
         lambda *a, **k: pytest.fail(f"subprocess.run called: {a}"),
     )
+    # The lookup authenticates from $GITHUB_TOKEN / $GH_TOKEN or `gh auth
+    # token`; none of that may leak in from the machine running the suite.
+    monkeypatch.delenv("GITHUB_TOKEN", raising=False)
+    monkeypatch.delenv("GH_TOKEN", raising=False)
+    monkeypatch.setattr(
+        "claude_swap.update_check.shutil", SimpleNamespace(which=lambda *a, **k: None)
+    )
+    uc._gh_cli_token.cache_clear()
+    yield
+    uc._gh_cli_token.cache_clear()
 
 
 def _rel(tag: str, **extra) -> dict:

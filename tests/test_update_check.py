@@ -2,15 +2,20 @@
 
 from __future__ import annotations
 
+import http.client
 import json
 import re
+import subprocess
 import time
 import urllib.error
+import urllib.request
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
 
+import claude_swap.update_check as uc
 from claude_swap.update_check import (
     CACHE_PATH,
     CACHE_TTL,
@@ -45,6 +50,21 @@ def _no_network(monkeypatch):
         raise OSError("network disabled in tests")
 
     monkeypatch.setattr("claude_swap.update_check.urllib.request.urlopen", _offline)
+
+
+@pytest.fixture(autouse=True)
+def _no_github_credentials(monkeypatch):
+    """The lookup authenticates from $GITHUB_TOKEN / $GH_TOKEN or `gh auth
+    token`. Nothing here may pick up the developer's token or run the real
+    `gh`; the tests of that path stage both themselves."""
+    import claude_swap.update_check as uc
+
+    monkeypatch.delenv("GITHUB_TOKEN", raising=False)
+    monkeypatch.delenv("GH_TOKEN", raising=False)
+    monkeypatch.setattr(uc, "shutil", SimpleNamespace(which=lambda *a, **k: None))
+    uc._gh_cli_token.cache_clear()
+    yield
+    uc._gh_cli_token.cache_clear()
 
 
 @pytest.fixture(autouse=True)
@@ -240,6 +260,337 @@ class TestGitHubReleaseSource:
         # The backup root (and its cache/) is shared with an upstream cswap
         # install; its update_check.json holds a PyPI claude-swap version.
         assert CACHE_PATH.name == "cc_swap_update_check.json"
+
+
+def _http_error(code: int, **headers: str) -> urllib.error.HTTPError:
+    """An HTTPError with response headers; ``X_RateLimit_Reset`` -> ``X-RateLimit-Reset``."""
+    message = http.client.HTTPMessage()
+    for name, value in headers.items():
+        message[name.replace("_", "-")] = value
+    return urllib.error.HTTPError(RELEASES_URL, code, "error", message, None)
+
+
+def _rate_limit_error(reset: int) -> urllib.error.HTTPError:
+    """GitHub's answer once the quota is spent: 403 with the window's end."""
+    return _http_error(403, X_RateLimit_Remaining="0", X_RateLimit_Reset=str(reset))
+
+
+def _hhmm(epoch: float) -> str:
+    return time.strftime("%H:%M", time.localtime(epoch))
+
+
+def _raise_on_request(monkeypatch, exc: BaseException) -> None:
+    def _urlopen(req, timeout=None):
+        raise exc
+
+    monkeypatch.setattr("claude_swap.update_check.urllib.request.urlopen", _urlopen)
+
+
+def _capture_requests(monkeypatch) -> list[urllib.request.Request]:
+    """Answer every request with a 0.4.0 release; return the requests seen."""
+    seen: list[urllib.request.Request] = []
+
+    def _urlopen(req, timeout=None):
+        seen.append(req)
+        return _make_release_response("0.4.0")
+
+    monkeypatch.setattr("claude_swap.update_check.urllib.request.urlopen", _urlopen)
+    return seen
+
+
+def _stage_gh(monkeypatch, *, stdout="gho_FROMGH\n", returncode=0, raises=None) -> list:
+    """Put a fake `gh` on PATH. Returns the ``(argv, kwargs)`` of each run."""
+    calls: list = []
+    monkeypatch.setattr(
+        "claude_swap.update_check.shutil.which",
+        lambda name, *a, **k: "/opt/bin/gh" if name == "gh" else None,
+    )
+
+    def _run(cmd, **kwargs):
+        calls.append((cmd, kwargs))
+        if raises is not None:
+            raise raises
+        return subprocess.CompletedProcess(cmd, returncode, stdout=stdout, stderr="")
+
+    monkeypatch.setattr("claude_swap.update_check.subprocess.run", _run)
+    return calls
+
+
+class TestGitHubAuthentication:
+    """The API allows 60 anonymous requests an hour per IP; a token raises that."""
+
+    def test_anonymous_when_there_is_no_token_anywhere(self, monkeypatch):
+        seen = _capture_requests(monkeypatch)
+
+        assert uc._fetch_latest_tag() == "cc-v0.4.0"
+
+        assert seen[0].get_header("Authorization") is None
+
+    def test_github_token_is_sent_as_a_bearer_token(self, monkeypatch):
+        monkeypatch.setenv("GITHUB_TOKEN", "ghp_envtoken")
+        seen = _capture_requests(monkeypatch)
+
+        uc._fetch_latest_tag()
+
+        assert seen[0].get_header("Authorization") == "Bearer ghp_envtoken"
+
+    def test_gh_token_is_used_when_github_token_is_unset(self, monkeypatch):
+        monkeypatch.setenv("GH_TOKEN", "ghp_other")
+        seen = _capture_requests(monkeypatch)
+
+        uc._fetch_latest_tag()
+
+        assert seen[0].get_header("Authorization") == "Bearer ghp_other"
+
+    def test_github_token_wins_over_gh_token(self, monkeypatch):
+        monkeypatch.setenv("GITHUB_TOKEN", "ghp_first")
+        monkeypatch.setenv("GH_TOKEN", "ghp_second")
+        seen = _capture_requests(monkeypatch)
+
+        uc._fetch_latest_tag()
+
+        assert seen[0].get_header("Authorization") == "Bearer ghp_first"
+
+    def test_the_gh_cli_supplies_a_token_when_the_environment_has_none(self, monkeypatch):
+        calls = _stage_gh(monkeypatch)
+        seen = _capture_requests(monkeypatch)
+
+        uc._fetch_latest_tag()
+
+        assert seen[0].get_header("Authorization") == "Bearer gho_FROMGH"
+        argv, kwargs = calls[0]
+        assert argv == ["/opt/bin/gh", "auth", "token"]
+        assert kwargs["timeout"] == 3
+
+    def test_the_environment_wins_over_the_gh_cli(self, monkeypatch):
+        monkeypatch.setenv("GITHUB_TOKEN", "ghp_envtoken")
+        calls = _stage_gh(monkeypatch)
+        seen = _capture_requests(monkeypatch)
+
+        uc._fetch_latest_tag()
+
+        assert calls == []
+        assert seen[0].get_header("Authorization") == "Bearer ghp_envtoken"
+
+    def test_a_blank_environment_token_is_ignored(self, monkeypatch):
+        monkeypatch.setenv("GITHUB_TOKEN", "   ")
+        seen = _capture_requests(monkeypatch)
+
+        uc._fetch_latest_tag()
+
+        assert seen[0].get_header("Authorization") is None
+
+    @pytest.mark.parametrize(
+        "staging",
+        [
+            {"returncode": 1, "stdout": ""},  # not logged in
+            {"stdout": "\n"},
+            {"stdout": "two words\n"},  # not a token; never goes into a header
+            {"raises": subprocess.TimeoutExpired(["gh"], 3)},
+            {"raises": OSError("exec format error")},
+        ],
+        ids=["not-logged-in", "blank", "malformed", "timeout", "oserror"],
+    )
+    def test_a_gh_that_cannot_help_means_anonymous(self, monkeypatch, staging):
+        _stage_gh(monkeypatch, **staging)
+        seen = _capture_requests(monkeypatch)
+
+        assert uc._fetch_latest_tag() == "cc-v0.4.0"
+
+        assert seen[0].get_header("Authorization") is None
+
+    def test_gh_is_asked_once_per_process(self, monkeypatch):
+        calls = _stage_gh(monkeypatch)
+        _capture_requests(monkeypatch)
+
+        uc._fetch_latest_tag()
+        uc._fetch_latest_tag()
+        uc._get_json(f"{uc._API_URL}/compare/a...b", 2)
+
+        assert len(calls) == 1
+
+    def test_the_token_goes_only_to_api_github_com(self, monkeypatch):
+        monkeypatch.setenv("GITHUB_TOKEN", "ghp_envtoken")
+        seen = _capture_requests(monkeypatch)
+
+        uc._get_json("https://example.com/releases", 2)
+        uc._get_json("https://api.github.com.evil.example/releases", 2)
+        uc._get_json(RELEASES_URL, 2)
+
+        assert [r.get_header("Authorization") for r in seen] == [
+            None, None, "Bearer ghp_envtoken",
+        ]
+
+    def test_the_token_does_not_follow_a_redirect_to_another_host(self, monkeypatch):
+        monkeypatch.setenv("GITHUB_TOKEN", "ghp_envtoken")
+        seen = _capture_requests(monkeypatch)
+        uc._fetch_latest_tag()
+        request = seen[0]
+
+        redirected = urllib.request.HTTPRedirectHandler().redirect_request(
+            request, None, 302, "Found", request.headers, "https://elsewhere.example/x"
+        )
+
+        assert redirected.get_header("User-agent")  # other headers do carry over
+        assert redirected.get_header("Authorization") is None
+
+    def test_a_rejected_token_falls_back_to_an_anonymous_request(self, monkeypatch):
+        monkeypatch.setenv("GITHUB_TOKEN", "ghp_stale")
+        seen: list = []
+
+        def _urlopen(req, timeout=None):
+            seen.append(req)
+            if req.get_header("Authorization"):
+                raise _http_error(401)
+            return _make_release_response("0.4.0")
+
+        monkeypatch.setattr("claude_swap.update_check.urllib.request.urlopen", _urlopen)
+
+        assert uc._fetch_latest_tag() == "cc-v0.4.0"
+        assert [r.get_header("Authorization") for r in seen] == ["Bearer ghp_stale", None]
+
+    def test_a_forbidden_token_falls_back_to_an_anonymous_request(self, monkeypatch):
+        # e.g. a token with no SSO grant: 403, but not a spent quota.
+        monkeypatch.setenv("GITHUB_TOKEN", "ghp_nosso")
+        seen: list = []
+
+        def _urlopen(req, timeout=None):
+            seen.append(req)
+            if req.get_header("Authorization"):
+                raise _http_error(403)
+            return _make_release_response("0.4.0")
+
+        monkeypatch.setattr("claude_swap.update_check.urllib.request.urlopen", _urlopen)
+
+        assert uc._fetch_latest_tag() == "cc-v0.4.0"
+        assert len(seen) == 2
+
+    def test_a_spent_token_quota_is_reported_not_retried_anonymously(self, monkeypatch):
+        monkeypatch.setenv("GITHUB_TOKEN", "ghp_envtoken")
+        seen: list = []
+
+        def _urlopen(req, timeout=None):
+            seen.append(req)
+            raise _rate_limit_error(int(time.time()) + 600)
+
+        monkeypatch.setattr("claude_swap.update_check.urllib.request.urlopen", _urlopen)
+
+        with pytest.raises(uc._LookupFailed) as excinfo:
+            uc._fetch_json(RELEASES_URL, 2)
+
+        assert len(seen) == 1
+        assert excinfo.value.rate_limited
+
+    def test_a_token_that_works_costs_no_second_request(self, monkeypatch):
+        monkeypatch.setenv("GITHUB_TOKEN", "ghp_envtoken")
+        seen = _capture_requests(monkeypatch)
+
+        uc._fetch_latest_tag()
+
+        assert len(seen) == 1
+
+    def test_the_token_is_never_printed_or_logged(self, monkeypatch, capsys, caplog):
+        secret = "ghp_TOPSECRETVALUE"
+        monkeypatch.setenv("GITHUB_TOKEN", secret)
+        monkeypatch.setattr("claude_swap.update_check._detect_install_method", lambda: None)
+        caplog.set_level("DEBUG")
+        reset = int(time.time()) + 600
+
+        for answer in (_rate_limit_error(reset), OSError("network error"), None):
+            if answer is None:
+                _capture_requests(monkeypatch)
+            else:
+                _raise_on_request(monkeypatch, answer)
+            run_self_upgrade()
+            uc.run_upgrade_check()
+            check_for_update("0.0.1")
+
+        captured = capsys.readouterr()
+        assert secret not in captured.out + captured.err + caplog.text
+
+    def test_a_rate_limited_passive_check_stays_silent(self, monkeypatch, capsys):
+        _raise_on_request(monkeypatch, _rate_limit_error(int(time.time()) + 600))
+
+        assert check_for_update("0.3.1") is None
+
+        captured = capsys.readouterr()
+        assert captured.out == "" and captured.err == ""
+
+
+class TestWhyTheLookupFailed:
+    """``_fetch_json`` says in words why GitHub did not answer, so that
+    ``upgrade`` can tell the user instead of quietly using the cache."""
+
+    def _failure(self, monkeypatch, exc: BaseException) -> uc._LookupFailed:
+        _raise_on_request(monkeypatch, exc)
+        with pytest.raises(uc._LookupFailed) as excinfo:
+            uc._fetch_json(RELEASES_URL, 2)
+        return excinfo.value
+
+    def test_a_spent_quota_names_when_it_resets(self, monkeypatch):
+        reset = int(time.time()) + 1800
+
+        failure = self._failure(monkeypatch, _rate_limit_error(reset))
+
+        assert failure.reason == f"rate limited until {_hhmm(reset)}"
+
+    def test_a_secondary_limit_counts_down_from_retry_after(self, monkeypatch):
+        failure = self._failure(monkeypatch, _http_error(429, Retry_After="120"))
+
+        assert re.fullmatch(r"rate limited until \d\d:\d\d", failure.reason)
+
+    def test_a_spent_quota_without_a_reset_header_is_still_a_rate_limit(self, monkeypatch):
+        failure = self._failure(monkeypatch, _http_error(403, X_RateLimit_Remaining="0"))
+
+        assert failure.reason == "rate limited"
+
+    @pytest.mark.parametrize("code", [403, 404, 500, 503])
+    def test_other_http_errors_name_the_status(self, monkeypatch, code):
+        failure = self._failure(monkeypatch, _http_error(code))
+
+        assert failure.reason == f"HTTP {code}"
+
+    @pytest.mark.parametrize(
+        "exc", [TimeoutError(), urllib.error.URLError(TimeoutError("timed out"))],
+        ids=["bare", "wrapped"],
+    )
+    def test_a_timeout_says_so(self, monkeypatch, exc):
+        assert self._failure(monkeypatch, exc).reason == "timed out"
+
+    @pytest.mark.parametrize(
+        "exc",
+        [OSError("boom"), urllib.error.URLError(OSError("name resolution failed"))],
+        ids=["oserror", "urlerror"],
+    )
+    def test_a_network_error_says_so(self, monkeypatch, exc):
+        assert self._failure(monkeypatch, exc).reason.startswith("network error")
+
+    def test_a_reply_that_is_not_json_says_so(self, monkeypatch):
+        resp = _make_release_response("0.4.0")
+        resp.read.return_value = b"<html>captive portal</html>"
+        monkeypatch.setattr(
+            "claude_swap.update_check.urllib.request.urlopen", lambda req, timeout=None: resp
+        )
+
+        with pytest.raises(uc._LookupFailed) as excinfo:
+            uc._fetch_json(RELEASES_URL, 2)
+
+        assert excinfo.value.reason == "unexpected response"
+
+    def test_a_rate_limit_without_a_token_suggests_one(self, monkeypatch):
+        failure = self._failure(monkeypatch, _rate_limit_error(int(time.time()) + 60))
+
+        assert "GITHUB_TOKEN" in failure.hint and "gh auth login" in failure.hint
+
+    def test_a_rate_limit_with_a_token_does_not(self, monkeypatch):
+        monkeypatch.setenv("GITHUB_TOKEN", "ghp_envtoken")
+
+        failure = self._failure(monkeypatch, _rate_limit_error(int(time.time()) + 60))
+
+        assert failure.hint is None
+
+    def test_other_failures_have_no_hint(self, monkeypatch):
+        assert self._failure(monkeypatch, OSError("boom")).hint is None
 
 
 class TestCheckForUpdatePrereleases:
@@ -640,9 +991,9 @@ class TestUpgradeIgnoresTheCache:
         mock_run.assert_called_once_with(
             ["uv", "tool", "install", "--force", f"{FORK}@cc-v0.1.0"], check=False
         )
-        out = capsys.readouterr().out
-        assert "cc-v0.1.0" in out
-        assert "cached" in out.lower()
+        err = capsys.readouterr().err
+        assert "cc-v0.1.0" in err
+        assert "cached" in err.lower()
 
     def test_live_failure_and_no_cache_uses_default_branch(
         self, mock_run, mock_detect, capsys

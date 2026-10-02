@@ -26,7 +26,11 @@ uv tool install git+https://github.com/wonjun-lab/cc-swap
 
 To upgrade, run `cc-swap upgrade`. If the service is installed, `cc-swap upgrade` re-runs `cc-swap service install` for you after a successful reinstall, so the service restarts on the new build. (Reinstalling by hand with `uv tool install --force git+https://github.com/wonjun-lab/cc-swap` leaves the service on the old build until you run `cc-swap service install`.)
 
-`cc-swap upgrade --check` only reports: it prints the installed and the latest release, then the release notes and commit subjects in between. It exits `0` when you are up to date, `10` when an update is available and `1` when the latest release could not be determined (offline with no cached tag), so a timer can run it daily.
+`cc-swap upgrade --check` only reports: it prints the installed and the latest release, then the release notes and commit subjects in between. It exits `0` when you are up to date, `10` when an update is available, `2` when GitHub could not be asked and the cache cannot settle it (see below) and `1` when no release is published yet, so a timer can run it daily.
+
+`upgrade` and `upgrade --check` look the latest release up on the GitHub API, which allows only 60 anonymous requests an hour per IP. They authenticate when they can: with `$GITHUB_TOKEN` or `$GH_TOKEN` if set, otherwise with the token from `gh auth token` when the GitHub CLI is on your `PATH` (given 3 seconds to answer). The token is sent only to `api.github.com`, as `Authorization: Bearer`, and is never printed or logged; with no token, or one GitHub rejects, the lookup goes out anonymously.
+
+When the lookup fails (rate limited, offline, ...) they say so on stderr, for example `cc-swap: could not reach GitHub (rate limited until 05:12); using cached cc-v0.3.1 from 2h ago — it may be out of date`. A cached release never counts as proof that you are current: if it matches or trails what you run, `upgrade` prints `cannot confirm the latest release`, changes nothing and exits `2` (`upgrade --check` exits `2` too, without saying "up to date"; `upgrade --force` still reinstalls the cached release). A cached release newer than what you run is still installed (`upgrade`) or reported as an update (`upgrade --check`, exit `10`). With nothing cached, `upgrade` installs the default branch and says so. The passive update notice stays silent when it cannot reach GitHub.
 
 ### Migrating from cswap
 
