@@ -896,3 +896,26 @@ class Primer:
 
         self.engine._mutate_state(mutate)
         return won
+
+
+def prime_snapshot(engine, usage: Mapping[str, dict | str | None], now: float) -> Snapshot:
+    """A Snapshot for priming, from the engine's state and this tick's usage.
+    The active account is re-read here, after any switch the tick made."""
+    switcher = engine.switcher
+    state = engine._read_state()
+    quarantine = state.get("quarantine")
+    records = (switcher._get_sequence_data() or {}).get("accounts", {})
+    if not isinstance(records, dict):
+        records = {}
+    return build_snapshot(
+        now=now,
+        active=switcher.current_account_number(),
+        usage=usage,
+        records=records,
+        quarantined=set(quarantine) if isinstance(quarantine, dict) else set(),
+        api_key_accounts={n for n in records if switcher.account_kind_for(n) == "api_key"},
+        rate_limit_tiers={},
+        samples=(),
+        last_switch_at=None,
+        settings=load_maximize_settings(switcher.backup_dir),
+    )
