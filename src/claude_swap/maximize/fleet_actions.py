@@ -50,6 +50,18 @@ def live_login_fingerprint(switcher) -> str | None:
     return oauth.credential_fingerprint(creds) if creds else None
 
 
+def backup_active_before_relogin(switcher, number: str) -> tuple[bool, str]:
+    """Before a re-login of ``number`` replaces the live login, the active
+    account's newest refresh token must be in its backup — the login about to
+    be replaced is otherwise its only copy. ``(ok, reason)``; ``ok`` only
+    when the live and backup fingerprints match afterwards. Re-logging the
+    active slot itself needs no backup (its login is what gets replaced)."""
+    sync = getattr(switcher, "sync_active_backup", None)
+    if sync is None:
+        return True, ""
+    return sync(skip_number=str(number))
+
+
 def relogin_store(
     switcher, number: str, *, return_to: str | None, before: str | None = None
 ) -> dict:

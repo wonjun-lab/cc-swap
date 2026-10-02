@@ -168,7 +168,11 @@ def open_relogin(app: "CswapApp", number: str) -> None:
     ``~/.local/bin/claude``) and the account's email; enter then stores the
     live login only if it is this slot's account, and switches back to the
     account active now."""
-    from claude_swap.maximize.fleet_actions import live_login_fingerprint, relogin_store
+    from claude_swap.maximize.fleet_actions import (
+        backup_active_before_relogin,
+        live_login_fingerprint,
+        relogin_store,
+    )
     from claude_swap.maximize.primer import resolve_claude_path
     from claude_swap.tui.data import run_action
     from claude_swap.tui.fleet_modals import ReloginModal
@@ -201,6 +205,7 @@ def open_relogin(app: "CswapApp", number: str) -> None:
         ReloginModal(
             lines, backup_root=root, store=store,
             fingerprint=partial(live_login_fingerprint, app.switcher),
+            prepare=partial(backup_active_before_relogin, app.switcher, number),
         ),
         partial(_relogin_done, app, number),
     )

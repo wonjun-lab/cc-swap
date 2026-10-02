@@ -158,11 +158,18 @@ class ReloginModal(ModalScreen["ActionResult | None"]):
         backup_root: Path,
         store: Callable[[str | None], ActionResult],
         fingerprint: Callable[[], str | None] | None = None,
+        prepare: Callable[[], tuple[bool, str]] | None = None,
     ) -> None:
         """``store(before)`` stores the live login; ``before`` is the live
         login's fingerprint when this opened (None = unknown). ``fingerprint``
-        reads that fingerprint (a hash, never a token)."""
+        reads that fingerprint (a hash, never a token). ``prepare`` runs
+        first, off the UI thread — backing up the active account's current
+        login — and ``(False, reason)`` refuses to start the re-login."""
         super().__init__()
+        self._prepare = prepare
+        self._preparing = prepare is not None
+        self._refused: str | None = None
+        self._started = False
         self._lines = lines
         self._root = backup_root
         self._store = store
@@ -183,6 +190,41 @@ class ReloginModal(ModalScreen["ActionResult | None"]):
             )
 
     def on_mount(self) -> None:
+        if self._prepare is None:
+            self._start()
+            return
+        self.query_one("#fx-relogin-steps", Static).update(
+            "Backing up the active account's current login first…"
+        )
+        self.run_worker(
+            self._prepare_blocking, thread=True, group="fleet-relogin-prepare",
+            exit_on_error=False, name="fleet-relogin-prepare",
+        )
+
+    def _prepare_blocking(self) -> None:
+        try:
+            ok, reason = self._prepare()
+        except Exception as e:
+            ok, reason = False, f"{type(e).__name__}: {e}"
+        self.app.call_from_thread(self._prepared, ok, reason)
+
+    def _prepared(self, ok: bool, reason: str) -> None:
+        self._preparing = False
+        if not self.is_attached:
+            return
+        if not ok:
+            self._refused = reason
+            palette = Palette.from_theme(self.app.current_theme)
+            self.query_one("#fx-relogin-steps", Static).update(
+                Text(f"Not starting the re-login: {reason}", style=palette.sev_crit)
+            )
+            self._status("nothing was changed · esc close")
+            return
+        self.query_one("#fx-relogin-steps", Static).update("\n".join(self._lines))
+        self._start()
+
+    def _start(self) -> None:
+        self._started = True
         self._run_pause_op(self._pause_blocking, "fleet-pause")
         # Renew while the modal stays open: the marker never outlives the
         # last renewal by more than MAX_PAUSE_S, so a crash still lifts it.
@@ -227,6 +269,8 @@ class ReloginModal(ModalScreen["ActionResult | None"]):
         if self._lifted:
             return
         self._lifted = True
+        if not self._started:
+            return  # never paused: nothing of ours to lift
         timer = getattr(self, "_renew_timer", None)
         if timer is not None:
             timer.stop()
@@ -246,7 +290,7 @@ class ReloginModal(ModalScreen["ActionResult | None"]):
             self.query_one("#fx-relogin-status", Static).update(Text(note, style=palette.muted))
 
     def action_store(self) -> None:
-        if self._busy:
+        if self._busy or self._preparing or self._refused is not None:
             return
         if self.app.busy:
             self.notify("Another action is still running", severity="warning")

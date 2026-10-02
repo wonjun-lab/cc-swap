@@ -510,3 +510,66 @@ def test_relogin_store_refreshes_in_place_and_switches_back(tmp_path):
     fake.calls.clear()
     assert relogin_store(fake, "4", return_to="4") == {"stored": True, "number": "4"}
     assert fake.calls == [("add", None, True)]
+
+
+class BackingUpSwitcher(IdentitySwitcher):
+    def __init__(self, *a, verdict=(True, ""), **kw):
+        super().__init__(*a, **kw)
+        self.verdict = verdict
+        self.synced: list[str | None] = []
+
+    def sync_active_backup(self, *, skip_number=None):
+        self.synced.append(skip_number)
+        return self.verdict
+
+
+@pytest.mark.asyncio
+class TestReloginBacksUpTheActiveAccountFirst:
+    async def _open_relogin(self, pilot):
+        await _open(pilot)
+        await _to_row(pilot, "4")
+        await pilot.press("r")
+        await _open(pilot)
+
+    async def test_refuses_to_start_when_the_active_login_cannot_be_backed_up(self, tmp_path):
+        from claude_swap.tui.fleet_modals import ReloginModal
+
+        _settings(tmp_path)
+        fake = BackingUpSwitcher(
+            _accounts(), tmp_path, live=("user4@example.com", "", "uuid-4"), live_rt="rt-x",
+            verdict=(False, "#1's current login could not be backed up"),
+        )
+        app = make_app(fake)
+        state = tmp_path / "autoswitch_state.json"
+        async with app.run_test(size=(140, 40)) as pilot:
+            await self._open_relogin(pilot)
+            modal = app.screen
+            assert isinstance(modal, ReloginModal)
+            steps = modal.query_one("#fx-relogin-steps", Static).render().plain
+            assert steps.startswith("Not starting the re-login: #1's current login")
+            assert "/login" not in steps
+            assert not state.exists() or "pausedUntil" not in json.loads(state.read_text())
+            fake.live_rt = "rt-new"
+            await pilot.press("enter")
+            await _open(pilot)
+            assert app.screen is modal and ("add", None, True) not in fake.calls
+            await pilot.press("escape")
+            await _open(pilot)
+        assert fake.synced == ["4"]
+
+    async def test_starts_once_the_active_login_is_backed_up(self, tmp_path):
+        from claude_swap.tui.fleet_modals import ReloginModal
+
+        _settings(tmp_path)
+        fake = BackingUpSwitcher(_accounts(), tmp_path)
+        app = make_app(fake)
+        state = tmp_path / "autoswitch_state.json"
+        async with app.run_test(size=(140, 40)) as pilot:
+            await self._open_relogin(pilot)
+            assert isinstance(app.screen, ReloginModal)
+            steps = app.screen.query_one("#fx-relogin-steps", Static).render().plain
+            assert "/login" in steps
+            assert json.loads(state.read_text())["pausedReason"] == "relogin"
+            await pilot.press("escape")
+            await _open(pilot)
+        assert fake.synced == ["4"]

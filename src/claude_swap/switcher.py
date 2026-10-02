@@ -2042,6 +2042,49 @@ class ClaudeAccountSwitcher:
             "uuid": (acct.get("uuid") or "").strip(),
         }
 
+    def sync_active_backup(self, *, skip_number: str | None = None) -> tuple[bool, str]:
+        """Make the active slot's backup hold the live login's lineage (the
+        oracle-checked resync), then verify it. ``(ok, reason)``: ``ok`` only
+        when the live and backup refresh-token fingerprints match. Nothing
+        to do when there is no managed live login, it is an API key, or the
+        active slot is ``skip_number``. Never raises; no secrets in reasons."""
+        try:
+            num = self.current_account_number()
+            if num is None:
+                if self.has_live_login():
+                    return False, (
+                        "the live login is not a managed account; run "
+                        "`cc-swap add` first so it is not lost"
+                    )
+                return True, ""
+            if skip_number is not None and num == str(skip_number):
+                return True, ""
+            ident = self.account_identity(num)
+            email, org = ident["email"], ident["organizationUuid"]
+            self._store.forget_last_active_read()
+            live = self._read_credentials()
+            verdict = self._store.last_active_read()
+            if verdict is not None and (verdict.degraded or verdict.keychain_unavailable):
+                return False, f"{KEYCHAIN_REFUSAL}; retry in a GUI terminal"
+            if live is None:
+                return False, f"#{num}'s live login could not be read"
+            if not live or looks_like_api_key(live):
+                return True, ""
+            live_fp = oauth.credential_fingerprint(live)
+            backup = self._read_account_credentials(num, email)
+            if oauth.credential_fingerprint(backup) != live_fp:
+                self._resync_rotated_backup(num, email, org, live)
+                backup = self._read_account_credentials(num, email)
+            if oauth.credential_fingerprint(backup) == live_fp:
+                return True, ""
+            return False, (
+                f"#{num}'s current login could not be backed up (its owner "
+                f"could not be verified); run `cc-swap add` while logged in "
+                f"as #{num}, then retry"
+            )
+        except Exception as e:
+            return False, f"backing up the active login failed ({type(e).__name__})"
+
     def adopt_new_active_login(self, account_num: str) -> str:
         """Back up a NEW live login on the active slot ``account_num``
         whose stored lineage is dead (the engine calls this only for a
