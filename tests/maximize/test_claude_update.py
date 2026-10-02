@@ -383,6 +383,49 @@ def test_update_timeout_kills_the_child_and_exits_1(fake, root, capsys):
         pass
 
 
+def _unrunnable_claude(root, tmp_path) -> Path:
+    """An executable file the kernel cannot exec (no shebang, not a binary):
+    Popen raises OSError (ENOEXEC) for it."""
+    bad = tmp_path / "badbin" / "claude"
+    bad.parent.mkdir(parents=True)
+    bad.write_text("this is not a program\n")
+    bad.chmod(0o755)
+    atomic_write_json(
+        settings_path(root), {"schemaVersion": 1, "prime": {"claudePath": str(bad)}}
+    )
+    return bad
+
+
+def test_a_claude_that_cannot_be_started_is_a_clean_error(root, tmp_path, capsys):
+    _unrunnable_claude(root, tmp_path)
+    assert cu.run([]) == 1
+    err = capsys.readouterr().err
+    assert "could not run" in err and "claude update" in err
+    assert "Traceback" not in err
+    assert "claudeVersion" not in state_of(root)
+
+
+def test_a_claude_that_cannot_be_started_releases_the_lock(root, tmp_path):
+    _unrunnable_claude(root, tmp_path)
+    cu.run([])
+    with FileLock(root / cu.LOCK_FILENAME, timeout=0):
+        pass
+
+
+def test_a_claude_that_cannot_be_started_through_the_command_entry_exits_1(root, tmp_path, capsys):
+    _unrunnable_claude(root, tmp_path)
+    with pytest.raises(SystemExit) as exit_:
+        cu.claude_update_command([])
+    assert exit_.value.code == 1
+
+
+def test_a_claude_that_cannot_be_started_keeps_json_parseable(root, tmp_path, capsys):
+    _unrunnable_claude(root, tmp_path)
+    assert cu.run(["--json"]) == 1
+    data = json.loads(capsys.readouterr().out)
+    assert data["ok"] is False and "claude update" in data["error"]
+
+
 def test_update_refuses_while_another_update_runs(fake, root, capsys):
     with FileLock(root / cu.LOCK_FILENAME, timeout=0):
         assert cu.run([]) == 1

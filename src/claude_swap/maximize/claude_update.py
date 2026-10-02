@@ -417,6 +417,13 @@ def perform_update(root: Path, *, timeout: float, sink) -> UpdateResult:
         before = installed_version(claude)
         run = run_claude_update(claude, timeout=timeout, sink=sink)
         after = installed_version(claude)
+    except OSError as e:
+        # `claude update` could not even be started (not executable, wrong
+        # format, vanished since the lookup): nothing ran, nothing changed.
+        return UpdateResult(
+            claude=claude,
+            error=f"could not run `{claude} update`: {e.strerror or e}",
+        )
     finally:
         lock.release()
 
