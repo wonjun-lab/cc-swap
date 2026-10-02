@@ -65,6 +65,7 @@ def test_build_snapshot_maps_records_in_order():
         samples=[Sample(NOW - 2000, 1, 1), Sample(NOW - 60, 10, 20)],
         last_switch_at=NOW - 100,
         settings=MaximizeSettings(last_resort="team", plan_override="b@x.com:20x"),
+        active_changed_at=NOW - 50,
     )
     assert [v.number for v in snap.accounts] == ["2", "1", "3", "4"]
     by = {v.number: v for v in snap.accounts}
@@ -74,6 +75,7 @@ def test_build_snapshot_maps_records_in_order():
     assert by["4"].api_key and by["4"].plan_weight == 1
     assert [s.ts for s in snap.samples] == [NOW - 60]      # 30-minute trim
     assert snap.view("1") is by["1"] and snap.view("9") is None
+    assert (snap.last_switch_at, snap.active_changed_at) == (NOW - 100, NOW - 50)
 
 
 def test_rows_and_table_carry_no_email():

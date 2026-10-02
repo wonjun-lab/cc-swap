@@ -70,6 +70,7 @@ def build_snapshot(
     samples: Sequence[Sample],
     last_switch_at: float | None,
     settings: MaximizeSettings,
+    active_changed_at: float | None = None,
 ) -> Snapshot:
     """One view per ``records`` entry, in ``records`` order (sequence order)."""
     last_resort = parse_account_list(settings.last_resort)
@@ -101,4 +102,5 @@ def build_snapshot(
         samples=trim_samples(samples, now),
         last_switch_at=last_switch_at,
         settings=settings,
+        active_changed_at=active_changed_at,
     )

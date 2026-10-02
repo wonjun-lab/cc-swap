@@ -48,6 +48,9 @@ class Snapshot:
     samples: tuple[Sample, ...]          # active account, last 30 min, oldest first
     last_switch_at: float | None
     settings: MaximizeSettings
+    # When the active account last changed by any route (an engine switch or
+    # a manual login the engine noticed); None when no change was seen.
+    active_changed_at: float | None = None
 
     def view(self, number: str | None) -> AccountView | None:
         """The account with this slot number, or None."""

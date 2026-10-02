@@ -301,10 +301,14 @@ def _rebalance(
             f"(score {a_score:.2f})",
             pending=False,
         )
-    if snap.last_switch_at is not None:
-        remaining_s = s.rebalance_cooldown_min * 60.0 - (
-            snap.now - snap.last_switch_at
-        )
+    # The cooldown runs from the later of the last engine switch and the
+    # last change of active account: a manual switch restarts it too.
+    since = max(
+        (t for t in (snap.last_switch_at, snap.active_changed_at) if t is not None),
+        default=None,
+    )
+    if since is not None:
+        remaining_s = s.rebalance_cooldown_min * 60.0 - (snap.now - since)
         if remaining_s > 0:
             return Hold(
                 f"rebalance cooldown ({remaining_s / 60:.0f} min left): {why}",

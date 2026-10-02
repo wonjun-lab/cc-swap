@@ -59,6 +59,8 @@ _logger = logging.getLogger("claude-swap")
 
 RUNTIME_ATTR = "_maximize_runtime"
 SAMPLES_KEY = "maximizeSamples"
+# Inside the SAMPLES_KEY record: when its account became the active one.
+CHANGED_KEY = "activeChangedAt"
 # rateLimitTier only changes with a plan change; re-read the stored
 # credential (a Keychain read on macOS) at most hourly per slot.
 TIER_CACHE_TTL_S = 3600.0
@@ -382,6 +384,25 @@ def _fresh_sample(entry, value: object, now: float) -> Sample | None:
     return Sample(ts=float(fetched_at), pct5=pct5, pct7=pct7)
 
 
+def _active_changed_at(source: Mapping, current: str, now: float) -> float | None:
+    """When the active account last changed, from the samples record.
+
+    A record naming another account means the active account changed since
+    the last tick (a manual login, or another surface switched): ``now`` is
+    the first moment we know of it. No record at all is a first run, not a
+    change (None).
+    """
+    raw = source.get(SAMPLES_KEY)
+    if not isinstance(raw, Mapping):
+        return None
+    if str(raw.get("account")) != current:
+        return now
+    ts = raw.get(CHANGED_KEY)
+    if isinstance(ts, bool) or not isinstance(ts, (int, float)):
+        return None
+    return min(float(ts), now)
+
+
 def _update_samples(
     engine: aw.AutoSwitchEngine,
     rt: MaximizeRuntime,
@@ -390,31 +411,35 @@ def _update_samples(
     entry,
     value: object,
     now: float,
-) -> tuple[Sample, ...]:
+) -> tuple[tuple[Sample, ...], float | None]:
     """Append this tick's fresh reading; persist ``maximizeSamples``.
 
-    The buffer belongs to one account: another active account (a switch, a
-    manual login) starts it empty.
+    Returns ``(samples, active_changed_at)``. The buffer belongs to one
+    account: another active account (a switch, a manual login) starts it
+    empty and stamps the change time, which restarts the rebalance cooldown.
     """
     source = rt.dry_samples if engine.dry_run else state
     samples = _stored_samples(source, current)
+    changed_at = _active_changed_at(source, current, now)
     new = _fresh_sample(entry, value, now)
     if new is not None and (not samples or new.ts > samples[-1].ts):
         samples.append(new)
     trimmed = idle.trim_samples(samples, now)
-    record = {
+    record: dict[str, Any] = {
         "account": current,
         "samples": [[x.ts, x.pct5, x.pct7] for x in trimmed],
     }
+    if changed_at is not None:
+        record[CHANGED_KEY] = changed_at
     if engine.dry_run:
         rt.dry_samples = {SAMPLES_KEY: record}
     elif state.get(SAMPLES_KEY) != record:
         engine._mutate_state(lambda s: s.__setitem__(SAMPLES_KEY, record))
-    return trimmed
+    return trimmed, changed_at
 
 
 def _reset_samples(engine: aw.AutoSwitchEngine, number: str) -> None:
-    record = {"account": number, "samples": []}
+    record = {"account": number, "samples": [], CHANGED_KEY: engine.clock()}
     engine._mutate_state(lambda s: s.__setitem__(SAMPLES_KEY, record))
 
 
@@ -670,7 +695,7 @@ def run_maximize_tick(
     reload_if_changed(engine, rt)
     now = engine.clock()
     records = _records(engine, current)
-    samples = _update_samples(
+    samples, active_changed_at = _update_samples(
         engine, rt, state, current, entries.get(current), usage.get(current), now
     )
     last = state.get("lastSwitchAt")
@@ -689,6 +714,7 @@ def run_maximize_tick(
             else None
         ),
         settings=rt.settings,
+        active_changed_at=active_changed_at,
     )
     decision = policy.decide(snap)
     rt.last_snapshot, rt.last_decision = snap, decision

@@ -131,7 +131,9 @@ class TestSoftAndHard:
         assert no_switch_reasons(h) == ["maximize-pending", "maximize-pending"]
         [switch] = of(h, SwitchEvent)
         assert switch.trigger == "soft"
-        assert h.state()[SAMPLES_KEY] == {"account": "2", "samples": []}
+        assert h.state()[SAMPLES_KEY] == {
+            "account": "2", "samples": [], "activeChangedAt": h.clock.now,
+        }
 
     def test_soft_keeps_waiting_while_busy(self, temp_home):
         h = make(temp_home)
@@ -204,12 +206,56 @@ class TestSamples:
         h.tick_with_usage(usage)
         stored = h.state()[SAMPLES_KEY]
         assert stored["account"] == "1" and len(stored["samples"]) == 2
+        assert "activeChangedAt" not in stored   # first run: no change seen
         h.make_live(EMAILS[2], 2)          # manual switch outside the engine
         h.clock.advance(120)
         h.tick_with_usage(usage)
         stored = h.state()[SAMPLES_KEY]
-        assert stored == {"account": "2", "samples": [[h.clock.now, 10.0, 10.0]]}
-        assert runtime_for(h.engine).last_snapshot.samples[0].ts == h.clock.now
+        assert stored == {
+            "account": "2",
+            "samples": [[h.clock.now, 10.0, 10.0]],
+            "activeChangedAt": h.clock.now,
+        }
+        snap = runtime_for(h.engine).last_snapshot
+        assert snap.samples[0].ts == h.clock.now
+        assert snap.active_changed_at == h.clock.now
+        changed = h.clock.now
+        h.clock.advance(120)
+        h.tick_with_usage(usage)
+        assert h.state()[SAMPLES_KEY]["activeChangedAt"] == changed   # kept
+
+    def test_manual_switch_restarts_the_rebalance_cooldown(self, temp_home):
+        # 2 beats 3 by far on the weekly score; no engine switch ever ran,
+        # so only the manual login can hold the rebalance back.
+        h = make(temp_home)
+        now = h.clock.now
+
+        def usage() -> dict:
+            return {
+                "1": win(10, 40),
+                "2": win(0, 70, r7=now + 0.5 * 86400),
+                "3": win(10, 10, r7=now + 6 * 86400),
+            }
+
+        h.tick_with_usage(usage())
+        h.make_live(EMAILS[3], 3)          # manual switch outside the engine
+        h.clock.advance(60)
+        changed = h.clock.now
+        outcomes = [h.tick_with_usage(usage())]
+        for _ in range(4):                 # 11 idle minutes on 3
+            h.clock.advance(165)
+            outcomes.append(h.tick_with_usage(usage()))
+        assert h.clock.now - changed == 660
+        assert outcomes == [TickOutcome.NO_ACTION] * 5
+        detail = of(h, NoSwitchEvent)[-1].detail
+        assert detail.startswith("rebalance cooldown (19 min left)"), detail
+        assert "lastSwitchAt" not in h.state()
+        while h.clock.now - changed < 1800:
+            h.clock.advance(300)
+            outcome = h.tick_with_usage(usage())
+        assert outcome is TickOutcome.SWITCHED
+        assert of(h, SwitchEvent)[-1].trigger == "rebalance"
+        assert h.active_number() == 2
 
     def test_cached_reading_not_resampled(self, temp_home):
         # The store serves one fetch for several ticks (serve TTL, backoff):
@@ -486,16 +532,17 @@ def test_combined_soft_idle_last_resort_excluded_and_priming(temp_home):
     assert all(d.startswith("rebalance cooldown") for d in holds)
 
     # C: the user logs into the excluded account by hand; at idle (and past
-    # the cooldown) the engine moves off it to the best normal account.
+    # the cooldown, which the manual login restarted when the first tick saw
+    # it) the engine moves off it to the best normal account.
     h.make_live(EMAILS[4], 4)
     usage = {"1": win(0, 40), "2": win(30, 20), "3": win(5, 12), "4": win(10, 5)}
     outcomes = []
-    for _ in range(7):
+    for _ in range(8):
         h.clock.advance(300)
         outcomes.append(h.tick_with_usage(usage))
         if outcomes[-1] is TickOutcome.SWITCHED:
             break
-    assert outcomes[-1] is TickOutcome.SWITCHED and len(outcomes) == 6
+    assert outcomes[-1] is TickOutcome.SWITCHED and len(outcomes) == 7
     assert h.active_number() == 2
     assert of(h, SwitchEvent)[-1].trigger == "rebalance"
 

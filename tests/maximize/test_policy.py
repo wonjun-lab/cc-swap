@@ -72,6 +72,7 @@ def snap(
     *accounts: AccountView,
     samples="none",
     last_switch_min: float | None = None,
+    active_changed_min: float | None = None,
     **settings,
 ) -> Snapshot:
     a = next((v for v in accounts if v.number == active), None)
@@ -82,6 +83,9 @@ def snap(
         samples=_samples(samples, a),
         last_switch_at=None if last_switch_min is None else NOW - last_switch_min * 60,
         settings=MaximizeSettings(**settings),
+        active_changed_at=(
+            None if active_changed_min is None else NOW - active_changed_min * 60
+        ),
     )
 
 
@@ -284,6 +288,23 @@ CASES = [
     Case("rebalance-after-cooldown-switches",
          snap("1", acct("1", 10, 10, reset7_d=6), acct("2", 0, 70, reset7_d=0.5),
               samples="idle", last_switch_min=31),
+         Switch, target="2", trigger="rebalance"),
+    Case("rebalance-cooldown-restarts-on-a-manual-switch",
+         # No engine switch for hours, but the user switched by hand 11 min ago.
+         snap("1", acct("1", 10, 10, reset7_d=6), acct("2", 0, 70, reset7_d=0.5),
+              samples="idle", last_switch_min=300, active_changed_min=11),
+         Hold, pending=False, reason_has="cooldown (19 min left)"),
+    Case("rebalance-cooldown-after-manual-switch-alone",
+         snap("1", acct("1", 10, 10, reset7_d=6), acct("2", 0, 70, reset7_d=0.5),
+              samples="idle", active_changed_min=11),
+         Hold, pending=False, reason_has="cooldown (19 min left)"),
+    Case("rebalance-cooldown-uses-the-later-of-switch-and-change",
+         snap("1", acct("1", 10, 10, reset7_d=6), acct("2", 0, 70, reset7_d=0.5),
+              samples="idle", last_switch_min=10, active_changed_min=200),
+         Hold, pending=False, reason_has="cooldown (20 min left)"),
+    Case("rebalance-after-manual-switch-cooldown-switches",
+         snap("1", acct("1", 10, 10, reset7_d=6), acct("2", 0, 70, reset7_d=0.5),
+              samples="idle", last_switch_min=300, active_changed_min=31),
          Switch, target="2", trigger="rebalance"),
     Case("rebalance-busy-across-a-5h-reset-holds",
          snap("1", acct("1", 3, 41, reset7_d=6), acct("2", 0, 20, reset7_d=1),
