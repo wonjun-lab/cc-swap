@@ -6,13 +6,16 @@ decision is reproducible from a Snapshot alone.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from collections.abc import Mapping
+from dataclasses import dataclass, field
 from typing import Literal
 
 from claude_swap.settings import MaximizeSettings
 
 Tier = Literal["normal", "last_resort", "excluded"]
-Trigger = Literal["at-limit", "hard", "soft", "rebalance"]
+Trigger = Literal["at-limit", "hard", "soft", "preempt", "rebalance"]
+# A hold's reason code beyond pending/plain (engine NoSwitchEvent reason).
+HoldCode = Literal["reset-wait", "preempt", "rebalance-deferred"]
 
 # Lower sorts first. ``excluded`` is listed only so every tier has an order;
 # an excluded account is never landable (score.landable).
@@ -44,6 +47,28 @@ class Sample:
 
 
 @dataclass(frozen=True)
+class QuietWindow:
+    """A predicted quiet stretch (maximize/history.py): epochs plus local
+    ``HH:MM`` labels for reasons."""
+
+    start: float
+    end: float
+    start_label: str
+    end_label: str
+
+
+@dataclass(frozen=True)
+class Forecast:
+    """The learned idle pattern as of ``Snapshot.now`` (``history.forecast``).
+    None on a Snapshot means no pattern: a cold start or learning off."""
+
+    days: int                         # days with observations, last 14
+    p_busy_now: float | None          # None: this time slot was never observed
+    current: QuietWindow | None       # the quiet window ``now`` is inside
+    next: QuietWindow | None          # the first one starting after ``now``
+
+
+@dataclass(frozen=True)
 class Snapshot:
     now: float
     active: str | None
@@ -54,6 +79,10 @@ class Snapshot:
     # When the active account last changed by any route (an engine switch or
     # a manual login the engine noticed); None when no change was seen.
     active_changed_at: float | None = None
+    # From the usage history (maximize/history.py): the idle pattern, and
+    # each account's 7d burn rate (pct/hour while active; absent = unknown).
+    forecast: Forecast | None = None
+    rates7: Mapping[str, float] = field(default_factory=dict)
 
     def view(self, number: str | None) -> AccountView | None:
         """The account with this slot number, or None."""
@@ -79,6 +108,8 @@ class Hold:
     # A reset-aware wait (``maximize.resetWaitMin``): when the last window
     # being waited out resets (epoch s). None for every other hold.
     reset_wait_until: float | None = None
+    # The reason code when it is none of maximize-pending/-hold.
+    code: HoldCode | None = None
 
 
 @dataclass(frozen=True)
