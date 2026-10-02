@@ -547,7 +547,9 @@ class PrimeEvent(AutoSwitchEvent):
 
     kind: ClassVar[str] = "prime"
     account: str
-    outcome: str  # primed | already-on | skipped-live | unverified | failed | timeout | disabled
+    # primed | already-on | skipped-live | skipped-active | unverified | failed
+    # | timeout | disabled
+    outcome: str
     resets_at: str | None
     detail: str = ""
 

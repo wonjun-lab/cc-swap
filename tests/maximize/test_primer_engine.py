@@ -216,8 +216,47 @@ class TestPrimer:
     def test_never_primes_the_account_that_just_became_active(self, rig):
         rig.harness.make_live("b@example.com", 2)  # a switch landed this tick
         runner = StubRunner(rig)
-        rig.primer(runner=runner).run_due(rig.snap(active="1", nums=("1", "2")))
+        events = rig.primer(runner=runner).run_due(rig.snap(active="1", nums=("1", "2")))
         assert runner.calls == []
+        assert [(e.account, e.outcome) for e in events] == [("2", "skipped-active")]
+
+    @pytest.mark.parametrize("during", ["usage-fetch", "token"])
+    def test_switch_during_the_checks_skips_without_spending_an_attempt(
+        self, rig, monkeypatch, during
+    ):
+        switched: list[bool] = []
+
+        def switch_to_2():
+            if not switched:
+                switched.append(True)
+                rig.harness.make_live("b@example.com", 2)
+
+        freshened: list[str] = []
+        original = rig.engine._freshen_target
+
+        def freshen(num, email):
+            freshened.append(num)
+            if during == "token":
+                switch_to_2()
+            return original(num, email)
+
+        monkeypatch.setattr(rig.engine, "_freshen_target", freshen)
+        if during == "usage-fetch":
+            rig.usage.on_fetch = lambda num: switch_to_2() if num == "2" else None
+        runner = StubRunner(rig)
+        primer = rig.primer(runner=runner)
+        snap = rig.snap(nums=("1", "2"))
+        events = primer.run_due(snap)
+        assert runner.calls == []
+        assert [(e.account, e.outcome) for e in events] == [("2", "skipped-active")]
+        if during == "usage-fetch":
+            assert freshened == []  # re-checked before the token step
+        entry = rig.primes()["b@example.com"]
+        assert (entry["lastOutcome"], entry["attempts"]) == ("skipped-active", 0)
+        rig.harness.make_live("a@example.com", 1)  # switched back: eligible again
+        primer.run_due(snap)
+        assert runner.tokens() == ["sk-2"]
+        assert rig.primes()["b@example.com"]["attempts"] == 1
 
     def test_one_launch_per_tick(self, rig):
         runner = StubRunner(rig)

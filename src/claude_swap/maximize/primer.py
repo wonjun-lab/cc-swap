@@ -780,8 +780,11 @@ class Primer:
         switcher = self.engine.switcher
         num, email = target.number, target.email
         now = self._clock()
-        if switcher.current_account_number() == num:
-            return [], False  # became active this tick; never prime the active login
+        # Never prime the active login. A switch can land at any point while
+        # the checks below run, so this is re-read before the token step and
+        # right before the claim as well.
+        if self._is_active(num):
+            return self._skip_active(target, entry, now), False
         if switcher.live_session_pids_for(num, email):
             return self._skip_live(target, entry, now), False
         usage = self._fresh_usage(num, since=now - PRECHECK_MAX_AGE_S)
@@ -801,6 +804,8 @@ class Primer:
             and entry.get("lastOutcome") == "auth-failed"
             and entry.get("windowKey") == target.window_key
         )
+        if self._is_active(num):
+            return self._skip_active(target, entry, self._clock()), False
         token, status = self._access_token(num, email, force_refresh=force)
         if status in ("invalid_grant", "identity-conflict"):
             self.engine._quarantine(num, email, status)
@@ -814,6 +819,8 @@ class Primer:
         # The checks above can take a while (usage fetch, token refresh). The
         # launch instant is read here, guarded here, and recorded as the
         # prime time verification measures against.
+        if self._is_active(num):
+            return self._skip_active(target, entry, self._clock()), False
         launch_at = self._clock()
         pause = guard_wait(launch_at)
         if pause:
@@ -824,6 +831,8 @@ class Primer:
                 )
                 return [], False
             wait(pause)
+            if self._is_active(num):
+                return self._skip_active(target, entry, self._clock()), False
             launch_at = self._clock()
         attempts = attempts_used(entry, target.window_key, launch_at) + 1
         if not self._claim(email, target.window_key, attempts, launch_at, entry):
@@ -966,6 +975,17 @@ class Primer:
             return None
         value = entry.decision_value()
         return value if isinstance(value, dict) else None
+
+    def _is_active(self, number: str) -> bool:
+        return self.engine.switcher.current_account_number() == number
+
+    def _skip_active(
+        self, target: PrimeTarget, entry: Mapping | None, now: float
+    ) -> list[PrimeEvent]:
+        """The target became the active login after the snapshot: no launch,
+        no attempt spent; ``skip_reason`` keeps it out while it stays active."""
+        self._mark(target, entry, now, "skipped-active")
+        return [PrimeEvent(target.number, "skipped-active", None, "it became the active login")]
 
     def _skip_live(
         self, target: PrimeTarget, entry: Mapping | None, now: float
