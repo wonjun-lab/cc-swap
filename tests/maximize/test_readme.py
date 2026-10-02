@@ -2,11 +2,16 @@
 
 from __future__ import annotations
 
+import inspect
+import re
 from pathlib import Path
 
 import pytest
 
+from claude_swap import cli
 from claude_swap.settings import SETTING_SPECS, format_setting_value
+from claude_swap.tui.app import CswapApp
+from claude_swap.tui.fleet import FleetScreen
 
 README = Path(__file__).resolve().parents[2] / "README.md"
 FORK_KEYS = sorted(k for k, s in SETTING_SPECS.items() if s.section in ("maximize", "prime"))
@@ -80,6 +85,113 @@ def test_readme_describes_the_service_takeover_as_a_retry_not_a_wait_for_termina
 ])
 def test_readme_documents_the_fleet_screen_and_relogin(snippet):
     assert snippet in README.read_text(encoding="utf-8")
+
+
+# --- README <-> code contracts ----------------------------------------------
+#
+# These read the registries (``_FORK_COMMANDS``, the parsers, the Fleet
+# bindings), so a command or key added later is held to the README as soon as
+# it is registered. Pending when this was written, and enforced after merge:
+# doctor, init, why, history, `auto on|off`, `prime verify`.
+
+
+def _readme_text() -> str:
+    return README.read_text(encoding="utf-8")
+
+
+def _snippets() -> list[str]:
+    """Every inline-code ``cc-swap …`` snippet in the README."""
+    return [m.group(1) for m in re.finditer(r"`(cc-swap [^`\n]+)`", _readme_text())]
+
+
+def _help_output(handler, argv, capsys) -> str | None:
+    """``--help`` text of ``handler(argv)``, or None if it does not print help."""
+    capsys.readouterr()
+    with pytest.raises(SystemExit) as excinfo:
+        handler([*argv, "--help"])
+    out = capsys.readouterr().out
+    return out if excinfo.value.code in (0, None) and out else None
+
+
+def _known_verbs() -> set[str]:
+    main_source = inspect.getsource(cli.main)
+    dispatched = set(re.findall(r'argv\[0\] == "([a-z][a-z-]*)"', main_source))
+    dispatched |= set(re.findall(r'sys\.argv\[1\] == "([a-z][a-z-]*)"', main_source))
+    return {*cli._FORK_COMMANDS, *cli._SUBCOMMAND_FLAGS, *dispatched, "switch", "help"}
+
+
+@pytest.mark.parametrize("command", sorted(cli._FORK_COMMANDS))
+def test_readme_documents_every_registered_fork_command(command):
+    assert any(s.split()[1] == command for s in _snippets()), (
+        f"README has no `cc-swap {command} …` snippet; document the command"
+    )
+
+
+def test_every_cc_swap_verb_in_the_readme_is_a_real_command():
+    known = _known_verbs()
+    unknown = sorted({s.split()[1] for s in _snippets() if not s.split()[1].startswith("-")} - known)
+    assert not unknown, f"README names commands the CLI does not have: {unknown}"
+
+
+def test_every_flag_on_a_documented_fork_command_exists_in_its_parser(capsys):
+    handlers = {**{c: getattr(cli, n) for c, n in cli._FORK_COMMANDS.items()},
+                "auto": cli._auto_command}
+    problems: list[str] = []
+    for snippet in _snippets():
+        words = snippet.split()
+        verb = words[1]
+        flags = re.findall(r"--[a-z0-9][a-z0-9-]*", snippet)
+        if verb not in handlers or not flags:
+            continue
+        helps = [_help_output(handlers[verb], [], capsys)]
+        if len(words) > 2 and re.fullmatch(r"[a-z][a-z-]*", words[2]):
+            helps.append(_help_output(handlers[verb], [words[2]], capsys))
+        text = "\n".join(h for h in helps if h)
+        problems += [f"`{snippet}`: {f} is not in `{verb}`'s help" for f in flags if f not in text]
+    assert not problems, "\n".join(problems)
+
+
+def test_every_config_key_the_readme_sets_exists():
+    keys = set(re.findall(r"cc-swap config (?:set|get|unset) ([A-Za-z0-9.]+)", _readme_text()))
+    assert keys, "expected README config examples"
+    assert sorted(keys - set(SETTING_SPECS)) == []
+
+
+def test_every_fleet_key_the_readme_names_is_bound():
+    text = _readme_text()
+    start = text.index("## Fleet: the TUI home for maximize")
+    section = text[start : text.index("\n## ", start + 5)]
+    named = set(re.findall(r"`((?:ctrl\+)?[a-z?])`", section))
+    assert {"s", "m", "r", "ctrl+f"} <= named, "section parse found too little"
+    bound = {"?" if k == "question_mark" else k for b in FleetScreen.BINDINGS for k in b.key.split(",")}
+    bound |= {k for b in CswapApp.BINDINGS for k in b.key.split(",")}
+    assert sorted(named - bound) == [], "README names Fleet keys that are not bound"
+
+
+def test_every_cc_swap_env_var_matches_between_readme_and_code():
+    src = Path(__file__).resolve().parents[2] / "src" / "claude_swap"
+    in_code = {
+        name
+        for path in src.rglob("*.py")
+        for name in re.findall(r"CC_SWAP_[A-Z0-9_]+", path.read_text(encoding="utf-8"))
+    }
+    in_readme = set(re.findall(r"CC_SWAP_[A-Z0-9_]+", _readme_text()))
+    # Markers the generated service file sets for itself; not user settings.
+    internal = {"CC_SWAP_SERVICE"}
+    assert sorted(in_readme - in_code) == [], "README documents env vars the code never reads"
+    assert sorted(in_code - in_readme - internal) == [], (
+        "code reads env vars the README never mentions"
+    )
+
+
+def test_readme_documents_upgrade_check_and_its_exit_codes():
+    text = _readme_text()
+    assert "cc-swap upgrade --check" in text
+    assert "`10`" in text and "`0`" in text
+    # The exit code the README promises is the real one.
+    from claude_swap.update_check import EXIT_UPDATE_AVAILABLE
+
+    assert EXIT_UPDATE_AVAILABLE == 10
 
 
 def test_readme_says_the_service_rotates_its_macos_logs():

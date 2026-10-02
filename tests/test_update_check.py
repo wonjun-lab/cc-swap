@@ -48,6 +48,16 @@ def _isolated_cache(tmp_path, monkeypatch):
     )
 
 
+@pytest.fixture(autouse=True)
+def _no_real_service(monkeypatch):
+    """After a successful upgrade cc-swap probes the service with launchctl or
+    systemctl. Nothing here may run those for real: the service is simply not
+    installed (tests/test_upgrade_check.py covers the installed case)."""
+    from claude_swap.maximize import service
+
+    monkeypatch.setattr(service, "status", lambda **kw: {"installed": False})
+
+
 def _cache_path() -> Path:
     """The (monkeypatched) cache path currently in effect."""
     import claude_swap.update_check as uc

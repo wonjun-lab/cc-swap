@@ -24,7 +24,9 @@ Where the upstream sections below install, upgrade or remove `claude-swap` from 
 uv tool install git+https://github.com/wonjun-lab/cc-swap
 ```
 
-To upgrade, run `uv tool install --force git+https://github.com/wonjun-lab/cc-swap`, then re-run `cc-swap service install` so the service restarts on the new build.
+To upgrade, run `cc-swap upgrade`. If the service is installed, `cc-swap upgrade` re-runs `cc-swap service install` for you after a successful reinstall, so the service restarts on the new build. (Reinstalling by hand with `uv tool install --force git+https://github.com/wonjun-lab/cc-swap` leaves the service on the old build until you run `cc-swap service install`.)
+
+`cc-swap upgrade --check` only reports: it prints the installed and the latest release, then the release notes and commit subjects in between. It exits `0` when you are up to date, `10` when an update is available and `1` when the latest release could not be determined (offline with no cached tag), so a timer can run it daily.
 
 ### Migrating from cswap
 
@@ -159,7 +161,7 @@ If any step fails, run `cc-swap config set prime.enabled false` and open an issu
 ## Always-on service
 
 ```bash
-cc-swap service install     # install (or refresh) and start it; re-run after every upgrade
+cc-swap service install     # install (or refresh) and start it; `cc-swap upgrade` re-runs it for you
 cc-swap service status      # installed? running? pid?
 cc-swap service uninstall   # stop it and remove it
 ```
