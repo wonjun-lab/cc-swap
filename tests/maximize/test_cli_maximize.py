@@ -92,6 +92,31 @@ class TestAutoMaximize:
         )
         assert FakeEngine.instances == []
 
+    @pytest.mark.parametrize("flag", ["--soft5h", "--hard5h", "--soft7d", "--hard7d"])
+    @pytest.mark.parametrize("value", ["nan", "NaN", "inf", "-inf", "Infinity", "1e400"])
+    def test_non_finite_flag_values_are_rejected_by_argparse(
+        self, temp_home, capsys, flag, value
+    ):
+        # Rejected before merge_maximize_cli ever sees them: argparse exits 2
+        # with a usage error, no engine is built.
+        assert _auto(["--once", "--strategy", "maximize", f"{flag}={value}"]) == 2
+        err = capsys.readouterr().err
+        assert flag in err
+        assert "finite number" in err
+        assert FakeEngine.instances == []
+
+    @pytest.mark.parametrize("flag", ["--soft5h", "--hard5h", "--soft7d", "--hard7d"])
+    def test_non_numeric_flag_values_are_still_rejected(self, temp_home, capsys, flag):
+        assert _auto(["--once", "--strategy", "maximize", flag, "high"]) == 2
+        assert flag in capsys.readouterr().err
+        assert FakeEngine.instances == []
+
+    def test_finite_flag_values_still_parse_as_floats(self, temp_home):
+        _auto(["--once", "--strategy", "maximize", "--soft5h", "40", "--hard7d", "97.5"])
+        flags = FakeEngine.instances[-1].maximize_cli
+        assert flags.soft5h == 40.0
+        assert flags.hard7d == 97.5
+
     def test_banner_shows_maximize_marks(self, temp_home, capsys):
         root = _backup_root()
         root.mkdir(parents=True, exist_ok=True)

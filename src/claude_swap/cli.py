@@ -584,6 +584,19 @@ Examples:
         sys.exit(130)
 
 
+def _finite_float(value: str) -> float:
+    """argparse ``type=`` for a flag that takes a number: nan and inf parse as
+    floats, but they are not thresholds, so reject them here instead of
+    letting them reach the settings merge."""
+    try:
+        number = float(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"invalid number: {value!r}") from None
+    if not math.isfinite(number):
+        raise argparse.ArgumentTypeError(f"expected a finite number, got {value!r}")
+    return number
+
+
 def _auto_command(argv: list[str]) -> None:
     """Handle `cswap auto [--once] [--json] [...]`.
 
@@ -695,7 +708,7 @@ Defaults live in settings.json in the backup root; flags override them.
         when = "at the next idle moment" if kind == "soft" else "immediately"
         parser.add_argument(
             flag,
-            type=float,
+            type=_finite_float,
             metavar="PCT",
             help=(
                 f"maximize only: {window} {kind} mark, switch {when} once the "
