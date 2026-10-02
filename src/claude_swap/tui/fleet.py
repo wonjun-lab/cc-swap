@@ -83,6 +83,35 @@ def host_name() -> str:
     return socket.gethostname().split(".")[0] or "this host"
 
 
+def prime_guard(root: Path) -> str | None:
+    """Priming paused after a Claude Code update (no subprocess: what the
+    engine last saw, from ``prime_verify.json``)."""
+    from claude_swap.maximize.prime_verify import paused_note
+
+    try:
+        return paused_note(root)
+    except Exception:
+        return None
+
+
+HISTORY_COUNT = 50
+
+
+def history_text(root: Path, live: str | None) -> str:
+    """Fleet's switch-history view: the ledger's newest entries, newest
+    first, plus a note when the live login moved outside cc-swap."""
+    from claude_swap.maximize import ledger
+    from claude_swap.maximize.history_cli import drift_line, history_lines
+
+    entries = ledger.read(root, HISTORY_COUNT)
+    lines = history_lines(list(reversed(entries)))
+    note = drift_line(root, live)
+    if note:
+        lines = [note, ""] + lines
+    lines += ["", f"(newest first; all of it: cc-swap history -n 0 · {ledger.path_for(root)})"]
+    return "\n".join(lines)
+
+
 def tone_style(tone: str, palette: Palette) -> str:
     return {
         "ok": palette.sev_ok,
@@ -168,6 +197,7 @@ def open_relogin(app: "CswapApp", number: str) -> None:
     ``~/.local/bin/claude``) and the account's email; enter then stores the
     live login only if it is this slot's account, and switches back to the
     account active now."""
+    from claude_swap.maximize import ledger
     from claude_swap.maximize.fleet_actions import (
         backup_active_before_relogin,
         live_login_fingerprint,
@@ -197,9 +227,11 @@ def open_relogin(app: "CswapApp", number: str) -> None:
     )
 
     def store(before: str | None):
-        return run_action(
-            partial(relogin_store, app.switcher, number, return_to=previous, before=before)
-        )
+        # The only switch a re-login store makes is the one back to `previous`.
+        return run_action(ledger.tagged(
+            partial(relogin_store, app.switcher, number, return_to=previous, before=before),
+            source="fleet", trigger="relogin-return",
+        ))
 
     app.push_screen(
         ReloginModal(
@@ -285,6 +317,7 @@ class FleetScreen(Screen):
         Binding("r", "relogin", "Re-login", show=False),
         Binding("f", "fetch", "Fetch", show=False),
         Binding("e,g", "app.open_auto", "Engine log", show=False),
+        Binding("v", "menu('history')", "Switch history", show=False),
         Binding("c", "classic", "Classic dashboard", show=False),
         Binding("w", "app.open_watch", "Watch", show=False),
         Binding("question_mark,h", "help", "Help", show=False),
@@ -317,6 +350,7 @@ class FleetScreen(Screen):
         self._hostname = host_name()
         self._ssh = fx.over_ssh()
         self._fx_timers: list = []
+        self._prime_guard: str | None = None
 
     # -- composition ------------------------------------------------------------------
 
@@ -392,6 +426,7 @@ class FleetScreen(Screen):
             self._state = mxview.read_state(self._root)
         except Exception:
             self._state = mxview.MaximizeState()
+        self._prime_guard = prime_guard(self._root)
         now = time.time()
         self._rows = fx.fleet_rows(snap, self._mx, self._prime, self._state, now=now)
         self._accounts = {a.number: a for a in snap.accounts}
@@ -422,6 +457,7 @@ class FleetScreen(Screen):
             holder_pid=os.getpid() if own else self._holder_pid,
             own=own,
             service=self._service,
+            auto_off=self._state.auto_off,
         )
 
     def _decision(self) -> fx.DecisionView:
@@ -561,7 +597,7 @@ class FleetScreen(Screen):
         self.query_one("#fx-head", Static).update(Text(head, style=f"bold {palette.foreground}"))
         lines = fx.status_lines(
             self._engine_status(), self._decision(), self._rows, self._mx, self._prime,
-            now=now, width=width,
+            now=now, width=width, prime_guard=self._prime_guard,
         )
         for widget_id, (text, tone) in zip(("#fx-engine", "#fx-now", "#fx-prime"), lines):
             line = Text(text[:8], style=palette.muted)
@@ -647,6 +683,7 @@ class FleetScreen(Screen):
             mode_label=menus.mode_label(es.holder, es.pid),
             relogin=relogin,
             fetching=self.app._normal_refreshing,
+            auto_off=es.auto_off,
         )
         tone = "plain"
         if entry.action == "mode" and es.holder == "none":
@@ -710,6 +747,7 @@ class FleetScreen(Screen):
             "accounts": self.open_accounts,
             "fetch": self.action_fetch,
             "engine": self.app.action_open_auto,
+            "history": self.open_history,
             "classic": self.action_classic,
             "quit": self.action_quit,
         }.get(action)
@@ -730,6 +768,9 @@ class FleetScreen(Screen):
         """Carry out a Mode choice. Going live always asks first (the auto
         screen's wording); Fleet never takes the lease without a choice."""
         host = self._host
+        if action in ("auto-off", "auto-on"):
+            self._set_auto(action == "auto-off")
+            return
         if action is None or host is None:
             return
         if action == "start-dry":
@@ -756,6 +797,43 @@ class FleetScreen(Screen):
             host.stop()
         self._apply_store_only()
         self._render_all()
+
+    def _set_auto(self, off: bool) -> None:
+        """Mode → o: the persistent automatic-switching switch (``cc-swap
+        auto off|on``), honoured by whichever engine runs."""
+        self.run_worker(
+            partial(self._set_auto_blocking, off), thread=True,
+            group="fleet-action", exit_on_error=False, name="fleet-auto-toggle",
+        )
+
+    def _set_auto_blocking(self, off: bool) -> None:
+        from claude_swap.maximize import pause
+
+        try:
+            pause.set_auto_off(self._root, off, by="fleet", now=time.time(), host=self._hostname)
+        except Exception as e:
+            self.app.call_from_thread(
+                self.notify, f"Could not change automatic switching: {e}",
+                severity="error", timeout=8,
+            )
+            return
+        message = (
+            "Automatic switching OFF — nothing switches or primes until you turn it on"
+            if off else "Automatic switching ON"
+        )
+        self.app.call_from_thread(self._after_setting, message)
+
+    def open_history(self) -> None:
+        """The switch ledger, newest first (``cc-swap history``)."""
+        from claude_swap.tui.modals import OutputModal
+
+        snap = self.app.snapshot
+        live = snap.active_number if snap is not None else None
+        try:
+            text = history_text(self._root, live)
+        except Exception as e:
+            text = f"Could not read the switch history: {e}"
+        self.app.push_screen(OutputModal("Switch history", text))
 
     def _on_go_live(self, action: str, confirmed: bool | None) -> None:
         host = self._host
@@ -817,14 +895,25 @@ class FleetScreen(Screen):
             return
         warning = fx.switch_warning(row, self._mx)
         if warning is None:
-            self.app.do_switch(number)
+            self._switch(number)
             return
         from claude_swap.tui.modals import ConfirmModal
 
         self.app.push_screen(
             ConfirmModal(warning + "\n\nSwitch anyway?", title=f"Switch to #{number}",
                          yes_label="Switch"),
-            lambda confirmed: self.app.do_switch(number) if confirmed else None,
+            lambda confirmed: self._switch(number) if confirmed else None,
+        )
+
+    def _switch(self, number: str) -> None:
+        """The app's switch action, recorded in the switch ledger as Fleet's."""
+        from claude_swap.maximize import ledger
+
+        self.app._start_action(
+            f"Switch to account {number}",
+            ledger.tagged(
+                partial(self.app.switcher.switch_to, number, json_output=True), source="fleet"
+            ),
         )
 
     def action_last_resort(self) -> None:

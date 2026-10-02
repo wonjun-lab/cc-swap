@@ -717,6 +717,26 @@ def sample_sequence_data_with_org():
 
 
 @pytest.fixture(autouse=True)
+def _no_switch_ledger_leak():
+    """``cli.main`` installs the switch-ledger filter on the process-global
+    ``claude-swap`` logger (cc-swap, maximize/ledger.py); a test that runs
+    ``main`` must not leave it recording every later test's switches."""
+    yield
+    from claude_swap.maximize import ledger
+
+    ledger.uninstall()
+
+
+@pytest.fixture(autouse=True)
+def _no_claude_version_probe(monkeypatch):
+    """The priming version guard runs ``claude --version``; no test runs a
+    real (or the fake, call-recording) ``claude`` for it."""
+    monkeypatch.setattr(
+        "claude_swap.maximize.prime_verify.read_claude_version", lambda _path: "9.9.9"
+    )
+
+
+@pytest.fixture(autouse=True)
 def _deterministic_poll_jitter(monkeypatch):
     """Zero the poll-plan jitter so cadence tests are clock-exact; the jitter
     itself is exercised in test_poll_policy via an injected rng."""

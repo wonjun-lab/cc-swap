@@ -34,7 +34,7 @@ from typing import Any, Protocol
 from claude_swap import autoswitch as aw
 from claude_swap import oauth, poll_policy
 from claude_swap.exceptions import ConfigError
-from claude_swap.maximize import idle, pause, policy
+from claude_swap.maximize import idle, ledger, pause, policy
 from claude_swap.maximize.model import (
     AccountView,
     Decision,
@@ -120,6 +120,9 @@ class MaximizeRuntime:
     login_deadlines: dict[str, float] = field(default_factory=dict)
     login_deadlines_at: float | None = None
     login_warned: dict[str, float] = field(default_factory=dict)
+    # (ledger's last destination, live slot) seen on the previous tick while
+    # they differed: a login changed outside cc-swap once it repeats.
+    drift_seen: tuple[object, str] | None = None
 
 
 # -- settings ------------------------------------------------------------------
@@ -665,7 +668,8 @@ def _switch(
             return engine._perform(number, email, pick.trigger, left), None
         status = engine._freshen_target(number, email)
         if status == "ok":
-            outcome = engine._perform(number, email, pick.trigger, left)
+            with ledger.switch_context(reason=pick.reason):
+                outcome = engine._perform(number, email, pick.trigger, left)
             if outcome is aw.TickOutcome.SWITCHED:
                 _reset_samples(engine, number)
                 return outcome, number
@@ -839,6 +843,39 @@ def _run_primer(
         engine._emit(event)
 
 
+def _note_drift(engine: aw.AutoSwitchEngine, rt: MaximizeRuntime, current: str) -> None:
+    """Record a live login that changed with no switch in the ledger (a
+    ``/login`` inside a Claude Code session). Only once the mismatch shows
+    on two ticks in a row: a switch another process is making right now
+    lands in the ledger a moment after the live login changes."""
+    if engine.dry_run or not ledger.installed():
+        return
+    root = engine.switcher.backup_dir
+    try:
+        previous = ledger.drift(root, current)
+        if previous is None:
+            rt.drift_seen = None
+            return
+        seen = (previous.get("ts"), current)
+        if rt.drift_seen != seen:
+            rt.drift_seen = seen
+            return
+        rt.drift_seen = None
+        entry = ledger.record_external(
+            root, current, reason="the live login changed outside cc-swap"
+        )
+        if entry is not None:
+            engine._emit(aw.ConfigWarningEvent(
+                message=(
+                    f"the live login changed outside cc-swap: "
+                    f"#{entry.get('from') or '?'} -> #{current} "
+                    "(a /login in a Claude Code session?)"
+                )
+            ))
+    except Exception as e:  # bookkeeping must never break a tick
+        _logger.debug("switch ledger drift check failed: %s", type(e).__name__)
+
+
 def run_maximize_tick(
     engine: aw.AutoSwitchEngine,
     entries: Mapping,
@@ -864,6 +901,7 @@ def run_maximize_tick(
             detail=f"switching paused ({why}) for {until - now:.0f}s more",
         ))
         return aw.TickOutcome.NO_ACTION
+    _note_drift(engine, rt, current)
     records = _records(engine, current)
     deadlines = _login_deadlines(engine, rt, records, current, now)
     _warn_login_expiry(engine, rt, deadlines, now)
@@ -894,6 +932,11 @@ def run_maximize_tick(
     rt.last_snapshot, rt.last_decision = snap, decision
     engine._emit(_decision_event(snap, decision, engine.dry_run))
     _publish_decision(engine, snap, decision, state, tiers)
+    # `cc-swap auto off`: the decision is shown and published, but nothing
+    # acts on it — no switch, no failover, no prime.
+    held = pause.auto_off_hold(engine, state)
+    if held is not None:
+        return held
     if isinstance(decision, Indeterminate):
         _run_primer(engine, rt, snap)
         return None

@@ -1173,6 +1173,11 @@ class AutoSwitchEngine:
             )
             if outcome is not None:
                 return outcome
+        # cc-swap: `cc-swap auto off` — keep polling, never switch.
+        from claude_swap.maximize.pause import auto_off_hold
+
+        if (held := auto_off_hold(self, state)) is not None:
+            return held
 
         active_headroom = headroom.get(current)
         if active_headroom is not None:
@@ -2350,8 +2355,10 @@ class AutoSwitchEngine:
                     detail="live credential read degraded before the switch; holding",
                 ))
                 return TickOutcome.NO_ACTION
+            from claude_swap.maximize.ledger import engine_switch  # cc-swap: ledger tag
+
             try:
-                result = self.switcher.switch_to(number, json_output=True)
+                result = engine_switch(self, number, trigger)
             except CredentialReadError as exc:
                 # The switch refused a degraded/unreadable live read: hold,
                 # write nothing (the state lock is released unchanged).

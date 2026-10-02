@@ -340,7 +340,7 @@ def fleet_rows(
 
 
 DecisionKind = Literal[
-    "switch", "hold", "pending", "exhausted", "indeterminate", "paused", "none"
+    "switch", "hold", "pending", "exhausted", "indeterminate", "paused", "off", "none"
 ]
 
 
@@ -357,6 +357,8 @@ class DecisionView:
     eta_hard_min: float | None = None
     at: float | None = None
     source: Literal["engine", "here", "computed"] = "computed"
+    # kind "off" (`cc-swap auto off`): what the decision would have been.
+    would: str | None = None
 
 
 _SLOT_RE = re.compile(r"#(\w+)")
@@ -434,7 +436,34 @@ def decision_view(
 ) -> DecisionView:
     """What maximize decided: a re-login pause first, then this TUI's own
     engine (``own``, a ``MaximizeDecisionEvent``), then a fresh published
-    decision for the current active account, else recomputed here."""
+    decision for the current active account, else recomputed here. With
+    automatic switching off the decision is shown as what it *would* do."""
+    dv = _decision_view(state, msnap, now=now, poll_s=poll_s, own=own, own_at=own_at)
+    if not state.auto_off or dv.kind == "paused":
+        return dv
+    target = f" → #{dv.target}" if dv.target else ""
+    would = {
+        "switch": f"switch ({dv.trigger}){target}",
+        "pending": f"switch at the next idle moment{target}",
+        "hold": "hold",
+        "exhausted": "every account is at its limit",
+        "indeterminate": "fail over (usage unreadable)",
+    }.get(dv.kind)
+    return replace(
+        dv, kind="off", target=None, trigger=None, would=would,
+        at=state.auto_off_since, reason=state.auto_off_by or "",
+    )
+
+
+def _decision_view(
+    state: mxview.MaximizeState,
+    msnap: Snapshot,
+    *,
+    now: float,
+    poll_s: float,
+    own=None,
+    own_at: float | None = None,
+) -> DecisionView:
     paused = pause.active_pause(
         {"pausedUntil": state.paused_until, "pausedReason": state.paused_reason}, now
     )
@@ -493,6 +522,16 @@ def decision_parts(dv: DecisionView, *, now: float) -> tuple[list[tuple[str, int
     else:
         suffix = f"{hhmm(dv.at or now)} · {'engine' if dv.source == 'engine' else 'here'}"
     target = f" → #{dv.target}" if dv.target else ""
+    if dv.kind == "off":
+        since = f"since {hhmm(dv.at)}" if dv.at else ""
+        by = f"by {dv.reason}" if dv.reason else ""
+        parts = [("AUTO OFF · no switch, no prime", 0)]
+        if dv.would:
+            parts.append((f"would {dv.would}", 2))
+        if since or by:
+            parts.append((" ".join(p for p in (since, by) if p), 3))
+        parts.append(("cc-swap auto on (m → o)", 1))
+        return parts, "warn"
     if dv.kind == "paused":
         until = hhmm(dv.at) if dv.at else "?"
         return [
@@ -534,6 +573,8 @@ class EngineStatus:
     holder: Literal["service", "other", "here-live", "here-dry", "none"]
     pid: int | None
     service: Mapping | None
+    # `cc-swap auto off`: whoever holds the lease neither switches nor primes.
+    auto_off: bool = False
 
 
 def engine_status(
@@ -542,13 +583,14 @@ def engine_status(
     holder_pid: int | None,
     own: str | None,
     service: Mapping | None,
+    auto_off: bool = False,
 ) -> EngineStatus:
     """Who holds the engine lease. ``own`` is ``"live"``/``"dry"`` when this
     TUI runs the engine. The service is recognised by its pid."""
     if own == "live":
-        return EngineStatus("here-live", holder_pid, service)
+        return EngineStatus("here-live", holder_pid, service, auto_off)
     if own == "dry":
-        return EngineStatus("here-dry", holder_pid, service)
+        return EngineStatus("here-dry", holder_pid, service, auto_off)
     if held_elsewhere:
         if (
             service is not None
@@ -556,9 +598,9 @@ def engine_status(
             and holder_pid is not None
             and service.get("pid") == holder_pid
         ):
-            return EngineStatus("service", holder_pid, service)
-        return EngineStatus("other", holder_pid, service)
-    return EngineStatus("none", None, service)
+            return EngineStatus("service", holder_pid, service, auto_off)
+        return EngineStatus("other", holder_pid, service, auto_off)
+    return EngineStatus("none", None, service, auto_off)
 
 
 def _manager(service: Mapping | None) -> str:
@@ -605,6 +647,9 @@ def engine_parts(es: EngineStatus) -> tuple[list[tuple[str, int]], Tone]:
     if service is not None and service.get("linger") is False:
         parts.append(("linger off: stops at logout", 3))
         tone = "warn"
+    if es.auto_off:
+        parts.insert(1, ("AUTO OFF: watching only", 0))
+        tone = "warn"
     return parts, tone
 
 
@@ -633,8 +678,18 @@ def _fit(parts: Sequence[tuple[str, int]], width: int, *, prefix: str = "") -> s
 
 
 def _prime_parts(
-    rows: Sequence[FleetRow], prime: PrimeSettings
+    rows: Sequence[FleetRow],
+    prime: PrimeSettings,
+    *,
+    auto_off: bool = False,
+    guard: str | None = None,
 ) -> tuple[list[tuple[str, int]], Tone]:
+    if prime.enabled and (auto_off or guard):
+        # Priming is on but does not run: say why first.
+        parts = [("stopped: automatic switching is off", 0)] if auto_off else []
+        if guard:
+            parts.append((guard, 0))
+        return parts, "warn"
     if not prime.enabled:
         cold = sum(
             1 for r in rows
@@ -672,13 +727,16 @@ def status_lines(
     *,
     now: float,
     width: int,
+    prime_guard: str | None = None,
 ) -> list[Cell]:
-    """The three status lines under the header: engine, now, prime."""
+    """The three status lines under the header: engine, now, prime.
+    ``prime_guard`` is ``prime_verify.paused_note``: priming paused after a
+    Claude Code update."""
     out: list[Cell] = []
     for label, (parts, tone) in (
         ("engine  ", engine_parts(es)),
         ("now     ", decision_parts(dv, now=now)),
-        ("prime   ", _prime_parts(rows, prime)),
+        ("prime   ", _prime_parts(rows, prime, auto_off=es.auto_off, guard=prime_guard)),
     ):
         out.append((_fit(parts, width, prefix=label), tone))
     return out
@@ -1146,32 +1204,55 @@ def fit_layout(height: int, width: int, n_rows: int, *, attention: bool) -> Layo
 class ModeAction:
     key: str
     label: str
-    action: Literal["start-dry", "start-live", "go-live", "go-dry", "stop"]
+    action: Literal[
+        "start-dry", "start-live", "go-live", "go-dry", "stop", "auto-off", "auto-on"
+    ]
 
 
-def mode_transitions(holder: str) -> list[ModeAction]:
+def mode_transitions(holder: str, *, auto_off: bool | None = None) -> list[ModeAction]:
     """What the Mode modal offers for an engine holder. A viewer gets facts
-    only: the service (or another process) owns switching."""
+    only about the engine: the service (or another process) owns switching.
+    With ``auto_off`` given (the TUI always gives it), every holder also
+    gets the persistent automatic-switching toggle (``cc-swap auto``),
+    which whatever engine runs honours."""
     if holder == "none":
-        return [
+        out = [
             ModeAction("d", "Run an engine here · dry-run (watch only)", "start-dry"),
             ModeAction("l", "Run an engine here · live (switches accounts)", "start-live"),
         ]
-    if holder == "here-dry":
-        return [
+    elif holder == "here-dry":
+        out = [
             ModeAction("l", "Go live (switches accounts)", "go-live"),
             ModeAction("s", "Stop the engine here", "stop"),
         ]
-    if holder == "here-live":
-        return [
+    elif holder == "here-live":
+        out = [
             ModeAction("d", "Back to dry-run (watch only)", "go-dry"),
             ModeAction("s", "Stop the engine here", "stop"),
         ]
-    return []
+    else:
+        out = []
+    if auto_off is True:
+        out.append(ModeAction("o", "Automatic switching: OFF → turn it on", "auto-on"))
+    elif auto_off is False:
+        out.append(ModeAction(
+            "o", "Automatic switching: on → turn it off (persistent; any engine)", "auto-off"
+        ))
+    return out
 
 
 def mode_facts(es: EngineStatus) -> list[str]:
     """The Mode modal's text: who switches, and how to change that."""
+    lines = _holder_facts(es)
+    if es.auto_off:
+        lines.append(
+            "Automatic switching is OFF (cc-swap auto off): the engine keeps polling "
+            "and deciding but never switches or primes. o / cc-swap auto on resumes it."
+        )
+    return lines
+
+
+def _holder_facts(es: EngineStatus) -> list[str]:
     service = es.service or {}
     linux = service.get("platform") == "linux"
     stop = (

@@ -26,6 +26,7 @@ MAIN_MENU: tuple[MenuEntry, ...] = (
     MenuEntry("f", "Fetch latest usage", "fetch", "Fetch"),
     MenuEntry("a", "Account settings", "accounts", "Accounts"),
     MenuEntry("e", "Engine log", "engine", "Engine"),
+    MenuEntry("v", "View switch history", "history", "Swaps"),
     MenuEntry("c", "Classic dashboard", "classic", "Classic"),
     MenuEntry("q", "Quit", "quit", "Quit"),
 )
@@ -74,11 +75,13 @@ def menu_title(
     mode_label: str | None = None,
     relogin: int = 0,
     fetching: bool = False,
+    auto_off: bool = False,
 ) -> str:
     """An item's title with its state in the name."""
     entry = BY_ACTION[action]
     if action == "mode":
-        return f"Mode: {mode_label or 'off'}"
+        tail = " · AUTO OFF" if auto_off else ""
+        return f"Mode: {mode_label or 'off'}{tail}"
     if action == "accounts" and relogin:
         return f"{entry.title} · {relogin} need{'s' if relogin == 1 else ''} re-login"
     if action == "fetch" and fetching:
@@ -215,8 +218,10 @@ def help_entries() -> list[tuple[str, str]]:
         ("next prime", "≤HH:MM due now · HH:MM–HH:MM after its reset · or why it is not primed"),
         ("", ""),
         ("", "Status lines"),
-        ("engine", "who switches: the service, another process, this TUI, or nothing"),
+        ("engine", "who switches: the service, another process, this TUI, or nothing; "
+                   "AUTO OFF = cc-swap auto off (m → o turns it back on)"),
         ("now", "the engine's last decision (or computed here when none is fresh)"),
-        ("prime", "accounts due for priming, upcoming windows, blockers"),
+        ("prime", "accounts due for priming, upcoming windows, blockers; paused after "
+                  "a claude update until cc-swap prime verify passes"),
     ]
     return rows
