@@ -9,6 +9,15 @@
 
 The upstream documentation follows [below](#claude-swap), and everything in it applies to cc-swap. During the transition cc-swap installs both `cc-swap` and `cswap`, so commands written as `cswap …` keep working.
 
+Where the upstream sections below install, upgrade or remove `claude-swap` from PyPI, use the fork instead — running the upstream commands would replace cc-swap with upstream:
+
+| Upstream command | cc-swap equivalent |
+|---|---|
+| `uv tool install claude-swap` / `pipx install claude-swap` | `uv tool install git+https://github.com/wonjun-lab/cc-swap` |
+| `uv tool install 'claude-swap[menubar]'` | `uv tool install 'cc-swap[menubar] @ git+https://github.com/wonjun-lab/cc-swap'` |
+| `uv tool upgrade claude-swap` / `pipx upgrade claude-swap` | `cc-swap upgrade` (installs the latest fork release tag) |
+| `uv tool uninstall claude-swap` | `uv tool uninstall cc-swap` |
+
 ## Install
 
 ```bash
@@ -68,7 +77,7 @@ Turn it on with `cc-swap config set autoswitch.strategy maximize`, or use `cc-sw
 | `maximize.idleWindowMin` | int 3–60 | 10 | Minutes over which "idle" is judged |
 | `maximize.idleMaxDeltaPct` | float 0–10 | 1 | Most growth (percentage points) in that window that still counts as idle |
 | `maximize.forceEtaMin` | int 0–60 | 10 | Switch at once if the recent pace reaches a hard ceiling within this many minutes (0 = off) |
-| `maximize.pendingPollS` | int 60–600 | 120 | Active-account poll interval while waiting for idle |
+| `maximize.pendingPollS` | int 180–600 | 180 | Active-account poll interval while waiting for idle (floor 180 s: the usage endpoint allows ~30 requests/hour per account, shared by every machine) |
 | `maximize.rebalanceCooldownMin` | int 0–240 | 30 | Minimum minutes between rebalancing switches |
 | `maximize.tieEpsilon` | float 0–2 | 0.1 | Scores this close count as a tie |
 | `maximize.lastResort` | string | — | Last-resort accounts: emails or aliases, comma-separated |
