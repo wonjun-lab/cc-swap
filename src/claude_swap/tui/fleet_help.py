@@ -1,6 +1,8 @@
 """Fleet help (``?`` / ``h``): how to read the home screen, what each tag
-and word means (soft/hard, next, last resort, pace, priming, viewer/lease)
-and every key. A popup over the home screen; it scrolls when short."""
+and word means (soft/hard, next, last resort, pace, priming, viewer/lease,
+waiting out a reset, preempt, quiet time), what the engine has learned of
+your busy and quiet times, and every key. A popup over the home screen; it
+scrolls when short."""
 
 from __future__ import annotations
 
@@ -16,16 +18,19 @@ from textual.widgets import Static
 from claude_swap.tui import menus
 from claude_swap.tui.theme import Palette
 
-TERM_WIDTH = 18
+TERM_WIDTH = 20  # the longest term ("rebalance deferred") plus a gap
 INDENT = 2 + TERM_WIDTH
 
 
-def help_text(palette: Palette, width: int | None = None) -> Text:
+def help_text(
+    palette: Palette, width: int | None = None, idle_pattern: str | None = None
+) -> Text:
     """Every help entry, the explanation wrapped to ``width`` with its
-    continuation lines under the explanation (not under the term)."""
+    continuation lines under the explanation (not under the term).
+    ``idle_pattern`` (``view.idle_pattern_text``) adds what has been learned."""
     wrap = max(width - INDENT - 1, 20) if width else None  # 1: a scrollbar may appear
     text = Text()
-    for i, (term, what) in enumerate(menus.help_entries()):
+    for i, (term, what) in enumerate(menus.help_entries(idle_pattern)):
         if i:
             text.append("\n")
         if not term:
@@ -54,6 +59,10 @@ class HelpScreen(ModalScreen[None]):
         Binding("k,up", "scroll_up", show=False),
     ]
 
+    def __init__(self, idle_pattern: str | None = None) -> None:
+        super().__init__()
+        self._idle_pattern = idle_pattern
+
     def compose(self) -> ComposeResult:
         with VerticalScroll(id="fx-help-scroll"):
             yield Static("", id="fx-help", markup=False)
@@ -70,7 +79,9 @@ class HelpScreen(ModalScreen[None]):
             return
         widget = self.query_one("#fx-help", Static)
         width = widget.content_region.width or None
-        widget.update(help_text(Palette.from_theme(self.app.current_theme), width))
+        widget.update(help_text(
+            Palette.from_theme(self.app.current_theme), width, self._idle_pattern
+        ))
 
     def action_back(self) -> None:
         self.dismiss(None)

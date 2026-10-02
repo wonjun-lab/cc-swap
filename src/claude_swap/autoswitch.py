@@ -561,7 +561,9 @@ class ConfigWarningEvent(AutoSwitchEvent):
 class MaximizeDecisionEvent(AutoSwitchEvent):
     """One ``maximize`` policy decision (cc-swap fork). Slot numbers only —
     no emails. ``rows`` is ``maximize.report.decision_rows``; the human form
-    prints them as a table on dry runs."""
+    prints them as a table on dry runs. ``code`` is a hold's own reason code
+    (``reset-wait``, ``preempt``, ``rebalance-deferred``; ``model.Hold.code``),
+    so a TUI hosting the engine words it like a published one."""
 
     kind: ClassVar[str] = "maximize"
     active: str | None
@@ -572,6 +574,7 @@ class MaximizeDecisionEvent(AutoSwitchEvent):
     pending: bool = False
     rows: list[dict] = field(default_factory=list)
     dry_run: bool = False
+    code: str | None = None
 
     def _fields(self) -> dict:
         fields = {
@@ -582,6 +585,8 @@ class MaximizeDecisionEvent(AutoSwitchEvent):
             "scores": self.scores,
             "pending": self.pending,
         }
+        if self.code:
+            fields["code"] = self.code
         if self.rows:
             fields["accounts"] = self.rows
         if self.dry_run:

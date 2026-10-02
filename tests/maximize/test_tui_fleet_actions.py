@@ -293,6 +293,54 @@ class TestStrategy:
             assert preview().startswith("with these values: HOLD · ")
             assert "saved values: HOLD — waiting for idle" in preview()
 
+    async def test_strategy_edits_the_reset_wait_and_idle_pattern_settings(self, tmp_path):
+        from textual.widgets import Input
+
+        from claude_swap.tui import menus
+
+        _settings(tmp_path)
+        app = make_app(_fleet(tmp_path))
+        async with app.run_test(size=(140, 44)) as pilot:
+            screen = await self._open_strategy(pilot)
+            toasts = _toasts(app)
+
+            def body() -> str:
+                return screen.query_one("#fx-st-body", Static).render().plain
+
+            for label in ("reset wait", "learn idle pattern", "preempt horizon",
+                          "busy rebalance gap"):
+                assert label in body(), label
+            assert (
+                "your busy and quiet times · idle pattern: learning (0 of 3 days observed)"
+                in body()
+            )
+            keys = [f.key for f in menus.STRATEGY_FIELDS]
+            screen._cursor = keys.index("maximize.resetWaitMin")
+            await pilot.press("left")                         # 15 -> 14 min
+            await pilot.pause()
+            screen._cursor = keys.index("maximize.learnIdlePattern")
+            await pilot.press("right")                        # on -> off
+            await pilot.pause()
+            assert "idle pattern: off (maximize.learnIdlePattern)" in body()
+            # e parses strictly: 49 h is out of range and changes nothing.
+            screen._cursor = keys.index("maximize.preemptHorizonMaxH")
+            await pilot.press("e")
+            await pilot.pause()
+            app.screen.query_one("#fx-text-input", Input).value = "49"
+            await pilot.press("enter")
+            await pilot.pause()
+            assert any("preemptHorizonMaxH" in m and s == "error" for m, s in toasts)
+            await pilot.press("e")
+            await pilot.pause()
+            app.screen.query_one("#fx-text-input", Input).value = "6"
+            await pilot.press("enter")
+            await pilot.pause()
+            await pilot.press("s")
+            await pilot.pause()
+            assert _maximize(tmp_path) == {
+                "resetWaitMin": 14, "learnIdlePattern": False, "preemptHorizonMaxH": 6,
+            }
+
 
 @pytest.mark.asyncio
 class TestAccounts:

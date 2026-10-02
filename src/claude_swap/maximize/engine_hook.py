@@ -632,6 +632,9 @@ def _decision_event(
         pending=pending,
         rows=decision_rows(snap),
         dry_run=dry_run,
+        # The hold's own code, as published (``_publish_decision``): a TUI
+        # hosting this engine words it like a viewer reading the state file.
+        code=decision.code if isinstance(decision, Hold) else None,
     )
 
 

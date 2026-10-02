@@ -273,6 +273,225 @@ def test_preview_decision_uses_edited_thresholds():
     assert (dv.kind, dv.trigger, dv.target) == ("switch", "hard", "2")
 
 
+# -- hold codes, the reset-aware wait and the usage history (feat/reset-wait hooks) ----------------
+
+
+#: #1 at 5h 96% (past hard 95), the window resetting in 8 minutes, at a pace
+#: that needs 80 minutes to reach 100%: the policy waits the reset out.
+def _reset_wait_fleet():
+    snap = accounts(
+        acc(1, usage(96, 40, reset5=NOW + 8 * 60 + 20), active=True, alias="main"),
+        acc(2, usage(10, 20), alias="side"),
+    )
+    state = MaximizeState(samples_account="1", samples=(
+        Sample(NOW - 660, 95.5, 40.0), Sample(NOW - 60, 96.0, 40.0),
+    ))
+    return snap, state
+
+
+RESET_WAIT_REASON = (
+    "#1 5h 96% — resets in 8m, waiting it out (switches at once if it hits 100%)"
+)
+
+
+def test_a_published_code_is_read_for_a_hold_only():
+    from claude_swap.maximize.view import _published
+
+    base = {"at": NOW, "pid": 1, "active": "1", "decision": "hold", "trigger": None,
+            "target": None, "reason": RESET_WAIT_REASON, "pending": False}
+    assert _published({**base, "code": "reset-wait"})[0].code == "reset-wait"
+    assert _published({**base, "code": "rebalance-deferred"})[0].code == "rebalance-deferred"
+    assert _published(base)[0].code is None
+    assert _published({**base, "code": "from-a-newer-engine"})[0].code is None
+    assert _published({**base, "code": ["reset-wait"]})[0].code is None
+    switch = {**base, "decision": "switch", "trigger": "hard", "code": "reset-wait"}
+    assert _published(switch)[0].code is None
+
+
+def test_a_reset_wait_hold_names_its_window_and_has_no_hard_eta():
+    snap, state = _reset_wait_fleet()
+    msnap = fleet.fleet_snapshot(snap, MX, state, now=NOW)
+    dv = fleet.decision_view(state, msnap, now=NOW, poll_s=60)
+    assert (dv.kind, dv.code, dv.source) == ("hold", "reset-wait", "computed")
+    assert dv.reason == RESET_WAIT_REASON
+    assert dv.waits == (("5h", 96.0, pytest.approx(NOW + 8 * 60 + 20)),)
+    # Past the hard cap the ETA to it is 0: "hard in ~0m" said nothing true.
+    assert dv.eta_hard_min is None
+    assert "hard in" not in fleet.now_line(dv, now=NOW)
+    # The same hold, published by the engine.
+    published = PublishedDecision(
+        at=NOW - 30, pid=4121, active="1", decision="hold", trigger=None, target=None,
+        reason=RESET_WAIT_REASON, pending=False, code="reset-wait",
+    )
+    dv = fleet.decision_view(replace(state, decision=published), msnap, now=NOW, poll_s=60)
+    assert (dv.kind, dv.code, dv.source, dv.target) == ("hold", "reset-wait", "engine", None)
+    assert dv.eta_hard_min is None and dv.waits[0][0] == "5h"
+    # A plain hold over the hard cap keeps its ETA (it is not waiting a reset out).
+    plain = fleet.decision_view(
+        replace(state, decision=replace(published, code=None)), msnap, now=NOW, poll_s=60
+    )
+    assert plain.code is None and plain.eta_hard_min == 0.0
+
+
+def test_a_tui_hosted_engine_carries_the_code_too():
+    snap, state = _reset_wait_fleet()
+    msnap = fleet.fleet_snapshot(snap, MX, state, now=NOW)
+    own = MaximizeDecisionEvent(active="1", decision="hold", trigger=None,
+                                reason=RESET_WAIT_REASON, code="reset-wait")
+    dv = fleet.decision_view(state, msnap, now=NOW, poll_s=60, own=own, own_at=NOW - 5)
+    assert (dv.kind, dv.code, dv.source) == ("hold", "reset-wait", "here")
+    assert dv.eta_hard_min is None
+    # A code on anything but a hold, or one this build does not know, is ignored.
+    odd = MaximizeDecisionEvent(active="1", decision="hold", trigger=None,
+                                reason=RESET_WAIT_REASON, code="from-a-newer-engine")
+    assert fleet.decision_view(state, msnap, now=NOW, poll_s=60, own=odd).code is None
+
+
+def test_the_engine_event_carries_the_hold_code():
+    from claude_swap.maximize import engine_hook
+    from claude_swap.maximize.model import Hold, Switch
+
+    snap, state = _reset_wait_fleet()
+    msnap = fleet.fleet_snapshot(snap, MX, state, now=NOW)
+    held = engine_hook._decision_event(
+        msnap, Hold(RESET_WAIT_REASON, pending=False, code="reset-wait"), False
+    )
+    assert held.code == "reset-wait" and held._fields()["code"] == "reset-wait"
+    moved = engine_hook._decision_event(msnap, Switch("2", "preempt", "why"), False)
+    assert moved.code is None and "code" not in moved._fields()
+
+
+def test_auto_off_says_which_hold_it_would_be():
+    snap, state = _reset_wait_fleet()
+    msnap = fleet.fleet_snapshot(snap, MX, state, now=NOW)
+    dv = fleet.decision_view(replace(state, auto_off=True), msnap, now=NOW, poll_s=60)
+    assert (dv.kind, dv.would, dv.code) == ("off", "hold (reset-wait)", None)
+
+
+def _hourly_points(number: str, pct7_now: float, per_hour: float, hours: int):
+    from claude_swap.maximize.history import UsagePoint
+
+    return [
+        UsagePoint(NOW - k * H, number, 20.0, pct7_now - k * per_hour, True)
+        for k in range(hours, -1, -1)
+    ]
+
+
+def _preempt_fleet():
+    """#1 at 7d 84%, climbing 1.5 points an hour while active; #2 has room.
+    The 5h rose 3 points in the last 10 minutes: not idle."""
+    snap = accounts(
+        acc(1, usage(30, 84, days7=3), active=True, alias="main"),
+        acc(2, usage(10, 20, days7=3), alias="side"),
+    )
+    state = MaximizeState(samples_account="1", samples=(
+        Sample(NOW - 660, 27.0, 84.0), Sample(NOW - 60, 30.0, 84.0),
+    ))
+    return snap, state
+
+
+def test_fleet_decisions_use_the_usage_history():
+    from claude_swap.maximize import history
+
+    snap, state = _preempt_fleet()
+    h = history.History(points=tuple(_hourly_points("1", 84.0, 1.5, 6)))
+    with_history = fleet.fleet_snapshot(snap, MX, state, now=NOW, history=h)
+    assert with_history.rates7 == history.burn_rates(h.points, NOW)
+    assert with_history.rates7["1"] == pytest.approx(1.5)
+    assert with_history.forecast is None  # fewer than 3 days of slots: no pattern
+    dv = fleet.decision_view(state, with_history, now=NOW, poll_s=60)
+    assert (dv.kind, dv.code, dv.target, dv.source) == ("hold", "preempt", "2", "computed")
+    assert "would pass 90% in ~4h, within the next 4h" in dv.reason
+    # Without history (none, unreadable, or learning off) it decides as the
+    # engine does on a cold start.
+    bare = fleet.fleet_snapshot(snap, MX, state, now=NOW)
+    assert bare.rates7 == {} and bare.forecast is None
+    assert fleet.decision_view(state, bare, now=NOW, poll_s=60).code is None
+    off = replace(MX, preempt=False, learn_idle_pattern=False)
+    assert fleet.fleet_snapshot(snap, off, state, now=NOW, history=h).rates7 == {}
+
+
+def test_history_inputs_follow_the_settings_like_the_engine():
+    from claude_swap.maximize import history
+    from claude_swap.maximize import view as mxview
+
+    slots = tuple(
+        history.SlotObs(NOW - k * history.SLOT_S - (NOW % history.SLOT_S), k % 8 != 0)
+        for k in range(1, 4 * 96)
+    )
+    h = history.History(points=tuple(_hourly_points("1", 84.0, 1.5, 6)), slots=slots)
+    forecast, rates = mxview.history_inputs(h, MX, NOW)
+    assert forecast == history.forecast(h.slots, NOW) and forecast is not None
+    assert rates == history.burn_rates(h.points, NOW)
+    assert mxview.history_inputs(h, replace(MX, learn_idle_pattern=False), NOW)[0] is None
+    assert mxview.history_inputs(h, replace(MX, preempt=False), NOW)[1] == {}
+    assert mxview.history_inputs(None, MX, NOW) == (None, {})
+
+
+def test_a_history_error_falls_back_to_no_history(tmp_path, monkeypatch):
+    from claude_swap.maximize import history
+    from claude_swap.maximize import view as mxview
+
+    assert mxview.read_history(tmp_path, NOW) == history.History()  # no file yet
+    (tmp_path / history.HISTORY_FILENAME).mkdir()  # a directory: unreadable as a file
+    assert mxview.read_history(tmp_path, NOW) in (None, history.History())
+
+    def boom(*_a, **_k):
+        raise RuntimeError("corrupt")
+
+    monkeypatch.setattr(history, "forecast", boom)
+    h = history.History(points=tuple(_hourly_points("1", 84.0, 1.5, 6)))
+    assert mxview.history_inputs(h, MX, NOW) == (None, {})
+    snap, state = _preempt_fleet()
+    assert fleet.fleet_snapshot(snap, MX, state, now=NOW, history=h).rates7 == {}
+    monkeypatch.setattr(history, "read", boom)
+    (tmp_path / history.HISTORY_FILENAME).rmdir()
+    (tmp_path / history.HISTORY_FILENAME).write_text("{}\n")
+    assert mxview.read_history(tmp_path, NOW) is None
+
+
+def test_read_history_parses_once_while_the_file_is_unchanged(tmp_path, monkeypatch):
+    import os
+
+    from claude_swap.maximize import history
+    from claude_swap.maximize import view as mxview
+
+    path = tmp_path / history.HISTORY_FILENAME
+    path.write_text('{"k":"u","t":%r,"n":"1","p5":1,"p7":2,"a":1}\n' % (NOW - 60))
+    calls: list[int] = []
+    real = history.read
+    monkeypatch.setattr(history, "read", lambda root, now=None: calls.append(1) or real(root))
+    first = mxview.read_history(tmp_path, NOW)
+    assert len(first.points) == 1 and calls == [1]
+    assert mxview.read_history(tmp_path, NOW) == first and calls == [1]
+    with open(path, "a") as f:
+        f.write('{"k":"u","t":%r,"n":"2","p5":1,"p7":2,"a":0}\n' % (NOW - 30))
+    os.utime(path, ns=(path.stat().st_atime_ns, path.stat().st_mtime_ns + 1_000_000))
+    assert len(mxview.read_history(tmp_path, NOW).points) == 2 and calls == [1, 1]
+
+
+def test_the_idle_pattern_line_for_help_and_swap_strategy():
+    from claude_swap.maximize import history
+    from claude_swap.maximize import view as mxview
+
+    assert mxview.idle_pattern_text(history.History(), MX, NOW) == (
+        "idle pattern: learning (0 of 3 days observed)"
+    )
+    assert mxview.idle_pattern_text(None, MX, NOW) == "idle pattern: usage history unreadable"
+    assert mxview.idle_pattern_text(None, replace(MX, learn_idle_pattern=False), NOW) == (
+        "idle pattern: off (maximize.learnIdlePattern)"
+    )
+    slots = tuple(
+        history.SlotObs(NOW - k * history.SLOT_S - (NOW % history.SLOT_S), False)
+        for k in range(1, 10 * 96)
+    )
+    days = history.learned_days(slots, NOW)
+    text = mxview.idle_pattern_text(history.History(slots=slots), MX, NOW)
+    assert text.startswith(f"idle pattern: {days} days learned · quiet now until ")
+    assert ", " not in text  # Fleet's separator; doctor and why keep the comma
+    assert history.describe(slots, NOW).startswith(f"idle pattern: {days} days learned, ")
+
+
 # -- engine status and status lines ---------------------------------------------------------------
 
 

@@ -427,6 +427,66 @@ class TestFleetScreen:
             await pilot.pause()
             assert isinstance(app.screen, FleetScreen)
 
+    async def test_a_published_reset_wait_reads_as_waiting_it_out(
+        self, tmp_path, held_by_service
+    ):
+        _settings(tmp_path)
+        reason = "#1 5h 96% — resets in 8m, waiting it out (switches at once if it hits 100%)"
+        _state(tmp_path, maximizeDecision=_decision(
+            decision="hold", trigger=None, target=None, reason=reason, code="reset-wait",
+        ))
+        resetting = UsageEntry(
+            last_good={
+                "five_hour": {"pct": 96.0, "resets_at": _iso_in(500)},
+                "seven_day": {"pct": 40.0, "resets_at": _iso_in(86400 * 3)},
+            },
+            fetched_at=time.time() - 5, age_s=5.0,
+        )
+        fake = FakeSwitcher([
+            make_account(1, active=True, entry=resetting, alias="main"),
+            make_account(2, entry=make_entry(10.0, 20.0)),
+        ], tmp_path)
+        app = make_app(fake)
+        async with app.run_test(size=(160, 40)) as pilot:
+            await _open(pilot)
+            assert _status(app).startswith(
+                "Auto ON · using #1 main · 5h 96% — resets in 8m, waiting it out "
+                "(switches at once if it hits 100%)"
+            )
+        async with make_app(fake).run_test(size=(90, 28)) as pilot:
+            await _open(pilot)
+            # Narrower: the policy's own words, without the account's name.
+            assert _status(pilot.app).startswith(
+                "Auto ON · #1 5h 96% — resets in 8m, waiting it out"
+            )
+
+    async def test_help_names_the_learned_idle_pattern(self, tmp_path):
+        from claude_swap.maximize import history
+        from claude_swap.tui.fleet_help import HelpScreen
+
+        _settings(tmp_path)
+        now = time.time()
+        start = now - now % history.SLOT_S
+        slots = [history.SlotObs(start - k * history.SLOT_S, k % 4 == 0) for k in range(1, 5 * 96)]
+        (tmp_path / history.HISTORY_FILENAME).write_text(
+            "".join(history._line(s) for s in reversed(slots))
+        )
+        days = history.learned_days(slots, now)
+        app = make_app(_fleet(tmp_path))
+        async with app.run_test(size=(120, 40)) as pilot:
+            await _open(pilot)
+            # The home screen stays quiet about it ...
+            assert "idle pattern" not in _status(app) + _body(app)
+            await pilot.press("question_mark")
+            await _open(pilot)
+            assert isinstance(app.screen, HelpScreen)
+            text = app.screen.query_one("#fx-help", Static).render().plain
+            # ... and help says what has been learned.
+            assert "Learned so far" in text
+            assert f"idle pattern        {days} days learned · " in text
+            for word in ("waiting it out", "quiet time", "preempt", "rebalance deferred"):
+                assert word in text, word
+
     async def test_engine_log_opens_the_auto_screen(self, tmp_path, fake_engine):
         from claude_swap.tui.autoview import AutoScreen
         from claude_swap.tui.fleet import FleetScreen

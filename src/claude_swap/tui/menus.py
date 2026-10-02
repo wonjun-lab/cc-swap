@@ -179,6 +179,15 @@ class StrategyField:
     group: str
 
 
+#: The Swap strategy group of the idle-pattern knobs; its heading also says
+#: what has been learned (``view.idle_pattern_text``).
+QUIET_GROUP = "your busy and quiet times"
+
+#: Every Swap strategy field, in screen order. Values are validated where
+#: they change: ←/→ clamp into the key's ``SETTING_SPECS`` range (soft never
+#: passes hard; a bool toggles), and ``e`` parses strictly
+#: (``settings.parse_setting_value``: type, range, finite), as ``cc-swap
+#: config set`` does.
 STRATEGY_FIELDS: tuple[StrategyField, ...] = (
     StrategyField("maximize.soft5h", "5h soft", "%",
                   "switch at the next idle moment once the active passes this", 1,
@@ -198,10 +207,24 @@ STRATEGY_FIELDS: tuple[StrategyField, ...] = (
     StrategyField("maximize.forceEtaMin", "force ETA", "min",
                   "switch early when a hard cap is this close at the current rate", 1,
                   "when to leave the active account"),
+    StrategyField("maximize.resetWaitMin", "reset wait", "min",
+                  "wait out a window that resets this soon instead of switching (0 = off)", 1,
+                  "when to leave the active account"),
     StrategyField("maximize.rebalanceCooldownMin", "rebalance cooldown", "min", "", 5,
                   "when to leave the active account"),
     StrategyField("maximize.tieEpsilon", "tie epsilon", "", "scores this close count as a tie",
                   0.05, "when to leave the active account"),
+    StrategyField("maximize.learnIdlePattern", "learn idle pattern", "",
+                  "learn your usual busy and quiet times from the usage history", 1,
+                  QUIET_GROUP),
+    StrategyField("maximize.preempt", "preempt", "",
+                  "move at an idle moment when the 7d would pass soft before your quiet time",
+                  1, QUIET_GROUP),
+    StrategyField("maximize.preemptHorizonMaxH", "preempt horizon", "h",
+                  "look at most this far ahead for a pre-emptive move", 1, QUIET_GROUP),
+    StrategyField("maximize.busyRebalanceGap", "busy rebalance gap", "",
+                  "in a busy time, rebalance at once only for a score gain this large", 0.1,
+                  QUIET_GROUP),
     StrategyField("prime.enabled", "priming", "", "keep idle accounts' 5h windows started", 1,
                   "priming idle accounts"),
     StrategyField("prime.jitterS", "jitter", "s", "wait LO-HI seconds after a reset", 0,
@@ -215,9 +238,19 @@ STRATEGY_KEYS = "↑↓ move · ←→ adjust · e edit · s save · b back · q
 
 
 
-def help_entries() -> list[tuple[str, str]]:
+def help_entries(idle_pattern: str | None = None) -> list[tuple[str, str]]:
     """``(term, explanation)`` rows for the help screen; a row with no term
-    is a section heading (or a blank line)."""
+    is a section heading (or a blank line). ``idle_pattern``
+    (``view.idle_pattern_text``: ``idle pattern: 9 days learned · next quiet
+    window 23:00–07:30``) adds what the engine has learned so far."""
+    learned: list[tuple[str, str]] = []
+    if idle_pattern:
+        text = idle_pattern.removeprefix("idle pattern: ")
+        if text.startswith("off"):
+            text = "off: nothing is learned (m → s: learn idle pattern turns it on)"
+        else:
+            text += " (m → s: learn idle pattern turns it off)"
+        learned = [("", ""), ("", "Learned so far"), ("idle pattern", text)]
     return [
         ("", "How to read Fleet"),
         ("top line", "what automatic switching is doing now, in one sentence. "
@@ -248,6 +281,18 @@ def help_entries() -> list[tuple[str, str]]:
         ("hard mark", "at it, cc-swap moves you at once (forced)"),
         ("pause", "an idle moment: usage rose less than maximize.idleMaxDeltaPct over "
                   "the last maximize.idleWindowMin minutes"),
+        ("waiting it out", "a mark is crossed, but that window resets within "
+                           "maximize.resetWaitMin minutes: cc-swap waits for the reset "
+                           "instead of switching (a switch makes Claude Code re-read the "
+                           "whole context), and switches at once if it hits 100%"),
+        ("quiet time", "when you are usually idle, learned from the last 14 days: an hour "
+                       "or more that was busy less than 20% of the time (weekdays and "
+                       "weekends apart, after 3 days)"),
+        ("preempt", "the active 7d is on pace to pass its soft mark before your next quiet "
+                    "time: cc-swap moves at an idle moment now instead of being forced to "
+                    "in a busy stretch"),
+        ("rebalance deferred", "a slightly better account exists but this is usually a "
+                               "busy time: the move waits for your quiet time"),
         ("pace / score", "how the next account is picked: the 7d quota left per day left "
                          "(above 1 = quota to spare)"),
         ("landable", "an account switching may move you to: under both soft marks minus "
@@ -258,6 +303,7 @@ def help_entries() -> list[tuple[str, str]]:
                            "service, a terminal cc-swap auto, the menu bar or this TUI. "
                            "Otherwise this screen is a viewer and never switches by itself"),
         ("dry run", "an engine that decides but never switches"),
+        *learned,
         ("", ""),
         ("", "Keys"),
         ("↑ ↓ / j k", "select an account (← → across the two columns when wide)"),

@@ -2,8 +2,10 @@
 
 Everything is computed from the inputs the engine decides on: the usage
 store snapshot (via :func:`snapshot_from_accounts`, which wraps
-``maximize.snapshot.build_snapshot``) and the engine's state file
-(``maximizeSamples``, ``primes``, ``quarantine``, ``lastSwitchAt``). The panel
+``maximize.snapshot.build_snapshot``), the engine's state file
+(``maximizeSamples``, ``primes``, ``quarantine``, ``lastSwitchAt``) and its
+usage history (``usage_history.jsonl``, :func:`read_history`; the idle
+pattern and the 7d burn rates preempt and rebalance deferral read). The panel
 therefore reads the same whether the engine runs in this process or in the
 cc-swap service, and it never fetches anything itself.
 """
@@ -12,14 +14,16 @@ from __future__ import annotations
 
 import json
 import math
+import os
 import time
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import Literal
+from typing import Literal, get_args
 
+from claude_swap.maximize import history as usage_history
 from claude_swap.maximize.auto_off_flag import read_flag
-from claude_swap.maximize.model import AccountView, Sample, Snapshot
+from claude_swap.maximize.model import AccountView, Forecast, HoldCode, Sample, Snapshot
 from claude_swap.maximize.score import landable, rank, score
 from claude_swap.maximize.snapshot import build_snapshot
 from claude_swap.models import AccountsSnapshot
@@ -52,6 +56,9 @@ TIER_LABELS = {"normal": "normal", "last_resort": "last resort", "excluded": "ex
 #: ``engine_hook.DECISION_KEY`` (pinned by a test, like STATE_FILENAME).
 DECISION_KEY = "maximizeDecision"
 DECISION_KINDS = frozenset({"switch", "hold", "indeterminate", "exhausted"})
+#: A hold's own reason codes (``model.Hold.code``); any other ``code`` in a
+#: published record (a newer engine's) reads as a plain hold.
+HOLD_CODES: frozenset[str] = frozenset(get_args(HoldCode))
 #: ``pause.AUTO_OFF_KEY`` (pinned by a test, like STATE_FILENAME).
 AUTO_OFF_KEY = "autoOff"
 
@@ -68,6 +75,8 @@ class PublishedDecision:
     target: str | None
     reason: str
     pending: bool
+    # A hold's own code (one of HOLD_CODES), else None.
+    code: str | None = None
 
 
 @dataclass(frozen=True)
@@ -132,6 +141,7 @@ def _published(raw: object) -> tuple[PublishedDecision | None, dict[str, str | N
         return None, {}
     pid = raw.get("pid")
     trigger = raw.get("trigger")
+    code = raw.get("code")
     decision = PublishedDecision(
         at=at,
         pid=pid if isinstance(pid, int) and not isinstance(pid, bool) else None,
@@ -141,6 +151,8 @@ def _published(raw: object) -> tuple[PublishedDecision | None, dict[str, str | N
         target=_text(raw.get("target")),
         reason=reason,
         pending=raw.get("pending") is True,
+        # Only a hold carries one (``doctor_cli._published_code`` agrees).
+        code=code if kind == "hold" and isinstance(code, str) and code in HOLD_CODES else None,
     )
     plans_raw = raw.get("plans")
     plans: dict[str, str | None] = {}
@@ -216,6 +228,70 @@ def read_state(backup_root: Path) -> MaximizeState:
     )
 
 
+#: ``read_history``'s parse, per file, while the file is unchanged:
+#: ``{path: ((mtime_ns, size, inode), History)}``.
+_HISTORY_CACHE: dict[str, tuple[tuple[int, int, int], usage_history.History]] = {}
+
+
+def read_history(backup_root: Path, now: float) -> usage_history.History | None:
+    """The engine's usage history (``usage_history.jsonl``) trimmed to
+    ``now``; None when it cannot be read. Never raises.
+
+    The parse is kept while the file's mtime, size and inode stay the same
+    (the engine appends at most once a clock hour per account and once per
+    15-minute slot), so a redraw costs a ``stat``.
+    """
+    try:
+        path = usage_history.path_for(Path(backup_root))
+        try:
+            st = os.stat(path)
+        except FileNotFoundError:
+            _HISTORY_CACHE.pop(str(path), None)
+            return usage_history.History()
+        signature = (st.st_mtime_ns, st.st_size, st.st_ino)
+        cached = _HISTORY_CACHE.get(str(path))
+        if cached is not None and cached[0] == signature:
+            parsed = cached[1]
+        else:
+            parsed = usage_history.read(Path(backup_root))
+            _HISTORY_CACHE[str(path)] = (signature, parsed)
+        return usage_history.trimmed(parsed, now)
+    except Exception:  # a planning aid must never take a screen down
+        return None
+
+
+def history_inputs(
+    h: usage_history.History | None, settings: MaximizeSettings, now: float
+) -> tuple[Forecast | None, dict[str, float]]:
+    """``(forecast, rates7)`` for a Snapshot, the way the engine derives them
+    (``engine_hook._history_inputs``): the idle pattern while
+    ``learnIdlePattern`` is on, the 7d burn rates while ``preempt`` is. No
+    history (None) or any failure is no history, as for the engine."""
+    if h is None or not (settings.preempt or settings.learn_idle_pattern):
+        return None, {}
+    try:
+        forecast = usage_history.forecast(h.slots, now) if settings.learn_idle_pattern else None
+        rates = usage_history.burn_rates(h.points, now) if settings.preempt else {}
+    except Exception:
+        return None, {}
+    return forecast, rates
+
+
+def idle_pattern_text(
+    h: usage_history.History | None, settings: MaximizeSettings, now: float
+) -> str:
+    """``idle pattern: 9 days learned · next quiet window 23:00–07:30``
+    (``history.describe``) for Fleet's help and Swap strategy."""
+    if not settings.learn_idle_pattern:
+        return usage_history.describe((), now, enabled=False)
+    if h is None:
+        return "idle pattern: usage history unreadable"
+    try:
+        return usage_history.describe(h.slots, now, sep=" · ")
+    except Exception:
+        return "idle pattern: usage history unreadable"
+
+
 def snapshot_from_accounts(
     snap: AccountsSnapshot,
     settings: MaximizeSettings,
@@ -223,14 +299,19 @@ def snapshot_from_accounts(
     *,
     now: float,
     plans: Mapping[str, str | None] | None = None,
+    history: usage_history.History | None = None,
 ) -> Snapshot:
     """The policy Snapshot for the TUI's store snapshot.
 
     Plan tiers are not read here (reading ``rateLimitTier`` costs a Keychain
     read per account): ``plans`` — the labels a live engine published — and
     ``maximize.planOverride`` weigh in. That affects tie-breaks only.
+    ``history`` (:func:`read_history`) feeds the idle pattern and the 7d
+    burn rates under ``settings`` (:func:`history_inputs`); without it the
+    Snapshot has none, which is what the engine decides with on a cold start.
     """
     accounts = snap.accounts
+    forecast, rates7 = history_inputs(history, settings, now)
     return build_snapshot(
         now=now,
         active=snap.active_number,
@@ -250,6 +331,8 @@ def snapshot_from_accounts(
             for a in accounts
             if a.login_expires_at is not None
         },
+        forecast=forecast,
+        rates7=rates7,
     )
 
 

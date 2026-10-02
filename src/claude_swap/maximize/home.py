@@ -13,7 +13,11 @@ Fleet (``tui/fleet.py``) is the maximize home screen. It shows:
 The sentence never presents an old decision as the engine's current one:
 :func:`situation` tells a live decision from one the engine has not
 confirmed yet (``waiting``) and from an engine that stopped reporting
-(``stale``). Everything here takes ``now``; the widget only lays it out.
+(``stale``). A hold with its own code (``model.Hold.code``) gets its own
+words: waiting out a reset (``reset-wait``, minutes counted from ``now``),
+a pre-emptive move waiting for idle (``preempt``) and a rebalance deferred
+to your quiet time (``rebalance-deferred``); a ``preempt`` switch says why
+it moved early. Everything here takes ``now``; the widget only lays it out.
 
 Tones are ``maximize/fleet.py``'s (``ok``, ``warn``, ``crit``, ``dim``,
 ``accent``, ``plain``, ``bold``) plus ``okb``/``warnb`` (bold ok/warn) and
@@ -22,6 +26,7 @@ Tones are ``maximize/fleet.py``'s (``ok``, ``warn``, ``crit``, ``dim``,
 
 from __future__ import annotations
 
+import re
 from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Literal
@@ -233,11 +238,15 @@ def priming_runs(
 
 def next_number(dv: fx.DecisionView, picks: Sequence[str], sit: Situation) -> str | None:
     """The account automatic switching goes to next: the decision's target
-    while it is moving, else the engine's first pick. None while nothing
-    switches or the engine stopped reporting."""
+    while it is moving (a pending switch, a switch, a preempt waiting for
+    idle, a rebalance deferred to a quiet time), else the engine's first
+    pick. None while nothing switches or the engine stopped reporting."""
     if not switching_live(sit):
         return None
-    if dv.kind in ("pending", "switch") and dv.target:
+    moving = dv.kind in ("pending", "switch") or (
+        dv.kind == "hold" and dv.code in ("preempt", "rebalance-deferred")
+    )
+    if moving and dv.target:
         return dv.target
     return picks[0] if picks else None
 
@@ -275,6 +284,133 @@ def _past_soft(row: fx.FleetRow, mx: MaximizeSettings) -> tuple[str, float, floa
     if row.pct7 is not None and row.pct7 >= mx.soft_7d:
         return "7d", row.pct7, mx.soft_7d
     return None
+
+
+# -- the policy's own words, for the hold codes ---------------------------------------
+#
+# The policy (``maximize/policy.py``) writes these reasons; the patterns
+# below pick out the parts the sentence quotes. A reason they do not match
+# (a newer engine's wording) is quoted whole instead.
+
+#: ``#1 7d 84% would pass 90% in ~3h, before your usual quiet time (23:00)``
+#: (``policy._preempt``): the part after the slot number.
+_PREEMPT_WHY_RE = re.compile(
+    r"#\w+ (7d [\d.]+% would pass [\d.]+% in ~\d+[mh], [^—]*?)\s*(?:—|$)"
+)
+#: ``preempt cooldown (12 min left): …``
+_PREEMPT_COOLDOWN_RE = re.compile(r"preempt cooldown \((\d+) min left\)")
+#: ``rebalance deferred to your quiet time (23:00): …`` (``policy._rebalance``)
+_DEFERRED_RE = re.compile(r"rebalance deferred to your quiet time \((\d{1,2}:\d{2})\)")
+RESET_WAIT_TAIL = "(switches at once if it hits 100%)"
+
+
+def waits_text(waits: Sequence[tuple[str, float, float]], now: float) -> str:
+    """``5h 96% — resets in 8m`` per waited-out window, the policy's words
+    with the minutes counted from ``now``."""
+    return ", ".join(
+        f"{window} {pct:.0f}% — resets in {max(1, round((reset - now) / 60.0))}m"
+        for window, pct, reset in waits
+    )
+
+
+def _quoted(reason: str) -> str:
+    """A reason with the slot number it starts with dropped (the sentence
+    has already named the account)."""
+    return re.sub(r"^#\w+ ", "", reason.strip())
+
+
+def _reset_wait_variants(
+    head: Seg, act: fx.FleetRow, dv: fx.DecisionView, name, now: float
+) -> list[list[Seg]]:
+    if not dv.waits:  # the window reset since, or a reason this cannot read
+        return [
+            [head, (f" · using {name(act.number)} · {_quoted(dv.reason)}", "plain")],
+            [head, (f" · {dv.reason}", "plain")],
+            [head, (" · waiting out a reset", "plain")],
+            [head],
+        ]
+    waits = waits_text(dv.waits, now)
+    first = waits_text(dv.waits[:1], now)
+    return [
+        [head, (f" · using {name(act.number)} · {waits}, waiting it out ", "plain"),
+         (RESET_WAIT_TAIL, "dim")],
+        [head, (f" · #{act.number} {waits}, waiting it out {RESET_WAIT_TAIL}", "plain")],
+        [head, (f" · #{act.number} {waits}, waiting it out", "plain")],
+        [head, (f" · #{act.number} {first}, waiting", "plain")],
+        [head, (" · waiting out a reset", "plain")],
+        [head],
+    ]
+
+
+def _preempt_why(reason: str) -> str | None:
+    """``7d 84% would pass 90% in ~3h, before your usual quiet time (23:00)``."""
+    m = _PREEMPT_WHY_RE.search(reason or "")
+    return m.group(1).strip() if m else None
+
+
+def _preempt_hold_variants(
+    head: Seg, act: fx.FleetRow, dv: fx.DecisionView, name, dry: bool
+) -> list[list[Seg]]:
+    why = _preempt_why(dv.reason)
+    cooldown = _PREEMPT_COOLDOWN_RE.search(dv.reason or "")
+    target = name(dv.target) if dv.target else "the next account"
+    short_target = f"#{dv.target}" if dv.target else "the next account"
+    move = "would move" if dry else "will move"
+    if cooldown:  # it still waits for a pause once the cooldown is over
+        when = f"when you pause after the cooldown ({cooldown.group(1)}m left)"
+        short_when = "after the cooldown"
+    else:
+        when, short_when = "when you pause", "on pause"
+    if why is None:
+        return [
+            [head, (f" · using {name(act.number)} · {_quoted(dv.reason)}", "plain")],
+            [head, (f" · to {short_target} {short_when} (preempt)", "plain")],
+            [head],
+        ]
+    pace = why.split(", ", 1)[0]  # 7d 84% would pass 90% in ~3h
+    return [
+        [head, (f" · using {name(act.number)} · {why} — {move} to {target} {when}", "plain")],
+        [head, (f" · #{act.number} {why} — to {short_target} {when}", "plain")],
+        [head, (f" · #{act.number} {pace} — to {short_target} {short_when}", "plain")],
+        [head, (f" · to {short_target} {short_when} (preempt)", "plain")],
+        [head],
+    ]
+
+
+def _deferred_variants(
+    head: Seg, act: fx.FleetRow, dv: fx.DecisionView, name
+) -> list[list[Seg]]:
+    m = _DEFERRED_RE.search(dv.reason or "")
+    at = m.group(1) if m else None
+    deferred = "rebalance deferred to your quiet time" + (f" ({at})" if at else "")
+    better = f"({name(dv.target)} scores better; this is usually a busy time)" if dv.target else (
+        "(this is usually a busy time)"
+    )
+    return [
+        [head, (f" · using {name(act.number)} · all fine — {deferred} ", "plain"),
+         (better, "dim")],
+        [head, (f" · using {name(act.number)} · {deferred}", "plain")],
+        [head, (f" · {deferred}", "plain")],
+        [head, (f" · rebalance at {at}" if at else " · rebalance deferred", "plain")],
+        [head],
+    ]
+
+
+def _preempt_switch_variants(
+    head: Seg, dv: fx.DecisionView, name, verb: str
+) -> list[list[Seg]]:
+    why = _preempt_why(dv.reason)
+    move = f" · {verb} {name(dv.active)} → {name(dv.target)} now while you're idle"
+    out: list[list[Seg]] = []
+    if why:
+        out.append([head, (f"{move} ", "plain"), (f"— {why}", "dim")])
+    out += [
+        [head, (f"{move} (preempt)", "plain")],
+        [head, (f" · {verb} → #{dv.target} while idle (preempt)", "plain")],
+        [head, (f" · {verb} → #{dv.target}", "plain")],
+        [head],
+    ]
+    return out
 
 
 def status_variants(
@@ -363,9 +499,18 @@ def status_variants(
             [head, (f" · to {short_target} on pause", "plain")],
             [head],
         ]
+    if dv.kind == "hold" and act is not None:
+        if dv.code == "reset-wait":
+            return _reset_wait_variants(head, act, dv, name, now)
+        if dv.code == "preempt":
+            return _preempt_hold_variants(head, act, dv, name, dry)
+        if dv.code == "rebalance-deferred":
+            return _deferred_variants(head, act, dv, name)
     if dv.kind == "switch":
         trigger = f" ({dv.trigger})" if dv.trigger else ""
         verb = "would switch" if dry else "switching"
+        if dv.trigger == "preempt":
+            return _preempt_switch_variants(head, dv, name, verb)
         return [
             [head, (f" · {verb} {name(dv.active)} → {name(dv.target)} now{trigger}", "plain")],
             [head, (f" · {verb} → #{dv.target}", "plain")],

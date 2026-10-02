@@ -71,7 +71,9 @@ KNOWN_ASYMMETRY: dict[str, str] = {
     ),
     "why": (
         "Fleet's status sentence already says what the engine decided, live, and "
-        "when it stopped reporting; why is that same explanation for a shell"
+        "when it stopped reporting — a reset-wait, preempt or deferred rebalance in "
+        "plain words — and ? shows the learned idle pattern; why is that same "
+        "explanation for a shell"
     ),
     "prime verify": (
         "spawns claude in a throwaway profile (and with --live spends a real prime) "
@@ -198,6 +200,87 @@ def test_every_home_key_and_shortcut_is_bound():
 
 def test_ctrl_f_is_bound_app_wide():
     assert any("ctrl+f" in b.key for b in CswapApp.BINDINGS)
+
+
+# -- settings: `cc-swap config set` vs Fleet's Swap strategy (m → s) ---------------------------
+#
+# The same rule for settings: every ``maximize.*``/``prime.*`` key `config
+# set` accepts is a Swap strategy field, or is listed here with the reason it
+# is not. A key registered later fails until it is one or the other.
+
+#: Fork settings the Swap strategy screen does not edit, and why.
+STRATEGY_ASYMMETRY: dict[str, str] = {
+    "maximize.pendingPollS": (
+        "the poll interval while waiting for idle spends the per-account usage budget "
+        "every machine shares; change it deliberately with cc-swap config set"
+    ),
+    "maximize.lastResort": (
+        "a comma-separated list of emails or aliases; Fleet's l toggles last resort on "
+        "the selected account and edits this same list"
+    ),
+    "maximize.planOverride": (
+        "a per-email text map that only breaks ties; the plan normally comes from each "
+        "account's stored credentials"
+    ),
+    "maximize.loginExpiryGuardMin": (
+        "a landing guard near a login's fixed deadline; Fleet answers that deadline "
+        "with login tags, the attention line and r to renew the login"
+    ),
+    "prime.claudePath": (
+        "detected from your shell and saved by cc-swap service install; a path typed "
+        "into a TUI field is easy to get wrong and launchd runs without your PATH"
+    ),
+}
+
+
+def _fork_settings() -> set[str]:
+    from claude_swap.settings import SETTING_SPECS
+
+    return {k for k, s in SETTING_SPECS.items() if s.section in ("maximize", "prime")}
+
+
+@pytest.mark.parametrize("key", sorted(_fork_settings()))
+def test_every_fork_setting_is_in_swap_strategy_or_says_why_not(key):
+    edited = {f.key for f in menus.STRATEGY_FIELDS}
+    assert (key in edited) != (key in STRATEGY_ASYMMETRY), (
+        f"{key}: add it to tui/menus.py STRATEGY_FIELDS (Swap strategy, m → s) or to "
+        "STRATEGY_ASYMMETRY here with the reason Fleet does not edit it"
+    )
+
+
+def test_the_strategy_asymmetry_names_real_settings_with_real_reasons():
+    assert set(STRATEGY_ASYMMETRY) <= _fork_settings()
+    assert {f.key for f in menus.STRATEGY_FIELDS} <= _fork_settings()
+    for key, reason in STRATEGY_ASYMMETRY.items():
+        assert len(reason.split()) >= 8, f"say why Swap strategy does not edit {key}"
+
+
+def test_every_hold_code_why_explains_fleet_words_too():
+    """`cc-swap why` explains a hold's own code (doctor_cli.REASONS); Fleet's
+    sentence must word the same codes, not fall back to a generic hold."""
+    from claude_swap.maximize import doctor_cli
+    from claude_swap.maximize import fleet as fx
+    from claude_swap.maximize import home
+    from claude_swap.maximize.view import HOLD_CODES
+    from claude_swap.settings import MaximizeSettings
+
+    assert HOLD_CODES <= set(doctor_cli.REASONS)
+    row = fx.FleetRow(
+        number="1", name="main", email="m@x", org="personal", active=True, rank=1,
+        plan="20x", tier="normal", pct5=96.0, pct7=40.0, days7=3.0, score=1.0,
+        landable=False, land="active", state5="running", reset5=None,
+        prime=fx.PrimeCell("active", None, None, "—"), login="ok", stale=False,
+    )
+    es = fx.EngineStatus("service", 4121, {"running": True, "pid": 4121})
+
+    def said(code):
+        dv = fx.DecisionView("hold", "1", None, None, "#1 x", at=0.0, source="engine",
+                             code=code)
+        return home.status_variants(es, dv, [row], MaximizeSettings(), "live", now=0.0)
+
+    generic = said(None)
+    for code in sorted(HOLD_CODES):
+        assert said(code) != generic, code
 
 
 @pytest.mark.parametrize("command", sorted(cli._FORK_COMMANDS))

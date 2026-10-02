@@ -118,3 +118,104 @@ def test_help_explains_the_jargon_and_lists_every_key():
         assert key in text, key
     for entry in menus.MAIN_MENU:
         assert f"{entry.key} " in text
+
+
+def test_help_explains_the_reset_wait_and_idle_pattern_words():
+    terms = {term for term, _what in menus.help_entries()}
+    assert {"waiting it out", "quiet time", "preempt", "rebalance deferred"} <= terms
+    assert "idle pattern" not in terms  # nothing learned to show without it
+    from claude_swap.tui.fleet_help import TERM_WIDTH
+
+    assert max(len(t) for t in terms) < TERM_WIDTH  # a gap before every explanation
+
+
+def test_help_shows_what_has_been_learned_when_given():
+    line = "idle pattern: 9 days learned · next quiet window 23:00–07:30"
+    entries = dict(menus.help_entries(line))
+    assert entries["idle pattern"].startswith("9 days learned · next quiet window 23:00–07:30")
+    assert entries["idle pattern"].endswith("(m → s: learn idle pattern turns it off)")
+    assert ("", "Learned so far") in menus.help_entries(line)
+    off = dict(menus.help_entries("idle pattern: off (maximize.learnIdlePattern)"))
+    assert off["idle pattern"] == (
+        "off: nothing is learned (m → s: learn idle pattern turns it on)"
+    )
+
+
+NEW_STRATEGY_KEYS = (
+    "maximize.resetWaitMin", "maximize.learnIdlePattern", "maximize.preempt",
+    "maximize.preemptHorizonMaxH", "maximize.busyRebalanceGap",
+)
+
+
+def test_swap_strategy_edits_the_reset_wait_and_idle_pattern_settings():
+    from claude_swap.settings import SETTING_SPECS
+
+    fields = {f.key: f for f in menus.STRATEGY_FIELDS}
+    for key in NEW_STRATEGY_KEYS:
+        assert key in fields, key
+        spec = SETTING_SPECS[key]
+        field = fields[key]
+        assert field.step > 0, key  # ←/→ adjust (and e types a value)
+        if spec.kind != "bool":
+            assert field.step <= (spec.hi - spec.lo) / 10, key
+    assert fields["maximize.resetWaitMin"].group == "when to leave the active account"
+    assert {fields[k].group for k in NEW_STRATEGY_KEYS[1:]} == {menus.QUIET_GROUP}
+    # Groups are contiguous (the screen prints a heading per run).
+    groups = [f.group for f in menus.STRATEGY_FIELDS]
+    runs = [g for i, g in enumerate(groups) if i == 0 or groups[i - 1] != g]
+    assert len(runs) == len(set(runs))
+    assert all(len(f.label) <= 19 for f in menus.STRATEGY_FIELDS)
+    assert len({f.key for f in menus.STRATEGY_FIELDS}) == len(menus.STRATEGY_FIELDS)
+    assert all(f.key in SETTING_SPECS for f in menus.STRATEGY_FIELDS)
+
+
+@pytest.mark.parametrize(("key", "delta", "start", "expected"), [
+    ("maximize.resetWaitMin", -1, 0, 0),           # 0 = off is the floor
+    ("maximize.resetWaitMin", 1, 60, 60),          # 60 is the ceiling
+    ("maximize.preemptHorizonMaxH", -1, 1, 1),
+    ("maximize.preemptHorizonMaxH", 1, 48, 48),
+    ("maximize.busyRebalanceGap", 0.1, 5.0, 5.0),
+    ("maximize.busyRebalanceGap", -0.1, 0.05, 0.0),
+    ("maximize.busyRebalanceGap", 0.1, 0.5, 0.6),
+    ("maximize.preempt", 1, True, False),          # a bool toggles either way
+    ("maximize.learnIdlePattern", -1, False, True),
+])
+def test_swap_strategy_steps_stay_in_range(key, delta, start, expected):
+    from claude_swap.maximize import fleet as fx
+    from claude_swap.settings import MaximizeSettings, PrimeSettings
+
+    values = {**fx.strategy_values(MaximizeSettings(), PrimeSettings()), key: start}
+    stepped = fx.strategy_step(values, key, delta)[key]
+    assert stepped == pytest.approx(expected) and type(stepped) is type(expected)
+
+
+@pytest.mark.parametrize(("key", "raw"), [
+    ("maximize.resetWaitMin", "61"), ("maximize.resetWaitMin", "-1"),
+    ("maximize.resetWaitMin", "7.5"), ("maximize.preemptHorizonMaxH", "0"),
+    ("maximize.preemptHorizonMaxH", "49"), ("maximize.busyRebalanceGap", "5.5"),
+    ("maximize.busyRebalanceGap", "nan"), ("maximize.preempt", "maybe"),
+    ("maximize.learnIdlePattern", ""),
+])
+def test_swap_strategy_typed_values_are_validated(key, raw):
+    """``e`` parses as ``cc-swap config set`` does (``parse_setting_value``)."""
+    from claude_swap.exceptions import ClaudeSwitchError
+    from claude_swap.settings import SETTING_SPECS, parse_setting_value
+
+    with pytest.raises(ClaudeSwitchError):
+        parse_setting_value(SETTING_SPECS[key], raw)
+
+
+def test_swap_strategy_writes_the_new_settings_as_config_set_reads_them():
+    from claude_swap.maximize import fleet as fx
+    from claude_swap.settings import MaximizeSettings, PrimeSettings
+
+    saved = fx.strategy_values(MaximizeSettings(), PrimeSettings())
+    edited = fx.strategy_step(saved, "maximize.preempt", 1)
+    edited = fx.strategy_step(edited, "maximize.busyRebalanceGap", 0.1)
+    edited = fx.strategy_step(edited, "maximize.resetWaitMin", -1)
+    assert sorted(fx.strategy_writes(saved, edited)) == [
+        ("maximize.busyRebalanceGap", "0.6"), ("maximize.preempt", "false"),
+        ("maximize.resetWaitMin", "14"),
+    ]
+    s = fx.strategy_settings(edited)
+    assert (s.preempt, s.busy_rebalance_gap, s.reset_wait_min) == (False, 0.6, 14)

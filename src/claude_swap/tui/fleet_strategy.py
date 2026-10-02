@@ -1,10 +1,14 @@
-"""Swap strategy: every ``maximize.*`` threshold and the ``prime.*`` knobs,
-with a live preview of the decision the fleet would get under the edits.
+"""Swap strategy: every ``maximize.*`` threshold, the reset wait, the
+idle-pattern knobs (preempt, rebalance deferral) and the ``prime.*`` knobs,
+with a live preview of the decision the fleet would get under the edits —
+computed with the engine's usage history, as the engine would.
 
-←/→ step a field (soft never passes hard), ``e`` types a value, ``s``
+←/→ step a field (soft never passes hard; numbers stay in range), ``e``
+types a value (parsed strictly, as ``cc-swap config set`` does), ``s``
 saves through ``set_setting`` (thresholds in a valid order), ``b``/esc with
 unsaved edits asks once. The running engine — the service, or one here —
-re-reads settings.json on its next tick, so a viewer may save too.
+re-reads settings.json on its next tick, so a viewer may save too. The
+idle-pattern group's heading says what has been learned so far.
 """
 
 from __future__ import annotations
@@ -112,7 +116,10 @@ class StrategyScreen(Screen):
                 group = field.group
                 if i:
                     body.append("\n")
-                body.append(f"  {group}\n", style=palette.muted)
+                body.append(f"  {group}", style=palette.muted)
+                if group == menus.QUIET_GROUP:
+                    body.append(f" · {self.idle_pattern()}", style=palette.muted)
+                body.append("\n")
             selected = i == self._cursor
             changed = self._edited.get(field.key) != self._saved.get(field.key)
             body.append(" > " if selected else "   ", style=palette.accent)
@@ -134,13 +141,25 @@ class StrategyScreen(Screen):
         )
         self._render_preview()
 
+    def idle_pattern(self) -> str:
+        """What the engine has learned of your busy and quiet times, under
+        the edited ``learnIdlePattern``."""
+        now = time.time()
+        return mxview.idle_pattern_text(
+            mxview.read_history(self._root, now), fx.strategy_settings(self._edited), now
+        )
+
     def _decision_text(self, settings) -> str | None:
         snap = self.app.snapshot
         if snap is None:
             return None
         now = time.time()
         state = mxview.read_state(self._root)
-        msnap = fx.fleet_snapshot(snap, settings, state, now=now)
+        # The usage history under the edited settings: preempt and a deferred
+        # rebalance preview as the engine would decide them (no history, or
+        # an unreadable one, decides as the engine does without it).
+        history = mxview.read_history(self._root, now)
+        msnap = fx.fleet_snapshot(snap, settings, state, now=now, history=history)
         line = fx.now_line(fx.preview_decision(msnap, settings), now=now)
         return line.removesuffix(" · computed here")
 

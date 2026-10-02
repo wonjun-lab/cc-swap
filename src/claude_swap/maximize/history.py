@@ -460,8 +460,8 @@ def forecast(
     slots: Sequence[SlotObs], now: float, localtime: LocalTime = time.localtime
 ) -> Forecast | None:
     """The idle pattern as seen from ``now``; None on a cold start (fewer
-    than :data:`MIN_DAYS` days observed). Pure: the TUI and ``why`` call it
-    on :func:`read`'s slots."""
+    than :data:`MIN_DAYS` days observed). Pure: the TUI (``view.history_inputs``)
+    and ``why`` call it on :func:`read`'s slots."""
     pattern = learn(slots, now, localtime)
     if pattern.days < MIN_DAYS:
         return None
@@ -486,9 +486,10 @@ def describe(
     *,
     enabled: bool = True,
     localtime: LocalTime = time.localtime,
+    sep: str = ", ",
 ) -> str:
     """One line for doctor and ``cc-swap why``: ``idle pattern: 9 days
-    learned, next quiet window 23:00–07:30``."""
+    learned, next quiet window 23:00–07:30``. Fleet passes ``sep=" · "``."""
     if not enabled:
         return "idle pattern: off (maximize.learnIdlePattern)"
     f = forecast(slots, now, localtime)
@@ -497,10 +498,10 @@ def describe(
         return f"idle pattern: learning ({days} of {MIN_DAYS} days observed)"
     head = f"idle pattern: {f.days} days learned"
     if f.current is not None:
-        return f"{head}, quiet now until {f.current.end_label}"
+        return f"{head}{sep}quiet now until {f.current.end_label}"
     if f.next is not None:
-        return f"{head}, next quiet window {f.next.start_label}–{f.next.end_label}"
-    return f"{head}, no quiet window in the next {FORECAST_AHEAD_S / 3600:.0f}h"
+        return f"{head}{sep}next quiet window {f.next.start_label}–{f.next.end_label}"
+    return f"{head}{sep}no quiet window in the next {FORECAST_AHEAD_S / 3600:.0f}h"
 
 
 def summary(

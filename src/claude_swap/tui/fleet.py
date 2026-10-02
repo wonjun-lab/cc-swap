@@ -21,7 +21,9 @@ Viewer by default: the screen never takes the engine lease on its own. It
 probes the lease every few seconds (a free lease is taken and dropped at
 once; a service starting inside that microsecond window exits 4 and is
 restarted by launchd/systemd a minute later — acceptable) and reads what
-the engine publishes to its state file. Every computation lives in
+the engine publishes to its state file, plus its usage history (the idle
+pattern and burn rates a decision computed here uses, and ``?`` names).
+Every computation lives in
 ``maximize/fleet.py`` and ``maximize/home.py``; ``tui/fleet_render.py``
 draws it. Blocking work (the lease probe, ``service.status()``) runs in
 thread workers.
@@ -327,6 +329,9 @@ class FleetScreen(Screen):
         self._prime = PrimeSettings()
         self._poll_s = 60.0
         self._state = mxview.MaximizeState()
+        # The engine's usage history (view.read_history; None = unreadable):
+        # the idle pattern and burn rates Fleet's own decisions use.
+        self._history = None
         self._rows: list[fx.FleetRow] = []
         self._accounts: dict = {}
         self._order: list[str] = []
@@ -408,12 +413,14 @@ class FleetScreen(Screen):
         if snap is None:
             return
         self._load_settings()
+        now = time.time()
         try:
             self._state = mxview.read_state(self._root)
         except Exception:
             self._state = mxview.MaximizeState()
+        self._history = mxview.read_history(self._root, now)  # never raises
         self._prime_guard = prime_guard(self._root)
-        self._rows = fx.fleet_rows(snap, self._mx, self._prime, self._state, now=time.time())
+        self._rows = fx.fleet_rows(snap, self._mx, self._prime, self._state, now=now)
         self._accounts = {a.number: a for a in snap.accounts}
         self._maybe_fetch_on_open()
         self._render_all()
@@ -440,10 +447,13 @@ class FleetScreen(Screen):
         )
 
     def _msnap(self, now: float):
+        """The policy Snapshot Fleet decides on when no engine word is
+        fresh: the store, the state file and the usage history, so its own
+        decisions see the idle pattern and burn rates the engine sees."""
         snap = self.app.snapshot
         if snap is None:
             return None
-        return fx.fleet_snapshot(snap, self._mx, self._state, now=now)
+        return fx.fleet_snapshot(snap, self._mx, self._state, now=now, history=self._history)
 
     def _decision(self, msnap=None, now: float | None = None) -> fx.DecisionView:
         now = time.time() if now is None else now
@@ -983,10 +993,17 @@ class FleetScreen(Screen):
         self.app.set_store_only(False)
         self.app.pop_screen()
 
+    def idle_pattern(self) -> str:
+        """``idle pattern: 9 days learned · next quiet window 23:00–07:30``:
+        what the engine has learned of your busy and quiet times, for the
+        help screen (the home screen itself stays quiet about it)."""
+        now = time.time()
+        return mxview.idle_pattern_text(mxview.read_history(self._root, now), self._mx, now)
+
     def action_help(self) -> None:
         from claude_swap.tui.fleet_help import HelpScreen
 
-        self.app.push_screen(HelpScreen())
+        self.app.push_screen(HelpScreen(idle_pattern=self.idle_pattern()))
 
     def action_quit(self) -> None:
         request_quit(self.app)

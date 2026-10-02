@@ -12,7 +12,8 @@ from rich.text import Text
 from claude_swap.json_output import USAGE_RELOGIN_REQUIRED
 from claude_swap.maximize import fleet as fx
 from claude_swap.maximize import home, policy
-from claude_swap.maximize.view import window_ticks
+from claude_swap.maximize.model import Forecast, QuietWindow, Sample
+from claude_swap.maximize.view import MaximizeState, window_ticks
 from claude_swap.settings import MaximizeSettings
 from claude_swap.tui import fleet_render as render
 from claude_swap.tui.theme import Palette
@@ -281,6 +282,149 @@ def test_switch_exhausted_and_indeterminate_sentences():
     lost = fx.DecisionView("indeterminate", "1", None, None, "#1 usage unknown", at=NOW,
                            source="engine")
     assert _plain(_sentence(SERVICE, lost, "live")[0]).startswith("Auto ON · #1 usage unknown")
+
+
+# -- the hold codes (reset-wait, preempt, rebalance-deferred) and a preempt switch ---------------
+#
+# The decisions come from the real policy (``fx.preview_decision`` on a
+# snapshot with a forecast and burn rates), so the sentence is pinned to the
+# policy's own wording: a reason the sentence can no longer read fails here.
+
+
+def _code_fleet(p5, p7, other7, *, reset5=None, idle=False):
+    snap = accounts(
+        acc(1, usage(p5, p7, reset5=reset5, days7=3), active=True, alias="main"),
+        acc(2, usage(10, other7, days7=3), alias="side"),
+    )
+    a5 = p5 if idle else p5 - 0.5 if reset5 else p5 - 3
+    state = MaximizeState(samples_account="1", samples=(
+        Sample(NOW - 660, a5, p7), Sample(NOW - 60, p5, p7),
+    ))
+    return snap, state
+
+
+def _decided(snap, state, *, forecast=None, rates7=None, source="engine"):
+    msnap = fx.fleet_snapshot(snap, MX, state, now=NOW)
+    msnap = replace(msnap, forecast=forecast, rates7=rates7 or {})
+    dv = replace(fx.preview_decision(msnap, MX), source=source, at=NOW - 20)
+    rows = fx.fleet_rows(snap, MX, PRIME, state, now=NOW)
+    return dv, rows
+
+
+def _says(es, dv, rows, sit="live") -> list[str]:
+    return [_plain(v) for v in home.status_variants(es, dv, rows, MX, sit, now=NOW)]
+
+
+QUIET_23 = Forecast(days=9, p_busy_now=0.8, current=None,
+                    next=QuietWindow(NOW + 5 * H, NOW + 13 * H, "23:00", "07:30"))
+
+
+def test_a_reset_wait_hold_says_it_waits_the_reset_out():
+    snap, state = _code_fleet(96, 40, 20, reset5=NOW + 8 * 60 + 20)
+    dv, rows = _decided(snap, state)
+    assert (dv.kind, dv.code) == ("hold", "reset-wait")
+    said = _says(SERVICE, dv, rows)
+    assert said[0] == (
+        "Auto ON · using #1 main · 5h 96% — resets in 8m, waiting it out "
+        "(switches at once if it hits 100%)"
+    )
+    assert said[1] == (
+        "Auto ON · #1 5h 96% — resets in 8m, waiting it out (switches at once if it hits 100%)"
+    )
+    assert all("nowhere better" not in s and "forced" not in s for s in said)
+    # The minutes count down from now, not from when the engine decided.
+    later = home.status_variants(SERVICE, dv, rows, MX, "live", now=NOW + 5 * 60)
+    assert "resets in 3m" in _plain(later[0])
+    # The window reset since: the engine's own words, never a negative count.
+    gone = replace(dv, waits=())
+    assert _says(SERVICE, gone, rows)[0] == (
+        "Auto ON · using #1 main · 5h 96% — resets in 8m, waiting it out "
+        "(switches at once if it hits 100%)"
+    )
+
+
+def test_a_preempt_hold_says_why_and_where_it_moves_at_the_next_pause():
+    snap, state = _code_fleet(30, 84, 20)
+    dv, rows = _decided(snap, state, forecast=QUIET_23, rates7={"1": 1.5})
+    assert (dv.kind, dv.code, dv.target) == ("hold", "preempt", "2")
+    said = _says(SERVICE, dv, rows)
+    assert said[0] == (
+        "Auto ON · using #1 main · 7d 84% would pass 90% in ~4h, before your usual quiet "
+        "time (23:00) — will move to #2 side when you pause"
+    )
+    assert said[2] == "Auto ON · #1 7d 84% would pass 90% in ~4h — to #2 on pause"
+    assert _says(HERE_DRY, replace(dv, source="here"), rows)[0].startswith("Dry run · ")
+    assert "would move to #2" in _says(HERE_DRY, dv, rows)[0]
+    # In the rebalance cooldown it names no target and says it waits.
+    cool = replace(state, last_switch_at=NOW - 600)
+    dv, rows = _decided(snap, cool, forecast=QUIET_23, rates7={"1": 1.5})
+    assert (dv.code, dv.target) == ("preempt", None)
+    assert _says(SERVICE, dv, rows)[0].endswith(
+        "— will move to the next account when you pause after the cooldown (20m left)"
+    )
+
+
+def test_a_preempt_switch_says_it_moves_early_while_you_are_idle():
+    snap, state = _code_fleet(30, 84, 20, idle=True)
+    dv, rows = _decided(snap, state, forecast=QUIET_23, rates7={"1": 1.5})
+    assert (dv.kind, dv.trigger, dv.target) == ("switch", "preempt", "2")
+    said = _says(SERVICE, dv, rows)
+    assert said[0] == (
+        "Auto ON · switching #1 main → #2 side now while you're idle — 7d 84% would pass "
+        "90% in ~4h, before your usual quiet time (23:00)"
+    )
+    assert said[1] == "Auto ON · switching #1 main → #2 side now while you're idle (preempt)"
+    assert _says(HERE_DRY, dv, rows)[0].startswith("Dry run · would switch #1 main → #2")
+
+
+def test_a_deferred_rebalance_says_it_waits_for_your_quiet_time():
+    snap, state = _code_fleet(30, 50, 45, idle=True)
+    soon = replace(QUIET_23, next=replace(QUIET_23.next, start=NOW + 2 * H))
+    dv, rows = _decided(snap, state, forecast=soon)
+    assert (dv.kind, dv.code, dv.target) == ("hold", "rebalance-deferred", "2")
+    said = _says(SERVICE, dv, rows)
+    assert said[0] == (
+        "Auto ON · using #1 main · all fine — rebalance deferred to your quiet time (23:00) "
+        "(#2 side scores better; this is usually a busy time)"
+    )
+    assert "Auto ON · rebalance deferred to your quiet time (23:00)" in said
+    assert home.next_number(dv, ["2"], "live") == "2"
+
+
+def test_every_hold_code_has_its_own_words():
+    """Parity with ``cc-swap why``: every code a hold can carry
+    (``model.HoldCode``, doctor_cli.REASONS) is worded on the home screen,
+    never as the generic "nowhere better to go" or "all fine" hold."""
+    from typing import get_args
+
+    from claude_swap.maximize.model import HoldCode
+    from claude_swap.maximize.view import HOLD_CODES
+
+    assert HOLD_CODES == set(get_args(HoldCode))
+    rows = _fleet()[3]
+    generic = _says(SERVICE, fx.DecisionView("hold", "1", None, None, "x", at=NOW,
+                                             source="engine"), rows)
+    for code in sorted(HOLD_CODES):
+        dv = fx.DecisionView("hold", "1", "2", None, "#1 x", at=NOW, source="engine", code=code)
+        said = _says(SERVICE, dv, rows)
+        assert said != generic, code
+        assert all("nowhere better" not in s for s in said), code
+
+
+@pytest.mark.parametrize("width", [157, 117, 87, 77, 60, 40, 20])
+def test_hold_code_sentences_never_exceed_the_width(width):
+    cases = [
+        _decided(*_code_fleet(96, 40, 20, reset5=NOW + 8 * 60 + 20)),
+        _decided(*_code_fleet(30, 84, 20), forecast=QUIET_23, rates7={"1": 1.5}),
+        _decided(*_code_fleet(30, 84, 20, idle=True), forecast=QUIET_23, rates7={"1": 1.5}),
+    ]
+    for dv, rows in cases:
+        variants = home.status_variants(SERVICE, dv, rows, MX, "live", now=NOW)
+        lengths = [home.seg_len(v) for v in variants]
+        assert lengths == sorted(lengths, reverse=True), dv.code or dv.trigger
+        sentence, note = home.status_line(variants, home.holder_variants(SERVICE, "live"), width)
+        assert home.seg_len(sentence) <= width
+        assert render.status_text(sentence, note, width, P).cell_len <= width
 
 
 def test_holder_note_says_who_switches_and_whether_it_is_idle():

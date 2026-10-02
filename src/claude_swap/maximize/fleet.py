@@ -35,6 +35,7 @@ from claude_swap.json_output import (
 from claude_swap.maximize import idle, pause, policy
 from claude_swap.maximize import primer as mxprimer
 from claude_swap.maximize import view as mxview
+from claude_swap.maximize.history import History as UsageHistory
 from claude_swap.maximize.model import AccountView, Hold, Snapshot, Switch
 from claude_swap.maximize.plan import parse_plan_override
 from claude_swap.maximize.score import days_left, landable
@@ -246,11 +247,19 @@ class FleetRow:
 
 
 def fleet_snapshot(
-    snap: AccountsSnapshot, mx: MaximizeSettings, state: mxview.MaximizeState, *, now: float
+    snap: AccountsSnapshot,
+    mx: MaximizeSettings,
+    state: mxview.MaximizeState,
+    *,
+    now: float,
+    history: UsageHistory | None = None,
 ) -> Snapshot:
     """The policy Snapshot the TUI decides on: :func:`view.snapshot_from_accounts`
     with the published plans, and slots without a usable stored login set
-    aside like the engine does (``engine_hook._unavailable``)."""
+    aside like the engine does (``engine_hook._unavailable``). ``history``
+    (``view.read_history``) gives the decisions Fleet computes itself the
+    idle pattern and burn rates the engine's preempt and rebalance deferral
+    read; None decides as if there were no history."""
     unusable = {
         a.number
         for a in snap.accounts
@@ -258,7 +267,9 @@ def fleet_snapshot(
     }
     if unusable:
         state = replace(state, quarantined=state.quarantined | unusable)
-    return mxview.snapshot_from_accounts(snap, mx, state, now=now, plans=state.plans)
+    return mxview.snapshot_from_accounts(
+        snap, mx, state, now=now, plans=state.plans, history=history
+    )
 
 
 def _slot(number: str) -> tuple[int, str]:
@@ -352,9 +363,18 @@ class DecisionView:
     source: Literal["engine", "here", "computed"] = "computed"
     # kind "off" (`cc-swap auto off`): what the decision would have been.
     would: str | None = None
+    # A hold's own code (``model.Hold.code``: reset-wait, preempt,
+    # rebalance-deferred), from the engine or computed here; else None.
+    code: str | None = None
+    # reset-wait: ``(window, pct, reset epoch)`` for each window being waited
+    # out, read from the current snapshot so the minutes left stay live.
+    waits: tuple[tuple[str, float, float], ...] = ()
 
 
 _SLOT_RE = re.compile(r"#(\w+)")
+#: One waited-out window in a reset-wait reason (``policy._reset_wait``):
+#: ``5h 96% — resets in 8m``.
+_WAIT_RE = re.compile(r"\b(5h|7d) [\d.]+% — resets in \d+m")
 
 
 def _target_in(reason: str, active: str | None) -> str | None:
@@ -374,12 +394,31 @@ def _kind(decision: str, pending: bool) -> DecisionKind:
     return "none"
 
 
+def reset_waits(reason: str, msnap: Snapshot) -> tuple[tuple[str, float, float], ...]:
+    """The windows a reset-wait hold names (``5h 96% — resets in 8m``), with
+    the active account's current pct and reset from ``msnap``; a window that
+    has reset since (or reads no reset) is left out."""
+    a = msnap.view(msnap.active)
+    if a is None:
+        return ()
+    out: list[tuple[str, float, float]] = []
+    for window in dict.fromkeys(m.group(1) for m in _WAIT_RE.finditer(reason or "")):
+        pct, reset = (a.pct5, a.reset5) if window == "5h" else (a.pct7, a.reset7)
+        if pct is not None and reset is not None and reset > msnap.now:
+            out.append((window, pct, reset))
+    return tuple(out)
+
+
 def _enrich(dv: DecisionView, msnap: Snapshot) -> DecisionView:
-    """Growth and the hard-cap ETA, recomputed from the samples."""
+    """Growth and the hard-cap ETA, recomputed from the samples; for a
+    reset-wait hold, the windows it waits out. A reset-wait hold gets no
+    hard-cap ETA: it may already be past the hard cap (``hard in ~0m``), and
+    what ends it is the reset or 100%, not the cap."""
     waiting = mxview.pending(msnap) if dv.kind == "pending" else None
+    reset_wait = dv.kind == "hold" and dv.code == "reset-wait"
     eta = (
         idle.eta_to_hard_min(msnap.samples, msnap.settings)
-        if dv.kind in ("pending", "hold") and msnap.samples
+        if dv.kind in ("pending", "hold") and msnap.samples and not reset_wait
         else None
     )
     return replace(
@@ -388,11 +427,22 @@ def _enrich(dv: DecisionView, msnap: Snapshot) -> DecisionView:
         window=waiting.window if waiting else None,
         window_min=waiting.window_min if waiting else None,
         eta_hard_min=eta,
+        waits=reset_waits(dv.reason, msnap) if reset_wait else (),
     )
+
+
+def _hold_target(code: str | None, reason: str, active: str | None) -> str | None:
+    """Where a coded hold is headed: a preempt waiting for idle and a
+    deferred rebalance name their target in the reason; a reset-wait goes
+    nowhere."""
+    if code in ("preempt", "rebalance-deferred"):
+        return _target_in(reason, active)
+    return None
 
 
 def _computed(msnap: Snapshot, *, now: float) -> DecisionView:
     decision = policy.decide(msnap)
+    code: str | None = None
     if isinstance(decision, Switch):
         target, trigger = decision.target, decision.trigger
         kind: DecisionKind = "switch"
@@ -401,14 +451,17 @@ def _computed(msnap: Snapshot, *, now: float) -> DecisionView:
         target = None
         if isinstance(decision, Hold):
             kind = "pending" if decision.pending else "hold"
+            code = decision.code
             if decision.pending:
                 landing = policy.landing_candidates(msnap)
                 target = landing[0].number if landing else None
+            else:
+                target = _hold_target(code, decision.reason, msnap.active)
         else:
             kind = _kind(type(decision).__name__.lower(), False)
     return DecisionView(
         kind=kind, active=msnap.active, target=target, trigger=trigger,
-        reason=decision.reason, at=now, source="computed",
+        reason=decision.reason, at=now, source="computed", code=code,
     )
 
 
@@ -438,13 +491,13 @@ def decision_view(
     would = {
         "switch": f"switch ({dv.trigger}){target}",
         "pending": f"switch at the next idle moment{target}",
-        "hold": "hold",
+        "hold": f"hold ({dv.code})" if dv.code else "hold",
         "exhausted": "every account is at its limit",
         "indeterminate": "fail over (usage unreadable)",
     }.get(dv.kind)
     return replace(
         dv, kind="off", target=None, trigger=None, would=would,
-        at=state.auto_off_since, reason=state.auto_off_by or "",
+        at=state.auto_off_since, reason=state.auto_off_by or "", code=None, waits=(),
     )
 
 
@@ -467,6 +520,7 @@ def _decision_view(
             reason=why, at=until, source="engine",
         )
     if own is not None:
+        code = getattr(own, "code", None)
         dv = DecisionView(
             kind=_kind(own.decision, own.pending),
             active=own.active,
@@ -475,6 +529,7 @@ def _decision_view(
             reason=own.reason,
             at=own_at if own_at is not None else now,
             source="here",
+            code=code if own.decision == "hold" and code in mxview.HOLD_CODES else None,
         )
         return _enrich(dv, msnap)
     published = state.decision
@@ -491,6 +546,7 @@ def _decision_view(
             reason=published.reason,
             at=published.at,
             source="engine",
+            code=published.code,
         )
         return _enrich(dv, msnap)
     return _enrich(_computed(msnap, now=now), msnap)
