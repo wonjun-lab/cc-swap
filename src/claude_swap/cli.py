@@ -76,6 +76,7 @@ _SUBCOMMAND_FLAGS = {
 # attribute (``patch("claude_swap.cli._last_resort_command")``). New fork
 # commands (prime, service) register here; main() has a single hook for all.
 _FORK_COMMANDS: dict[str, str] = {
+    "claude-update": "_claude_update_command",
     "last-resort": "_last_resort_command",
     "prime": "_prime_command",
     "service": "_service_command",
@@ -1131,6 +1132,13 @@ def _prime_command(argv: list[str]) -> None:
     from claude_swap.maximize.prime_cli import prime_command
 
     prime_command(argv)
+
+
+def _claude_update_command(argv: list[str]) -> None:
+    """Handle `cc-swap claude-update` (maximize/claude_update.py)."""
+    from claude_swap.maximize.claude_update import claude_update_command
+
+    claude_update_command(argv)
 
 
 def _use_native_tls() -> None:
