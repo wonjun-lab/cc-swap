@@ -22,6 +22,15 @@ The destination is always the top of ``landing_candidates``. With none:
   back.
 * soft/rebalance: ``Hold``.
 
+Reset-aware wait (``resetWaitMin``, 0 = off): a hard or soft trigger whose
+window resets within ``resetWaitMin`` minutes, and whose recent pace reaches
+100% no sooner than ``RESET_WAIT_MARGIN_MIN`` after that reset (with no pace
+known: still under its hard cap), is waited out instead — the reset clears
+the reason to switch, and a switch costs a full context re-read on the new
+account. The other window's triggers still apply; with none left the
+decision is a ``Hold`` carrying ``reset_wait_until``, which the at-limit
+trigger ends at 100%. At-limit and rebalance never wait.
+
 Unknown active usage is ``Indeterminate`` (the engine's upstream failover
 path counts it).
 """
@@ -48,6 +57,9 @@ from claude_swap.maximize.score import below_hard, landable, rank, score, slot_o
 Window = Literal["5h", "7d"]
 # Utilization at which a window is spent (the at-limit trigger).
 LIMIT_PCT = 100.0
+# The reset-aware wait holds only while the recent pace reaches 100% at
+# least this many minutes after the window resets.
+RESET_WAIT_MARGIN_MIN = 2.0
 
 
 def _pct(value: float) -> str:
@@ -210,47 +222,161 @@ class _Force:
     windows: tuple[Window, ...]
 
 
-def _hard_force(snap: Snapshot, a: AccountView) -> _Force | None:
+def _fresh_samples(snap: Snapshot) -> bool:
+    """The newest sample is recent enough to say anything about the pace."""
+    return bool(snap.samples) and (
+        snap.now - snap.samples[-1].ts <= snap.settings.idle_window_min * 60.0
+    )
+
+
+def _reached(snap: Snapshot, a: AccountView) -> tuple[Window, ...]:
+    """The windows at or over their hard cap."""
     s = snap.settings
-    reached: tuple[Window, ...] = tuple(
+    return tuple(
         w
         for w, pct, cap in (("5h", a.pct5, s.hard_5h), ("7d", a.pct7, s.hard_7d))
         if pct >= cap
     )
+
+
+def _eta_forced(snap: Snapshot) -> dict[Window, float]:
+    """``{window: minutes}`` for each window whose recent pace reaches its
+    hard cap within ``force_eta_min`` (none on stale samples)."""
+    s = snap.settings
+    if s.force_eta_min <= 0 or not _fresh_samples(snap):
+        return {}
+    eta5, eta7 = idle.eta_to_hard(snap.samples, s)
+    return {
+        w: eta
+        for w, eta in (("5h", eta5), ("7d", eta7))
+        if eta is not None and eta <= s.force_eta_min
+    }
+
+
+def _force(
+    snap: Snapshot,
+    a: AccountView,
+    reached: tuple[Window, ...],
+    forced: dict[Window, float],
+) -> _Force | None:
+    """The hard trigger on these windows: a reached cap wins over a pace."""
+    s = snap.settings
     if reached:
         if reached[0] == "5h":
             why = f"#{a.number} 5h {_pct(a.pct5)} >= hard {_pct(s.hard_5h)}"
         else:
             why = f"#{a.number} 7d {_pct(a.pct7)} >= hard {_pct(s.hard_7d)}"
         return _Force(why, reached)
-    if (
-        s.force_eta_min > 0
-        and snap.samples
-        and snap.now - snap.samples[-1].ts <= s.idle_window_min * 60.0
-    ):
-        eta5, eta7 = idle.eta_to_hard(snap.samples, s)
-        forced: tuple[Window, ...] = tuple(
-            w
-            for w, eta in (("5h", eta5), ("7d", eta7))
-            if eta is not None and eta <= s.force_eta_min
+    if forced:
+        eta = min(forced.values())
+        return _Force(
+            f"#{a.number} reaches a hard cap in ~{eta:.1f} min "
+            f"(<= {s.force_eta_min} min)",
+            tuple(forced),
         )
-        if forced:
-            eta = min(e for e in (eta5, eta7) if e is not None)
-            return _Force(
-                f"#{a.number} reaches a hard cap in ~{eta:.1f} min "
-                f"(<= {s.force_eta_min} min)",
-                forced,
-            )
     return None
 
 
-def _soft_reason(a: AccountView, snap: Snapshot) -> str | None:
+def _hard_force(snap: Snapshot, a: AccountView) -> _Force | None:
+    reached = _reached(snap, a)
+    return _force(snap, a, reached, {} if reached else _eta_forced(snap))
+
+
+def _soft_reason(
+    a: AccountView, snap: Snapshot, skip: tuple[Window, ...] = ()
+) -> str | None:
     s = snap.settings
-    if a.pct5 >= s.soft_5h:
+    if "5h" not in skip and a.pct5 >= s.soft_5h:
         return f"#{a.number} 5h {_pct(a.pct5)} >= soft {_pct(s.soft_5h)}"
-    if a.pct7 >= s.soft_7d:
+    if "7d" not in skip and a.pct7 >= s.soft_7d:
         return f"#{a.number} 7d {_pct(a.pct7)} >= soft {_pct(s.soft_7d)}"
     return None
+
+
+def _window_pct(v: AccountView, window: Window) -> float:
+    return v.pct5 if window == "5h" else v.pct7
+
+
+def _window_reset(v: AccountView, window: Window) -> float | None:
+    return v.reset5 if window == "5h" else v.reset7
+
+
+def reset_wait_left(
+    snap: Snapshot, a: AccountView, window: Window, rate: float | None
+) -> float | None:
+    """Minutes until ``window`` resets if the reset-aware wait may hold for
+    it, else None.
+
+    It may when the reset is at most ``reset_wait_min`` minutes away and
+    the pace (``rate``, points per minute) reaches 100% no sooner than
+    ``RESET_WAIT_MARGIN_MIN`` after it. With no pace to project (unknown, or
+    not climbing), only a window still under its hard cap waits.
+    """
+    s = snap.settings
+    reset = _window_reset(a, window)
+    if s.reset_wait_min <= 0 or reset is None or reset <= snap.now:
+        return None
+    left = (reset - snap.now) / 60.0
+    if left > s.reset_wait_min:
+        return None
+    pct = _window_pct(a, window)
+    if rate is None or rate <= 0:
+        cap = s.hard_5h if window == "5h" else s.hard_7d
+        return left if pct < cap else None
+    to_limit = max(LIMIT_PCT - pct, 0.0) / rate
+    return left if to_limit >= left + RESET_WAIT_MARGIN_MIN else None
+
+
+def _reset_wait(
+    snap: Snapshot, a: AccountView, landing: list[AccountView]
+) -> Decision | None:
+    """The hard/soft decision with every window that may wait out its reset
+    set aside, or None when no triggering window may (decide as usual).
+
+    A window that is set aside triggers nothing; the other window's hard or
+    soft trigger still decides. With none left, hold until the reset.
+    """
+    s = snap.settings
+    if s.reset_wait_min <= 0:
+        return None
+    reached = _reached(snap, a)
+    forced = _eta_forced(snap)
+    soft = tuple(
+        w
+        for w, pct, mark in (("5h", a.pct5, s.soft_5h), ("7d", a.pct7, s.soft_7d))
+        if pct >= mark
+    )
+    rates = idle.velocity(snap.samples, s) if _fresh_samples(snap) else (None, None)
+    waits: dict[Window, float] = {}
+    for w, rate in zip(("5h", "7d"), rates):
+        if w in reached or w in forced or w in soft:
+            left = reset_wait_left(snap, a, w, rate)
+            if left is not None:
+                waits[w] = left
+    if not waits:
+        return None
+    force = _force(
+        snap,
+        a,
+        tuple(w for w in reached if w not in waits),
+        {w: eta for w, eta in forced.items() if w not in waits},
+    )
+    if force is not None:
+        return _hard(snap, a, landing, force)
+    other = _soft_reason(a, snap, skip=tuple(waits))
+    if other is not None:
+        return _soft(snap, landing, other)
+    held = ", ".join(
+        f"{w} {_pct(_window_pct(a, w))} — resets in {max(1, round(left))}m"
+        for w, left in waits.items()
+    )
+    return Hold(
+        f"#{a.number} {held}, waiting it out (switches at once if it hits 100%)",
+        pending=False,
+        reset_wait_until=max(
+            r for r in (_window_reset(a, w) for w in waits) if r is not None
+        ),
+    )
 
 
 def _at_limit(snap: Snapshot, landing: list[AccountView], why: str) -> Decision:
@@ -300,6 +426,18 @@ def _hard(
         f"{force.reason}; nothing landable and no account under the hard caps "
         f"has more {windows} room than #{a.number}; staying",
         pending=False,
+    )
+
+
+def _soft(snap: Snapshot, landing: list[AccountView], why: str) -> Decision:
+    if not landing:
+        return Hold(f"{why}; nothing landable", pending=False)
+    top = landing[0]
+    if idle.is_idle(snap.samples, snap.now, snap.settings):
+        return Switch(top.number, "soft", f"{why}; idle; -> {_target(top, snap.now)}")
+    return Hold(
+        f"{why}; waiting for idle to move to #{top.number} ({idle_note(snap)})",
+        pending=True,
     )
 
 
@@ -360,19 +498,13 @@ def decide(snap: Snapshot) -> Decision:
     if a.pct5 >= LIMIT_PCT or a.pct7 >= LIMIT_PCT:
         return _at_limit(snap, landing, f"#{a.number} at limit ({_usage(a)})")
     force = _hard_force(snap, a)
+    soft = _soft_reason(a, snap)
+    if force is not None or soft is not None:
+        waited = _reset_wait(snap, a, landing)
+        if waited is not None:
+            return waited
     if force is not None:
         return _hard(snap, a, landing, force)
-    soft = _soft_reason(a, snap)
     if soft is not None:
-        if not landing:
-            return Hold(f"{soft}; nothing landable", pending=False)
-        top = landing[0]
-        if idle.is_idle(snap.samples, snap.now, snap.settings):
-            return Switch(
-                top.number, "soft", f"{soft}; idle; -> {_target(top, snap.now)}"
-            )
-        return Hold(
-            f"{soft}; waiting for idle to move to #{top.number} ({idle_note(snap)})",
-            pending=True,
-        )
+        return _soft(snap, landing, soft)
     return _rebalance(snap, a, landing)

@@ -10,7 +10,8 @@ and maps the decision back onto those upstream paths:
                       (a ``Hold`` then takes the hold path below unless the
                       failure was systemic)
 * ``Hold``          → ``NoSwitchEvent``; a pending hold also pulls the active
-                      account's next poll to ``pending_poll_s``
+                      account's next poll to ``pending_poll_s``, a reset-aware
+                      wait (``reset-wait``) to the urgent 60 s cadence
 * ``Indeterminate`` → ``None``: ``_tick_inner`` continues into its own
                       unknown-usage counting and failover
 * ``Exhausted``     → ``AllExhaustedEvent`` + reset-aware sleep, or a
@@ -79,6 +80,13 @@ DECISION_KEY = "maximizeDecision"
 # An unchanged decision is rewritten this often, so a reader can tell a
 # steady engine from a stopped one by the record's age.
 PUBLISH_REFRESH_S = 300.0
+# A reset-aware wait's reason code: its ``NoSwitchEvent`` reason, and the
+# ``code`` its published decision carries for ``cc-swap why``.
+RESET_WAIT_CODE = "reset-wait"
+# A reset-aware wait polls the active account every URGENT_INTERVAL_S only
+# over the last this-many seconds before the reset: at most 15 polls a wait,
+# the planner's own bound on an urgent episode, whatever resetWaitMin says.
+RESET_WAIT_URGENT_S = 900.0
 
 # Numeric ``maximize`` keys. The settings loader is lenient per key (wrong
 # type → default, out of range → clamped) and reports only pair repairs in
@@ -97,6 +105,7 @@ _NUMERIC_KEYS: tuple[tuple[str, str], ...] = (
     ("rebalanceCooldownMin", "rebalance_cooldown_min"),
     ("tieEpsilon", "tie_epsilon"),
     ("loginExpiryGuardMin", "login_expiry_guard_min"),
+    ("resetWaitMin", "reset_wait_min"),
 )
 
 
@@ -599,7 +608,8 @@ def _publish_decision(
     """Write this tick's decision to the state file for TUI viewers.
 
     Slot numbers and the policy's own reason only — no emails, no raw
-    ``rateLimitTier`` strings. Rewritten when the decision changes, or when
+    ``rateLimitTier`` strings; a reset-aware wait adds ``code`` so
+    ``cc-swap why`` can name it. Rewritten when the decision changes, or when
     the stored one is :data:`PUBLISH_REFRESH_S` old (the TUI's freshness
     clock); never on dry runs, which write nothing."""
     if engine.dry_run:
@@ -620,6 +630,8 @@ def _publish_decision(
         "pending": pending,
         "plans": {num: plan_label(tier) for num, tier in tiers.items()},
     }
+    if isinstance(decision, Hold) and decision.reset_wait_until is not None:
+        record["code"] = RESET_WAIT_CODE
     previous = state.get(DECISION_KEY)
     if isinstance(previous, Mapping):
         at = previous.get("at")
@@ -728,20 +740,28 @@ def _pull_active_poll(
     current: str,
     entry,
     now: float,
+    *,
+    urgent: bool = False,
 ) -> None:
-    """Pending soft switch: poll the active account every ``pending_poll_s``.
+    """Poll the active account sooner while a switch waits.
 
-    Only ever pulls the next poll earlier, and never sooner than
+    A pending soft switch polls every ``pending_poll_s``, never sooner than
     ``fetchedAt + poll_policy.MIN_INTERVAL_S`` whatever the settings say (a
     session override skips the loader's clamp): the per-account poll budget
-    is shared by every machine. A token that 429'd recently keeps the
-    planner's post-429 cadence (spec §5.6), and the collector still enforces
-    any live backoff.
+    is shared by every machine. A reset-aware wait (``urgent``) polls at the
+    planner's urgent cadence, ``poll_policy.URGENT_INTERVAL_S``, so a climb
+    to 100% is caught quickly (``_hold`` bounds how long). Only ever pulls
+    the next poll earlier. A token that 429'd recently keeps the planner's
+    post-429 cadence (spec §5.6), and the collector still enforces any live
+    backoff.
     """
     fetched_at = getattr(entry, "fetched_at", None)
     if fetched_at is None or entry.recent_429(now):
         return
-    interval = max(float(rt.settings.pending_poll_s), poll_policy.MIN_INTERVAL_S)
+    if urgent:
+        interval = poll_policy.URGENT_INTERVAL_S
+    else:
+        interval = max(float(rt.settings.pending_poll_s), poll_policy.MIN_INTERVAL_S)
     deadline = max(now, fetched_at + interval)
     if entry.next_poll_at is not None and entry.next_poll_at <= deadline:
         return
@@ -765,10 +785,16 @@ def _hold(
     entry,
     now: float,
 ) -> aw.TickOutcome:
+    until = decision.reset_wait_until
     if decision.pending:
         _pull_active_poll(engine, rt, current, entry, now)
+    elif until is not None and until - now <= RESET_WAIT_URGENT_S:
+        _pull_active_poll(engine, rt, current, entry, now, urgent=True)
+    # Literal codes: tests/maximize/test_why.py reads them off this call.
     engine._emit(aw.NoSwitchEvent(
-        reason="maximize-pending" if decision.pending else "maximize-hold",
+        reason="maximize-pending" if decision.pending
+        else "reset-wait" if until is not None
+        else "maximize-hold",
         detail=decision.reason,
     ))
     return aw.TickOutcome.NO_ACTION

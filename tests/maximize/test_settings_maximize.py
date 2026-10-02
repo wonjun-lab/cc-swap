@@ -56,7 +56,7 @@ class TestRegistry:
             "maximize.idleMaxDeltaPct", "maximize.forceEtaMin",
             "maximize.pendingPollS", "maximize.rebalanceCooldownMin",
             "maximize.tieEpsilon", "maximize.lastResort", "maximize.planOverride",
-            "maximize.loginExpiryGuardMin",
+            "maximize.loginExpiryGuardMin", "maximize.resetWaitMin",
             "prime.enabled", "prime.model", "prime.jitterS", "prime.maxAttempts",
             "prime.claudePath",
         } <= keys
@@ -80,6 +80,7 @@ class TestRegistry:
             "maximize.rebalanceCooldownMin": (0, 240),
             "maximize.tieEpsilon": (0.0, 2.0),
             "maximize.loginExpiryGuardMin": (0, 1440),
+            "maximize.resetWaitMin": (0, 60),
             "prime.maxAttempts": (1, 5),
         }
 
@@ -654,3 +655,35 @@ def test_login_expiry_guard_defaults_to_two_hours_and_loads(tmp_path: Path):
     assert load_maximize_settings(tmp_path).login_expiry_guard_min == 30
     set_setting(tmp_path, "maximize.loginExpiryGuardMin", "0")
     assert load_maximize_settings(tmp_path).login_expiry_guard_min == 0
+
+
+class TestResetWaitMin:
+    def test_defaults_to_fifteen_and_loads_zero_as_off(self, tmp_path: Path):
+        assert MaximizeSettings().reset_wait_min == 15
+        assert SETTING_SPECS["maximize.resetWaitMin"].default == 15
+        _write(tmp_path, {"maximize": {"resetWaitMin": 0}})
+        assert load_maximize_settings(tmp_path).reset_wait_min == 0
+
+    def test_lenient_load_clamps_and_reports(self, tmp_path: Path):
+        _write(tmp_path, {"maximize": {"resetWaitMin": 90}})
+        problems: list[str] = []
+        assert load_maximize_settings(tmp_path, problems=problems).reset_wait_min == 60
+        assert problems == ["maximize.resetWaitMin is 90, outside 0-60; clamped to 60"]
+
+    def test_lenient_load_replaces_a_wrong_type_and_reports(self, tmp_path: Path):
+        _write(tmp_path, {"maximize": {"resetWaitMin": "soon"}})
+        problems: list[str] = []
+        assert load_maximize_settings(tmp_path, problems=problems).reset_wait_min == 15
+        assert problems == [
+            "maximize.resetWaitMin must be a number, got 'soon'; using default 15"
+        ]
+
+    def test_strict_set_accepts_the_range_and_rejects_the_rest(self, tmp_path: Path):
+        assert set_setting(tmp_path, "maximize.resetWaitMin", "30") == 30
+        assert set_setting(tmp_path, "maximize.resetWaitMin", "0") == 0
+        for bad in ("61", "-1", "5.5", "nan", "soon"):
+            with pytest.raises(ConfigError):
+                set_setting(tmp_path, "maximize.resetWaitMin", bad)
+        assert load_maximize_settings(tmp_path).reset_wait_min == 0
+        assert unset_setting(tmp_path, "maximize.resetWaitMin")
+        assert load_maximize_settings(tmp_path).reset_wait_min == 15

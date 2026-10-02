@@ -19,7 +19,7 @@ import argparse
 import json
 import sys
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 
 from claude_swap import paths
@@ -473,6 +473,10 @@ REASONS: dict[str, tuple[str, str]] = {
         "maximize sees no reason to move: below every soft mark and no better-scored account (or within rebalanceCooldownMin).",
         "Nothing.",
     ),
+    "reset-wait": (
+        "A hard or soft mark is crossed, but that window resets within maximize.resetWaitMin minutes and the recent pace will not reach 100% before then, so maximize waits for the reset instead of switching (a switch makes Claude Code re-read the whole context on the new account).",
+        "Nothing; it switches at once if the window hits 100%. Set maximize.resetWaitMin to 0 to switch without waiting.",
+    ),
 }
 
 #: Switch triggers (the README's "When it switches" table plus upstream's).
@@ -537,7 +541,7 @@ def published_why(backup_root, *, now: float) -> dict | None:
             "action": action,
             "ageS": 0,
         }
-    engine = _engine_why(backup_root, now=now)
+    engine = _engine_why(backup_root, now=now, state=state)
     off = pause.effective_auto_off(backup_root, state)
     if off is not None:
         # The engine keeps deciding (and publishing "switch") while auto is
@@ -556,7 +560,19 @@ def published_why(backup_root, *, now: float) -> dict | None:
     return engine
 
 
-def _engine_why(backup_root, *, now: float) -> dict | None:
+def _published_code(state: Mapping, published) -> str | None:
+    """The ``code`` a published hold carries (a reset-aware wait), when it
+    is the same record ``published`` was read from."""
+    from claude_swap.maximize import view as mxview
+
+    raw = state.get(mxview.DECISION_KEY)
+    if not isinstance(raw, Mapping) or raw.get("at") != published.at:
+        return None
+    code = raw.get("code")
+    return code if published.decision == "hold" and code in REASONS else None
+
+
+def _engine_why(backup_root, *, now: float, state: Mapping | None = None) -> dict | None:
     """The engine's fresh published decision about the live account, explained."""
     from claude_swap.maximize import view as mxview
     from claude_swap.maximize.fleet import fresh_s
@@ -585,7 +601,9 @@ def _engine_why(backup_root, *, now: float) -> dict | None:
         and not landed
     ):
         return None
-    code = _decision_code(published.decision, published.pending)
+    code = _published_code(state or {}, published) or _decision_code(
+        published.decision, published.pending
+    )
     if published.decision == "switch":
         meaning = f"Switching: {TRIGGERS.get(published.trigger or '', published.trigger or 'switch')}."
         action = (

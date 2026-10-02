@@ -96,6 +96,10 @@ class MaximizeSettings:
     # A soft/rebalance switch never lands on an account whose login expires
     # within this many minutes (at-limit/hard fallbacks still may).
     login_expiry_guard_min: int = 120
+    # A hard or soft switch waits instead when the window that triggered it
+    # resets within this many minutes and the pace will not reach 100%
+    # before then (0 = off). At-limit and rebalance never wait.
+    reset_wait_min: int = 15
 
 
 @dataclass(frozen=True)
@@ -219,6 +223,10 @@ SETTING_SPECS: dict[str, SettingSpec] = {
         SettingSpec(
             "maximize", "forceEtaMin", "force_eta_min", "int", 0, 60,
             help="maximize: switch now when a hard cap is this many minutes away (0 = off)",
+        ),
+        SettingSpec(
+            "maximize", "resetWaitMin", "reset_wait_min", "int", 0, 60,
+            help="maximize: skip a hard/soft switch when that window resets within this many minutes (0 = off)",
         ),
         # Floor = poll_policy.MIN_INTERVAL_S: the per-account poll budget is
         # shared by every machine; the engine enforces it again regardless.

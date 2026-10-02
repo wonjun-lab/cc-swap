@@ -76,6 +76,9 @@ class Switch:
 class Hold:
     reason: str
     pending: bool        # True = soft threshold crossed, waiting for idle
+    # A reset-aware wait (``maximize.resetWaitMin``): when the last window
+    # being waited out resets (epoch s). None for every other hold.
+    reset_wait_until: float | None = None
 
 
 @dataclass(frozen=True)

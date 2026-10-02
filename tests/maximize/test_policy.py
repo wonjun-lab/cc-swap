@@ -49,6 +49,18 @@ def acct(
     )
 
 
+def resets(view: AccountView, *, m5: float | None = None, m7: float | None = None) -> AccountView:
+    """``view`` with its 5h/7d window resetting ``m5``/``m7`` minutes from NOW."""
+    from dataclasses import replace
+
+    changes: dict[str, float] = {}
+    if m5 is not None:
+        changes["reset5"] = NOW + m5 * 60
+    if m7 is not None:
+        changes["reset7"] = NOW + m7 * 60
+    return replace(view, **changes)
+
+
 def rows(*items: tuple[float, float, float]) -> tuple[Sample, ...]:
     """(seconds before NOW, pct5, pct7), any order."""
     return tuple(sorted((Sample(NOW - ago, p5, p7) for ago, p5, p7 in items), key=lambda x: x.ts))
@@ -315,6 +327,87 @@ CASES = [
     Case("rebalance-busy-holds",
          snap("1", acct("1", 10, 10, reset7_d=6), acct("2", 0, 70, reset7_d=0.5), samples="busy"),
          Hold, pending=False, reason_has="waits for idle"),
+    # -- reset-aware wait (maximize.resetWaitMin, default 15) -----------------
+    # 5h at 96% (over hard 95), +2 pts over 10 min: 0.2 pt/min, 100% in 20 min.
+    Case("reset-wait-holds-when-100-comes-well-after-the-reset",
+         snap("1", resets(acct("1", 96, 40), m5=8), acct("2", 10, 10),
+              samples=rows((600, 94, 40), (0, 96, 40))),
+         Hold, pending=False,
+         reason_has="#1 5h 96% — resets in 8m, waiting it out "
+                    "(switches at once if it hits 100%)"),
+    Case("reset-wait-switches-when-100-comes-within-2-min-of-the-reset",
+         # 95.5% at 0.5 pt/min: 100% in 9 min, the reset in 8 (< 8 + 2).
+         snap("1", resets(acct("1", 95.5, 40), m5=8), acct("2", 10, 10),
+              samples=rows((600, 90.5, 40), (0, 95.5, 40))),
+         Switch, target="2", trigger="hard"),
+    Case("reset-wait-off-for-a-reset-beyond-reset-wait-min",
+         snap("1", resets(acct("1", 96, 40), m5=20), acct("2", 10, 10),
+              samples=rows((600, 94, 40), (0, 96, 40))),
+         Switch, target="2", trigger="hard"),
+    Case("reset-wait-never-delays-at-limit",
+         snap("1", resets(acct("1", 100, 40), m5=2), acct("2", 10, 10),
+              samples=rows((600, 100, 40), (0, 100, 40))),
+         Switch, target="2", trigger="at-limit"),
+    Case("reset-wait-zero-is-off",
+         snap("1", resets(acct("1", 96, 40), m5=8), acct("2", 10, 10),
+              samples=rows((600, 94, 40), (0, 96, 40)), reset_wait_min=0),
+         Switch, target="2", trigger="hard"),
+    Case("reset-wait-soft-skips-the-idle-switch",
+         snap("1", resets(acct("1", 62, 40), m5=5), acct("2"), samples="idle"),
+         Hold, pending=False, reason_has="#1 5h 62% — resets in 5m, waiting it out"),
+    Case("reset-wait-soft-while-busy-is-not-pending",
+         snap("1", resets(acct("1", 62, 40), m5=5), acct("2"), samples="busy"),
+         Hold, pending=False, reason_has="resets in 5m"),
+    Case("reset-wait-7d-hard-holds",
+         # 7d at 98.5% (hard 98), 0.05 pt/min: 100% in 30 min, reset in 10.
+         snap("1", resets(acct("1", 30, 98.5), m7=10), acct("2", 10, 10),
+              samples=rows((600, 30, 98), (0, 30, 98.5))),
+         Hold, pending=False, reason_has="#1 7d 98.5% — resets in 10m"),
+    Case("reset-wait-other-window-over-hard-switches",
+         # 5h could wait out its reset, but 7d 99% (reset in 3 days) cannot.
+         snap("1", resets(acct("1", 96, 99), m5=8), acct("2", 10, 10),
+              samples=rows((600, 94, 99), (0, 96, 99))),
+         Switch, target="2", trigger="hard", reason_has="#1 7d 99% >= hard 98%"),
+    Case("reset-wait-other-window-eta-forced-switches",
+         # 5h waits; 7d is 3 pts under hard at 0.5 pt/min (6 min <= forceEtaMin).
+         snap("1", resets(acct("1", 96, 95), m5=8), acct("2", 10, 10),
+              samples=rows((600, 94, 90), (0, 96, 95))),
+         Switch, target="2", trigger="hard", reason_has="hard cap in ~6.0 min"),
+    Case("reset-wait-other-window-soft-still-waits-for-idle",
+         snap("1", resets(acct("1", 96, 92), m5=8), acct("2", 10, 10),
+              samples=rows((600, 94, 92), (0, 96, 92))),
+         Hold, pending=True, reason_has="#1 7d 92% >= soft 90%; waiting for idle"),
+    Case("reset-wait-other-window-soft-switches-at-idle",
+         # 5h 94% (soft, under hard, idle) waits; the 7d soft mark does not.
+         snap("1", resets(acct("1", 94, 92), m5=8), acct("2", 10, 10), samples="idle"),
+         Switch, target="2", trigger="soft", reason_has="#1 7d 92% >= soft 90%"),
+    Case("reset-wait-unknown-pace-over-hard-switches",
+         snap("1", resets(acct("1", 96, 40), m5=8), acct("2", 10, 10)),
+         Switch, target="2", trigger="hard"),
+    Case("reset-wait-flat-pace-over-hard-switches",
+         snap("1", resets(acct("1", 96, 40), m5=8), acct("2", 10, 10), samples="idle"),
+         Switch, target="2", trigger="hard"),
+    Case("reset-wait-unknown-pace-under-hard-holds",
+         snap("1", resets(acct("1", 62, 40), m5=5), acct("2")),
+         Hold, pending=False, reason_has="resets in 5m"),
+    Case("reset-wait-holds-an-eta-forced-hard",
+         # 90% at 0.5 pt/min: hard 95 in 10 min (forced), 100% in 20; reset in 8.
+         snap("1", resets(acct("1", 90, 40), m5=8), acct("2", 10, 10),
+              samples=rows((600, 85, 40), (0, 90, 40))),
+         Hold, pending=False, reason_has="#1 5h 90% — resets in 8m"),
+    Case("reset-wait-on-stale-samples-is-an-unknown-pace",
+         snap("1", resets(acct("1", 96, 40), m5=8), acct("2", 10, 10),
+              samples=rows((1500, 94, 40), (900, 96, 40))),
+         Switch, target="2", trigger="hard"),
+    Case("reset-wait-both-windows",
+         snap("1", resets(acct("1", 96, 98.5), m5=8, m7=12), acct("2", 10, 10),
+              samples=rows((600, 94, 98), (0, 96, 98.5))),
+         Hold, pending=False,
+         reason_has="#1 5h 96% — resets in 8m, 7d 98.5% — resets in 12m, waiting it out"),
+    Case("reset-wait-leaves-rebalance-alone",
+         snap("1", resets(acct("1", 10, 10, reset7_d=6), m5=5),
+              acct("2", 0, 70, reset7_d=0.5), samples="idle"),
+         Switch, target="2", trigger="rebalance"),
     # -- unknowns -------------------------------------------------------------
     Case("active-usage-unknown-is-indeterminate",
          snap("1", acct("1", None, None), acct("2")),
@@ -421,3 +514,66 @@ class TestFallbacksSkipLapsedLogins:
         s = snap("1", acct("1", 100, 40), expiring(acct("2", 0, 10), 30))
         got = decide(s)
         assert isinstance(got, Switch) and got.target == "2"
+
+
+# -- reset-aware wait (maximize.resetWaitMin) ------------------------------------------
+
+
+class TestResetWait:
+    SLOW = rows((600, 94, 40), (0, 96, 40))  # 0.2 pt/min of 5h
+
+    def test_the_hold_carries_the_latest_reset_it_waits_for(self):
+        got = decide(snap("1", resets(acct("1", 96, 40), m5=8), acct("2", 10, 10),
+                          samples=self.SLOW))
+        assert isinstance(got, Hold) and got.reset_wait_until == NOW + 8 * 60
+        both = decide(snap("1", resets(acct("1", 96, 98.5), m5=8, m7=12), acct("2", 10, 10),
+                           samples=rows((600, 94, 98), (0, 96, 98.5))))
+        assert isinstance(both, Hold) and both.reset_wait_until == NOW + 12 * 60
+
+    def test_other_holds_carry_no_reset(self):
+        for case in CASES:
+            got = decide(case.snap)
+            if isinstance(got, Hold) and not case.id.startswith("reset-wait"):
+                assert got.reset_wait_until is None, case.id
+
+    def test_the_limit_is_inclusive(self):
+        at = snap("1", resets(acct("1", 96, 40), m5=15), acct("2", 10, 10), samples=self.SLOW)
+        assert isinstance(decide(at), Hold)
+        past = snap("1", resets(acct("1", 96, 40), m5=15.5), acct("2", 10, 10),
+                    samples=self.SLOW)
+        assert isinstance(decide(past), Switch)
+
+    def test_the_setting_moves_the_limit(self):
+        # A reset in 17 min (100% in 20): past the default 15, inside 30.
+        default = snap("1", resets(acct("1", 96, 40), m5=17), acct("2", 10, 10),
+                       samples=self.SLOW)
+        assert isinstance(decide(default), Switch)
+        wider = snap("1", resets(acct("1", 96, 40), m5=17), acct("2", 10, 10),
+                     samples=self.SLOW, reset_wait_min=30)
+        assert isinstance(decide(wider), Hold)
+
+    def test_the_margin_is_two_minutes_after_the_reset(self):
+        from claude_swap.maximize.policy import RESET_WAIT_MARGIN_MIN
+
+        assert RESET_WAIT_MARGIN_MIN == 2.0
+        # 0.2 pt/min from 96%: 100% in 20 min. A reset in 18 leaves exactly 2.
+        on_edge = snap("1", resets(acct("1", 96, 40), m5=18), acct("2", 10, 10),
+                       samples=self.SLOW, reset_wait_min=30)
+        assert isinstance(decide(on_edge), Hold)
+        short = snap("1", resets(acct("1", 96, 40), m5=18.5), acct("2", 10, 10),
+                     samples=self.SLOW, reset_wait_min=30)
+        assert isinstance(decide(short), Switch)
+
+    def test_a_past_or_unknown_reset_never_waits(self):
+        for m5 in (None, -1):
+            view = acct("1", 96, 40) if m5 is None else resets(acct("1", 96, 40), m5=m5)
+            got = decide(snap("1", view, acct("2", 10, 10), samples=self.SLOW))
+            assert isinstance(got, Switch) and got.trigger == "hard", m5
+
+    def test_nothing_landable_still_waits_rather_than_hold_for_room(self):
+        # Without the wait this is the "no account has more room" hold; with
+        # it, the reason is the reset.
+        got = decide(snap("1", resets(acct("1", 96, 40), m5=8), acct("2", 97, 10),
+                          samples=self.SLOW))
+        assert isinstance(got, Hold) and got.reset_wait_until is not None
+        assert "resets in 8m" in got.reason

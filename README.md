@@ -66,6 +66,8 @@ Turn it on with `cc-swap config set autoswitch.strategy maximize`, or use `cc-sw
 
 *Idle* means two usage readings at least `idleWindowMin` apart, with at most `idleMaxDeltaPct` growth in both windows. While it waits, the active account is polled every `pendingPollS` seconds. Usage from other machines on the same account counts too: there is no coordination between machines, and cc-swap trusts only what the server reports.
 
+**Waiting out a reset.** A switch makes Claude Code re-read the whole context on the new account, and a window that is about to reset clears the reason to switch. So when the window behind a `hard` or `soft` switch resets within `maximize.resetWaitMin` minutes (default 15) and the recent pace will not reach 100% until at least 2 minutes after that, maximize holds (`reset-wait`), polling the active account every 60 s in the last 15 minutes before the reset. With no pace measured yet, it waits only while that window is under its hard ceiling. At 100% the `at-limit` switch still happens at once, a trigger on the other window still switches, and `rebalance` never waits.
+
 `cc-swap auto --once --dry-run` prints each account's tier, score, landing eligibility and idle state, plus the decision and its reason. It needs no engine lease, so it works while the service runs.
 
 ### Settings
@@ -81,6 +83,7 @@ Turn it on with `cc-swap config set autoswitch.strategy maximize`, or use `cc-sw
 | `maximize.idleWindowMin` | int 3–60 | 10 | Minutes over which "idle" is judged |
 | `maximize.idleMaxDeltaPct` | float 0–10 | 1 | Most growth (percentage points) in that window that still counts as idle |
 | `maximize.forceEtaMin` | int 0–60 | 10 | Switch at once if the recent pace reaches a hard ceiling within this many minutes (0 = off) |
+| `maximize.resetWaitMin` | int 0–60 | 15 | Skip a hard or soft switch while the window that triggered it resets within this many minutes and the recent pace stays under 100% until 2 minutes past the reset (0 = off) |
 | `maximize.pendingPollS` | int 180–600 | 180 | Active-account poll interval while waiting for idle (floor 180 s: the usage endpoint allows ~30 requests/hour per account, shared by every machine) |
 | `maximize.rebalanceCooldownMin` | int 0–240 | 30 | Minimum minutes between rebalancing switches |
 | `maximize.tieEpsilon` | float 0–2 | 0.1 | Scores this close count as a tie |
@@ -269,6 +272,7 @@ In Fleet, Account settings → `i` (*Inspect all logins*) runs the same checks i
 | `auto-off` | Automatic switching is off (cc-swap auto off, or Fleet Mode → o): the engine keeps deciding but never switches or primes. | cc-swap auto on (or Fleet Mode → o); cc-swap auto status shows who turned it off and when. |
 | `maximize-pending` | A soft mark is crossed; maximize waits for an idle moment (idleWindowMin) before switching. | Nothing; a hard ceiling switches at once. Lower maximize.idleWindowMin to switch sooner. |
 | `maximize-hold` | maximize sees no reason to move: below every soft mark and no better-scored account (or within rebalanceCooldownMin). | Nothing. |
+| `reset-wait` | A hard or soft mark is crossed, but that window resets within maximize.resetWaitMin minutes and the recent pace will not reach 100% before then, so maximize waits for the reset instead of switching (a switch makes Claude Code re-read the whole context on the new account). | Nothing; it switches at once if the window hits 100%. Set maximize.resetWaitMin to 0 to switch without waiting. |
 
 ## Releasing
 
