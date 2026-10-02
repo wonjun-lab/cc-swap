@@ -258,6 +258,56 @@ class TestPrimer:
         assert runner.calls == []
 
 
+class TestForcedRefresh:
+    """The retry after a 401 spends exactly one refresh grant, and that grant
+    gets the same identity check as the engine's ``_freshen_target``."""
+
+    REJECTED = PrimeRunResult.from_output(
+        1, '{"is_error":true,"api_error_status":401,"result":"Invalid API key"}', ""
+    )
+
+    def test_one_grant_per_attempt_even_near_expiry(self, rig, monkeypatch):
+        # Inside _freshen_target's 10-minute buffer, so it would refresh too.
+        rig.harness.seed(2, "b@example.com", expires_at=int((rig.clock() + 300) * 1000))
+        refreshed = json.dumps({"claudeAiOauth": {
+            "accessToken": "sk-2b", "refreshToken": "rt-2b",
+            "expiresAt": int((rig.clock() + 8 * H) * 1000),
+        }})
+        grants: list[str] = []
+
+        def consume(num, email, snapshot):
+            grants.append(num)
+            return oauth.RefreshOutcome(refreshed, None)
+
+        monkeypatch.setattr(rig.switcher, "consume_backup_grant", consume)
+        runner = StubRunner(rig, [self.REJECTED], opens=False)
+        primer = rig.primer(runner=runner)
+        snap = rig.snap(nums=("1", "2"))
+        primer.run_due(snap)  # near-expiry freshen, launch, 401
+        assert grants == ["2"]
+        grants.clear()
+        primer.run_due(snap)  # the forced refresh, and nothing else
+        assert grants == ["2"]
+        assert runner.tokens() == ["sk-2", "sk-2b"]
+
+    def test_forced_refresh_checks_the_token_identity(self, rig, monkeypatch):
+        refreshed = json.dumps({"claudeAiOauth": {"accessToken": "sk-2b", "refreshToken": "rt-2b"}})
+        someone_else = {"uuid": "uuid-someone-else", "email": None, "organizationUuid": None}
+        monkeypatch.setattr(
+            rig.switcher, "consume_backup_grant",
+            lambda num, email, snapshot: oauth.RefreshOutcome(refreshed, None, someone_else),
+        )
+        runner = StubRunner(rig, [self.REJECTED], opens=False)
+        primer = rig.primer(runner=runner)
+        snap = rig.snap(nums=("1", "2"))
+        primer.run_due(snap)
+        events = primer.run_due(snap)
+        assert [(e.outcome, e.detail) for e in events] == [("failed", "identity-conflict")]
+        assert runner.tokens() == ["sk-2"]  # the other account's token never ran
+        assert rig.harness.state()["quarantine"]["2"]["reason"] == "identity-conflict"
+        assert rig.primes()["b@example.com"]["lastOutcome"] == "identity-conflict"
+
+
 def _bucket_end(rig) -> float:
     return (rig.clock.now // BUCKET_S + 1) * BUCKET_S
 

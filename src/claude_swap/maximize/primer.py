@@ -36,7 +36,12 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from claude_swap import oauth
-from claude_swap.autoswitch import AutoSwitchEvent, ConfigWarningEvent, PrimeEvent
+from claude_swap.autoswitch import (
+    _SYSTEMIC_STATUSES,
+    AutoSwitchEvent,
+    ConfigWarningEvent,
+    PrimeEvent,
+)
 from claude_swap.maximize.model import AccountView, Snapshot
 from claude_swap.maximize.snapshot import build_snapshot
 from claude_swap.poll_policy import parse_reset_ts
@@ -831,20 +836,20 @@ class Primer:
     ) -> tuple[str | None, str]:
         """The slot's current access token, freshened through upstream's
         consume gate when it expires within 10 minutes (``_freshen_target``)
-        or when the last launch was rejected with 401 (``force_refresh``).
+        or, instead of that, when the last launch was rejected with 401
+        (``force_refresh``) — one refresh grant per attempt at most.
         Only the access token leaves this method."""
-        status = self.engine._freshen_target(num, email)
+        if force_refresh:
+            status, creds = self._forced_refresh(num, email)
+        else:
+            status = self.engine._freshen_target(num, email)
+            creds = (
+                self.engine.switcher.read_account_credentials(num, email)
+                if status == "ok"
+                else None
+            )
         if status != "ok":
             return None, status
-        switcher = self.engine.switcher
-        creds = switcher.read_account_credentials(num, email)
-        if force_refresh and creds:
-            outcome = switcher.consume_backup_grant(num, email, creds)
-            if outcome.error in ("invalid_grant", "no_refresh_token"):
-                return None, "invalid_grant"
-            if outcome.error is not None or not outcome.credentials:
-                return None, outcome.error or "transient"
-            creds = outcome.credentials
         data = oauth.extract_oauth_data(creds) if creds else None
         token = data.get("accessToken") if data else None
         expires = _num(data.get("expiresAt")) if data else None
@@ -853,6 +858,31 @@ class Primer:
         if expires is not None and expires <= (self._clock() + TOKEN_MIN_LIFETIME_S) * 1000:
             return None, "transient"
         return token, "ok"
+
+    def _forced_refresh(self, num: str, email: str) -> tuple[str, str | None]:
+        """``_freshen_target`` with the refresh made unconditional: the same
+        live-session gate, the same consume gate, the same status mapping and
+        the same identity check on the grant's ``token_account`` — but not
+        a second, near-expiry grant in the same attempt."""
+        engine = self.engine
+        switcher = engine.switcher
+        if switcher.live_session_pids_for(num, email):
+            return "skip-live-session", None
+        creds = switcher.read_account_credentials(num, email)
+        if not creds:
+            return "transient", None
+        if not oauth.extract_oauth_data(creds):
+            return "invalid_grant", None
+        outcome = switcher.consume_backup_grant(num, email, creds)
+        if outcome.error is None and outcome.credentials:
+            if engine._note_token_identity(num, outcome.token_account):
+                return "identity-conflict", None
+            return "ok", outcome.credentials
+        if outcome.error in ("invalid_grant", "no_refresh_token"):
+            return "invalid_grant", None
+        if outcome.error in _SYSTEMIC_STATUSES:
+            return outcome.error, None
+        return "transient", None
 
     def _launch(
         self, target: PrimeTarget, claude: str, token: str, sleep: Sleep
