@@ -285,46 +285,104 @@ def parse_model_names(value: str | None) -> tuple[str, ...]:
     return tuple(seen.values())
 
 
-def _clamped(settings, section: str = "autoswitch"):
+def _describe(value) -> str:
+    """A raw settings value as it reads in a message, without dumping a huge one."""
+    text = repr(value)
+    return text if len(text) <= 40 else text[:37] + "..."
+
+
+def _clamp_number(spec: SettingSpec, value) -> tuple[float, str | None]:
+    """One numeric key's lenient clamp: ``(number, problem)``.
+
+    ``problem`` says what had to change, phrased to follow the key name, and
+    is None when the stored number stands: an int where a float is wanted is
+    the same number. Anything that is not a number, and NaN/±inf, reads as a
+    bad type and becomes the default; the rest is clamped into the range.
+    """
+    default = spec.default
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return default, (
+            f"must be a number, got {_describe(value)}; "
+            f"using default {format_setting_value(default)}"
+        )
+    # NaN and ±inf are not thresholds: `json.loads` accepts them, `int(nan)`
+    # raises, and NaN would slip through min/max unclamped. (An int never
+    # needs the check, and `isfinite` raises OverflowError on one too big for
+    # a float.)
+    if isinstance(value, float) and not math.isfinite(value):
+        return default, (
+            f"must be a finite number, got {_describe(value)}; "
+            f"using default {format_setting_value(default)}"
+        )
+    number = float(min(max(value, spec.lo), spec.hi))
+    if number != value:
+        return number, (
+            f"is {_describe(value)}, outside {format_setting_value(spec.lo)}-"
+            f"{format_setting_value(spec.hi)}; clamped to {format_setting_value(number)}"
+        )
+    return number, None
+
+
+def _clamped(settings, section: str = "autoswitch", repairs: list[str] | None = None):
     """Clamp values into the SETTING_SPECS ranges; bad types and non-finite
     numbers (NaN, ±inf) → the default.
 
     ``section`` selects the registry rows; the result has ``settings``' type.
+    When ``repairs`` is a list, one message per number or string that had to
+    be replaced or clamped is appended to it, and an unsupported choice goes
+    there too instead of into the log (a bool is only coerced, so a loader
+    that cares about one reports it itself). An int-valued float (12.0 for an
+    int key) is not a repair: nothing the user wrote changes.
     """
-
-    def num(value, default: float, lo: float, hi: float) -> float:
-        if isinstance(value, bool) or not isinstance(value, (int, float)):
-            return default
-        # NaN and ±inf are not thresholds, they are a bad type like a string:
-        # `json.loads` accepts them, `int(nan)` raises, and NaN would slip
-        # through min/max unclamped. (An int never needs the check, and
-        # `isfinite` raises OverflowError on one too big for a float.)
-        if isinstance(value, float) and not math.isfinite(value):
-            return default
-        return float(min(max(value, lo), hi))
 
     kwargs = {}
     for spec in SETTING_SPECS.values():
         if spec.section != section:
             continue
         value = getattr(settings, spec.field)
+        problem = None
         if spec.kind in ("float", "int"):
-            clamped = num(value, spec.default, spec.lo, spec.hi)
-            kwargs[spec.field] = int(clamped) if spec.kind == "int" else clamped
+            number, problem = _clamp_number(spec, value)
+            if spec.kind == "int":
+                whole = int(number)
+                if problem is None and whole != number:
+                    problem = (
+                        f"must be a whole number, got {_describe(value)}; "
+                        f"truncated to {whole}"
+                    )
+                number = whole
+            kwargs[spec.field] = number
         elif spec.kind == "bool":
             kwargs[spec.field] = bool(value)
         elif spec.kind == "string":
             # A non-empty string keeps as-is; anything else reverts to default
             # (None) so a null/garbage settings.json value disables the filter.
-            kwargs[spec.field] = value if isinstance(value, str) and value else spec.default
+            if isinstance(value, str) and value:
+                kwargs[spec.field] = value
+            else:
+                kwargs[spec.field] = spec.default
+                # null/"" on a key whose default is "unset" already say so.
+                if not (spec.default is None and value in (None, "")):
+                    problem = (
+                        f"must be a non-empty string, got {_describe(value)}; "
+                        f"using default {format_setting_value(spec.default)}"
+                    )
         else:  # choice
             if value not in spec.choices:
-                _logger.warning(
-                    "settings.json: unsupported %s %r; using %r",
-                    spec.dotted, value, spec.default,
-                )
+                if repairs is None:
+                    _logger.warning(
+                        "settings.json: unsupported %s %r; using %r",
+                        spec.dotted, value, spec.default,
+                    )
+                else:
+                    problem = (
+                        f"must be one of: {', '.join(spec.choices)}, got "
+                        f"{_describe(value)}; using default {spec.default}"
+                    )
                 value = spec.default
             kwargs[spec.field] = value
+        if problem is not None and repairs is not None:
+            repairs.append(f"{spec.dotted} {problem}")
     return type(settings)(**kwargs)
 
 
@@ -656,9 +714,15 @@ def _maximize_pair_errors(
     return errors
 
 
-def _section_from_raw(section, name: str, cls):
+def _section_from_raw(section, name: str, cls, repairs: list[str] | None = None):
     """One section's dataclass from its raw JSON dict: per-key lenient
-    (missing → default, bad type → default, out of range → clamped)."""
+    (missing → default, bad type or non-finite → default, out of range →
+    clamped).
+
+    When ``repairs`` is a list, one message is appended for each raw value
+    that was replaced by its default or clamped (see `_clamped`); nothing is
+    logged here, so the strict `config set` path can read a section quietly.
+    """
     if not isinstance(section, dict):
         return cls()
     kwargs = {
@@ -666,7 +730,7 @@ def _section_from_raw(section, name: str, cls):
         for spec in SETTING_SPECS.values()
         if spec.section == name and spec.json_key in section
     }
-    return _clamped(cls(**kwargs), name)
+    return _clamped(cls(**kwargs), name, repairs)
 
 
 def _report(problems: list[str] | None, message: str) -> None:
@@ -675,19 +739,35 @@ def _report(problems: list[str] | None, message: str) -> None:
         problems.append(message)
 
 
+def _section_for_load(
+    raw: dict, name: str, cls, problems: list[str] | None
+):
+    """`_section_from_raw` for the lenient loaders: each per-key repair is
+    logged and, when ``problems`` is given, appended to it."""
+    repairs: list[str] = []
+    settings = _section_from_raw(raw.get(name), name, cls, repairs)
+    for message in repairs:
+        _report(problems, message)
+    return settings
+
+
 def load_maximize_settings(
     backup_root: Path, *, problems: list[str] | None = None
 ) -> MaximizeSettings:
     """Load the ``maximize`` section; never raises.
 
-    Per key as `load_settings`. Per window, a soft mark above its hard cap
-    resets BOTH to their defaults: moving one toward the other would invent
-    a threshold nobody chose. Every repair is logged and, when ``problems``
-    is given, appended to it — the engine's hot reload uses that to keep its
-    previous values and raise a ConfigWarningEvent instead (spec §8.1).
+    Per key as `load_settings`: a wrong-typed or non-finite value becomes the
+    key's default and an out-of-range one is clamped. Per window, a soft mark
+    above its hard cap resets BOTH to their defaults: moving one toward the
+    other would invent a threshold nobody chose. Every repair — each key
+    replaced or clamped, each pair reset — is logged and, when ``problems`` is
+    given, appended to it as one message; the engine's hot reload uses that to
+    keep its previous values and raise a ConfigWarningEvent instead
+    (spec §8.1). A whole number written as a float (``12.0`` for an int key)
+    is not a repair.
     """
     raw = _read_raw(settings_path(backup_root))
-    settings = _section_from_raw(raw.get("maximize"), "maximize", MaximizeSettings)
+    settings = _section_for_load(raw, "maximize", MaximizeSettings, problems)
     defaults = MaximizeSettings()
     for soft, hard, message in _maximize_pair_errors(settings):
         _report(problems, f"{message}; using defaults for both")
@@ -706,11 +786,14 @@ def load_prime_settings(
     Stricter than the shared clamp in two places, both toward "off": only a
     JSON ``true`` enables priming (the shared bool clamp would read the
     string "false" as true), and a malformed ``jitterS`` reverts to the
-    default so `parse_jitter_range` on a loaded value cannot fail.
+    default so `parse_jitter_range` on a loaded value cannot fail. Like
+    `load_maximize_settings`, every repair (those two and each replaced or
+    clamped key) is logged and, when ``problems`` is given, appended to it
+    as one message.
     """
     raw = _read_raw(settings_path(backup_root))
     section = raw.get("prime")
-    settings = _section_from_raw(section, "prime", PrimeSettings)
+    settings = _section_for_load(raw, "prime", PrimeSettings, problems)
     defaults = PrimeSettings()
     if (
         isinstance(section, dict)

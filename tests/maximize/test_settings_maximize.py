@@ -234,6 +234,233 @@ class TestNonFiniteNumbers:
         assert not settings_path(tmp_path).exists()
 
 
+class TestProblemsReportEveryRepair:
+    """``problems=`` lists each raw value the loader had to change, not only
+    soft > hard pairs: the engine's hot reload keeps its previous values when
+    the list is non-empty, so a silently repaired key must still show up."""
+
+    def _load(self, tmp_path: Path, section: dict, caplog=None):
+        _write(tmp_path, {"maximize": section})
+        problems: list[str] = []
+        loaded = load_maximize_settings(tmp_path, problems=problems)
+        return loaded, problems
+
+    def test_a_wrong_type_is_reported_with_its_default(self, tmp_path: Path):
+        loaded, problems = self._load(tmp_path, {"hard5h": "high"})
+        assert loaded.hard_5h == 95.0
+        assert problems == [
+            "maximize.hard5h must be a number, got 'high'; using default 95"
+        ]
+
+    @pytest.mark.parametrize("raw", [True, None, [5], {"a": 1}])
+    def test_other_non_numbers_are_reported_too(self, tmp_path: Path, raw):
+        _, problems = self._load(tmp_path, {"landingMargin": raw})
+        assert len(problems) == 1
+        assert problems[0].startswith("maximize.landingMargin must be a number, got ")
+        assert problems[0].endswith("; using default 5")
+
+    def test_bool_is_a_wrong_type_even_when_it_equals_the_default(self, tmp_path: Path):
+        # idleMaxDeltaPct's default is 1.0 and True == 1.0: only a type check
+        # (not comparing the result to the input) catches this one.
+        loaded, problems = self._load(tmp_path, {"idleMaxDeltaPct": True})
+        assert loaded.idle_max_delta_pct == 1.0
+        assert len(problems) == 1
+
+    @pytest.mark.parametrize("literal, shown", [
+        ("NaN", "nan"), ("Infinity", "inf"), ("-Infinity", "-inf"),
+    ])
+    def test_non_finite_is_reported(self, tmp_path: Path, literal, shown):
+        settings_path(tmp_path).write_text('{"maximize": {"idleWindowMin": %s}}' % literal)
+        problems: list[str] = []
+        loaded = load_maximize_settings(tmp_path, problems=problems)
+        assert loaded.idle_window_min == 10
+        assert problems == [
+            f"maximize.idleWindowMin must be a finite number, got {shown}; "
+            "using default 10"
+        ]
+
+    def test_clamped_above_is_reported(self, tmp_path: Path):
+        loaded, problems = self._load(tmp_path, {"hard5h": 150})
+        assert loaded.hard_5h == 99.9
+        assert problems == ["maximize.hard5h is 150, outside 1-99.9; clamped to 99.9"]
+
+    def test_clamped_below_is_reported_for_an_int_key(self, tmp_path: Path):
+        loaded, problems = self._load(tmp_path, {"idleWindowMin": 1})
+        assert loaded.idle_window_min == 3
+        assert problems == ["maximize.idleWindowMin is 1, outside 3-60; clamped to 3"]
+
+    def test_huge_int_is_reported_without_dumping_its_digits(self, tmp_path: Path):
+        settings_path(tmp_path).write_text(
+            '{"maximize": {"idleWindowMin": %s}}' % ("9" * 400)
+        )
+        problems: list[str] = []
+        load_maximize_settings(tmp_path, problems=problems)
+        assert len(problems) == 1
+        assert "clamped to 60" in problems[0]
+        assert len(problems[0]) < 200
+
+    def test_a_fractional_value_for_an_int_key_is_reported(self, tmp_path: Path):
+        loaded, problems = self._load(tmp_path, {"idleWindowMin": 12.7})
+        assert loaded.idle_window_min == 12
+        assert problems == [
+            "maximize.idleWindowMin must be a whole number, got 12.7; truncated to 12"
+        ]
+
+    def test_an_integral_float_for_an_int_key_is_not_a_repair(self, tmp_path: Path):
+        # Pure int truncation: 12.0 -> 12 changes nothing the user wrote.
+        loaded, problems = self._load(tmp_path, {"idleWindowMin": 12.0, "pendingPollS": 120.0})
+        assert (loaded.idle_window_min, loaded.pending_poll_s) == (12, 120)
+        assert problems == []
+
+    def test_an_int_for_a_float_key_is_not_a_repair(self, tmp_path: Path):
+        loaded, problems = self._load(tmp_path, {"soft5h": 40, "tieEpsilon": 1})
+        assert (loaded.soft_5h, loaded.tie_epsilon) == (40.0, 1.0)
+        assert problems == []
+
+    def test_values_on_the_range_edges_are_not_repairs(self, tmp_path: Path):
+        _, problems = self._load(tmp_path, {"soft5h": 1, "hard5h": 99.9, "idleWindowMin": 60})
+        assert problems == []
+
+    def test_a_non_string_for_a_string_key_is_reported(self, tmp_path: Path):
+        loaded, problems = self._load(tmp_path, {"lastResort": 5})
+        assert loaded.last_resort is None
+        assert problems == [
+            "maximize.lastResort must be a non-empty string, got 5; "
+            "using default (none)"
+        ]
+
+    @pytest.mark.parametrize("raw", [None, ""])
+    def test_unsetting_a_string_key_with_null_or_empty_is_not_a_repair(
+        self, tmp_path: Path, raw
+    ):
+        # The default is "unset", so null / "" already mean what they say.
+        loaded, problems = self._load(tmp_path, {"lastResort": raw, "planOverride": raw})
+        assert (loaded.last_resort, loaded.plan_override) == (None, None)
+        assert problems == []
+
+    def test_one_message_per_repaired_key_in_registry_order(self, tmp_path: Path):
+        _, problems = self._load(tmp_path, {
+            "idleWindowMin": 1, "soft5h": "x", "hard7d": 1000, "soft7d": 85,
+        })
+        assert [p.split()[0] for p in problems] == [
+            "maximize.soft5h", "maximize.hard7d", "maximize.idleWindowMin",
+        ]
+
+    def test_a_pair_repair_adds_to_the_key_repairs(self, tmp_path: Path):
+        # soft5h clamps to 99.9 (one message), which then exceeds hard5h 90
+        # (a second message, for the pair).
+        loaded, problems = self._load(tmp_path, {"soft5h": 150, "hard5h": 90})
+        assert (loaded.soft_5h, loaded.hard_5h) == (50.0, 95.0)
+        assert len(problems) == 2
+        assert "maximize.soft5h is 150" in problems[0]
+        assert "must not exceed" in problems[1]
+
+    def test_clean_files_report_nothing(self, tmp_path: Path):
+        for payload in (
+            {},
+            {"maximize": {}},
+            {"maximize": {"soft5h": 40, "idleWindowMin": 15, "lastResort": "a@x.com"}},
+            {"maximize": "not a section"},
+        ):
+            _write(tmp_path, payload)
+            problems: list[str] = []
+            load_maximize_settings(tmp_path, problems=problems)
+            assert problems == [], payload
+
+    def test_every_repair_is_also_logged_as_a_warning(self, tmp_path: Path, caplog):
+        _write(tmp_path, {"maximize": {"hard5h": "high", "idleWindowMin": 1}})
+        with caplog.at_level(logging.WARNING, logger="claude-swap"):
+            load_maximize_settings(tmp_path)  # no problems= list: still logged
+        warnings = [r.getMessage() for r in caplog.records]
+        assert len(warnings) == 2
+        assert any("maximize.hard5h must be a number" in w for w in warnings)
+        assert any("maximize.idleWindowMin is 1" in w for w in warnings)
+
+    def test_each_repair_is_logged_once_when_problems_is_given(self, tmp_path: Path, caplog):
+        _write(tmp_path, {"maximize": {"hard5h": "high"}})
+        with caplog.at_level(logging.WARNING, logger="claude-swap"):
+            load_maximize_settings(tmp_path, problems=[])
+        assert len(caplog.records) == 1
+
+    def test_the_strict_path_stays_quiet_about_other_keys(self, tmp_path: Path, caplog):
+        # `config set` reads the raw section to judge a soft/hard pair; it
+        # must not log the lenient loader's repairs for unrelated keys.
+        _write(tmp_path, {"maximize": {"idleWindowMin": "x"}})
+        with caplog.at_level(logging.WARNING, logger="claude-swap"):
+            set_setting(tmp_path, "maximize.soft5h", "40")
+        assert caplog.records == []
+
+
+class TestPrimeProblems:
+    def _load(self, tmp_path: Path, section: dict):
+        _write(tmp_path, {"prime": section})
+        problems: list[str] = []
+        return load_prime_settings(tmp_path, problems=problems), problems
+
+    def test_clamped_max_attempts_is_reported(self, tmp_path: Path):
+        loaded, problems = self._load(tmp_path, {"maxAttempts": 9})
+        assert loaded.max_attempts == 5
+        assert problems == ["prime.maxAttempts is 9, outside 1-5; clamped to 5"]
+
+    def test_wrong_type_max_attempts_is_reported(self, tmp_path: Path):
+        loaded, problems = self._load(tmp_path, {"maxAttempts": "many"})
+        assert loaded.max_attempts == 2
+        assert problems == ["prime.maxAttempts must be a number, got 'many'; using default 2"]
+
+    def test_non_finite_max_attempts_is_reported(self, tmp_path: Path):
+        settings_path(tmp_path).write_text('{"prime": {"maxAttempts": NaN}}')
+        problems: list[str] = []
+        loaded = load_prime_settings(tmp_path, problems=problems)
+        assert loaded.max_attempts == 2
+        assert problems == [
+            "prime.maxAttempts must be a finite number, got nan; using default 2"
+        ]
+
+    @pytest.mark.parametrize("raw", ["", None, 5])
+    def test_empty_or_wrong_type_model_is_reported(self, tmp_path: Path, raw):
+        # Unlike lastResort, model's default is a value: replacing the user's
+        # entry with it is a repair.
+        loaded, problems = self._load(tmp_path, {"model": raw})
+        assert loaded.model == "claude-haiku-4-5"
+        assert len(problems) == 1
+        assert problems[0].startswith("prime.model must be a non-empty string, got ")
+        assert problems[0].endswith("; using default claude-haiku-4-5")
+
+    def test_a_non_string_jitter_is_reported_once(self, tmp_path: Path):
+        loaded, problems = self._load(tmp_path, {"jitterS": 5})
+        assert loaded.jitter_s == "45-300"
+        assert len(problems) == 1
+        assert problems[0].startswith("prime.jitterS must be a non-empty string")
+
+    def test_malformed_jitter_is_still_reported_exactly_once(self, tmp_path: Path):
+        _, problems = self._load(tmp_path, {"jitterS": "300-45"})
+        assert len(problems) == 1
+        assert problems[0].startswith("prime.jitterS ")
+
+    def test_a_non_bool_enabled_is_still_reported_exactly_once(self, tmp_path: Path):
+        loaded, problems = self._load(tmp_path, {"enabled": "false"})
+        assert loaded.enabled is False
+        assert len(problems) == 1
+        assert "prime.enabled" in problems[0]
+
+    def test_clean_prime_section_reports_nothing(self, tmp_path: Path):
+        _, problems = self._load(tmp_path, {
+            "enabled": True, "model": "haiku", "jitterS": "60-120",
+            "maxAttempts": 3, "claudePath": "/opt/claude",
+        })
+        assert problems == []
+        _, problems = self._load(tmp_path, {"claudePath": None})
+        assert problems == []
+
+    def test_every_repair_is_logged(self, tmp_path: Path, caplog):
+        _write(tmp_path, {"prime": {"maxAttempts": 9}})
+        with caplog.at_level(logging.WARNING, logger="claude-swap"):
+            load_prime_settings(tmp_path)
+        assert [r.getMessage() for r in caplog.records] == [
+            "settings.json: prime.maxAttempts is 9, outside 1-5; clamped to 5"
+        ]
+
+
 class TestLoadPrime:
     def test_missing_file_gives_defaults(self, tmp_path: Path):
         assert load_prime_settings(tmp_path) == PrimeSettings()
