@@ -334,12 +334,23 @@ def init_command(argv: list[str]) -> None:
             probes = _probes()
             steps = init_steps(probes)
     code = 0 if all(s.status == "ok" for s in steps) else 1
+    # The checklist covers onboarding; doctor checks everything else (a
+    # plaintext copy of the login, a service that holds no lease, ...). Its
+    # verdict is part of ours so "All set" never stands next to a doctor
+    # that exits 1.
+    findings = dr.run_checks(probes)
+    doctor_problems = _worst(findings)
     if args.json:
         print(json.dumps({
             "schemaVersion": SCHEMA_VERSION,
             "exitCode": code,
             "applied": applied,
             "steps": [s.to_json() for s in steps],
+            "doctor": {
+                "exitCode": dr.exit_code(findings),
+                "counts": dr.counts(findings),
+                "problems": [f.to_json() for f in doctor_problems],
+            },
         }, indent=2))
         sys.exit(code)
     for line in applied:
@@ -350,7 +361,18 @@ def init_command(argv: list[str]) -> None:
         if step.status != "ok" and step.fix:
             print(" " * 9 + muted(f"→ {step.fix}"))
     print()
-    if code == 0:
+    if code == 0 and doctor_problems:
+        n = len(doctor_problems)
+        print(
+            f"Set up, but cc-swap doctor reports {n} problem{'s' if n != 1 else ''} "
+            f"({summary_line(findings)}):"
+        )
+        for f in doctor_problems:
+            label = f.check if f.scope in ("env", "accounts") else f"{f.scope} {f.check}"
+            print(f"  {_tag(f.severity)}  {label}: {f.detail}")
+            if f.fix:
+                print(" " * 9 + muted(f"→ {f.fix}"))
+    elif code == 0:
         print("All set. cc-swap doctor checks the details any time.")
     else:
         left = sum(1 for s in steps if s.status != "ok")
