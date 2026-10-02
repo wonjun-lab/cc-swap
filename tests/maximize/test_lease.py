@@ -406,6 +406,13 @@ def test_busy_message_without_a_pid_names_no_pid():
     assert "cc-swap auto --once --dry-run" in busy_message(None)
 
 
+def test_busy_message_points_at_uninstalling_the_service_not_at_status():
+    message = busy_message(123)
+    assert "cc-swap service uninstall" in message
+    assert "service status" not in message
+    assert "(pid 123)" in message
+
+
 def test_busy_exit_code_is_distinct_from_every_once_outcome_and_ctrl_c():
     from claude_swap.autoswitch import TickOutcome
 

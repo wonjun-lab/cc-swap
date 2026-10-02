@@ -56,3 +56,19 @@ def test_readme_strategy_row_mentions_maximize():
 ])
 def test_readme_covers_install_migration_priming_and_the_service(snippet):
     assert snippet in README.read_text(encoding="utf-8")
+
+
+def test_readme_describes_the_service_takeover_as_a_retry_not_a_wait_for_terminals():
+    text = README.read_text(encoding="utf-8")
+    # The service holds the lease while it runs, so a terminal engine is refused
+    # (exit 4); it never "waits and takes over after you stop it".
+    assert "the service waits and takes over" not in text
+    assert "retries every minute and takes over once that engine stops" in text
+    assert "run `cc-swap service uninstall` first" in text
+
+
+def test_readme_warns_that_the_macos_error_log_is_not_rotated():
+    text = README.read_text(encoding="utf-8")
+    assert "auto.err.log" in text
+    assert "is not rotated" in text
+    assert "370 KiB" in text

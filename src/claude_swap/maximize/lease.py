@@ -194,9 +194,10 @@ def busy_message(pid: int | None) -> str:
     who = f" (pid {pid})" if pid else ""
     return (
         f"another cc-swap auto-switch engine is already running{who}. "
-        "Only one engine may run at a time: stop it first (cc-swap service "
-        "status, a terminal running cc-swap auto, or a TUI auto screen), or "
-        "inspect without an engine: cc-swap auto --once --dry-run"
+        "Only one engine may run at a time: stop it first (a terminal running "
+        "cc-swap auto, a TUI auto screen, the menu bar's auto-switch, or the "
+        "service: cc-swap service uninstall), or inspect without an engine: "
+        "cc-swap auto --once --dry-run"
     )
 
 

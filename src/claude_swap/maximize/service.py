@@ -29,10 +29,12 @@ terminal, and a service pinned to it would auto-switch the wrong store.
 
 A second engine is refused by the engine lease (``maximize/lease.py``):
 ``cc-swap auto`` then exits with ``EXIT_ENGINE_BUSY`` (4). Both managers
-count that as a failure and retry after ``RESTART_DELAY_S``, so the service
-takes over within a minute of a terminal ``cc-swap auto`` or a TUI auto
-screen letting go — without spinning, and on systemd without tripping the
-start-rate limit (``StartLimitIntervalSec=0``).
+count that as a failure and retry after ``RESTART_DELAY_S``, so a service that
+started while another engine held the lease takes over within a minute of that
+engine letting go — without spinning, and on systemd without tripping the
+start-rate limit (``StartLimitIntervalSec=0``). Once the service holds the
+lease it is the one that refuses: to run an engine in a terminal instead,
+uninstall the service first.
 """
 
 from __future__ import annotations
