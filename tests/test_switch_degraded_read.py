@@ -185,3 +185,66 @@ def test_fleet_relogin_switch_back_failure_keeps_the_stored_login(tmp_path):
     out = relogin_store(s, "4", return_to="1")
     assert out["stored"] is True and "returned_to" not in out
     assert MESSAGE in out["switch_back_error"]
+
+
+def _pin_with_failed_delete(sw, store, monkeypatch):
+    """An active write falls back to the file and its Keychain delete fails:
+    the process pins file mode with an unverified residual."""
+    rc36_on_active(store, monkeypatch, delete_fails=True)
+    monkeypatch.setattr(kc, "set_password", lambda *a, **k: (_ for _ in ()).throw(
+        kc.KeychainError("rc=36")))
+    sw._write_credentials(OLD1)
+    assert sw._store._residual_verdict is False
+    assert sw._read_active_credentials().degraded
+
+
+def _keychain_recovers(store, monkeypatch):
+    monkeypatch.setattr(kc, "get_password", store.get_password)
+    monkeypatch.setattr(kc, "delete_password", store.delete_password)
+    monkeypatch.setattr(kc, "set_password", store.set_password)
+
+
+def _advance(monkeypatch, seconds):
+    import time as _t
+
+    real = _t.monotonic
+    monkeypatch.setattr(_t, "monotonic", lambda: real() + seconds)
+
+
+def test_pinned_residual_heals_once_the_keychain_answers(mac, monkeypatch):
+    sw, home, store = mac
+    _pin_with_failed_delete(sw, store, monkeypatch)
+    _keychain_recovers(store, monkeypatch)
+    # Inside the 60 s cooldown nothing is retried: still degraded.
+    assert sw._read_active_credentials().degraded
+    _advance(monkeypatch, 61)
+    verdict = sw._read_active_credentials()
+    assert not verdict.degraded and not verdict.keychain_unavailable
+    # Claude Code reads the Keychain first, so cc-swap follows it again: the
+    # new login there is the live credential, not the plaintext file.
+    assert "rt-NEW-1" in verdict.value
+    assert sw._store._residual_verdict is None
+    # Switching resumes, and the departing slot keeps the new login.
+    with patch("claude_swap.oauth.fetch_oauth_profile", return_value=None):
+        assert sw.switch_to("2", json_output=True)["switched"]
+    assert "rt-NEW-1" in sw._read_account_credentials("1", "a@example.com")
+
+
+def test_pinned_residual_heals_when_the_item_is_gone(mac, monkeypatch):
+    sw, home, store = mac
+    _pin_with_failed_delete(sw, store, monkeypatch)
+    _keychain_recovers(store, monkeypatch)
+    store.delete_password(CLAUDE_CODE_KEYCHAIN_SERVICE, kc.keychain_account_name())
+    _advance(monkeypatch, 61)
+    verdict = sw._read_active_credentials()
+    assert not verdict.degraded and verdict.value == OLD1  # the file is the authority
+
+
+def test_pinned_residual_stays_degraded_while_the_keychain_is_down(mac, monkeypatch):
+    sw, home, store = mac
+    _pin_with_failed_delete(sw, store, monkeypatch)
+    _advance(monkeypatch, 61)
+    assert sw._read_active_credentials().degraded
+    assert sw._store._residual_verdict is False
+    _advance(monkeypatch, 200)
+    assert sw._read_active_credentials().degraded

@@ -97,6 +97,7 @@ def test_plist_snapshot():
         "EnvironmentVariables": {
             "PATH": "/Users/u/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
             "PYTHONUNBUFFERED": "1",
+            "CC_SWAP_SERVICE": "1",
         },
         "StandardOutPath": "/Users/u/Library/Logs/cc-swap/auto.log",
         "StandardErrorPath": "/Users/u/Library/Logs/cc-swap/auto.err.log",
@@ -118,6 +119,7 @@ Restart=on-failure
 RestartSec=60
 Environment="PATH=/home/u/.local/bin:/usr/local/bin:/usr/bin:/bin"
 Environment="PYTHONUNBUFFERED=1"
+Environment="CC_SWAP_SERVICE=1"
 
 [Install]
 WantedBy=default.target
@@ -339,7 +341,7 @@ def test_install_forwards_nothing_when_the_profile_env_is_absent(tmp_path, on_ma
     fake_run({"launchctl print": _done(1)})
     result = service.install(home=tmp_path, program=MAC_PROGRAM, uid=UID, backup_root=tmp_path / "root")
     env = plistlib.loads(Path(result["path"]).read_bytes())["EnvironmentVariables"]
-    assert set(env) == {"PATH", "PYTHONUNBUFFERED"}
+    assert set(env) == {"PATH", "PYTHONUNBUFFERED", "CC_SWAP_SERVICE"}
     assert result["forwarded_env"] == {}
 
 

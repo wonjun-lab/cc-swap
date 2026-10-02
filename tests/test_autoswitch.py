@@ -733,6 +733,37 @@ class TestActiveCredentialUnreadable:
         reasons = {e.reason for e in harness.events if isinstance(e, NoSwitchEvent)}
         assert reasons == {"active-credential-unreadable"}
 
+    def test_a_long_hold_warns_every_15_minutes_with_the_remedy(self, harness):
+        from claude_swap.autoswitch import ConfigWarningEvent
+        from claude_swap.credentials import ActiveCredentials
+
+        denied = ActiveCredentials("", True, True)
+        usage = {"1": None, "2": _usage(10), "3": _usage(20)}
+        for _ in range(40):  # 40 minutes, one tick a minute
+            tick_with_active_read(harness, usage, denied)
+            harness.clock.advance(60)
+        warnings = [e.message for e in harness.events if isinstance(e, ConfigWarningEvent)]
+        assert len(warnings) == 3  # the first one, then at 15 and 30 minutes
+        assert "unlock" in warnings[1] and "restart" in warnings[1]
+        assert not harness.engine._stop.is_set()  # not a service: keeps holding
+
+    def test_the_service_exits_non_zero_after_a_15_minute_hold(self, harness, monkeypatch):
+        from claude_swap.credentials import ActiveCredentials
+
+        monkeypatch.setenv("CC_SWAP_SERVICE", "1")
+        denied = ActiveCredentials("", True, True)
+        usage = {"1": None, "2": _usage(10), "3": _usage(20)}
+        for _ in range(14):
+            tick_with_active_read(harness, usage, denied)
+            harness.clock.advance(60)
+        assert not harness.engine._stop.is_set()
+        tick_with_active_read(harness, usage, denied)
+        harness.clock.advance(60)
+        tick_with_active_read(harness, usage, denied)
+        assert harness.engine._stop.is_set()
+        assert harness.engine.run_loop() != 0  # launchd/systemd restart it
+        assert harness.active_number() == 1
+
     def test_switch_refusing_a_degraded_read_holds_without_state_change(self, harness):
         from claude_swap.exceptions import CredentialReadError
 

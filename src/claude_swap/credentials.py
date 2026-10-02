@@ -142,6 +142,17 @@ _ACTIVE_READ_RETRY_DELAY = 0.3  # seconds between attempts
 KEYCHAIN_RECHECK_COOLDOWN_S = 60.0
 
 
+def _refresh_token_of(credentials: str | None) -> str | None:
+    """The refresh token in an OAuth credential blob (compared, never logged)."""
+    try:
+        data = json.loads(credentials or "")
+    except (ValueError, TypeError):
+        return None
+    oauth = data.get("claudeAiOauth") if isinstance(data, dict) else None
+    token = oauth.get("refreshToken") if isinstance(oauth, dict) else None
+    return token if isinstance(token, str) and token else None
+
+
 class ActiveCredentials(NamedTuple):
     """Outcome of reading Claude Code's active credential.
 
@@ -335,6 +346,9 @@ class CredentialStore:
         # superseded generation. A fact about THIS item, which is why neither
         # flag above can stand in for it.
         self._residual_verdict: bool | None = None
+        # When an unverified residual (verdict False) is next re-checked
+        # (monotonic; see `_recheck_pinned_residual`).
+        self._residual_recheck_at: float = 0.0
         self._last_active_credentials_backend: str | None = None
         # The full verdict of THIS thread's last `_read_credentials`, so a
         # caller of the value-only contract can still ask whether that very
@@ -437,6 +451,7 @@ class CredentialStore:
         self._keychain_disabled_until = 0.0
         self._file_mode_is_ours = True
         self._residual_verdict = residual_cleared
+        self._residual_recheck_at = time.monotonic() + KEYCHAIN_RECHECK_COOLDOWN_S
         if residual_cleared:
             # Settle what happened before; later failures are the flags'
             # question again. `_kc_call` re-arms the cooldown on any failure
@@ -446,6 +461,61 @@ class CredentialStore:
             # degraded=False and disarmed the capture guard.
             self._keychain_op_failed = False
             self._active_read_failed = False
+
+    def _recheck_pinned_residual(self) -> None:
+        """Retry what the pin could not verify, once per cooldown.
+
+        A pin with an unverified residual (``_residual_verdict is False``)
+        made every later active read degraded for the rest of the process —
+        and with it the engine's hold (2026-10-03 review). Once the Keychain
+        answers again the question can be settled, and then the pin is
+        lifted so routing goes back to Keychain-first, as Claude Code reads:
+
+        - no item, or one carrying the file's lineage: nothing can shadow the
+          file wrongly;
+        - a different item: it is what Claude Code reads first, so it is the
+          live credential — cc-swap follows it (non-destructive: nothing is
+          deleted, a newer login Claude Code wrote stays) and says so.
+
+        Still unreadable: try again after the next cooldown. Calls the
+        wrapper directly, not through ``_kc_call``, so a failure here does
+        not turn the pin into an ordinary cooldown.
+        """
+        if self._host.platform != Platform.MACOS or self._residual_verdict is not False:
+            return
+        now = time.monotonic()
+        if now < self._residual_recheck_at:
+            return
+        self._residual_recheck_at = now + KEYCHAIN_RECHECK_COOLDOWN_S
+        try:
+            residual = macos_keychain.get_password(
+                CLAUDE_CODE_KEYCHAIN_SERVICE, macos_keychain.keychain_account_name()
+            )
+        except macos_keychain.KEYCHAIN_ERRORS:
+            return
+        try:
+            on_file = get_credentials_path().read_text(encoding="utf-8")
+        except OSError:
+            on_file = ""
+        if residual and _refresh_token_of(residual) != _refresh_token_of(on_file):
+            self._host._logger.warning(
+                "The Keychain answers again and holds a different credential "
+                "than the plaintext file written while it was unreadable; "
+                "Claude Code reads the Keychain first, so cc-swap follows it. "
+                "If the active account looks wrong, switch again."
+            )
+        else:
+            self._host._logger.info(
+                "The Keychain answers again; the active credential store is "
+                "consistent, leaving file mode."
+            )
+        # Unpin: back to Keychain-first routing with nothing failed.
+        self._keychain_usable_cache = None
+        self._keychain_disabled_until = 0.0
+        self._file_mode_is_ours = False
+        self._residual_verdict = None
+        self._keychain_op_failed = False
+        self._active_read_failed = False
 
     @property
     def _keychain_unreadable(self) -> bool:
@@ -597,6 +667,7 @@ class CredentialStore:
         otherwise nudge the user into an unnecessary re-login.
         """
         keychain_failed = False
+        self._recheck_pinned_residual()
         # 1. OAuth Keychain (macOS, when usable), with a bounded retry.
         #
         # READ THE ITEM FOR *THIS* PROFILE, NOT THE FIXED NAME.

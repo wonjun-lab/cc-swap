@@ -33,6 +33,7 @@ import enum
 import json
 import logging
 import math
+import os
 import random
 import threading
 import time
@@ -63,6 +64,15 @@ from claude_swap.usage_store import (
     due_candidate,
     plan_oversleeps_interval,
 )
+
+# A hold on an unreadable live credential nags (and the service restarts)
+# after this long.
+READ_HOLD_NAG_S = 15 * 60.0
+# Set by `cc-swap service install` in the service's environment.
+SERVICE_ENV = "CC_SWAP_SERVICE"
+# EX_TEMPFAIL: launchd's KeepAlive/SuccessfulExit=false and systemd's
+# Restart=on-failure both restart on it.
+READ_HOLD_EXIT_CODE = 75
 
 # Usage sentinels that say the active slot's stored lineage is dead.
 _DEAD_SENTINELS = (USAGE_RELOGIN_REQUIRED, USAGE_LOGIN_EXPIRED)
@@ -797,6 +807,11 @@ class AutoSwitchEngine:
         # One warning per episode of an unreadable live credential (the
         # tick holds while it lasts; see `_active_read_unhealthy`).
         self._read_hold_warned = False
+        self._read_hold_since: float | None = None
+        self._read_hold_last_warn = 0.0
+        # Set when the loop should end with a failure code (a service exit
+        # that asks launchd/systemd for a restart).
+        self._exit_code: int | None = None
         # One "unmanaged login" warning per episode.
         self._unmanaged_warned = False
         # One-shot typo guard for ``autoswitch.model``: resolved (and possibly
@@ -1107,8 +1122,11 @@ class AutoSwitchEngine:
             # overwrite a login cswap cannot see — possibly a fresh /login
             # that was never backed up (2026-10-03). Hold, count nothing,
             # write nothing, until a read succeeds.
+            now = self.clock()
             if not self._read_hold_warned:
                 self._read_hold_warned = True
+                self._read_hold_since = now
+                self._read_hold_last_warn = now
                 self._emit(ConfigWarningEvent(
                     message=(
                         f"Keychain unreadable; holding — Account-{current}'s "
@@ -1116,12 +1134,15 @@ class AutoSwitchEngine:
                         "switch until a read succeeds"
                     )
                 ))
+            else:
+                self._long_read_hold(now)
             self._emit(NoSwitchEvent(
                 reason="active-credential-unreadable",
                 detail="live credential read failed or degraded; holding",
             ))
             return TickOutcome.NO_ACTION
         self._read_hold_warned = False
+        self._read_hold_since = None
 
         held = self._back_up_new_active_login(current, entries, quarantined)
         if held is not None:
@@ -2378,6 +2399,30 @@ class AutoSwitchEngine:
 
     # -- helpers --------------------------------------------------------------
 
+    def _long_read_hold(self, now: float) -> None:
+        """A hold on an unreadable live credential that outlasts
+        :data:`READ_HOLD_NAG_S` says what to do, every READ_HOLD_NAG_S; the
+        service (``CC_SWAP_SERVICE=1``) exits non-zero so launchd/systemd
+        restart it with fresh Keychain state."""
+        since = self._read_hold_since if self._read_hold_since is not None else now
+        if now - since < READ_HOLD_NAG_S or now - self._read_hold_last_warn < READ_HOLD_NAG_S:
+            return
+        self._read_hold_last_warn = now
+        minutes = int((now - since) // 60)
+        service = os.environ.get(SERVICE_ENV) == "1"
+        self._emit(ConfigWarningEvent(
+            message=(
+                f"Keychain unreadable for {minutes} min; still holding. Unlock "
+                "the login keychain (Keychain Access, or `security "
+                "unlock-keychain` in a GUI terminal), or restart cc-swap"
+                + (" — the service now exits so launchd/systemd restarts it"
+                   if service else " (quit and run it again)")
+            )
+        ))
+        if service:
+            self._exit_code = READ_HOLD_EXIT_CODE
+            self.stop()
+
     def _warn_unmanaged_login(self, why: str) -> None:
         if not self._unmanaged_warned:
             self._unmanaged_warned = True
@@ -2623,7 +2668,7 @@ class AutoSwitchEngine:
             # already sees whatever settings that wake announced.
             self._wake.clear()
             if self._stop.is_set():
-                return 0
+                return self._exit_code or 0
             try:
                 outcome = self.tick()
             except Exception as e:  # pragma: no cover - tick() already guards

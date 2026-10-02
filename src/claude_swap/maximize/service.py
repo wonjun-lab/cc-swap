@@ -174,6 +174,9 @@ def service_env(
     env = {
         "PATH": service_path(program, claude_path, platform=platform, home=home),
         "PYTHONUNBUFFERED": "1",
+        # The engine exits non-zero (for a restart) on a stuck Keychain hold
+        # only when it knows it is the service.
+        "CC_SWAP_SERVICE": "1",
     }
     if platform == "linux" and xdg_data_home:
         # The Linux backup root follows $XDG_DATA_HOME (paths.get_backup_root);
