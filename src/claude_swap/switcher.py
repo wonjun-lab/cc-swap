@@ -6367,11 +6367,12 @@ class ClaudeAccountSwitcher:
         # live state into a fresh backup before swapping, so the active
         # slot's stored backup may be stale or absent without blocking us.
         #
-        # Usage-aware rotation anchors on the live account (current_num) so it
-        # never lands a no-op on the slot you're already on when the live login
-        # has drifted from the recorded activeAccountNumber. Plain rotation keeps
-        # anchoring on active_account for byte-for-byte unchanged behavior.
-        anchor = current_num if strategy == "next-available" else active_account
+        # Rotation anchors on the live account (current_num) so it never lands
+        # a no-op on the slot you're already on (or rotates backwards) when the
+        # live login has drifted from the recorded activeAccountNumber — e.g.
+        # after a /login outside cc-swap. Without drift the two are the same
+        # slot, so plain rotation is unchanged.
+        anchor = current_num
         try:
             current_index = sequence.index(int(anchor))
         except (TypeError, ValueError):

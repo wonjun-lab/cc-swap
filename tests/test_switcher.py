@@ -6060,6 +6060,42 @@ class TestUsageAwareSwitch:
         # Anchored on the live account (2) → next is 3, not 2 (a no-op).
         assert s._get_sequence_data()["activeAccountNumber"] == 3
 
+    @pytest.mark.parametrize("json_output", [False, True])
+    def test_plain_rotation_anchors_on_live_account_under_drift(
+        self, temp_home: Path, json_output
+    ):
+        """A /login outside cc-swap (live = 2) left sequence.json saying 1:
+        bare `switch` rotated 1 -> 2, a no-op "Already on", instead of 2 -> 3."""
+        s = self._setup(temp_home)
+        self._seed(s, 1, "a@example.com")
+        self._seed(s, 2, "b@example.com")
+        self._seed(s, 3, "c@example.com")
+        data = s._get_sequence_data()
+        data["activeAccountNumber"] = 1
+        s._write_json(s.sequence_file, data)
+        self._make_live(temp_home, "b@example.com", 2)
+
+        with patch.object(s, "list_accounts"):
+            result = s.switch(json_output=json_output)
+
+        assert s._get_sequence_data()["activeAccountNumber"] == 3
+        if json_output:
+            assert result["switched"] is True
+            assert result["from"]["number"] == 2 and result["to"]["number"] == 3
+
+    def test_plain_rotation_without_drift_is_unchanged(self, temp_home: Path):
+        s = self._setup(temp_home)
+        self._seed(s, 1, "a@example.com")
+        self._seed(s, 2, "b@example.com")
+        self._seed(s, 3, "c@example.com")
+        data = s._get_sequence_data()
+        data["activeAccountNumber"] = 3
+        s._write_json(s.sequence_file, data)
+        self._make_live(temp_home, "c@example.com", 3)
+        with patch.object(s, "list_accounts"):
+            s.switch()
+        assert s._get_sequence_data()["activeAccountNumber"] == 1  # wraps around
+
 
 class TestClaudeCodeLockCooperation:
     """_perform_switch must hold Claude Code's own advisory locks
