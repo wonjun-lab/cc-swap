@@ -106,13 +106,15 @@ def engine_switch(engine, number: str, trigger: str):
     (``autoswitch._perform`` calls this instead of ``switch_to``, under the
     state lock). A ``cc-swap auto off`` that landed after the tick read the
     state is honoured here: no switch."""
-    from claude_swap.maximize.pause import auto_off
+    from claude_swap.maximize.pause import auto_off, effective_auto_off
 
     try:
         state = engine._read_state()
     except Exception:
         state = {}
-    if auto_off(state) is not None:
+    state_path = getattr(engine, "state_path", None)
+    off = effective_auto_off(state_path.parent, state) if state_path else auto_off(state)
+    if off is not None:
         # `autoOff` marks the refusal so the caller reports `auto-off`, not a
         # no-op switch onto the already-active account.
         return {"switched": False, "reason": AUTO_OFF_REFUSAL, "autoOff": True}

@@ -15,13 +15,16 @@ far-future value) cannot stop switching for good.
 
 from __future__ import annotations
 
+import json
 import math
+import os
 import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 
 from claude_swap import autoswitch as aw
+from claude_swap.maximize.auto_off_flag import flag_path, read_flag
 from claude_swap.settings import atomic_write_json
 
 PAUSED_UNTIL_KEY = "pausedUntil"
@@ -111,9 +114,11 @@ def resume(backup_root: Path) -> None:
 #
 # Semantics of a damaged marker: the key present with anything but
 # ``false``/``null`` means OFF (it was set on purpose; failing open would
-# switch against the user's wish). A state file that cannot be read at all
-# carries no marker, so the engine runs as usual — the same as every other
-# state-file reader.
+# switch against the user's wish). The flag is mirrored in its own file
+# (``auto_off.json``, maximize/auto_off_flag.py) because a state file that
+# cannot be parsed reads as ``{}`` and is rewritten without the key: the flag
+# file is authoritative, and a damaged or unreadable one reads as OFF too. The
+# state key stays for compatibility (older builds read only that).
 
 AUTO_OFF_KEY = "autoOff"
 #: An engine repeats its ``auto-off`` no-switch event at most this often.
@@ -149,8 +154,28 @@ def auto_off(state: Mapping) -> AutoOff | None:
     )
 
 
+def effective_auto_off(backup_root: Path, state: Mapping) -> AutoOff | None:
+    """The marker that holds: the flag file's (authoritative; a damaged one
+    counts as off), else the state key's."""
+    flag = read_flag(backup_root)
+    if flag is not None:
+        return auto_off({AUTO_OFF_KEY: flag}) if flag else AutoOff(None, None, None)
+    return auto_off(state)
+
+
 def read_auto_off(backup_root: Path) -> AutoOff | None:
-    return auto_off(_StateFile(backup_root)._read_state())
+    return effective_auto_off(backup_root, _StateFile(backup_root)._read_state())
+
+
+def _state_is_damaged(path: Path) -> bool:
+    """The state file exists but cannot be parsed into an object."""
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return False
+    except (OSError, ValueError):
+        return True
+    return not isinstance(raw, dict)
 
 
 def set_auto_off(
@@ -159,21 +184,42 @@ def set_auto_off(
     """Turn automatic switching off (``off=True``) or back on. Returns
     whether anything changed; turning it off again keeps the first ``since``."""
     file = _StateFile(backup_root)
-    if not off and not file.state_path.exists():
+    flag_file = flag_path(backup_root)
+    if not off and not file.state_path.exists() and not os.path.lexists(flag_file):
         return False
     with file._state_lock():
         state = file._read_state()
+        damaged = _state_is_damaged(file.state_path)
+        flag = read_flag(backup_root)
+        in_state = isinstance(state.get(AUTO_OFF_KEY), Mapping)
         if off:
-            if isinstance(state.get(AUTO_OFF_KEY), Mapping):
-                return False
-            state[AUTO_OFF_KEY] = {"since": now, "by": by, "host": host}
-        else:
-            if AUTO_OFF_KEY not in state:
-                return False
+            if flag:
+                marker = dict(flag)
+            elif in_state:
+                marker = dict(state[AUTO_OFF_KEY])
+            else:
+                marker = {"since": now, "by": by, "host": host}
+            # Already off (flag file or state key): keep the first `since`,
+            # but make sure both copies exist.
+            changed = flag is None and not in_state
+            if not flag:
+                atomic_write_json(flag_file, {"schemaVersion": 1, AUTO_OFF_KEY: marker})
+            if not in_state and not damaged:
+                state[AUTO_OFF_KEY] = marker
+                state["schemaVersion"] = aw.STATE_SCHEMA_VERSION
+                atomic_write_json(file.state_path, state)
+            return changed
+        changed = flag is not None or AUTO_OFF_KEY in state
+        if flag is not None:
+            try:
+                flag_file.unlink()
+            except FileNotFoundError:
+                pass
+        if AUTO_OFF_KEY in state and not damaged:
             state.pop(AUTO_OFF_KEY, None)
-        state["schemaVersion"] = aw.STATE_SCHEMA_VERSION
-        atomic_write_json(file.state_path, state)
-    return True
+            state["schemaVersion"] = aw.STATE_SCHEMA_VERSION
+            atomic_write_json(file.state_path, state)
+        return changed
 
 
 def auto_off_detail(off: AutoOff) -> str:
@@ -188,7 +234,7 @@ def auto_off_hold(engine, state: Mapping) -> "aw.TickOutcome | None":
     """The engine's guard: ``NO_ACTION`` while auto switching is off, after
     one ``auto-off`` no-switch event per :data:`AUTO_OFF_EVENT_EVERY_S`;
     None (carry on) while it is on."""
-    off = auto_off(state)
+    off = effective_auto_off(engine.state_path.parent, state)
     if off is None:
         if getattr(engine, _AUTO_OFF_ATTR, None) is not None:
             setattr(engine, _AUTO_OFF_ATTR, None)

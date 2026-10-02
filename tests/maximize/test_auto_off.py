@@ -159,6 +159,96 @@ class TestMaximizeEngine:
         assert "auto-off" in REASONS
 
 
+class TestFlagFile:
+    """The flag lives in its own small file too, so a state file that cannot
+    be parsed cannot silently turn automatic switching back on."""
+
+    def _flag(self, root):
+        return root / "auto_off.json"
+
+    def test_turning_off_writes_the_flag_and_keeps_the_state_key(self, tmp_path):
+        assert pause.set_auto_off(tmp_path, True, by="cli", now=NOW, host="mbp") is True
+        assert json.loads(self._flag(tmp_path).read_text())["autoOff"] == {
+            "since": NOW, "by": "cli", "host": "mbp"
+        }
+        assert json.loads((tmp_path / "autoswitch_state.json").read_text())["autoOff"] == {
+            "since": NOW, "by": "cli", "host": "mbp"
+        }
+
+    def test_turning_on_removes_both(self, tmp_path):
+        pause.set_auto_off(tmp_path, True, by="cli", now=NOW)
+        assert pause.set_auto_off(tmp_path, False, by="cli", now=NOW) is True
+        assert not self._flag(tmp_path).exists()
+        assert "autoOff" not in json.loads((tmp_path / "autoswitch_state.json").read_text())
+        assert pause.read_auto_off(tmp_path) is None
+        assert pause.set_auto_off(tmp_path, False, by="cli", now=NOW) is False
+
+    def test_a_corrupt_state_file_keeps_it_off(self, tmp_path):
+        pause.set_auto_off(tmp_path, True, by="cli", now=NOW, host="mbp")
+        (tmp_path / "autoswitch_state.json").write_text("{not json")
+        assert pause.read_auto_off(tmp_path) == pause.AutoOff(NOW, "cli", "mbp")
+        assert mxview.read_state(tmp_path).auto_off is True
+        assert mxview.read_state(tmp_path).auto_off_by == "cli"
+
+    def test_a_state_file_replaced_without_the_key_keeps_it_off(self, tmp_path):
+        pause.set_auto_off(tmp_path, True, by="cli", now=NOW)
+        (tmp_path / "autoswitch_state.json").write_text(json.dumps({"schemaVersion": 1}))
+        assert pause.read_auto_off(tmp_path) is not None
+        assert mxview.read_state(tmp_path).auto_off is True
+
+    @pytest.mark.parametrize("content", ["", "{not json", "[]", "{}", '{"autoOff": 5}', "\xff\xfe"])
+    def test_a_damaged_flag_file_reads_as_off(self, tmp_path, content):
+        self._flag(tmp_path).write_bytes(content.encode("latin-1"))
+        assert pause.read_auto_off(tmp_path) is not None
+        assert mxview.read_state(tmp_path).auto_off is True
+
+    def test_an_unreadable_flag_file_reads_as_off(self, tmp_path):
+        self._flag(tmp_path).mkdir()  # exists, but cannot be read as a file
+        assert pause.read_auto_off(tmp_path) is not None
+        assert mxview.read_state(tmp_path).auto_off is True
+
+    def test_state_key_alone_still_counts_for_older_builds(self, tmp_path):
+        (tmp_path / "autoswitch_state.json").write_text(
+            json.dumps({"autoOff": {"since": NOW, "by": "cli"}})
+        )
+        assert pause.read_auto_off(tmp_path) is not None
+
+    def test_turning_off_does_not_overwrite_a_corrupt_state_file(self, tmp_path):
+        (tmp_path / "autoswitch_state.json").write_text("{not json")
+        assert pause.set_auto_off(tmp_path, True, by="cli", now=NOW) is True
+        assert (tmp_path / "autoswitch_state.json").read_text() == "{not json"
+        assert pause.read_auto_off(tmp_path) is not None
+
+    def test_turning_on_works_while_the_state_file_is_corrupt(self, tmp_path):
+        pause.set_auto_off(tmp_path, True, by="cli", now=NOW)
+        (tmp_path / "autoswitch_state.json").write_text("{not json")
+        assert pause.set_auto_off(tmp_path, False, by="cli", now=NOW) is True
+        assert pause.read_auto_off(tmp_path) is None
+
+    def test_off_again_keeps_the_first_since_and_heals_a_missing_flag(self, tmp_path):
+        pause.set_auto_off(tmp_path, True, by="cli", now=NOW, host="mbp")
+        self._flag(tmp_path).unlink()
+        assert pause.set_auto_off(tmp_path, True, by="fleet", now=NOW + 5) is False
+        assert pause.read_auto_off(tmp_path) == pause.AutoOff(NOW, "cli", "mbp")
+        assert self._flag(tmp_path).exists()
+
+    def test_engine_stays_off_through_a_corrupt_state_file(self, temp_home):
+        h = make(temp_home)
+        pause.set_auto_off(h.switcher.backup_dir, True, by="cli", now=NOW)
+        (h.switcher.backup_dir / "autoswitch_state.json").write_text("{not json")
+        assert h.tick_with_usage(HARD) is TickOutcome.NO_ACTION
+        assert h.active_number() == 1
+        # The tick rewrote the state without the key; the flag still holds.
+        assert h.tick_with_usage(HARD) is TickOutcome.NO_ACTION
+        assert h.active_number() == 1
+
+    def test_engine_stays_off_with_a_damaged_flag_file(self, temp_home):
+        h = make(temp_home)
+        (h.switcher.backup_dir / "auto_off.json").write_text("garbage")
+        assert h.tick_with_usage(HARD) is TickOutcome.NO_ACTION
+        assert h.active_number() == 1
+
+
 class TestUpstreamStrategies:
     USAGE = {
         "1": {"five_hour": {"pct": 95.0}, "seven_day": {"pct": 10.0}},

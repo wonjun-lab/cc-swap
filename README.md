@@ -190,7 +190,7 @@ cc-swap auto on            # resume
 cc-swap auto status        # on or off, who turned it off and when (--json for scripts)
 ```
 
-`off` is persistent and applies to whichever engine runs (the service, a terminal `cc-swap auto`, the TUI or the menu bar): it is stored as `autoOff` in `autoswitch_state.json`, survives restarts, and is picked up on the next tick without a restart. The engine keeps polling and deciding (Fleet's `now` line reads `AUTO OFF` and what it *would* do; the engine log says `no switch: auto-off` at most once an hour), but it never switches and never primes; manual switches still work. In Fleet, Mode (`m`) → `o` turns it off and on.
+`off` is persistent and applies to whichever engine runs (the service, a terminal `cc-swap auto`, the TUI or the menu bar): it is stored as `autoOff` in `autoswitch_state.json` and mirrored in its own file, `auto_off.json` in the backup root, so a damaged state file cannot switch it back on (the file is authoritative, and an unreadable or damaged `auto_off.json` reads as off; `cc-swap auto on` removes it), survives restarts, and is picked up on the next tick without a restart. The engine keeps polling and deciding (Fleet's `now` line reads `AUTO OFF` and what it *would* do; the engine log says `no switch: auto-off` at most once an hour), but it never switches and never primes; manual switches still work. In Fleet, Mode (`m`) → `o` turns it off and on.
 
 ## Fleet: the TUI home for maximize
 

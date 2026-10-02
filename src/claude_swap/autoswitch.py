@@ -2369,9 +2369,9 @@ class AutoSwitchEngine:
             if result and result.get("autoOff") and not result.get("switched"):
                 # `cc-swap auto off` landed after this tick read the state:
                 # the switch refused, which is not an already-active no-op.
-                from claude_swap.maximize.pause import auto_off, auto_off_detail
+                from claude_swap.maximize.pause import auto_off_detail, effective_auto_off
 
-                off = auto_off(self._read_state())
+                off = effective_auto_off(self.state_path.parent, self._read_state())
                 self._emit(
                     NoSwitchEvent(
                         reason="auto-off",
