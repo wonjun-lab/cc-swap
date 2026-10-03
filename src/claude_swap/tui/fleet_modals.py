@@ -440,11 +440,17 @@ class MenuModal(ModalScreen["str | None"]):
     """
     BINDINGS = [Binding("escape,b", "close", "Close", show=False)]
 
-    def __init__(self, rows: list[MenuRow], *, title: str = "Menu", note: str = "") -> None:
+    def __init__(
+        self, rows: list[MenuRow], *, title: str = "Menu", note: str = "",
+        digits: str | None = None,
+    ) -> None:
         super().__init__()
         self._rows = rows
         self._title = title
         self._note = note
+        # A digit that is no item's key dismisses with ``digits + digit``
+        # (the hold picker: typing a time starts the time input).
+        self._digits = digits
         self._by_key = {r.key: r.action for r in rows}
 
     def compose(self) -> ComposeResult:
@@ -471,7 +477,10 @@ class MenuModal(ModalScreen["str | None"]):
         self.query_one("#fx-menu-list", ListView).focus()
 
     def on_key(self, event) -> None:
-        action = self._by_key.get(event.character or "")
+        char = event.character or ""
+        action = self._by_key.get(char)
+        if action is None and self._digits is not None and len(char) == 1 and char.isdigit():
+            action = self._digits + char
         if action is not None and event.key not in ("enter", "escape"):
             event.stop()
             self.dismiss(action)
@@ -507,17 +516,22 @@ class TextInputModal(ModalScreen["str | None"]):
     """
     BINDINGS = [Binding("escape", "cancel", "Cancel", show=False)]
 
-    def __init__(self, title: str, prompt: str, value: str = "") -> None:
+    def __init__(
+        self, title: str, prompt: str, value: str = "", *, select: bool = True
+    ) -> None:
         super().__init__()
         self._title = title
         self._prompt = prompt
         self._value = value
+        # False: the value is the start of what is being typed (the cursor
+        # goes after it), not a default to type over.
+        self._select = select
 
     def compose(self) -> ComposeResult:
         with Vertical(classes="modal-box modal-box-wide fx-modal"):
             yield Label(self._title, classes="modal-title")
             yield Static(self._prompt, classes="modal-body", markup=False)
-            yield Input(value=self._value, id="fx-text-input")
+            yield Input(value=self._value, id="fx-text-input", select_on_focus=self._select)
             yield Static("enter save · esc cancel", classes="modal-hint")
 
     def on_mount(self) -> None:

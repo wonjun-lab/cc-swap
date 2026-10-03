@@ -905,7 +905,7 @@ class TestHoldKey:
             assert isinstance(app.screen, MenuModal)
             assert app.screen._title == f"Hold #1 {EMAILS[0]} — stay on this account"
             started = time.time()
-            await pilot.press("2")
+            await pilot.press("t")  # two hours
             await _open(pilot)
             assert isinstance(app.screen, FleetScreen)
             held = hold.read_hold(tmp_path, now=time.time())
@@ -941,6 +941,37 @@ class TestHoldKey:
             await pilot.press(*"later", "enter")
             await _open(pilot)
             assert hold.read_hold(tmp_path, now=time.time()) == held
+
+    async def test_typing_a_time_in_the_picker_types_it_and_never_holds_an_hour(
+        self, tmp_path, held_by_service
+    ):
+        from claude_swap.maximize import hold
+        from claude_swap.tui.fleet_modals import TextInputModal
+
+        app = make_app(_six(tmp_path))
+        async with app.run_test(size=(160, 45)) as pilot:
+            await _open(pilot)
+            await pilot.press("h", "1")
+            await _open(pilot)
+            assert isinstance(app.screen, TextInputModal)
+            assert hold.read_hold(tmp_path, now=time.time()) is None  # no 1-hour hold
+            await pilot.press(*"2:00", "enter")
+            await _open(pilot)
+            held = hold.read_hold(tmp_path, now=time.time())
+            assert held is not None
+            assert held.until == hold.parse_until("12:00", held.since)
+
+    async def test_h_twice_holds_one_hour(self, tmp_path, held_by_service):
+        from claude_swap.maximize import hold
+
+        app = make_app(_six(tmp_path))
+        async with app.run_test(size=(160, 45)) as pilot:
+            await _open(pilot)
+            started = time.time()
+            await pilot.press("h", "h")
+            await _open(pilot)
+            held = hold.read_hold(tmp_path, now=time.time())
+            assert started + 3600 - 5 <= held.until <= time.time() + 3600
 
     async def test_esc_closes_the_picker_without_a_hold(self, tmp_path, held_by_service):
         from claude_swap.maximize import hold

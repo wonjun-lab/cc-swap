@@ -150,24 +150,30 @@ def menu_rows(
     return out
 
 
-#: ``h``'s fixed choices: (key, hours).
-HOLD_HOURS: tuple[tuple[str, int], ...] = (("1", 1), ("2", 2), ("4", 4))
-#: The hold picker's actions: ``hold:<seconds>``, then these two.
-HOLD_UNTIL, HOLD_OFF = "hold:until", "hold:off"
+#: ``h``'s fixed choices: (key, title, hours). Letters, never digits: a
+#: digit typed in the picker starts a time (``12:00``) instead, so it can
+#: never set a 1-hour hold by accident. ``h h`` holds one hour.
+HOLD_HOURS: tuple[tuple[str, str, int], ...] = (
+    ("h", "One hour", 1), ("t", "Two hours", 2), ("f", "Four hours", 4),
+)
+#: The hold picker's actions: ``hold:<seconds>``, then these two, and a
+#: digit typed in the picker (``hold:typed:<digit>``).
+HOLD_UNTIL, HOLD_OFF, HOLD_TYPED = "hold:until", "hold:off", "hold:typed:"
 
 
 def hold_rows(held_until: float | None, now: float) -> list[MenuRow]:
-    """The ``h`` picker: 1h / 2h / 4h / until a time / off, each with when
-    it would end. ``held_until`` is the end of the hold on the active
-    account (None: no hold)."""
+    """The ``h`` picker: one / two / four hours / until a time / off, each
+    with when it would end. ``held_until`` is the end of the hold on the
+    active account (None: no hold)."""
     from claude_swap.maximize.hold import clock_text
 
     rows = [
-        MenuRow(key, f"Hold for {hours} hour{'s' if hours != 1 else ''}",
-                f"until {clock_text(now + hours * 3600, now)}", f"hold:{hours * 3600}")
-        for key, hours in HOLD_HOURS
+        MenuRow(key, title, f"until {clock_text(now + hours * 3600, now)}",
+                f"hold:{hours * 3600}")
+        for key, title, hours in HOLD_HOURS
     ]
-    rows.append(MenuRow("u", "Until a time…", "HH:MM, local time (the next one)", HOLD_UNTIL))
+    rows.append(MenuRow("u", "Until a time…", "or just type it: HH:MM, local time",
+                        HOLD_UNTIL))
     if held_until is not None:
         rows.append(MenuRow("o", "Off", f"lift the hold (it ends {clock_text(held_until, now)})",
                             HOLD_OFF, "warn"))
@@ -368,8 +374,8 @@ def help_entries(idle_pattern: str | None = None) -> list[tuple[str, str]]:
         ("enter", "switch to it (asks first when switching would not land there)"),
         ("r", "re-login it (guided; cc-swap launches nothing)"),
         ("l", "last resort on/off"),
-        ("h", "hold: stay on the active account for 1, 2 or 4 hours or until a time, "
-              "or lift the hold (o)"),
+        ("h", "hold: stay on the active account for 1, 2 or 4 hours (h, t, f) or until a "
+              "time (u, or just type it: 12:00), or lift the hold (o)"),
         ("m", "menu: o automatic switching on/off · m mode · s strategy · p prime · "
               "f fetch · x exclude · a accounts · e engine log · v history · "
               "u update · c classic · q quit"),

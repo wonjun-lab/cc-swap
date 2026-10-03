@@ -1018,7 +1018,8 @@ class FleetScreen(Screen):
 
     def action_hold(self) -> None:
         """h: hold the ACTIVE account (whatever row is selected) — stay on
-        it for 1, 2 or 4 hours or until a time, or lift the hold
+        it for 1, 2 or 4 hours (h, t, f) or until a time (u, or a digit
+        starts typing one), or lift the hold
         (``cc-swap hold``). Any engine honours it on its next tick."""
         from claude_swap.tui.fleet_modals import MenuModal
 
@@ -1035,6 +1036,7 @@ class FleetScreen(Screen):
                 menus.hold_rows(current.until if current is not None else None, now),
                 title=menus.HOLD_TITLE.format(number=row.number, name=row.name),
                 note=menus.HOLD_NOTE,
+                digits=menus.HOLD_TYPED,
             ),
             partial(self._on_hold_choice, row.number),
         )
@@ -1044,13 +1046,16 @@ class FleetScreen(Screen):
             return
         if action == menus.HOLD_OFF:
             self._hold_write(slot, None)
-        elif action == menus.HOLD_UNTIL:
+        elif action == menus.HOLD_UNTIL or action.startswith(menus.HOLD_TYPED):
             from claude_swap.tui.fleet_modals import TextInputModal
 
             self.app.push_screen(
                 TextInputModal(
                     f"Hold #{slot} until", "A local time, HH:MM (the next one; at most 24h "
                     "ahead). Enter holds, esc cancels.",
+                    value=action.removeprefix(menus.HOLD_TYPED)
+                    if action.startswith(menus.HOLD_TYPED) else "",
+                    select=False,
                 ),
                 partial(self._on_hold_until, slot),
             )

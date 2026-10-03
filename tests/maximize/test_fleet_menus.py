@@ -226,10 +226,13 @@ def test_the_hold_picker_offers_1_2_4_hours_until_and_off():
 
     now = 1_790_000_000.0
     rows = menus.hold_rows(None, now)
-    assert [r.key for r in rows] == ["1", "2", "4", "u", "o"]
+    # Letters, never digits: a digit starts typing a time (12:00), so it can
+    # never set a 1-hour hold by accident.
+    assert [r.key for r in rows] == ["h", "t", "f", "u", "o"]
+    assert not any(r.key.isdigit() for r in rows)
     assert [r.action for r in rows] == [
         "hold:3600", "hold:7200", "hold:14400", menus.HOLD_UNTIL, menus.HOLD_OFF]
-    assert rows[1].title == "Hold for 2 hours" and rows[0].title == "Hold for 1 hour"
+    assert [r.title for r in rows[:3]] == ["One hour", "Two hours", "Four hours"]
     assert rows[1].note == f"until {clock_text(now + 7200, now)}"
     assert (rows[-1].note, rows[-1].tone) == ("no hold now", "plain")
     held = menus.hold_rows(now + 1800, now)[-1]
