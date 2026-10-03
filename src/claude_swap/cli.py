@@ -774,7 +774,8 @@ Defaults live in settings.json in the backup root; flags override them.
         EngineBusyError,
         claim_for_auto,
     )
-    from claude_swap.autoswitch import AutoSwitchEngine, AutoSwitchEvent
+    from claude_swap.autoswitch import AutoSwitchEngine, AutoSwitchEvent, account_names
+    from claude_swap.maximize.hold import display_name_hook
     from claude_swap.maximize.logrotate import LogRotator
     from claude_swap.printer import accent, print_line, stdout_gone, yellowed
     from claude_swap.settings import (
@@ -801,7 +802,15 @@ Defaults live in settings.json in the backup root; flags override them.
 
     def human_emit(event: AutoSwitchEvent) -> None:
         stamp = _time.strftime("%H:%M:%S")
-        line = event.human()
+        # cc-swap: under maximize, name accounts by alias / short name, not
+        # address (auto.log gets pasted into issues). The strategy is read per
+        # line: a hot reload can change it.
+        live = running[0].settings if running else settings
+        if live.strategy == "maximize":
+            with account_names(display_name_hook(switcher.backup_dir)):
+                line = event.human()
+        else:
+            line = event.human()
         if event.kind == "switch":
             line = accent(line)
         elif event.kind in ("error", "account-quarantined"):
