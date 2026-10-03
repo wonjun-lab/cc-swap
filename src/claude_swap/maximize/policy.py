@@ -61,9 +61,12 @@ mark in the last point (99 or more) fires with up to a whole point left.
 When every window that reached its hard mark is listed in ``rideWindows``
 and still under 100%, the hard switch waits until
 
-    t_switch = first reading at the mark + q × T1 − ``RIDE_MARGIN_S``
+    t_switch = arm time + q × T1 − ``RIDE_MARGIN_S``
 
-(at most ``rideMaxMin`` after that first reading). ``T1`` is the time one
+(at most ``rideMaxMin`` after the arm time). The arm time is the reading
+before the first one at the mark (the crossing may have come right after
+it), else ``ride.ARM_UNKNOWN_GAP_S`` before that first one
+(``ride.arm_time``, ``Snapshot.ride_armed_at``). ``T1`` is the time one
 point takes (the shorter of ``Snapshot.ride_point_s``, measured from
 whole-point steps, and the recent velocity's; unknown = no ride), ``q``
 the learned share
@@ -402,9 +405,11 @@ def ride_point_s(snap: Snapshot, window: Window) -> float | None:
 
 
 def ride_armed_at(snap: Snapshot, window: Window) -> float:
-    """When ``window`` was first seen at its hard mark: the engine's record
-    (``Snapshot.ride_armed_at``), else the oldest sample of the newest run
-    at the mark, else ``now``."""
+    """When ``window``'s ride counts from: the engine's record
+    (``Snapshot.ride_armed_at``), else read off the samples as the engine
+    reads it (``ride.arm_time``): the last sample below the mark before
+    the newest run at it, else ``ride.ARM_UNKNOWN_GAP_S`` before the run's
+    first sample (or ``now``)."""
     armed = snap.ride_armed_at.get(window)
     if armed is not None and math.isfinite(armed):
         return min(float(armed), snap.now)
@@ -413,9 +418,9 @@ def ride_armed_at(snap: Snapshot, window: Window) -> float:
     for x in reversed(snap.samples):
         pct = x.pct5 if window == "5h" else x.pct7
         if not cap <= pct < LIMIT_PCT:
-            break
+            return learned_ride.arm_time(first, x.ts)
         first = min(first, x.ts)
-    return first
+    return learned_ride.arm_time(first, None)
 
 
 @dataclass(frozen=True)

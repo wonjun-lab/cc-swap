@@ -70,7 +70,21 @@ class TestArming:
         # only the engine's T1 (1 h) is known.
         samples = rows((900, 36, 98), (600, 37, 99), (300, 38.5, 99), (0, 40, 99))
         d = decide(ride_snap(samples=samples, armed=None, point_s=3600))
-        assert d.ride_until == pytest.approx(NOW - 600 + 0.3 * 3600 - RIDE_MARGIN_S)
+        # 99.0 was crossed after the 98 reading, perhaps right after it.
+        assert d.ride_until == pytest.approx(NOW - 900 + 0.3 * 3600 - RIDE_MARGIN_S)
+
+    def test_with_no_reading_below_the_mark_it_arms_a_slow_poll_back(self):
+        from claude_swap.maximize import ride
+
+        samples = rows((300, 38.5, 99), (0, 40, 99))
+        d = decide(ride_snap(samples=samples, armed=None, point_s=3600))
+        assert d.ride_until == pytest.approx(
+            NOW - 300 - ride.ARM_UNKNOWN_GAP_S + 0.3 * 3600 - RIDE_MARGIN_S
+        )
+        d = decide(ride_snap(samples="none", armed=None, point_s=3600))
+        assert d.ride_until == pytest.approx(
+            NOW - ride.ARM_UNKNOWN_GAP_S + 0.3 * 3600 - RIDE_MARGIN_S
+        )
 
     def test_q_is_clamped(self):
         assert decide(ride_snap(q=5.0)).ride_until == pytest.approx(

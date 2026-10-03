@@ -54,6 +54,23 @@ INTERVAL_MAX_AGE_S = 6 * 3600.0
 #: with no rise on either window is an idle period (``observe``'s
 #: ``quiet_s``; the engine passes the setting).
 DEFAULT_QUIET_S = 600.0
+#: The arm time. A reading is floored and taken a poll after the one
+#: before it, so a window first read at its mark may have crossed it any
+#: time after the previous reading. The ride counts from that previous
+#: reading (the earliest the crossing can be: conservative) when it is at
+#: most ``STEP_MAX_GAP_S`` older; with no such reading, from this long
+#: before the first one — ``poll_policy.ACTIVE_MAX_INTERVAL_S``, the
+#: longest the active account's normal cadence leaves between readings.
+ARM_UNKNOWN_GAP_S = 300.0
+
+
+def arm_time(read_at: float, previous_at: float | None) -> float:
+    """When a window first read at its hard mark at ``read_at`` is armed:
+    the previous reading's time (``previous_at``, below the mark) when it
+    is recent, else :data:`ARM_UNKNOWN_GAP_S` before ``read_at``."""
+    if previous_at is not None and 0 <= read_at - previous_at <= STEP_MAX_GAP_S:
+        return previous_at
+    return read_at - ARM_UNKNOWN_GAP_S
 
 
 def _num(value: object) -> float | None:

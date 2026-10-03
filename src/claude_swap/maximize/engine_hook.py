@@ -798,7 +798,11 @@ def _ride_track(
             item = armed.get(w)
             if item is None:
                 read_at = _finite(fetched_at)
-                at = read_at if read_at is not None and read_at <= now else now
+                read_at = read_at if read_at is not None and read_at <= now else now
+                # From the reading before this one (or a slow poll back):
+                # the window may have crossed its mark right after it.
+                previous = max((x.ts for x in samples if x.ts < read_at), default=None)
+                at = learned_ride.arm_time(read_at, previous)
                 item = armed[w] = {"at": at, "pointS": None}
             if item["pointS"] is None:
                 # The shorter of the measured steps and the recent velocity:
