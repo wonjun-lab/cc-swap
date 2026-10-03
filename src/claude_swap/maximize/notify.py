@@ -146,6 +146,7 @@ def scrub(text: str) -> str:
     token, one line, bounded."""
     text = _TOKEN_RE.sub("…", str(text))
     text = _EMAIL_RE.sub("…", text)
+    text = "".join(" " if ord(c) < 32 or ord(c) == 127 else c for c in text)  # NUL, BEL …
     text = " ".join(text.split())
     return text if len(text) <= TEXT_MAX else text[: TEXT_MAX - 1] + "…"
 
@@ -217,7 +218,7 @@ def _run(argv: list[str]) -> bool:
             argv, capture_output=True, timeout=TIMEOUT_S, check=False,
             stdin=subprocess.DEVNULL,
         )
-    except (OSError, subprocess.SubprocessError):
+    except (OSError, ValueError, subprocess.SubprocessError):  # ValueError: a NUL byte
         return False
     return result.returncode == 0
 

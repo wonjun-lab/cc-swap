@@ -112,7 +112,7 @@ def marker(root: Path, state: Mapping | None = None) -> AccountHold | None:
     except FileNotFoundError:
         mirror = state.get(STATE_KEY) if isinstance(state, Mapping) else None
         return parse_marker(mirror)
-    except (OSError, ValueError):  # unreadable, not JSON, not UTF-8
+    except (OSError, ValueError, RecursionError):  # unreadable, not JSON, nested too deep
         return None
     return parse_marker(raw.get(HOLD_KEY) if isinstance(raw, dict) else None)
 
@@ -174,7 +174,7 @@ def read_state(root: Path) -> dict:
     """``autoswitch_state.json`` as a dict (``{}`` when missing or unreadable)."""
     try:
         raw = json.loads((Path(root) / "autoswitch_state.json").read_text(encoding="utf-8"))
-    except (OSError, ValueError):
+    except (OSError, ValueError, RecursionError):
         return {}
     return raw if isinstance(raw, dict) else {}
 
@@ -397,7 +397,7 @@ def short_name(record: Mapping | None) -> str:
 def _names(root: Path) -> dict[str, str]:
     try:
         data = json.loads((Path(root) / "sequence.json").read_text(encoding="utf-8"))
-    except (OSError, ValueError):
+    except (OSError, ValueError, RecursionError):
         return {}
     accounts = data.get("accounts") if isinstance(data, dict) else None
     if not isinstance(accounts, dict):

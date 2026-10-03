@@ -92,6 +92,19 @@ def test_delivery_is_time_bounded_and_never_raises(monkeypatch):
 # -- privacy ------------------------------------------------------------------------------------
 
 
+def test_control_characters_never_reach_the_notifier(monkeypatch):
+    def run(argv, **kw):  # what the real one does with a NUL in an argument
+        if any("\x00" in a for a in argv):
+            raise ValueError("embedded null byte")
+        return subprocess.CompletedProcess(argv, 0)
+
+    monkeypatch.setattr(notify.subprocess, "run", run)
+    assert notify.scrub("a\x00b\x07c") == "a b c"
+    # Even unscrubbed, an embedded NUL is a failed send, never an exception.
+    backend = REAL_SYSTEM_BACKEND({}, "linux", lambda _n: "/usr/bin/notify-send")
+    assert backend.send("t", "a\x00b") is False
+
+
 @pytest.mark.parametrize(("text", "expected"), [
     ("switched to dev.shared@example.com", "switched to …"),
     ("token sk-ant-oat01-ABCDEFGHIJ leaked", "token … leaked"),

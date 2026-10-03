@@ -106,6 +106,13 @@ def test_a_damaged_hold_file_is_no_hold(tmp_path, content):
     assert h.marker(tmp_path, {h.STATE_KEY: {"slot": "1", "until": NOW + H}}) is None
 
 
+def test_a_pathologically_nested_hold_file_is_no_hold(tmp_path):
+    # The reviewer's corrupt.py probe: json.loads raises RecursionError.
+    (tmp_path / h.HOLD_FILENAME).write_text("[" * 100000 + "]" * 100000)
+    assert h.marker(tmp_path, {h.STATE_KEY: {"slot": "1", "until": NOW + H}}) is None
+    assert mxview.read_state(tmp_path).hold is None
+
+
 def test_a_hold_ends_at_its_end_and_a_far_future_one_is_none():
     hold = h.AccountHold("1", NOW + H)
     assert h.current(hold, NOW) == hold

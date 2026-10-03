@@ -181,7 +181,7 @@ def read_state(backup_root: Path) -> MaximizeState:
     flag_map = flag if flag else {}
     try:
         raw = json.loads((Path(backup_root) / STATE_FILENAME).read_text(encoding="utf-8"))
-    except (OSError, ValueError):
+    except (OSError, ValueError, RecursionError):
         raw = None
     hold = account_hold.marker(Path(backup_root), raw if isinstance(raw, dict) else None)
     if hold is not None and account_hold.moved_away(Path(backup_root), hold):
