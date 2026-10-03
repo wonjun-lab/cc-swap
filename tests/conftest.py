@@ -736,6 +736,19 @@ def _no_claude_version_probe(monkeypatch):
     )
 
 
+# No test ever pops a real desktop notification (``osascript`` /
+# ``notify-send``): delivery is off for this whole process — threads that
+# outlive their test's monkeypatch included — and the backend lookup is
+# stubbed per test as well. Notification tests hand in a fake backend.
+os.environ["CC_SWAP_NOTIFY"] = "0"
+
+
+@pytest.fixture(autouse=True)
+def _no_real_desktop_notification(monkeypatch):
+    monkeypatch.setenv("CC_SWAP_NOTIFY", "0")
+    monkeypatch.setattr("claude_swap.maximize.notify.system_backend", lambda *a, **k: None)
+
+
 @pytest.fixture(autouse=True)
 def _deterministic_poll_jitter(monkeypatch):
     """Zero the poll-plan jitter so cadence tests are clock-exact; the jitter

@@ -15,8 +15,9 @@ the ``auto`` parser; ``prime verify`` is a ``prime`` subcommand; ``upgrade
 are listed in ``EXTRA_FORK_ACTIONS`` so they are held to the same rule.
 
 A route is the key path from the Fleet home screen. Since 0.4.0 the home
-screen has six keys (its footer) and everything else lives in the ``m``
-menu: ``"l"`` is a home key; ``"m p"`` is ``m`` (the menu) then ``p``;
+screen's keys are its footer (seven since 0.5.0 added ``h`` hold) and
+everything else lives in the ``m`` menu: ``"l"`` is a home key; ``"m p"`` is
+``m`` (the menu) then ``p``;
 ``"m a i"`` is the menu, ``a`` (Account settings), then ``i`` on that
 screen; ``"m m"`` is the menu's Mode modal.
 """
@@ -36,8 +37,10 @@ from claude_swap.tui.fleet import FleetScreen
 #: another command: ``upgrade`` gained ``--check`` and the service refresh;
 #: ``auto on|off|status`` is caught before the ``auto`` parser; ``prime
 #: verify`` is a ``prime`` subcommand.
+#: Upstream's ``alias`` is here too: the short names Fleet shows are the
+#: alias first (maximize/names.py), and Fleet's ``n`` edits it.
 EXTRA_FORK_ACTIONS: tuple[str, ...] = (
-    "upgrade", "auto on", "auto off", "auto status", "prime verify",
+    "upgrade", "auto on", "auto off", "auto status", "prime verify", "alias",
 )
 
 #: CLI action -> the Fleet key path that performs the same thing.
@@ -51,6 +54,8 @@ FLEET_ROUTES: dict[str, str] = {
     "auto on": "m o",  # menu → o: automatic switching back on
     # The home sentence says Auto OFF; menu → Mode's facts say by whom and since when.
     "auto status": "m m",
+    "hold": "h",  # home key: hold the active account (1h/2h/4h/until/off)
+    "alias": "n",  # row key: name the selected account (also m → a → n)
 }
 
 #: CLI action -> why Fleet deliberately has no twin.
@@ -74,6 +79,11 @@ KNOWN_ASYMMETRY: dict[str, str] = {
         "when it stopped reporting — a reset-wait, preempt or deferred rebalance in "
         "plain words — and ? shows the learned idle pattern; why is that same "
         "explanation for a shell"
+    ),
+    "notify": (
+        "desktop notifications are for when you are not looking at Fleet, and the "
+        "engine sends them; testing the system notifier and its settings is a shell job "
+        "(cc-swap config set notify.* turns them off)"
     ),
     "prime verify": (
         "spawns claude in a throwaway profile (and with --live spends a real prime) "
@@ -155,7 +165,7 @@ def _sub_keys(path: tuple[str, ...]) -> set[str]:
 def test_a_routed_fleet_key_path_is_bound_at_every_step(action, route):
     first, *rest = route.split()
     assert first in _fleet_keys(), f"Fleet binds no `{first}` for `cc-swap {action}`"
-    assert first in menus.HOME_KEYS, (
+    assert first in (*menus.HOME_KEYS, *menus.ROW_KEYS), (
         f"`{first}` (for `cc-swap {action}`) is not one of the home screen's keys"
     )
     path = (first,)

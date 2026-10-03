@@ -231,11 +231,14 @@ class TestSettingSpecs:
         }
 
     def test_defaults_match_dataclass(self):
+        from claude_swap.settings import NotifySettings
+
         sources = {
             "autoswitch": AutoSwitchSettings(),
             "ui": UiSettings(),
             "maximize": MaximizeSettings(),
             "prime": PrimeSettings(),
+            "notify": NotifySettings(),
         }
         for spec in SETTING_SPECS.values():
             assert spec.default == getattr(sources[spec.section], spec.field)

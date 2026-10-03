@@ -37,6 +37,7 @@ from claude_swap.maximize import primer as mxprimer
 from claude_swap.maximize import view as mxview
 from claude_swap.maximize.history import History as UsageHistory
 from claude_swap.maximize.model import AccountView, Hold, Snapshot, Switch
+from claude_swap.maximize.names import display_names
 from claude_swap.maximize.plan import parse_plan_override
 from claude_swap.maximize.score import days_left, landable
 from claude_swap.models import AccountSnapshot, AccountsSnapshot
@@ -219,7 +220,7 @@ def prime_text(cell: PrimeCell) -> str:
 @dataclass(frozen=True)
 class FleetRow:
     number: str
-    name: str            # alias, else email
+    name: str            # alias, else the short name (maximize/names.py)
     email: str
     org: str             # display tag: org name or "personal"
     active: bool
@@ -312,6 +313,7 @@ def fleet_rows(
             rank[row.number] = position
     by_row = {r.number: r for r in ranked}
     views = {v.number: v for v in msnap.accounts}
+    shown = display_names((a.number, a.email, a.alias) for a in snap.accounts)
     out: list[FleetRow] = []
     for acc in sorted(snap.accounts, key=lambda a: _slot(a.number)):
         v = views[acc.number]
@@ -324,7 +326,7 @@ def fleet_rows(
         out.append(
             FleetRow(
                 number=acc.number,
-                name=acc.alias or acc.email,
+                name=shown[acc.number],
                 email=acc.email,
                 org=acc.display_tag,
                 active=active,
@@ -508,7 +510,10 @@ def decision_view(
     would = {
         "switch": f"switch ({dv.trigger}){target}",
         "pending": f"switch at the next idle moment{target}",
-        "hold": f"hold ({dv.code})" if dv.code else "hold",
+        "hold": (
+            "hold (account hold)" if dv.code == "hold"
+            else f"hold ({dv.code})" if dv.code else "hold"
+        ),
         "exhausted": "every account is at its limit",
         "indeterminate": "fail over (usage unreadable)",
     }.get(dv.kind)
@@ -741,6 +746,24 @@ _LOGIN_TEXT: dict[str, Cell] = {
 
 def clip(text: str, width: int) -> str:
     return text if len(text) <= width else text[: max(width - 1, 0)] + "…"
+
+
+def name_request(
+    alias: str, shown: str, typed: str | None
+) -> tuple[str, str | None] | None:
+    """What Fleet's ``n`` asks of ``cc-swap alias`` for what was ``typed``
+    over the name ``shown``: ``("set", name)``, ``("unset", None)`` (empty:
+    back to the short name, maximize/names.py), or None — esc, nothing
+    changed, or nothing to clear. The alias rules themselves are the
+    switcher's (``set_alias``), exactly as the CLI's."""
+    if typed is None:
+        return None
+    typed = typed.strip()
+    if not typed:
+        return ("unset", None) if alias else None
+    if typed == shown:
+        return None
+    return "set", typed
 
 
 def switch_warning(row: FleetRow, mx: MaximizeSettings) -> str | None:

@@ -4,7 +4,7 @@ No Textual here, so every line can be checked without a terminal. The
 accounts are a table with a dim header (``home.COLUMNS``)::
 
     order  account          plan  5h            5h resets      …  status
-      ●    main@acme.dev #1  20x   ━━━┃━━━┃ 62%  1h47m · 07:10  …  ● active
+      ●    main@acme.dev #1  20x   ━━━┃━━━┃ 62%  1h47m      …  ● active
       1    side@acme.dev #2  5x    ───┃───┃  0%  not started    …  next
 
 laid out by ``home.table_plan``; under it, when there are rows to spare,
@@ -411,6 +411,15 @@ def status_text(
     return line
 
 
+def summary_text(cap: home.Capacity, width: int, now: float, palette: Palette) -> Text:
+    """The capacity summary over the column headers: the longest variant
+    of ``home.summary_variants`` that fits ``width``."""
+    line = Text(no_wrap=True, overflow="ellipsis")
+    for text, tone in home.fit_variant(home.summary_variants(cap, now), width):
+        line.append(text, style=tone_style(tone, palette))
+    return line
+
+
 def attention_text(parts: Sequence[str], tone: str, width: int, palette: Palette) -> Text:
     return Text(
         home.attention_line(parts, width), style=f"bold {tone_style(tone, palette)}",
@@ -419,7 +428,8 @@ def attention_text(parts: Sequence[str], tone: str, width: int, palette: Palette
 
 
 def keys_text(width: int, palette: Palette) -> Text:
-    """``enter switch · r re-login · l last resort · m menu · ? help · q quit``."""
+    """``enter switch · r re-login · l last resort · h hold · m menu · ? help
+    · q quit``."""
     keys = Text(no_wrap=True, overflow="ellipsis")
     for i, (key, what) in enumerate(home.key_hints(width)):
         if i:

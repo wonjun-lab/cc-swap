@@ -29,7 +29,7 @@ from tests.test_tui import (  # noqa: F401 (fake_engine is a fixture)
     settle,
 )
 
-FOOTER = "enter switch · r re-login · l last resort · m menu · ? help · q quit"
+FOOTER = "enter switch · r re-login · l last resort · h hold · m menu · ? help · q quit"
 
 
 def _settings(root, **maximize) -> None:
@@ -127,6 +127,10 @@ EMAILS = [
     "dev.shared@example.com", "dev.master@example.com", "jordan.lee@example.com",
     "jordan.lee@uni.example", "dev.llm0@example.com", "nightowl@example.com",
 ]
+#: What the table, the sentence and the attention line call them: the part
+#: before the @, the two jordan.lee told apart (maximize/names.py).
+NAMES = ["dev.shared", "dev.master", "jordan.lee@example", "jordan.lee@uni", "dev.llm0",
+         "nightowl"]
 
 
 def _six(root) -> FakeSwitcher:
@@ -355,7 +359,7 @@ class TestFleetScreen:
         async with app.run_test(size=(160, 40)) as pilot:
             await _open(pilot)
             assert _status(app).startswith(
-                "Auto ON · switching #1 main → #2 user2@example.com now (soft)"
+                "Auto ON · switching #1 main → #2 user2 now (soft)"
             )
             assert _cell(app, "1", "plan") == "20x"
             assert _cell(app, "2", "plan") == "—"  # nothing says
@@ -561,17 +565,28 @@ async def test_every_size_shows_the_table_with_headers_and_both_resets(
         keys = screen.query_one("#fx-keys")
         scroll = screen.query_one("#fx-scroll")
         detail = screen.query_one("#fx-detail")
-        # The sentence, the attention line, the headers and the footer are
-        # on screen, outside the scroll; blank lines only when tall enough.
+        summary = screen.query_one("#fx-summary")
+        # The sentence, the attention line, the capacity summary, the
+        # headers and the footer are on screen, outside the scroll; blank
+        # lines only when tall enough.
         top = 1 if height >= 20 else 0
         assert status.region.y == top and attention.region.y == top + 1
-        assert head.region.y == attention.region.y + 1 + top
+        # 200x16 has the rows for the panel but not for the summary too:
+        # the summary goes first.
+        assert plan.summary is (height >= 20)
+        if plan.summary:
+            assert summary.display and summary.region.y == attention.region.y + 1 + top
+            assert head.region.y == summary.region.y + 1
+            assert _plain(app, "#fx-summary").startswith("5h free: ")
+        else:
+            assert not summary.display
+            assert head.region.y == attention.region.y + 1 + top
         assert scroll.region.y == head.region.y + 1
         assert keys.region.y == height - 1 and scroll.region.bottom <= keys.region.y
         assert _status(app).startswith("Auto ON · ")
         assert "#2" in _status(app) and "when you pause" in _status(app)
         assert _plain(app, "#fx-attention").startswith(
-            f"! #5 {EMAILS[4]} needs re-login — select it, press r"
+            f"! #5 {NAMES[4]} needs re-login — select it, press r"
         )
         assert _plain(app, "#fx-keys") == FOOTER
         # The headers, each over its column (plan only when it fits).
@@ -603,7 +618,7 @@ async def test_every_size_shows_the_table_with_headers_and_both_resets(
             assert all(len(line.rstrip()) < width - 3 for line in _rows(app).values())
         if width >= 160:
             assert all(len(line.rstrip()) <= plan.total for line in _rows(app).values())
-            assert _cell(app, "1", "account") == f"{EMAILS[0]} #1"  # whole names
+            assert _cell(app, "1", "account") == f"{NAMES[0]} #1"  # whole short names
         # The selected account in full under the table, when it fits.
         assert detail.display
         assert detail.region.y == scroll.region.bottom
@@ -655,6 +670,23 @@ async def test_a_very_short_terminal_drops_the_panel_but_keeps_the_table(
         assert screen.query_one("#fx-scroll").region.height >= 2
         assert not screen.query_one("#fx-detail").display  # it goes first
         assert screen.query_one("#fx-head").display and screen._plan is not None
+
+
+@pytest.mark.asyncio
+async def test_short_names_everywhere_but_the_panel(tmp_path, held_by_service):
+    app = make_app(_six(tmp_path))
+    async with app.run_test(size=(160, 45)) as pilot:
+        await _open(pilot)
+        screen = app.screen
+        # The account column is as wide as the longest short name plus " #N".
+        assert screen._plan.width("account") == max(len(n) for n in NAMES) + 3
+        assert {n: _cell(app, n, "account") for n in SIX_ORDER} == {
+            str(i + 1): f"{name} #{i + 1}" for i, name in enumerate(NAMES)
+            if str(i + 1) in SIX_ORDER
+        }
+        for selector in ("#fx-status", "#fx-attention", "#fx-body"):
+            assert "example.com" not in _plain(app, selector), selector
+        assert EMAILS[0] in _plain(app, "#fx-detail")  # the whole address: the panel only
 
 
 @pytest.mark.asyncio
@@ -871,3 +903,238 @@ class TestKeys:
             await pilot.press("q")
             await pilot.pause()
         assert app.return_code == 0
+
+
+# -- n: name the selected account ------------------------------------------------------------------
+
+
+class AliasSwitcher(FakeSwitcher):
+    """FakeSwitcher with `cc-swap alias`'s rules: models.normalize_alias,
+    and no alias two accounts share."""
+
+    def set_alias(self, identifier: str, alias: str):
+        import dataclasses
+
+        from claude_swap.exceptions import ConfigError, ValidationError
+        from claude_swap.models import normalize_alias
+
+        try:
+            name = normalize_alias(alias)
+        except ValueError as e:
+            raise ValidationError(str(e)) from e
+        if any(a.alias == name and a.number != identifier for a in self._accounts):
+            raise ConfigError(f"Alias '{name}' is already used")
+        self.calls.append(("set_alias", identifier, name))
+        self._accounts = [dataclasses.replace(a, alias=name) if a.number == identifier else a
+                          for a in self._accounts]
+        return identifier, name
+
+    def unset_alias(self, identifier: str):
+        import dataclasses
+
+        self.calls.append(("unset_alias", identifier))
+        self._accounts = [dataclasses.replace(a, alias="") if a.number == identifier else a
+                          for a in self._accounts]
+        return identifier
+
+
+def _six_aliasable(root) -> AliasSwitcher:
+    six = _six(root)
+    return AliasSwitcher(six._accounts, root)
+
+
+@pytest.mark.asyncio
+class TestNameKey:
+    async def test_n_names_the_selected_account(self, tmp_path, held_by_service):
+        from claude_swap.tui.fleet_modals import TextInputModal
+
+        fake = _six_aliasable(tmp_path)
+        app = make_app(fake)
+        async with app.run_test(size=(160, 45)) as pilot:
+            await _open(pilot)
+            await pilot.press("down", "n")  # #2, the row below the active one
+            await _open(pilot)
+            assert isinstance(app.screen, TextInputModal)
+            box = app.screen.query_one("#fx-text-input")
+            assert box.value == NAMES[1]  # prefilled with what the table shows
+            await pilot.press(*"side", "enter")  # typing replaces it
+            await _open(pilot)
+            assert ("set_alias", "2", "side") in fake.calls
+            assert _cell(app, "2", "account") == "side #2"
+
+    async def test_an_empty_name_brings_the_short_name_back(self, tmp_path, held_by_service):
+        import dataclasses
+
+        fake = _six_aliasable(tmp_path)
+        fake._accounts = [dataclasses.replace(a, alias="side") if a.number == "2" else a
+                          for a in fake._accounts]
+        app = make_app(fake)
+        async with app.run_test(size=(160, 45)) as pilot:
+            await _open(pilot)
+            await pilot.press("down", "n", "backspace", "enter")  # clear it, save
+            await _open(pilot)
+            assert ("unset_alias", "2") in fake.calls
+            assert _cell(app, "2", "account") == f"{NAMES[1]} #2"
+
+    async def test_esc_and_an_unchanged_name_change_nothing(self, tmp_path, held_by_service):
+        fake = _six_aliasable(tmp_path)
+        app = make_app(fake)
+        async with app.run_test(size=(160, 45)) as pilot:
+            await _open(pilot)
+            await pilot.press("down", "down", "down", "down", "n")  # #4 jordan.lee@uni
+            await _open(pilot)
+            await pilot.press("escape")
+            await _open(pilot)
+            await pilot.press("n", "enter")  # unchanged: never sent (it has an @)
+            await _open(pilot)
+            assert not [c for c in fake.calls if "alias" in c[0]]
+
+    async def test_a_name_the_alias_rules_refuse_says_why(self, tmp_path, held_by_service):
+        from claude_swap.tui.modals import OutputModal
+
+        fake = _six_aliasable(tmp_path)
+        app = make_app(fake)
+        async with app.run_test(size=(160, 45)) as pilot:
+            await _open(pilot)
+            await pilot.press("down", "n", *"a,b", "enter")
+            await _open(pilot)
+            assert isinstance(app.screen, OutputModal)
+            assert "may only contain letters" in app.screen._output
+            assert not [c for c in fake.calls if c[0] == "set_alias"]
+
+
+# -- h: hold the active account ------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestHoldKey:
+    async def test_h_holds_the_active_account_and_the_sentence_says_so(
+        self, tmp_path, held_by_service
+    ):
+        from claude_swap.maximize import hold
+        from claude_swap.tui.fleet import FleetScreen
+        from claude_swap.tui.fleet_modals import MenuModal
+
+        app = make_app(_six(tmp_path))
+        async with app.run_test(size=(200, 40)) as pilot:
+            await _open(pilot)
+            await pilot.press("down", "down")  # the selection never matters: the active one
+            await pilot.press("h")
+            await _open(pilot)
+            assert isinstance(app.screen, MenuModal)
+            assert app.screen._title == f"Hold #1 {NAMES[0]} — stay on this account"
+            started = time.time()
+            await pilot.press("t")  # two hours
+            await _open(pilot)
+            assert isinstance(app.screen, FleetScreen)
+            held = hold.read_hold(tmp_path, now=time.time())
+            assert held.slot == "1" and held.by == "fleet"
+            assert started + 7200 - 5 <= held.until <= time.time() + 7200
+            status = _status(app)
+            assert status.startswith(f"Holding #1 {NAMES[0]} until ")
+            assert "(2h left) — only hard 98%/100% will move you (h to change)" in status
+            # h → o lifts it; the sentence goes back to the engine's word.
+            await pilot.press("h", "o")
+            await _open(pilot)
+            assert hold.read_hold(tmp_path, now=time.time()) is None
+            assert _status(app).startswith("Auto ON · ")
+
+    async def test_h_until_a_time(self, tmp_path, held_by_service):
+        from claude_swap.maximize import hold
+        from claude_swap.tui.fleet_modals import TextInputModal
+
+        app = make_app(_six(tmp_path))
+        async with app.run_test(size=(160, 45)) as pilot:
+            await _open(pilot)
+            await pilot.press("h", "u")
+            await _open(pilot)
+            assert isinstance(app.screen, TextInputModal)
+            await pilot.press(*"23:00", "enter")
+            await _open(pilot)
+            held = hold.read_hold(tmp_path, now=time.time())
+            assert held is not None
+            assert held.until == hold.parse_until("23:00", held.since)
+            # A time it cannot read changes nothing.
+            await pilot.press("h", "u")
+            await _open(pilot)
+            await pilot.press(*"later", "enter")
+            await _open(pilot)
+            assert hold.read_hold(tmp_path, now=time.time()) == held
+
+    async def test_typing_a_time_in_the_picker_types_it_and_never_holds_an_hour(
+        self, tmp_path, held_by_service
+    ):
+        from claude_swap.maximize import hold
+        from claude_swap.tui.fleet_modals import TextInputModal
+
+        app = make_app(_six(tmp_path))
+        async with app.run_test(size=(160, 45)) as pilot:
+            await _open(pilot)
+            await pilot.press("h", "1")
+            await _open(pilot)
+            assert isinstance(app.screen, TextInputModal)
+            assert hold.read_hold(tmp_path, now=time.time()) is None  # no 1-hour hold
+            await pilot.press(*"2:00", "enter")
+            await _open(pilot)
+            held = hold.read_hold(tmp_path, now=time.time())
+            assert held is not None
+            assert held.until == hold.parse_until("12:00", held.since)
+
+    async def test_h_twice_holds_one_hour(self, tmp_path, held_by_service):
+        from claude_swap.maximize import hold
+
+        app = make_app(_six(tmp_path))
+        async with app.run_test(size=(160, 45)) as pilot:
+            await _open(pilot)
+            started = time.time()
+            await pilot.press("h", "h")
+            await _open(pilot)
+            held = hold.read_hold(tmp_path, now=time.time())
+            assert started + 3600 - 5 <= held.until <= time.time() + 3600
+
+    async def test_esc_closes_the_picker_without_a_hold(self, tmp_path, held_by_service):
+        from claude_swap.maximize import hold
+        from claude_swap.tui.fleet import FleetScreen
+
+        app = make_app(_six(tmp_path))
+        async with app.run_test(size=(160, 45)) as pilot:
+            await _open(pilot)
+            await pilot.press("h", "escape")
+            await _open(pilot)
+            assert isinstance(app.screen, FleetScreen)
+            assert not (tmp_path / hold.HOLD_FILENAME).exists()
+
+    async def test_question_mark_is_help_and_h_is_not(self, tmp_path):
+        from claude_swap.tui.fleet_help import HelpScreen
+        from claude_swap.tui.fleet_modals import MenuModal
+
+        _settings(tmp_path)
+        app = make_app(_fleet(tmp_path))
+        async with app.run_test(size=(140, 40)) as pilot:
+            await _open(pilot)
+            await pilot.press("question_mark")
+            await pilot.pause()
+            assert isinstance(app.screen, HelpScreen)
+            await pilot.press("escape", "h")
+            await pilot.pause()
+            assert isinstance(app.screen, MenuModal)
+
+
+@pytest.mark.asyncio
+async def test_the_capacity_summary_sits_over_the_headers(tmp_path, held_by_service):
+    app = make_app(_six(tmp_path))
+    async with app.run_test(size=(160, 45)) as pilot:
+        await _open(pilot)
+        screen = app.screen
+        summary = _plain(app, "#fx-summary")
+        # Usable: #1 (62% 5h, past soft), #2, #3, #4, #6 (#5's login is dead).
+        assert summary.startswith("5h free: 4 accounts · next 5h back ")
+        assert "(#1) · 7d left this week ≈ 3.5 accounts · next 7d reset " in summary
+        assert screen.query_one("#fx-head").region.y == screen.query_one(
+            "#fx-summary").region.y + 1
+        await pilot.resize_terminal(80, 24)
+        await _open(pilot)
+        assert _plain(app, "#fx-summary") == "5h free: 4 accounts · 7d left this week ≈ 3.5 accounts"
+        await pilot.resize_terminal(80, 10)
+        await _open(pilot)
+        assert not screen.query_one("#fx-summary").display

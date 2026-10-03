@@ -3,9 +3,14 @@
 Fleet (``tui/fleet.py``) is the maximize home screen. It shows:
 
 * one plain-English sentence about the engine (:func:`status_variants`), with
-  a dim note on the right saying who runs it (:func:`holder_variants`);
+  a dim note on the right saying who runs it (:func:`holder_variants`); an
+  account hold (``cc-swap hold``, ``h``) on the active account reads
+  ``Holding #1 until 15:30 (2h left) — only hard 98%/100% will move you``;
 * at most one attention line, only when something needs you
   (:func:`attention_parts`);
+* a capacity summary over the table (:func:`capacity`,
+  :func:`summary_variants`): ``5h free: 4 accounts · next 5h back 07:10
+  (#3) · 7d left this week ≈ 2.3 accounts · next 7d reset Oct 5 12:51``;
 * every account as one row of a table with column headers (``order ·
   account · plan · 5h · 5h resets · 7d · 7d resets · status``), in the order
   :func:`ordered_rows` gives: the ``order`` column numbers where automatic
@@ -41,6 +46,7 @@ from typing import Literal
 
 from claude_swap import oauth
 from claude_swap.maximize import fleet as fx
+from claude_swap.maximize import hold as account_hold
 from claude_swap.settings import MaximizeSettings
 
 Tone = str
@@ -48,6 +54,9 @@ Seg = tuple[str, Tone]
 
 #: Fewer rows than this drops the blank lines around the status block.
 BLANKS_MIN_ROWS = 20
+#: Fewer rows than this never shows the capacity summary (every line goes
+#: to the table).
+SUMMARY_MIN_ROWS = 12
 
 
 def step_selection(order: Sequence[str], selected: str | None, direction: str) -> str | None:
@@ -227,13 +236,15 @@ def exact_reset(reset: float | None, now: float) -> str:
 
 
 def row_resets(row: fx.FleetRow, window: str, now: float, *, clock: bool) -> str:
-    """One row's ``5h resets`` (``1h47m · 07:10``) or ``7d resets``
-    (``3d19h · Oct 7 02:18``) cell: ``not started`` for a 5h window that is
-    not running (a working login), else :func:`resets_text`."""
+    """One row's ``5h resets`` (``1h47m``: the countdown alone at every
+    width, ``clock`` or not — the detail panel has the exact time) or ``7d
+    resets`` (``3d19h · Oct 7 02:18``, the clock only while ``clock``) cell:
+    ``not started`` for a 5h window that is not running (a working login),
+    else :func:`resets_text`."""
     if window == "5h":
         if row.login == "ok" and row.pct5 is not None and row.state5 == "cold":
             return NOT_STARTED
-        return resets_text(row.reset5, now, clock=clock, date=False)
+        return resets_text(row.reset5, now, clock=False)
     return resets_text(row.reset7, now, clock=clock)
 
 
@@ -242,7 +253,7 @@ def row_resets(row: fx.FleetRow, window: str, now: float, *, clock: bool) -> str
 # One row per account, a header over it. The columns, left to right:
 #
 #   order  account           plan  5h            5h resets      7d  …  7d resets  status
-#     ●    main@acme.dev #1  20x   ━━━┃━━━┃ 62%  1h47m · 07:10  …      …          ● active
+#     ●    main@acme.dev #1  20x   ━━━┃━━━┃ 62%  1h47m      …      …          ● active
 #
 # ``status`` follows ``7d resets`` directly, never the terminal's right
 # edge. :func:`table_plan` fits the columns to the terminal.
@@ -345,6 +356,7 @@ class TablePlan:
     detail: bool                              # the selected account's panel shows
     blanks: bool                              # blank lines around the status block
     room: int                                 # the width the screen lays text out in
+    summary: bool = False                     # the capacity summary over the headers
 
     def width(self, key: str) -> int:
         return dict(self.columns)[key]
@@ -398,7 +410,12 @@ def _name_room(room: int, needs: TableNeeds, columns: Sequence[tuple[str, int]],
 
 
 def table_plan(
-    width: int, height: int, needs: TableNeeds, *, attention: bool = False
+    width: int,
+    height: int,
+    needs: TableNeeds,
+    *,
+    attention: bool = False,
+    summary: bool = False,
 ) -> TablePlan:
     """The table's columns for a ``width`` x ``height`` terminal.
 
@@ -412,8 +429,11 @@ def table_plan(
     never go, so a terminal too narrow even for that clips the row's end.
 
     Height: the selected account's panel (``needs.detail`` lines) shows
-    under the table only when every row fits above it; on a short terminal
-    it goes first. The table itself is used at every size."""
+    under the table only when every row fits above it. The capacity summary
+    (``summary``: there is one to show) takes one line over the headers; on
+    a short terminal it goes first, before the panel — it shows only where
+    it costs the panel nothing, and never below :data:`SUMMARY_MIN_ROWS`
+    rows. The table itself is used at every size."""
     room = text_width(width)
     name = min(needs.name, NAME_CAP)
     columns: list[tuple[str, int]] | None = None
@@ -438,11 +458,102 @@ def table_plan(
                            name=max(min(name, fit), 1))
     blanks = height >= BLANKS_MIN_ROWS
     fixed_lines = 1 + 1 + 1 + int(attention) + 2 * int(blanks)  # status, header, footer
-    detail = needs.detail > 0 and needs.rows + needs.detail <= height - fixed_lines
+    rest = height - fixed_lines
+    detail = needs.detail > 0 and needs.rows + needs.detail <= rest
+    shown = summary and height >= SUMMARY_MIN_ROWS and (
+        not detail or needs.rows + needs.detail + 1 <= rest
+    )
     return TablePlan(
         bar=bar, clock=clock, plan=plan, gap=gap, columns=tuple(columns),
-        detail=detail, blanks=blanks, room=room,
+        detail=detail, blanks=blanks, room=room, summary=shown,
     )
+
+
+# -- the capacity summary ------------------------------------------------------------------
+#
+#   5h free: 4 accounts · next 5h back 07:10 (#3) · 7d left this week ≈ 2.3 accounts
+#   · next 7d reset Oct 5 12:51
+#
+# Over the accounts automatic switching can use (:func:`usable_for_capacity`).
+# "7d left ≈ N accounts" adds up (100 − 7d%)/100 per account, NOT weighted by
+# plan: a 20x and a 5x account half spent read as one account left between
+# them (``?`` help says so).
+
+
+@dataclass(frozen=True)
+class Capacity:
+    """What the summary line says (:func:`capacity`)."""
+
+    usable: int                              # accounts counted
+    free5: int                               # under the 5h soft mark, 7d not spent
+    back5: tuple[float, str] | None          # (reset, slot): the soonest 5h back
+    left7: float                             # Σ (100 − 7d%)/100
+    next7: float | None                      # the soonest 7d reset
+
+
+def usable_for_capacity(row: fx.FleetRow, now: float) -> bool:
+    """An account the summary counts: one automatic switching may use
+    (not :func:`unusable`), with usage windows (no API key) it can read."""
+    return (
+        not unusable(row, now)
+        and row.login != "api"
+        and row.pct5 is not None
+        and row.pct7 is not None
+    )
+
+
+def capacity(
+    rows: Sequence[fx.FleetRow], mx: MaximizeSettings, now: float
+) -> Capacity | None:
+    """The fleet's capacity right now, or None with no account to count.
+
+    ``free5``: accounts (the active one included) whose 5h is under its
+    soft mark and whose 7d is under its hard mark. ``back5``: among the
+    others whose 7d is not spent, the soonest 5h reset. ``left7``: the 7d
+    room left, as whole accounts. ``next7``: the soonest 7d reset."""
+    usable = [r for r in rows if usable_for_capacity(r, now)]
+    if not usable:
+        return None
+    week_ok = [r for r in usable if (r.pct7 or 0.0) < mx.hard_7d]
+    free = [r for r in week_ok if (r.pct5 or 0.0) < mx.soft_5h]
+    waiting = [
+        (r.reset5, r.number) for r in week_ok
+        if (r.pct5 or 0.0) >= mx.soft_5h and r.reset5 is not None and r.reset5 > now
+    ]
+    resets7 = [r.reset7 for r in usable if r.reset7 is not None and r.reset7 > now]
+    left7 = sum(max(0.0, 100.0 - min(r.pct7 or 0.0, 100.0)) / 100.0 for r in usable)
+    return Capacity(
+        usable=len(usable),
+        free5=len(free),
+        back5=min(waiting) if waiting else None,
+        left7=left7,
+        next7=min(resets7) if resets7 else None,
+    )
+
+
+def summary_variants(cap: Capacity, now: float) -> list[list[Seg]]:
+    """The summary line as tone segments, longest first: the clocks go
+    first (the 7d reset, then the 5h one), then the 7d part."""
+    n = cap.free5
+    head: list[Seg] = [
+        ("5h free: ", "dim"),
+        (f"{n} account{'' if n == 1 else 's'}" if n else "none", "plain" if n else "warn"),
+    ]
+    back: list[Seg] = []
+    if cap.back5 is not None:
+        reset, slot = cap.back5
+        back = [(" · next 5h back ", "dim"),
+                (f"{reset_clock(reset, now, date=False)} (#{slot})", "plain")]
+    week: list[Seg] = [(" · 7d left this week ≈ ", "dim"), (f"{cap.left7:.1f} accounts", "plain")]
+    reset7: list[Seg] = []
+    if cap.next7 is not None:
+        reset7 = [(" · next 7d reset ", "dim"), (reset_clock(cap.next7, now), "plain")]
+    out = [head + back + week + reset7, head + back + week, head + week, head]
+    unique: list[list[Seg]] = []
+    for variant in out:
+        if variant not in unique:
+            unique.append(variant)
+    return unique
 
 
 # -- how live the engine's word is ------------------------------------------------------
@@ -663,6 +774,67 @@ def _deferred_variants(
     ]
 
 
+#: ``#1 held until 15:30 (2h left) — …`` (``policy._held``): the end and
+#: the time left, for a hold the engine words that Fleet has not read.
+_HELD_RE = re.compile(r"held until (.+?) \((\w+) left\)")
+
+
+def _safety_moving(dv: fx.DecisionView) -> bool:
+    """The decision is one an account hold never sets aside: a switch, a
+    reset-aware wait, a hard mark with nowhere roomier to go, every account
+    at its limit, unreadable usage."""
+    return dv.kind in ("switch", "exhausted", "indeterminate") or (
+        dv.kind == "hold" and dv.code in ("reset-wait", "hard-stay")
+    )
+
+
+def _hard_stay_variants(
+    head: Seg, act: fx.FleetRow, dv: fx.DecisionView, name
+) -> list[list[Seg]]:
+    """Past a hard mark, but no account has more room: it stays until 100%."""
+    why = _quoted((dv.reason or "").split(";", 1)[0])
+    return [
+        [head, (f" · using {name(act.number)} · {why} — no account has more room, it stays ",
+                "plain"), ("(switches at once at 100%)", "dim")],
+        [head, (f" · #{act.number} {why} — no account has more room, it stays", "plain")],
+        [head, (f" · #{act.number} past hard — nowhere roomier, it stays", "plain")],
+        [head],
+    ]
+
+
+def _hold_variants(
+    act: fx.FleetRow,
+    dv: fx.DecisionView,
+    name,
+    mx: MaximizeSettings,
+    now: float,
+    hold: "account_hold.AccountHold | None",
+    dry: bool,
+) -> list[list[Seg]]:
+    """``Holding #1 until 15:30 (2h left) — only hard 98%/100% will move you``."""
+    if hold is not None:
+        clock = account_hold.clock_text(hold.until, now)
+        left: str | None = account_hold.left_text(hold.until - now)
+    else:  # the engine's word only: its reason names the end
+        m = _HELD_RE.search(dv.reason or "")
+        clock, left = (m.group(1), m.group(2)) if m else (None, None)
+    head: list[Seg] = (
+        [("Dry run", "warnb"), (" · holding", "plain")] if dry else [("Holding", "okb")]
+    )
+    until = f" until {clock}" if clock else ""
+    span = f"{until} ({left} left)" if left else until
+    safety = account_hold.safety_text(mx.hard_5h, mx.hard_7d)
+    short = f" #{act.number}"
+    return [
+        [*head, (f" {name(act.number)}{span} — {safety} ", "plain"), ("(h to change)", "dim")],
+        [*head, (f"{short}{span} — {safety}", "plain")],
+        [*head, (f"{short}{span} — only hard/100% moves you", "plain")],
+        [*head, (f"{short}{span}", "plain")],
+        [*head, (f"{short}{until}", "plain")],
+        [*head, (short, "plain")],
+    ]
+
+
 def _preempt_switch_variants(
     head: Seg, dv: fx.DecisionView, name, verb: str
 ) -> list[list[Seg]]:
@@ -689,9 +861,17 @@ def status_variants(
     *,
     now: float,
     published_at: float | None = None,
+    hold: "account_hold.AccountHold | None" = None,
+    hold_read: bool = False,
 ) -> list[list[Seg]]:
     """The status sentence as tone segments, longest variant first; the
-    widget shows the first that fits (it never wraps)."""
+    widget shows the first that fits (it never wraps).
+
+    ``hold`` is the account hold marker (``view.MaximizeState.hold``) and
+    ``hold_read`` says the caller read it: then a hold pinning the active
+    account is worded at once (before the engine's next tick says so),
+    unless the decision is one a hold never sets aside. Without
+    ``hold_read`` only a decision coded ``hold`` is."""
     by = {r.number: r for r in rows}
 
     def name(n: str | None) -> str:
@@ -736,6 +916,15 @@ def status_variants(
             [stale_head, (" · engine silent", "warn")],
         ]
     act = by.get(dv.active or "") or next((r for r in rows if r.active), None)
+    live_act = next((r for r in rows if r.active), None) or act
+    if live_act is not None and sit in ("live", "waiting"):
+        pinned = account_hold.holding(hold, live_act.number, now) if hold_read else None
+        coded = (
+            not hold_read and dv.kind == "hold" and dv.code == "hold"
+            and dv.active == live_act.number
+        )
+        if (pinned is not None and not _safety_moving(dv)) or coded:
+            return _hold_variants(live_act, dv, name, mx, now, pinned, dry)
     if sit == "waiting":
         using = f" · using {name(act.number)}" if act else ""
         return [
@@ -773,6 +962,8 @@ def status_variants(
             return _preempt_hold_variants(head, act, dv, name, dry)
         if dv.code == "rebalance-deferred":
             return _deferred_variants(head, act, dv, name)
+        if dv.code == "hard-stay":
+            return _hard_stay_variants(head, act, dv, name)
     if dv.kind == "switch":
         trigger = f" ({dv.trigger})" if dv.trigger else ""
         verb = "would switch" if dry else "switching"
@@ -927,7 +1118,7 @@ def attention_line(parts: Sequence[str], width: int) -> str:
 
 
 KEY_HINTS: tuple[tuple[str, str], ...] = (
-    ("enter", "switch"), ("r", "re-login"), ("l", "last resort"),
+    ("enter", "switch"), ("r", "re-login"), ("l", "last resort"), ("h", "hold"),
     ("m", "menu"), ("?", "help"), ("q", "quit"),
 )
 
@@ -935,8 +1126,13 @@ KEY_HINTS: tuple[tuple[str, str], ...] = (
 def key_hints(width: int) -> list[tuple[str, str]]:
     """The footer's ``(key, what)`` pairs: every word when it fits
     (``enter switch · r re-login · …``), else the keys with only menu, help
-    and quit spelled out."""
-    full = " · ".join(f"{k} {w}" for k, w in KEY_HINTS)
-    if len(full) <= width:
+    and quit spelled out, else the keys alone."""
+    def text(pairs) -> str:
+        return " · ".join(f"{k} {w}" if w else k for k, w in pairs)
+
+    if len(text(KEY_HINTS)) <= width:
         return list(KEY_HINTS)
-    return [(k, w if k in ("m", "?", "q") else "") for k, w in KEY_HINTS]
+    short = [(k, w if k in ("m", "?", "q") else "") for k, w in KEY_HINTS]
+    if len(text(short)) <= width:
+        return short
+    return [(k, "") for k, _w in KEY_HINTS]

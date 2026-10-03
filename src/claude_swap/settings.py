@@ -122,11 +122,25 @@ class PrimeSettings:
     claude_path: str | None = None
 
 
+@dataclass(frozen=True)
+class NotifySettings:
+    """cc-swap desktop notifications (``notify`` section,
+    maximize/notify.py): on by default; one switch per event."""
+
+    enabled: bool = True
+    switch: bool = True
+    relogin: bool = True
+    login_expiring: bool = True
+    prime_paused: bool = True
+    keychain: bool = True
+
+
 _SECTION_DEFAULT_SOURCES = {
     "autoswitch": AutoSwitchSettings,
     "ui": UiSettings,
     "maximize": MaximizeSettings,
     "prime": PrimeSettings,
+    "notify": NotifySettings,
 }
 
 
@@ -298,6 +312,30 @@ SETTING_SPECS: dict[str, SettingSpec] = {
         SettingSpec(
             "prime", "claudePath", "claude_path", "string",
             help="prime: claude executable (default: auto-detect)",
+        ),
+        SettingSpec(
+            "notify", "enabled", "enabled", "bool",
+            help="notify: desktop notifications from the engine (osascript / notify-send)",
+        ),
+        SettingSpec(
+            "notify", "switch", "switch", "bool",
+            help="notify: an account switch, with its trigger",
+        ),
+        SettingSpec(
+            "notify", "relogin", "relogin", "bool",
+            help="notify: an account needs a re-login",
+        ),
+        SettingSpec(
+            "notify", "loginExpiring", "login_expiring", "bool",
+            help="notify: a login ends within 24 hours (once per account per day)",
+        ),
+        SettingSpec(
+            "notify", "primePaused", "prime_paused", "bool",
+            help="notify: priming paused after a Claude Code update",
+        ),
+        SettingSpec(
+            "notify", "keychain", "keychain", "bool",
+            help="notify: the live login has been unreadable (Keychain) for over 15 minutes",
         ),
     )
 }
@@ -683,6 +721,7 @@ def effective_settings(backup_root: Path) -> list[tuple[SettingSpec, object, boo
         "ui": load_ui_settings(backup_root),
         "maximize": load_maximize_settings(backup_root),
         "prime": load_prime_settings(backup_root),
+        "notify": load_notify_settings(backup_root),
     }
     rows = []
     for spec in SETTING_SPECS.values():
@@ -871,6 +910,16 @@ def load_prime_settings(
     for message in repairs:
         _report(problems, message)
     return settings
+
+
+def load_notify_settings(
+    backup_root: Path, *, problems: list[str] | None = None
+) -> NotifySettings:
+    """Load the ``notify`` section; never raises. Per key as the other
+    sections (a bool that is not a JSON ``true``/``false`` is read as the
+    user meant it, or the default)."""
+    raw = _read_raw(settings_path(backup_root))
+    return _section_for_load(raw, "notify", NotifySettings, problems)
 
 
 def prime_from_raw(section, repairs: list[str]) -> PrimeSettings:

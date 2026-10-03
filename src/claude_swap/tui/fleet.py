@@ -6,7 +6,12 @@ back to it, ``ctrl+f`` returns). One screen answers "what is automatic
 switching doing, and is anything wrong":
 
 * one plain-English sentence about the engine, with who runs it on the
-  right, and at most one attention line (``maximize/home.py``);
+  right, and at most one attention line (``maximize/home.py``); ``h`` holds
+  the active account (stay on it for 1/2/4 hours or until a time) and the
+  sentence then says ``Holding #1 until 15:30 (2h left) — …``;
+* a capacity summary over the column headers (``home.capacity``): how many
+  accounts have 5h room, when the next 5h comes back, about how many
+  accounts' worth of 7d is left this week, and the next 7d reset;
 * every account as one row of a table under dim column headers — ``order ·
   account · plan · 5h · 5h resets · 7d · 7d resets · status``: the active
   account first, then the engine's pick order numbered 1, 2, 3 …; 5h/7d
@@ -15,13 +20,13 @@ switching doing, and is anything wrong":
 * under the table, when there are rows to spare, the selected account in
   full (organization, plan, login deadline, priming, every usage window
   with its exact reset);
-* a footer of six keys; everything else is in the ``m`` menu popup.
+* a footer of seven keys; everything else is in the ``m`` menu popup.
 
 The table is used at every terminal size; ``home.table_plan`` fits its
 columns to the width (shorter bars, then no reset clocks, no plan column,
-shorter names) and drops the detail panel first when the terminal is
-short. The sentence, the attention line, the column headers and the footer
-never scroll away.
+shorter names) and, when the terminal is short, drops the capacity summary
+first, then the detail panel. The sentence, the attention line, the column
+headers and the footer never scroll away.
 
 Viewer by default: the screen never takes the engine lease on its own. It
 probes the lease every few seconds (a free lease is taken and dropped at
@@ -53,6 +58,7 @@ from textual.screen import ModalScreen, Screen
 from textual.widgets import Static
 
 from claude_swap.maximize import fleet as fx
+from claude_swap.maximize import hold as account_hold
 from claude_swap.maximize import home
 from claude_swap.maximize import policy
 from claude_swap.maximize import view as mxview
@@ -305,8 +311,10 @@ class FleetScreen(Screen):
         Binding("enter", "switch_selected", "Switch", show=False),
         Binding("r", "relogin", "Re-login", show=False),
         Binding("l", "last_resort", "Last resort", show=False),
+        Binding("h", "hold", "Hold", show=False),
+        Binding("n", "rename", "Name", show=False),  # a row key, not in the footer
         Binding("m", "open_menu", "Menu", show=False),
-        Binding("question_mark,h", "help", "Help", show=False),
+        Binding("question_mark", "help", "Help", show=False),
         Binding("q", "quit", "Quit", show=False),
         Binding("down,j", "move('down')", show=False),
         Binding("up,k", "move('up')", show=False),
@@ -356,6 +364,7 @@ class FleetScreen(Screen):
     def compose(self) -> ComposeResult:
         yield Static("", id="fx-status", markup=False)
         yield Static("", id="fx-attention", markup=False)
+        yield Static("", id="fx-summary", markup=False)
         yield Static("", id="fx-head", markup=False)
         with VerticalScroll(id="fx-scroll", can_focus=False):
             yield FleetBody(id="fx-body")
@@ -607,6 +616,7 @@ class FleetScreen(Screen):
         variants = home.status_variants(
             es, dv, self._rows, self._mx, sit, now=now,
             published_at=published.at if published else None,
+            hold=self._state.hold, hold_read=True,
         )
         sentence, note = home.status_line(variants, home.holder_variants(es, sit), width)
         self.query_one("#fx-status", Static).update(
@@ -628,10 +638,12 @@ class FleetScreen(Screen):
     def _render_accounts(
         self, rows: list[fx.FleetRow], ctx: render.Ctx, attention: bool, palette: Palette,
     ) -> None:
-        """The column headers, the table and the selected account's panel,
-        laid out by ``home.table_plan`` for this terminal."""
+        """The capacity summary, the column headers, the table and the
+        selected account's panel, laid out by ``home.table_plan`` for this
+        terminal."""
         body = self.query_one("#fx-body", FleetBody)
         head = self.query_one("#fx-head", Static)
+        summary = self.query_one("#fx-summary", Static)
         detail = self.query_one("#fx-detail", Static)
         size = self.size
         width, height = size.width or 120, size.height or 36
@@ -643,7 +655,8 @@ class FleetScreen(Screen):
                 else "No managed accounts yet: m → a (Account settings) adds one.",
                 style=palette.muted,
             ))
-            head.display = detail.display = False
+            head.display = detail.display = summary.display = False
+            self.set_class(False, "-summary")
             self._fit_scroll(height, attention, 0)
             return
         row = self.current_row()
@@ -652,8 +665,13 @@ class FleetScreen(Screen):
         needs = home.table_needs(
             rows, statuses, now=ctx.now, detail=render.detail_height(row, acc, ctx),
         )
-        plan = home.table_plan(width, height, needs, attention=attention)
+        cap = home.capacity(rows, self._mx, ctx.now)
+        plan = home.table_plan(width, height, needs, attention=attention, summary=cap is not None)
         self._plan = plan
+        summary.display = plan.summary
+        self.set_class(plan.summary, "-summary")
+        if plan.summary and cap is not None:
+            summary.update(render.summary_text(cap, plan.room, ctx.now, palette))
         head.update(render.table_header(plan, palette))
         head.display = True
         layout_map = render.render_table(
@@ -664,18 +682,24 @@ class FleetScreen(Screen):
         detail.display = plan.detail
         if plan.detail:
             detail.update(render.render_detail(row, acc, plan.room, ctx))
-        self._fit_scroll(height, attention, needs.detail if plan.detail else 0)
+        self._fit_scroll(height, attention, needs.detail if plan.detail else 0,
+                         summary=plan.summary)
         if self._scroll_to_sel:
             self._scroll_to_sel = False
             self.call_after_refresh(self._scroll_selected_into_view)
 
-    def _fit_scroll(self, height: int, attention: bool, detail_lines: int) -> None:
+    def _fit_scroll(
+        self, height: int, attention: bool, detail_lines: int, *, summary: bool = False
+    ) -> None:
         """Cap the table at the rows the fixed lines leave: the status line,
-        the attention line, the blank lines, the column headers, the
-        selected account's panel (``table_plan`` shows it only when every
-        row fits above it) and the footer always stay on screen."""
+        the attention line, the blank lines, the capacity summary, the
+        column headers, the selected account's panel (``table_plan`` shows
+        it only when every row fits above it) and the footer always stay on
+        screen."""
         fixed = 1 + 1 + 1  # status line, column headers, footer
         if attention:
+            fixed += 1
+        if summary:
             fixed += 1
         if height >= home.BLANKS_MIN_ROWS:
             fixed += 2  # above the status line and above the table
@@ -990,6 +1014,122 @@ class FleetScreen(Screen):
     def _after_setting(self, message: str) -> None:
         self.notify(message, timeout=3)
         self._on_snapshot(self.app.snapshot)
+
+    # -- name (n) -----------------------------------------------------------------------
+
+    def action_rename(self) -> None:
+        """n: name the selected account (``cc-swap alias``): a small input
+        prefilled with the name the table shows. Enter saves (the switcher
+        checks it as the CLI does), empty clears the alias, esc cancels."""
+        from claude_swap.tui.fleet_modals import TextInputModal
+
+        row = self.current_row()
+        if row is None:
+            return
+        self.app.push_screen(
+            TextInputModal(
+                f"Name #{row.number}",
+                "Letters, digits, - _ . (no @ or comma, not taken). Empty: back to the "
+                "part of the address before the @.",
+                row.name,
+            ),
+            partial(self._on_rename, row.number, row.name),
+        )
+
+    def _on_rename(self, number: str, shown: str, typed: str | None) -> None:
+        acc = self._accounts.get(number)
+        request = fx.name_request(acc.alias if acc is not None else "", shown, typed)
+        if request is None:
+            return
+        switcher = self.app.switcher
+        verb, name = request
+        if verb == "set":
+            self.app._start_action(f"Name #{number}", partial(switcher.set_alias, number, name))
+        else:
+            self.app._start_action(f"Name #{number}", partial(switcher.unset_alias, number))
+
+    # -- hold (h) -----------------------------------------------------------------------
+
+    def action_hold(self) -> None:
+        """h: hold the ACTIVE account (whatever row is selected) — stay on
+        it for 1, 2 or 4 hours (h, t, f) or until a time (u, or a digit
+        starts typing one), or lift the hold
+        (``cc-swap hold``). Any engine honours it on its next tick."""
+        from claude_swap.tui.fleet_modals import MenuModal
+
+        snap = self.app.snapshot
+        active = snap.active_number if snap is not None else None
+        row = next((r for r in self._rows if r.number == active), None)
+        if row is None:
+            self.notify("No active account to hold", timeout=3)
+            return
+        now = time.time()
+        current = account_hold.holding(self._state.hold, row.number, now)
+        self.app.push_screen(
+            MenuModal(
+                menus.hold_rows(current.until if current is not None else None, now),
+                title=menus.HOLD_TITLE.format(number=row.number, name=row.name),
+                note=menus.HOLD_NOTE,
+                digits=menus.HOLD_TYPED,
+            ),
+            partial(self._on_hold_choice, row.number),
+        )
+
+    def _on_hold_choice(self, slot: str, action: str | None) -> None:
+        if action is None:
+            return
+        if action == menus.HOLD_OFF:
+            self._hold_write(slot, None)
+        elif action == menus.HOLD_UNTIL or action.startswith(menus.HOLD_TYPED):
+            from claude_swap.tui.fleet_modals import TextInputModal
+
+            self.app.push_screen(
+                TextInputModal(
+                    f"Hold #{slot} until", "A local time, HH:MM (the next one; at most 24h "
+                    "ahead). Enter holds, esc cancels.",
+                    value=action.removeprefix(menus.HOLD_TYPED)
+                    if action.startswith(menus.HOLD_TYPED) else "",
+                    select=False,
+                ),
+                partial(self._on_hold_until, slot),
+            )
+        elif action.startswith("hold:"):
+            self._hold_write(slot, time.time() + float(action.removeprefix("hold:")))
+
+    def _on_hold_until(self, slot: str, text: str | None) -> None:
+        if not text:
+            return
+        try:
+            until = account_hold.parse_until(text, time.time())
+        except ValueError as e:
+            self.notify(str(e), severity="error", timeout=6)
+            return
+        self._hold_write(slot, until)
+
+    def _hold_write(self, slot: str, until: float | None) -> None:
+        """Set (``until``) or lift (None) the hold, in a thread worker."""
+        self.run_worker(
+            partial(self._hold_blocking, slot, until), thread=True,
+            group="fleet-action", exit_on_error=False, name="fleet-hold",
+        )
+
+    def _hold_blocking(self, slot: str, until: float | None) -> None:
+        now = time.time()
+        try:
+            if until is None:
+                lifted = account_hold.clear_hold(self._root)
+                message = "Hold lifted" if lifted else "No hold to lift"
+            else:
+                hold = account_hold.set_hold(
+                    self._root, slot, until, by="fleet", now=now, host=self._hostname,
+                )
+                message = account_hold.held_message(hold, now, asked=until)
+        except Exception as e:
+            self.app.call_from_thread(
+                self.notify, f"Could not change the hold: {e}", severity="error", timeout=8,
+            )
+            return
+        self.app.call_from_thread(self._after_setting, message)
 
     def action_exclude(self) -> None:
         row = self.current_row()

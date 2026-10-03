@@ -75,6 +75,7 @@ def build_snapshot(
     forecast: Forecast | None = None,
     rates7: Mapping[str, float] | None = None,
     active_recent_429: bool = False,
+    hold_until: float | None = None,
 ) -> Snapshot:
     """One view per ``records`` entry, in ``records`` order (sequence order)."""
     last_resort = parse_account_list(settings.last_resort)
@@ -111,4 +112,5 @@ def build_snapshot(
         forecast=forecast,
         rates7=dict(rates7 or {}),
         active_recent_429=active_recent_429,
+        hold_until=hold_until,
     )

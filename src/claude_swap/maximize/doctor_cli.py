@@ -10,7 +10,8 @@ Three presentations of the same read-only checks (``maximize/doctor.py``):
   ``maximize``, install the service).
 * ``why [--json] [--no-fallback]`` — the engine's last published decision
   with its reason code explained (:data:`REASONS`, mirrored by the README
-  table "Why didn't it switch?"); without a fresh one, a dry-run tick.
+  table "Why didn't it switch?"); without a fresh one, a dry-run tick. An
+  account hold on the active account (``cc-swap hold``) is named too.
 """
 
 from __future__ import annotations
@@ -485,6 +486,14 @@ REASONS: dict[str, tuple[str, str]] = {
         "A better-scored account exists, but this is usually a busy time and the gain is under maximize.busyRebalanceGap, so the move waits for your next quiet window (at most 6 hours away).",
         "Nothing; lower maximize.busyRebalanceGap, or set maximize.learnIdlePattern to false, to rebalance at any idle moment.",
     ),
+    "hard-stay": (
+        "A hard mark is reached (or close at the recent pace), but no account under the hard caps has more room on that window than the active one, so maximize stays on it rather than move somewhere that would force a move straight back.",
+        "Nothing; at 100% the at-limit switch moves you at once to whatever has quota left. cc-swap add another account for more room.",
+    ),
+    "hold": (
+        "You asked to stay on the active account (cc-swap hold, or Fleet: h) so a long task keeps its context: until the hold ends, maximize skips its soft, preempt and rebalance moves. A hard mark, 100% and a reset-wait still switch.",
+        "Nothing; cc-swap hold off (or Fleet: h → o) lifts it. It ends by itself at its end time (at most 24h), or when the active account changes.",
+    ),
 }
 
 #: Switch triggers (the README's "When it switches" table plus upstream's).
@@ -686,10 +695,30 @@ def _why_lines(why: dict) -> list[str]:
         if would.get("target") and would["decision"] in ("switch", "pending"):
             verdict += f" → #{would['target']}"
         lines.append(dimmed(f"  if on    the engine would {verdict}: {would['reason']}"))
+    if why.get("holdLine"):
+        lines.append(f"  hold     {why['holdLine']}")
     pattern = why.get("idlePattern")
     if pattern:
         lines.append(_pattern_line(pattern))
     return lines
+
+
+def account_hold_now(backup_root, *, now: float) -> tuple[dict | None, str | None]:
+    """``(json, line)`` for an account hold pinning the active account
+    (``cc-swap hold``), else ``(None, None)``. Read-only."""
+    from claude_swap.maximize import hold as account_hold
+
+    try:
+        pinned = account_hold.holding(
+            account_hold.read_hold(backup_root, now=now),
+            account_hold.live_slot(backup_root), now, root=backup_root,
+        )
+        line = account_hold.status_line(backup_root, now)
+    except Exception:
+        return None, None
+    if pinned is None or line is None:
+        return None, None
+    return account_hold.status_payload(pinned, now), line
 
 
 def _dry_run_tick() -> int:
@@ -725,16 +754,26 @@ def why_command(argv: list[str], *, clock: Callable[[], float] = time.time) -> N
     why = published_why(root, now=now)
     if why is not None:
         why["idlePattern"] = idle_pattern(root, now=now)
+    held, hold_line = account_hold_now(root, now=now)
     if args.json:
         payload = {"schemaVersion": SCHEMA_VERSION, **(why or {"source": "none"})}
+        payload.pop("holdLine", None)
         if why is None:
             payload["fallback"] = "cc-swap auto --once --dry-run --json"
+        if held is not None:
+            payload["hold"] = held
         print(json.dumps(payload, indent=2))
         sys.exit(0)
     if why is not None:
+        if hold_line:
+            why["holdLine"] = (
+                f"{hold_line.removeprefix('Holding ')} (cc-swap hold off lifts it)"
+            )
         for line in _why_lines(why):
             print(line)
         sys.exit(0)
+    if hold_line:
+        print(f"{hold_line} (cc-swap hold off lifts it)")
     print(
         "No engine published a fresh decision (no engine running, the strategy "
         "is not maximize, or the login changed since)."

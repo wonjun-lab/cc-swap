@@ -84,6 +84,8 @@ _FORK_COMMANDS: dict[str, str] = {
     "init": "_init_command",
     "why": "_why_command",
     "history": "_history_command",
+    "hold": "_hold_command",
+    "notify": "_notify_command",
 }
 
 
@@ -1205,6 +1207,20 @@ def _history_command(argv: list[str]) -> None:
     history_command(argv)
 
 
+def _hold_command(argv: list[str]) -> None:
+    """Handle `cc-swap hold` (maximize/hold.py), imported lazily."""
+    from claude_swap.maximize.hold import hold_command
+
+    hold_command(argv)
+
+
+def _notify_command(argv: list[str]) -> None:
+    """Handle `cc-swap notify` (maximize/notify.py), imported lazily."""
+    from claude_swap.maximize.notify import notify_command
+
+    notify_command(argv)
+
+
 def _use_native_tls() -> None:
     """Route TLS trust decisions through the OS-native verifier.
 
@@ -1536,6 +1552,8 @@ cc-swap:
   %(prog)s init [--apply]             onboarding/migration checklist (ok/FIX/TODO)
   %(prog)s why                        why the engine did or didn't switch
   %(prog)s auto off|on|status         stop / resume automatic switching (persistent)
+  %(prog)s hold [2h|until 23:00|off]  stay on the active account (soft moves wait)
+  %(prog)s notify test|status         desktop notifications from the engine
   %(prog)s history [-n N] [--json]    recent account switches (who, why)
   %(prog)s claude-update [--check]    update Claude Code via `claude update` (exit 10 = available)
 

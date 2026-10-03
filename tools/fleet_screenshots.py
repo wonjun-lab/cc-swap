@@ -19,12 +19,19 @@ marked last resort, a dead login and a primed account. ``--emails`` swaps
 in other addresses (six, comma-separated) for a private preview; keep real
 addresses out of the README images.
 
+The ``hold`` scenario holds #1 (``cc-swap hold``, Fleet ``h``) for two hours
+with every login healthy (no attention line), so even 200x16 has the rows
+for the capacity summary next to the selected account's panel; its shots
+are ``fleet-hold-200x16``, ``fleet-hold-120x36`` and the ``h`` picker
+(``fleet-holdpicker-120x36``).
+
 Writes ``fleet-<size>.svg`` for each shot, plus a PNG (macOS Quick Look,
 cropped to the window) when ``qlmanage`` and ``sips`` exist, into the first
 ``--out`` (default ``/tmp/cc-swap-tui-poc/table``) and copies them into any
 further ``--out``. ``--assets DIR`` also copies the README's images there
 (:data:`README_ASSETS`). NAMEs pick shots (``160x45``, ``menu``,
-``autooff``, ``resetwait``, ``preempt``, ``strategy`` …); none means all.
+``autooff``, ``resetwait``, ``preempt``, ``hold``, ``strategy`` …); none
+means all. Desktop notifications are off for the run (``CC_SWAP_NOTIFY=0``).
 """
 
 from __future__ import annotations
@@ -45,6 +52,7 @@ from pathlib import Path
 HOME = Path(tempfile.mkdtemp(prefix="ccswap-shots-home-"))
 os.environ["HOME"] = str(HOME)
 os.environ["CC_SWAP_FETCH_ON_OPEN"] = "0"
+os.environ["CC_SWAP_NOTIFY"] = "0"
 ROOT = Path(__file__).resolve().parents[1]
 sys.path[:0] = [str(ROOT), str(ROOT / "src")]
 
@@ -89,20 +97,28 @@ def _account(n, email, entry, *, active=False, org="", login_days=None, disabled
     )
 
 
-def accounts_for(emails: list[str], first: UsageEntry | None = None) -> list[AccountSnapshot]:
+def accounts_for(
+    emails: list[str], first: UsageEntry | None = None, *, healthy: bool = False
+) -> list[AccountSnapshot]:
     """#1 active, past its 5h soft mark, with a Fable window (``first``
     replaces its usage); #2 next, its 5h not started; #3 login ends in
     about a day; #4 a Team account, last resort, 5h not started; #5 a dead
-    login (its last reading still says when its windows reset); #6 primed."""
+    login (its last reading still says when its windows reset); #6 primed.
+    ``healthy``: #3's login has 12 days left and #5's login works (its 7d
+    nearly spent, its 5h past soft), so nothing needs you."""
     e = emails
+    if healthy:
+        fifth = _account(5, e[4], _entry(71.0, 0.7 * H, 92.0, 1.6), login_days=17)
+    else:
+        fifth = _account(5, e[4], _entry(0.0, None, 57.0, 1.6, age=9 * H,
+                                         sentinel=USAGE_RELOGIN_REQUIRED))
     return [
         _account(1, e[0], first or _entry(62.0, 1.8 * H, 41.0, 3.8, fable=38.0),
                  active=True, login_days=21),
         _account(2, e[1], _entry(0.0, None, 35.0, 2.2), login_days=20),
-        _account(3, e[2], _entry(22.0, 2.6 * H, 18.0, 5.4), login_days=1.2),
+        _account(3, e[2], _entry(22.0, 2.6 * H, 18.0, 5.4), login_days=12 if healthy else 1.2),
         _account(4, e[3], _entry(0.0, None, 30.0, 4.0), org="Acme Team", login_days=29),
-        _account(5, e[4], _entry(0.0, None, 57.0, 1.6, age=9 * H,
-                                 sentinel=USAGE_RELOGIN_REQUIRED)),
+        fifth,
         _account(6, e[5], _entry(3.0, 3.3 * H, 22.0, 5.1), login_days=14),
     ]
 
@@ -139,9 +155,20 @@ def seed_history(root: Path) -> str:
 def _scenario(name: str, quiet: str, emails: list[str]) -> tuple[list, dict, list]:
     """``(accounts, published decision, #1's samples)`` for a scenario:
     ``pending`` (past the 5h soft mark, waiting for a pause), ``reset-wait``
-    (past it too, but the 5h window resets in 8 minutes) or ``preempt``
-    (the 7d would pass its soft mark before the quiet time)."""
+    (past it too, but the 5h window resets in 8 minutes), ``preempt`` (the
+    7d would pass its soft mark before the quiet time) or ``hold`` (past the
+    5h soft mark, but held for two hours: the engine sets the move aside)."""
     base = {"at": NOW - 50, "pid": os.getpid(), "active": "1", "plans": PLANS}
+    if name == "hold":
+        from claude_swap.maximize.hold import AccountHold, safety_text, until_text
+
+        held = until_text(AccountHold("1", NOW + 2 * H), NOW - 50)
+        return accounts_for(emails, healthy=True), {
+            **base, "decision": "hold", "trigger": None, "target": None, "pending": False,
+            "code": "hold",
+            "reason": f"#1 held {held} — {safety_text(98, 98)}; otherwise: #1 5h 62% >= soft "
+                      "50%; waiting for idle to move to #2 (5h +3 / 7d +0.2 pts over 10 min)",
+        }, [[NOW - 660, 59.0, 40.8], [NOW - 60, 62.0, 41.0]]
     if name == "reset-wait":
         accounts = accounts_for(emails, _entry(96.0, 8 * 60 + 20, 41.0, 3.8, fable=38.0))
         return accounts, {
@@ -182,9 +209,10 @@ def seed(
     quiet = seed_history(root)
     accounts, decision, samples = _scenario(scenario, quiet, emails)
     reset6 = NOW + 3.3 * H
+    dead = scenario != "hold"  # the hold shots have every login healthy
     state = {
         "schemaVersion": 1,
-        "quarantine": {"5": {"email": emails[4], "reason": "invalid_grant"}},
+        "quarantine": {"5": {"email": emails[4], "reason": "invalid_grant"}} if dead else {},
         "maximizeSamples": {"account": "1", "samples": samples},
         "primes": {emails[5]: {
             "windowKey": "w", "attempts": 1,
@@ -200,6 +228,11 @@ def seed(
     elif flag.exists():
         flag.unlink()
     (root / "autoswitch_state.json").write_text(json.dumps(state))
+    from claude_swap.maximize import hold
+
+    hold.clear_hold(root)
+    if scenario == "hold":
+        hold.set_hold(root, "1", NOW + 2 * H, by="fleet", now=NOW - 50, host="mbp")
     return accounts
 
 
@@ -302,12 +335,16 @@ async def main() -> None:
         for scenario, shots in (
             ("reset-wait", ((160, 45), (80, 24))),
             ("preempt", ((120, 36),)),
+            ("hold", ((200, 16), (120, 36))),
         ):
             names = [f"fleet-{scenario.replace('-', '')}-{w}x{h}" for w, h in shots]
             if any(wanted(n) for n in names):
                 scenario_accounts = seed(root, emails=emails, scenario=scenario)
                 for (w, h), name in zip(shots, names):
                     await take(w, h, name, accounts=scenario_accounts)
+        if wanted("fleet-holdpicker-120x36"):
+            hold_accounts = seed(root, emails=emails, scenario="hold")
+            await take(120, 36, "fleet-holdpicker-120x36", keys=("h",), accounts=hold_accounts)
         seed(root, emails=emails)
     finally:
         lease.release()
