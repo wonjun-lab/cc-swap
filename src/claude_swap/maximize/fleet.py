@@ -244,6 +244,21 @@ class FleetRow:
     # When the stored login lapses (epoch seconds, ``refreshTokenExpiresAt``);
     # None when the login records no deadline.
     login_deadline: float | None = None
+    # When the 7d window resets (None: unknown or already past). A login
+    # that cannot be read keeps the resets of its last good reading in
+    # ``reset5``/``reset7`` while they are still ahead.
+    reset7: float | None = None
+
+
+def _seen_resets(acc: AccountSnapshot, now: float) -> tuple[float | None, float | None]:
+    """The resets still ahead in the last good reading of an account whose
+    usage now reads as a sentinel (a dead login, an API key …)."""
+    if acc.usage.sentinel is None:
+        return None, None
+    from claude_swap.maximize.snapshot import usage_windows
+
+    _p5, reset5, _p7, reset7 = usage_windows(acc.usage.last_good, now)
+    return (reset5 if reset5 is not None and reset5 > now else None), reset7
 
 
 def fleet_snapshot(
@@ -305,6 +320,7 @@ def fleet_rows(
         raw = state.primes.get(acc.email)
         entry = raw if isinstance(raw, Mapping) else None
         active = acc.number == msnap.active
+        seen5, seen7 = _seen_resets(acc, now)
         out.append(
             FleetRow(
                 number=acc.number,
@@ -324,7 +340,7 @@ def fleet_rows(
                 ),
                 land=land_note(v, mx, active=active, login=login, now=now),
                 state5=r.state5,
-                reset5=v.reset5 if r.state5 != "cold" else None,
+                reset5=(v.reset5 if r.state5 != "cold" else None) or seen5,
                 prime=prime_cell(v, entry, msnap.active, prime, now),
                 login=login,
                 stale=acc.usage.age_s is not None and acc.usage.age_s > STALE_OK_S,
@@ -335,6 +351,7 @@ def fleet_rows(
                     if acc.login_expires_at is not None
                     else None
                 ),
+                reset7=v.reset7 if v.reset7 is not None else seen7,
             )
         )
     return out

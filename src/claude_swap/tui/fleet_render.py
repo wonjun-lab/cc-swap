@@ -1,14 +1,18 @@
 """Fleet's renderers: the pure model (``maximize/home.py``) as Rich text.
 
-No Textual here, so every line can be checked without a terminal. An
-account block keeps the upstream dashboard's look
-(``1  main (main@acme.dev)  [personal] [20x]`` over its 5h/7d bars); the
-narrow layout puts one account on a line
-(``● 1 main   5h ━━━┃━ 62%  7d ━━──┃ 41%      ● active``). Bars carry the
-soft (amber) and hard (red) ticks and are colored by them
-(``widgets.bar_color``), the same in every layout.
+No Textual here, so every line can be checked without a terminal. The
+accounts are a table with a dim header (``home.COLUMNS``)::
 
-A selected account gets the panel background only: its threshold colors
+    order  account          plan  5h            5h resets      …  status
+      ●    main@acme.dev #1  20x   ━━━┃━━━┃ 62%  1h47m · 07:10  …  ● active
+      1    side@acme.dev #2  5x    ───┃───┃  0%  not started    …  next
+
+laid out by ``home.table_plan``; under it, when there are rows to spare,
+the selected account in full (:func:`render_detail`). Bars carry the soft
+(amber) and hard (red) ticks and are coloured by them
+(``widgets.bar_color``) at every width.
+
+The selected row gets the panel background only: its threshold colours
 stay as they are.
 """
 
@@ -16,10 +20,11 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
+from datetime import datetime
 
 from rich.text import Text
 
-from claude_swap.json_output import USAGE_API_KEY
+from claude_swap import oauth
 from claude_swap.maximize import fleet as fx
 from claude_swap.maximize import home
 from claude_swap.models import AccountSnapshot
@@ -27,12 +32,15 @@ from claude_swap.tui import data
 from claude_swap.tui.theme import Palette
 from claude_swap.tui.widgets import bar_cells, bar_color, usage_rows
 
-_LOGIN_NOTES = {
-    "relogin": "needs re-login",
-    "expired": "token expired",
-    "foreign": "foreign login",
-    "keychain": "keychain locked",
-    "api": "API key",
+#: What stands in for the bars when the stored login cannot be read: the 5h
+#: column's words, longest first, then the 7d column's (the shortest fit
+#: the percentage-only columns of a narrow terminal).
+_LOGIN_CELLS: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {
+    "relogin": (("⚠ needs re-login", "⚠ re-login", "⚠"), ("select it, press r", "press r", "")),
+    "expired": (("⚠ token expired", "⚠ expired", "⚠"), ("heals itself", "")),
+    "foreign": (("⚠ foreign login", "⚠ foreign", "⚠"), ("a switch repairs it", "")),
+    "keychain": (("⚠ keychain locked", "⚠ keychain", "⚠"), ("",)),
+    "api": (("· API key", "· API", "API"), ("no usage windows", "")),
 }
 
 
@@ -67,6 +75,12 @@ class Ctx:
             row, is_next=row.number == self.next_no, now=self.now, priming=self.priming
         )
 
+    def status(self, row: fx.FleetRow) -> tuple[str, str] | None:
+        """The status column (the tag, else ``primed``)."""
+        return home.status_for(
+            row, is_next=row.number == self.next_no, now=self.now, priming=self.priming
+        )
+
 
 def pad_to(line: Text, width: int) -> Text:
     """``line`` cut (with …) or padded to exactly ``width`` cells."""
@@ -78,164 +92,108 @@ def pad_to(line: Text, width: int) -> Text:
     return out
 
 
-def with_tag(left: Text, tag: tuple[str, str] | None, width: int, palette: Palette) -> Text:
-    """``left`` with ``tag`` right-aligned in ``width`` cells; the tag goes
-    when fewer than 12 cells would be left for ``left``."""
-    if tag is None:
-        return pad_to(left, width)
-    text, tone = tag
-    room = width - len(text) - 2
-    if room < 12:
-        return pad_to(left, width)
-    out = pad_to(left, room) if left.cell_len > room else left.copy()
-    out.append(" " * (width - out.cell_len - len(text)))
-    out.append(text, style=tone_style(tone, palette))
-    return out
+def _fit(variants: Sequence[str], width: int) -> str:
+    """The first (longest) of ``variants`` that fits ``width``."""
+    fallback = variants[-1] if variants else ""
+    return next((v for v in variants if home.cells(v) <= width), fallback)
 
 
-# -- one account ---------------------------------------------------------------------------
+# -- the table ------------------------------------------------------------------------------
 
 
-def header_line(
-    row: fx.FleetRow, acc: AccountSnapshot | None, width: int, ctx: Ctx
-) -> Text:
-    """``1  main (main@acme.dev)  [personal] [20x]`` plus the tag; the email,
-    then the org and plan, drop when the line is too narrow."""
+def table_header(plan: home.TablePlan, palette: Palette) -> Text:
+    """The dim column headers, each over its column."""
+    line = Text(style=palette.muted, no_wrap=True, overflow="ellipsis")
+    for i, (key, width) in enumerate(plan.columns):
+        if i:
+            line.append(" " * plan.gap)
+        line.append(pad_to(Text(home.HEADERS[key]), width))
+    return pad_to(line, plan.room)
+
+
+def _order_cell(mark: str, width: int, ctx: Ctx) -> Text:
     p = ctx.palette
-    tag = ctx.tag(row)
-    alias = acc.alias if acc is not None else ""
-    age = data.format_age(acc.usage.age_s) if acc is not None and row.stale else None
-
-    def build(email: bool, org: bool) -> Text:
-        t = Text()
-        t.append(f"{row.number:>2}  ", style=f"bold {p.foreground}")
-        if alias:
-            t.append(alias, style=f"bold {p.accent}")
-            if email:
-                t.append(f" ({row.email})", style=p.foreground)
-        else:
-            t.append(row.email, style=p.foreground)
-        if org:
-            t.append(f"  [{row.org}]", style=p.muted)
-            if row.plan not in ("?", "api"):
-                t.append(f" [{row.plan}]", style=p.muted)
-            if age:
-                t.append(f"  {age}", style=p.muted)
-        return t
-
-    need = len(tag[0]) + 3 if tag else 0
-    for email, org in ((True, True), (False, True), (False, False)):
-        left = build(email, org)
-        if left.cell_len + need <= width:
-            break
-    return with_tag(left, tag, width, p)
+    style = {
+        home.ORDER_ACTIVE: f"bold {p.accent}", home.ORDER_NONE: p.muted,
+    }.get(mark, f"bold {p.foreground}")
+    return Text(mark.center(width), style=style)
 
 
-def body_lines(
-    row: fx.FleetRow, acc: AccountSnapshot | None, width: int, ctx: Ctx, *, max_bar: int
-) -> list[Text]:
-    """The block under the header: one bar per usage window (5h, 7d, then
-    any spend or per-model window), or what stands in for them."""
+def _account_cell(row: fx.FleetRow, width: int, ctx: Ctx) -> Text:
+    """The name (cut with … to fit) and the dim slot number after it."""
     p = ctx.palette
-    if acc is None:
-        return []
-    sentinel = acc.usage.sentinel
-    if row.login == "relogin":
-        out = [Text("    ").append("⚠ needs re-login — select it and press r", style=p.sev_crit)]
-        seen = data.last_seen_note(acc.usage)
-        if seen:
-            out.append(Text(f"    └ {seen}", style=p.muted))
-        return [pad_to(line, width) for line in out]
-    if sentinel is not None:
-        api = sentinel == USAGE_API_KEY
-        mark = "·" if api else "⚠"
-        line = Text("    ").append(
-            f"{mark} {data.sentinel_label(sentinel)}", style=p.muted if api else p.sev_warn
-        )
-        return [pad_to(line, width)]
-    rows = usage_rows(acc.usage.last_good, ctx.now, acc.usage.fetched_at)
-    if not rows:
-        return [pad_to(Text("    usage unavailable", style=p.muted), width)]
+    slot = home.account_slot(row)
+    name = Text(row.name, style=f"bold {p.accent}" if row.active else p.foreground)
+    room = width - home.cells(slot)
+    if name.cell_len > room:
+        name.truncate(max(room, 1), overflow="ellipsis")
+    return name.append(slot, style=p.muted)
+
+
+def _usage_cell(row: fx.FleetRow, window: str, plan: home.TablePlan, ctx: Ctx) -> Text:
+    """A bar with its soft/hard ticks and the percentage (just the
+    percentage when the plan has no room for bars)."""
+    p = ctx.palette
+    pct = row.pct5 if window == "5h" else row.pct7
+    soft, hard = ctx.ticks.get(window, (None, None))
     dim = row.stale or row.tier == "excluded"
-    label_w = max(len(r[0]) for r in rows)
-    bar_w = max(10, min(max_bar, width - 4 - label_w - 1 - 5 - 2 - 28))
-    out: list[Text] = []
-    for label, pct, suffix, suffix_full in rows:
-        if label == "5h" and row.state5 == "cold":
-            suffix = suffix_full = "not started"
-        elif label == "5h" and row.state5 == "primed":
-            suffix, suffix_full = f"{suffix} · primed", f"{suffix_full} · primed"
-        if 4 + label_w + 1 + bar_w + 5 + 2 + len(suffix_full) <= width:
-            suffix = suffix_full
-        soft, hard = ctx.ticks.get(label, (None, None))
-        line = Text("    ")
-        line.append(f"{label:<{label_w}} ", style=p.muted)
-        line.append(bar_cells(pct, bar_w, stale=dim, threshold=soft, hard=hard, palette=p))
-        color = bar_color(pct, threshold=soft, hard=hard, palette=p)
-        line.append(f" {pct:3.0f}%", style=f"{color} dim" if dim else color)
-        if suffix:
-            line.append(f"  {suffix}", style=p.muted)
-        out.append(pad_to(line, width))
-    return out
-
-
-def block_lines(
-    row: fx.FleetRow, acc: AccountSnapshot | None, width: int, ctx: Ctx, *, max_bar: int
-) -> list[Text]:
-    """A whole account block: the header and its bars, ``width`` wide."""
-    return [
-        pad_to(header_line(row, acc, width, ctx), width),
-        *body_lines(row, acc, width, ctx, max_bar=max_bar),
-    ]
-
-
-@dataclass(frozen=True)
-class MiniWidths:
-    number: int
-    name: int
-    bar: int
-
-
-def mini_widths(rows: Sequence[fx.FleetRow], width: int, ctx: Ctx) -> MiniWidths:
-    """One set of widths for every one-line row, so the bars line up."""
-    number = max((len(r.number) for r in rows), default=1)
-    name = max(4, min(10, max((len(r.name) for r in rows), default=4)))
-    tags = [ctx.tag(r) for r in rows]
-    tag_w = max([12, *(len(t[0]) for t in tags if t)])
-    fixed = 2 + number + 1 + name + 1 + 2 * (3 + 5) + 2 + tag_w + 2
-    return MiniWidths(number, name, max(5, min(14, (width - fixed) // 2)))
-
-
-def mini_line(row: fx.FleetRow, width: int, ctx: Ctx, widths: MiniWidths) -> Text:
-    """``● 1 main   5h ━━━┃━ 62%  7d ━━──┃ 41%      ● active``."""
-    p = ctx.palette
     t = Text()
-    t.append("● " if row.active else "  ", style=f"bold {p.accent}")
-    t.append(f"{row.number:>{widths.number}} ", style=f"bold {p.foreground}")
-    t.append(
-        fx.clip(row.name, widths.name).ljust(widths.name + 1),
-        style=f"bold {p.accent}" if row.active else p.foreground,
-    )
-    if row.login != "ok":
-        tone = p.sev_crit if row.login == "relogin" else (
-            p.muted if row.login == "api" else p.sev_warn
-        )
-        t.append(_LOGIN_NOTES.get(row.login, row.login), style=tone)
+    if plan.bar:
+        t.append(bar_cells(pct, plan.bar, stale=dim, threshold=soft, hard=hard, palette=p))
+        t.append(" ")
+    color = bar_color(pct, threshold=soft, hard=hard, palette=p)
+    t.append(f"{pct:3.0f}%" if pct is not None else "   ?",
+             style=f"{color} dim" if dim else color)
+    return t
+
+
+def _login_cell(row: fx.FleetRow, window: str, width: int, ctx: Ctx) -> Text:
+    """What stands in for a bar when the login cannot be read."""
+    p = ctx.palette
+    first, second = _LOGIN_CELLS.get(row.login, ((row.login,), ("",)))
+    words = _fit(first if window == "5h" else second, width)
+    if window == "7d" or row.login == "api":
+        tone = p.muted
     else:
-        dim = row.stale or row.tier == "excluded"
-        for i, (label, pct) in enumerate((("5h", row.pct5), ("7d", row.pct7))):
-            soft, hard = ctx.ticks.get(label, (None, None))
-            if i:
-                t.append("  ")
-            t.append(f"{label} ", style=p.muted)
-            t.append(bar_cells(pct, widths.bar, stale=dim, threshold=soft, hard=hard, palette=p))
-            color = bar_color(pct, threshold=soft, hard=hard, palette=p)
-            t.append(f" {pct:3.0f}%" if pct is not None else "    ?",
-                     style=f"{color} dim" if dim else color)
-    return with_tag(t, ctx.tag(row), width, p)
+        tone = p.sev_crit if row.login == "relogin" else p.sev_warn
+    return Text(words, style=tone)
 
 
-# -- the account area ------------------------------------------------------------------------
+def _resets_cell(row: fx.FleetRow, window: str, plan: home.TablePlan, ctx: Ctx) -> Text:
+    """``1h47m`` with `` · 07:10`` dim after it; ``not started``, ``—``
+    and ``now`` dim."""
+    p = ctx.palette
+    text = home.row_resets(row, window, ctx.now, clock=plan.clock)
+    left, sep, clock = text.partition(" · ")
+    if not sep:
+        quiet = text in (home.NOT_STARTED, home.NOT_KNOWN, "now")
+        return Text(text, style=p.muted if quiet else p.foreground)
+    return Text(left, style=p.foreground).append(f" · {clock}", style=p.muted)
+
+
+def table_row(row: fx.FleetRow, mark: str, plan: home.TablePlan, ctx: Ctx) -> Text:
+    """One account's row, ``plan.room`` wide."""
+    p = ctx.palette
+    line = Text()
+    for i, (key, width) in enumerate(plan.columns):
+        if i:
+            line.append(" " * plan.gap)
+        if key == "order":
+            cell = _order_cell(mark, width, ctx)
+        elif key == "account":
+            cell = _account_cell(row, width, ctx)
+        elif key == "plan":
+            cell = Text(home.plan_text(row), style=p.foreground)
+        elif key in ("5h", "7d"):
+            cell = (_usage_cell(row, key, plan, ctx) if row.login == "ok"
+                    else _login_cell(row, key, width, ctx))
+        elif key in ("reset5", "reset7"):
+            cell = _resets_cell(row, "5h" if key == "reset5" else "7d", plan, ctx)
+        else:
+            status = ctx.status(row)
+            cell = Text(status[0], style=tone_style(status[1], p)) if status else Text()
+        line.append(pad_to(cell, width))
+    return pad_to(line, plan.room)
 
 
 @dataclass
@@ -243,7 +201,7 @@ class Body:
     """The rendered account area plus where each account landed in it."""
 
     text: Text = field(default_factory=Text)
-    #: number -> (first line, line count) of its block or row.
+    #: number -> (first line, line count) of its row.
     spans: dict[str, tuple[int, int]] = field(default_factory=dict)
     #: per line, ``(x0, x1, number)`` for each account drawn on it (clicks).
     hits: list[list[tuple[int, int, str]]] = field(default_factory=list)
@@ -260,81 +218,181 @@ class Body:
         return next((n for x0, x1, n in self.hits[y] if x0 <= x < x1), None)
 
 
-def render_blocks(
+def render_table(
     rows: Sequence[fx.FleetRow],
-    accounts: Mapping[str, AccountSnapshot],
-    width: int,
-    ctx: Ctx,
-    layout: home.HomeLayout,
-    *,
-    selected: str | None,
-    selected_bg: str,
-) -> Body:
-    """Wide and medium: account blocks, ``layout.columns`` side by side
-    (row by row), a blank line between block rows."""
-    cols = layout.columns
-    cw = home.column_width(width, layout)
-    blocks: list[list[Text]] = []
-    for row in rows:
-        lines = block_lines(row, accounts.get(row.number), cw, ctx, max_bar=layout.max_bar)
-        if row.number == selected:
-            for line in lines:
-                line.stylize(selected_bg)
-        blocks.append(lines)
-    body = Body()
-    for start in range(0, len(rows), cols):
-        group = blocks[start:start + cols]
-        numbers = [r.number for r in rows[start:start + cols]]
-        if start:
-            body.append(Text(""))
-        first = len(body.hits)
-        tall = max(len(b) for b in group)
-        for i in range(tall):
-            line = Text()
-            owners: list[tuple[int, int, str]] = []
-            for j, block in enumerate(group):
-                if j:
-                    line.append(" " * layout.gap)
-                x0 = line.cell_len
-                line.append(block[i] if i < len(block) else Text(" " * cw))
-                owners.append((x0, x0 + cw, numbers[j]))
-            body.append(line, owners)
-        for j, number in enumerate(numbers):
-            body.spans[number] = (first, len(group[j]))
-    return body
-
-
-def render_list(
-    rows: Sequence[fx.FleetRow],
-    width: int,
+    plan: home.TablePlan,
     ctx: Ctx,
     *,
     selected: str | None,
     selected_bg: str,
 ) -> Body:
-    """Narrow: one line per account."""
-    widths = mini_widths(rows, width, ctx)
+    """One line per account, in ``rows`` order (the header is
+    :func:`table_header`, drawn above the scrolling area)."""
+    marks = home.order_marks(rows, ctx.now)
     body = Body()
     for row in rows:
-        line = pad_to(mini_line(row, width, ctx, widths), width)
+        line = table_row(row, marks.get(row.number, home.ORDER_NONE), plan, ctx)
         if row.number == selected:
             line.stylize(selected_bg)
         body.spans[row.number] = (len(body.hits), 1)
-        body.append(line, [(0, width, row.number)])
+        body.append(line, [(0, plan.room, row.number)])
     return body
 
 
-def render_expanded(
-    row: fx.FleetRow | None, acc: AccountSnapshot | None, width: int, ctx: Ctx, *, max_bar: int
+# -- the selected account in full -------------------------------------------------------------
+
+
+def _reset_ts(window: Mapping | None) -> float | None:
+    raw = window.get("resets_at") if isinstance(window, Mapping) else None
+    if not raw:
+        return None
+    try:
+        return datetime.fromisoformat(str(raw).replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return None
+
+
+_MARKERS = ("(!)", "(ahead of pace)")
+
+
+def detail_windows(
+    row: fx.FleetRow, acc: AccountSnapshot | None, now: float
+) -> list[tuple[str, float, str]]:
+    """``(label, pct, words)`` per usage window the account has (spend, 5h,
+    7d, then per-model windows such as ``Fable``), each with its exact
+    reset: ``resets 07:10 (in 1h47m)``."""
+    if acc is None or acc.usage.sentinel is not None:
+        return []
+    last_good = acc.usage.last_good
+    scoped = {
+        w.get("name"): w for w in (last_good or {}).get("scoped") or [] if isinstance(w, dict)
+    }
+    out: list[tuple[str, float, str]] = []
+    for label, pct, _suffix, full in usage_rows(last_good, now, acc.usage.fetched_at):
+        marks = [m for m in _MARKERS if m in full]
+        if label == "$$":
+            out.append((label, pct, full))
+            continue
+        if label == "5h":
+            cold = row.state5 == "cold"
+            words = home.NOT_STARTED if cold else home.exact_reset(row.reset5, now)
+            if row.state5 == "primed":
+                words += " · primed"
+        elif label == "7d":
+            words = home.exact_reset(row.reset7, now)
+        else:
+            words = home.exact_reset(_reset_ts(scoped.get(label)), now)
+        out.append((label, pct, "  ".join([words, *marks])))
+    return out
+
+
+def _login_words(row: fx.FleetRow, now: float) -> tuple[str, str]:
+    """``login ends Oct 24 09:12 (in 21d 0h)`` and its tone."""
+    if row.login == "relogin":
+        cause = "login expired" if row.login_expired else "refresh token dead"
+        return f"re-login needed ({cause})", "crit"
+    if row.login == "api":
+        return "API key", "dim"
+    left = fx.login_left(row, now)
+    if left is None:
+        return "login: no deadline recorded", "dim"
+    if left <= 0:
+        return "login expired", "crit"
+    tone = "crit" if left < fx.LOGIN_URGENT_S else "warn" if left < fx.LOGIN_WARN_S else "dim"
+    when = oauth.local_clock(row.login_deadline)
+    return f"login ends {when} (in {oauth.login_countdown(left)})", tone
+
+
+def _prime_words(row: fx.FleetRow, ctx: Ctx) -> str:
+    """``5h opened by priming`` / ``next prime ≤08:30`` / why not."""
+    cell = row.prime
+    if row.state5 == "primed":
+        return "5h opened by priming"
+    if cell.kind == "active" or row.login != "ok":
+        return ""
+    if cell.kind in ("due", "window"):
+        return f"next prime {fx.prime_text(cell)}" if ctx.priming else "priming not running"
+    if cell.kind == "off":
+        return "priming off"
+    return f"not primed: {cell.note}" if cell.note not in ("", "—") else ""
+
+
+def render_detail(
+    row: fx.FleetRow | None, acc: AccountSnapshot | None, width: int, ctx: Ctx
 ) -> Text:
-    """Narrow: a rule, then the selected account as a full block."""
-    text = Text("─" * width, style=ctx.palette.track)
+    """A rule, then the selected account in full: its name, organization,
+    plan and tag; a long bar per usage window with the exact reset; the
+    login deadline and priming."""
+    p = ctx.palette
+    text = Text("─" * width, style=p.track, no_wrap=True)
     if row is None:
         return text
-    for line in block_lines(row, acc, width, ctx, max_bar=max_bar):
+    lines: list[Text] = []
+    head = Text()
+    alias = acc.alias if acc is not None else ""
+    name_style = f"bold {p.accent}" if row.active else f"bold {p.foreground}"
+    head.append(alias or row.email, style=name_style)
+    if alias:
+        head.append(f" ({row.email})", style=p.foreground)
+    head.append(home.account_slot(row), style=p.muted)
+    facts = [row.org] + ([home.plan_text(row)] if row.plan != "?" else [])
+    head.append("  " + " · ".join(facts), style=p.muted)
+    status = ctx.status(row)
+    if status:
+        head.append("  ")
+        head.append(status[0], style=tone_style(status[1], p))
+    lines.append(head)
+
+    windows = detail_windows(row, acc, ctx.now)
+    if row.login != "ok":
+        words = "⚠ needs re-login — select it and press r" if row.login == "relogin" else (
+            f"{_LOGIN_CELLS.get(row.login, ((row.login,), ()))[0][0]}"
+        )
+        tone = p.sev_crit if row.login == "relogin" else (
+            p.muted if row.login == "api" else p.sev_warn
+        )
+        lines.append(Text("    ").append(words, style=tone))
+        seen = data.last_seen_note(acc.usage) if acc is not None else None
+        if seen:
+            lines.append(Text(f"    └ {seen}", style=p.muted))
+    elif not windows:
+        lines.append(Text("    usage unavailable", style=p.muted))
+    else:
+        dim = row.stale or row.tier == "excluded"
+        label_w = max(home.cells(w[0]) for w in windows)
+        words_w = max(home.cells(w[2]) for w in windows)
+        bar_w = max(10, min(60, width - 4 - label_w - 1 - 5 - 2 - words_w))
+        for label, pct, words in windows:
+            soft, hard = ctx.ticks.get(label, (None, None))
+            line = Text("    ")
+            line.append(label + " " * (label_w - home.cells(label) + 1), style=p.muted)
+            line.append(bar_cells(pct, bar_w, stale=dim, threshold=soft, hard=hard, palette=p))
+            color = bar_color(pct, threshold=soft, hard=hard, palette=p)
+            line.append(f" {pct:3.0f}%", style=f"{color} dim" if dim else color)
+            line.append(f"  {words}", style=p.foreground)
+            lines.append(line)
+
+    info = Text("    ")
+    login, tone = _login_words(row, ctx.now)
+    info.append(login, style=tone_style(tone, p))
+    extra = [w for w in (_prime_words(row, ctx),) if w]
+    if row.stale and acc is not None and acc.usage.age_s is not None:
+        extra.append(f"reading {data.format_duration(acc.usage.age_s)} old")
+    for words in extra:
+        info.append(f" · {words}", style=p.muted)
+    lines.append(info)
+
+    for line in lines:
         text.append("\n")
-        text.append(line)
+        text.append(pad_to(line, width))
     return text
+
+
+def detail_height(row: fx.FleetRow | None, acc: AccountSnapshot | None, ctx: Ctx) -> int:
+    """Lines :func:`render_detail` takes (its rule included)."""
+    if row is None:
+        return 0
+    return len(render_detail(row, acc, 80, ctx).plain.splitlines())
 
 
 # -- status, attention, keys ---------------------------------------------------------------------
@@ -370,3 +428,4 @@ def keys_text(width: int, palette: Palette) -> Text:
         if what:
             keys.append(f" {what}", style=palette.muted)
     return keys
+

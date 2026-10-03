@@ -260,14 +260,22 @@ def help_entries(idle_pattern: str | None = None) -> list[tuple[str, str]]:
                        "background service switches, this screen only watches"),
         ("! line", "only when something needs you: a dead or expiring login, priming "
                    "paused after a Claude Code update, a service that stops at logout"),
+        ("order", "● the active account; 1, 2, 3 … where automatic switching goes "
+                  "next, in that order; – never (a dead login, an excluded account). "
+                  "The table lists the accounts in this order"),
+        ("account", "the alias, else the email, then #N: its slot number, which the "
+                    "attention line and cc-swap commands use"),
+        ("plan", "20x / 5x; team is an organization account"),
         ("bars", "┃ amber = the soft mark, ┃ red = the hard mark. The fill is green "
                  "under soft, amber from soft, red from hard; 5h and 7d each have "
                  "their own marks (m → s changes them)"),
-        ("[20x] [5x]", "the plan; [team] is an organization account"),
-        ("order", "the active account, then where switching would go, best first, "
-                  "then the rest; excluded accounts last"),
+        ("5h / 7d resets", "when each window resets, for every account: 1h47m · 07:10 "
+                           "= in 1h47m, at 07:10. 'not started' = no 5h window is "
+                           "running; — = not known"),
+        ("panel", "under the table when the terminal has room: the selected account "
+                  "in full, with every usage window and its exact reset"),
         ("", ""),
-        ("", "Tags (each account shows the most important one)"),
+        ("", "Status (each account shows the most important one)"),
         ("● active", "the account Claude Code uses now"),
         ("re-login (r)", "its stored login is dead: select it and press r"),
         ("excluded", "never picked automatically (m → x includes it again)"),
@@ -275,6 +283,8 @@ def help_entries(idle_pattern: str | None = None) -> list[tuple[str, str]]:
         ("login 3d left", "the login reaches its fixed deadline soon: r renews it early"),
         ("last resort", "used only when every other account is at its limit (l toggles)"),
         ("5h off · prime", "its 5h window has not started; priming starts it at that time"),
+        ("primed", "priming opened the 5h window it is in (shown when nothing above "
+                   "applies)"),
         ("", ""),
         ("", "Words"),
         ("soft mark", "past it, cc-swap moves you at the next pause in your work"),
@@ -306,7 +316,7 @@ def help_entries(idle_pattern: str | None = None) -> list[tuple[str, str]]:
         *learned,
         ("", ""),
         ("", "Keys"),
-        ("↑ ↓ / j k", "select an account (← → across the two columns when wide)"),
+        ("↑ ↓ / j k", "select an account (a click selects too)"),
         ("enter", "switch to it (asks first when switching would not land there)"),
         ("r", "re-login it (guided; cc-swap launches nothing)"),
         ("l", "last resort on/off"),
