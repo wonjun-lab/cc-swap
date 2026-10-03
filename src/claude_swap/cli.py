@@ -606,6 +606,28 @@ def _finite_float(value: str) -> float:
     return number
 
 
+def _mark_pct(flag: str):
+    """argparse ``type=`` for ``auto --soft5h/--hard5h/--soft7d/--hard7d``:
+    a finite number inside that setting's range (maximize.<flag>). Out of
+    range is rejected here, with the range, instead of being clamped into it
+    and reported later as a soft/hard conflict."""
+    from claude_swap.settings import SETTING_SPECS
+
+    spec = SETTING_SPECS[f"maximize.{flag.lstrip('-')}"]
+
+    def parse(value: str) -> float:
+        number = _finite_float(value)
+        if not spec.lo <= number <= spec.hi:
+            raise argparse.ArgumentTypeError(
+                f"{value!r} is out of range: expected a percentage between "
+                f"{spec.lo:g} and {spec.hi:g}"
+            )
+        return number
+
+    parse.__name__ = "percentage"
+    return parse
+
+
 def _auto_command(argv: list[str]) -> None:
     """Handle `cswap auto [--once] [--json] [...]`.
 
@@ -727,7 +749,7 @@ Defaults live in settings.json in the backup root; flags override them.
         when = "at the next idle moment" if kind == "soft" else "immediately"
         parser.add_argument(
             flag,
-            type=_finite_float,
+            type=_mark_pct(flag),
             metavar="PCT",
             help=(
                 f"maximize only: {window} {kind} mark, switch {when} once the "
@@ -811,7 +833,8 @@ Defaults live in settings.json in the backup root; flags override them.
         ]
         if given and settings.strategy != "maximize":
             parser.error(
-                f"{', '.join(given)} only apply to the maximize strategy "
+                f"{', '.join(given)} only {'applies' if len(given) == 1 else 'apply'}"
+                " to the maximize strategy "
                 "(--strategy maximize or autoswitch.strategy maximize)"
             )
         maximize = None
