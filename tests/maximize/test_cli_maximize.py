@@ -82,8 +82,14 @@ class TestAutoMaximize:
 
     def test_threshold_flags_without_maximize_are_rejected(self, temp_home, capsys):
         assert _auto(["--once", "--soft5h", "40"]) == 2
-        assert "--soft5h only apply to the maximize strategy" in capsys.readouterr().err
+        assert "--soft5h only applies to the maximize strategy" in capsys.readouterr().err
         assert FakeEngine.instances == []
+
+    def test_several_flags_without_maximize_keep_the_plural(self, temp_home, capsys):
+        assert _auto(["--once", "--soft5h", "40", "--hard5h", "90"]) == 2
+        assert "--soft5h, --hard5h only apply to the maximize strategy" in (
+            capsys.readouterr().err
+        )
 
     def test_soft_above_hard_exits_1(self, temp_home, capsys):
         assert _auto(["--once", "--strategy", "maximize", "--soft5h", "97"]) == 1
@@ -110,6 +116,27 @@ class TestAutoMaximize:
         assert _auto(["--once", "--strategy", "maximize", flag, "high"]) == 2
         assert flag in capsys.readouterr().err
         assert FakeEngine.instances == []
+
+    @pytest.mark.parametrize("flag", ["--soft5h", "--hard5h", "--soft7d", "--hard7d"])
+    @pytest.mark.parametrize("value", ["150", "100", "99.95", "0", "0.5", "-5"])
+    def test_out_of_range_flag_values_are_rejected_at_parse_time(
+        self, temp_home, capsys, flag, value
+    ):
+        # Not clamped and then reported as a soft/hard conflict: the message
+        # names the flag, the value and the accepted range.
+        assert _auto(["--once", "--strategy", "maximize", f"{flag}={value}"]) == 2
+        err = capsys.readouterr().err
+        assert flag in err
+        assert "between 1 and 99.9" in err
+        assert value in err
+        assert "must not exceed" not in err
+        assert FakeEngine.instances == []
+
+    @pytest.mark.parametrize("value", ["1", "99.9", "50"])
+    def test_range_ends_are_accepted_by_the_type(self, value):
+        from claude_swap import cli
+
+        assert cli._mark_pct("--soft5h")(value) == float(value)
 
     def test_finite_flag_values_still_parse_as_floats(self, temp_home):
         _auto(["--once", "--strategy", "maximize", "--soft5h", "40", "--hard7d", "97.5"])

@@ -29,7 +29,7 @@ from pathlib import Path
 from typing import NamedTuple
 
 from claude_swap import __version__
-from claude_swap.cache import CACHE_DIR, MISSING, read_cache, write_cache
+from claude_swap.cache import CACHE_DIR, write_cache
 
 # Not upstream's ``update_check.json``: the backup root (and so CACHE_DIR) is
 # shared with an upstream cswap install, whose cached PyPI version would read
@@ -434,6 +434,13 @@ def _fetch_releases(timeout: float, *, passive: bool = False) -> list:
     return data
 
 
+def _lookup_latest_tag(timeout: float = 2) -> str | None:
+    """:func:`_fetch_latest_tag` without swallowing the failure: raises
+    :class:`_LookupFailed`, so the caller can tell "GitHub did not answer"
+    from "GitHub answered: no release yet" (None)."""
+    return _pick_latest_tag(_fetch_releases(timeout, passive=True))
+
+
 def _fetch_latest_tag(timeout: float = 2) -> str | None:
     """The fork's latest published release tag, as published (``cc-v0.4.0``),
     for the passive update notice: one request of at most ``timeout``
@@ -447,7 +454,7 @@ def _fetch_latest_tag(timeout: float = 2) -> str | None:
     does tell the two apart; see :func:`_latest_tag_for_upgrade`.)
     """
     try:
-        return _pick_latest_tag(_fetch_releases(timeout, passive=True))
+        return _lookup_latest_tag(timeout)
     except _LookupFailed:
         return None
 
@@ -567,19 +574,60 @@ def _is_older_than_running(tag: str) -> bool:
         return False
 
 
+def _read_notice_cache() -> dict | None:
+    """The update-check cache file as a dict, or None when absent/malformed."""
+    try:
+        raw = json.loads(CACHE_PATH.read_text(encoding="utf-8"))
+        float(raw["timestamp"])
+        raw["data"]
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+    return raw if isinstance(raw, dict) else None
+
+
+def _passive_latest_tag() -> object:
+    """The latest tag for the passive notice: the cached one while it is
+    fresh, else a live lookup (cached, so offline commands do not each pay the
+    timeout).
+
+    A failed lookup keeps the previous good tag *and its timestamp* and
+    records the failure beside it (``lastError`` / ``lastErrorAt``), so a
+    later ``upgrade`` that cannot reach GitHub still has a tag to fall back
+    on. ``lastErrorAt`` holds the retry off for :data:`CACHE_TTL`, as a fresh
+    entry would. The tag is cached as published, not as a bare version: the
+    Windows hint has to name the exact ref the release lives at.
+    """
+    raw = _read_notice_cache()
+    now = time.time()
+    if raw is not None:
+        if now - float(raw["timestamp"]) < CACHE_TTL:
+            return raw["data"]
+        try:
+            if now - float(raw.get("lastErrorAt")) < CACHE_TTL:
+                return raw["data"]
+        except (TypeError, ValueError):
+            pass
+    try:
+        tag = _lookup_latest_tag()
+    except _LookupFailed as failure:
+        good = raw["data"] if raw is not None else None
+        if isinstance(good, str) and _TAG_RE.fullmatch(good) and is_fork_tag(good):
+            entry = {"timestamp": raw["timestamp"], "data": good}
+        else:
+            entry = {"timestamp": now, "data": None}
+        entry["lastError"] = failure.reason
+        entry["lastErrorAt"] = now
+        CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        CACHE_PATH.write_text(json.dumps(entry), encoding="utf-8")
+        return entry["data"]
+    write_cache(CACHE_PATH, tag)
+    return tag
+
+
 def check_for_update(current_version: str) -> str | None:
     """Return a notification string if a newer version exists, else None."""
     try:
-        cached_data = read_cache(CACHE_PATH, CACHE_TTL)
-        if cached_data is not MISSING:
-            latest_tag = cached_data
-        else:
-            latest_tag = _fetch_latest_tag()
-            # Cache failures too (as upstream does): offline, the next
-            # command must not pay the 2s timeout again. The tag is cached as
-            # published, not as a bare version: the Windows hint below has to
-            # name the exact git ref the release lives at.
-            write_cache(CACHE_PATH, latest_tag)
+        latest_tag = _passive_latest_tag()
 
         # The cache file is not something we trust to hold one of our tags.
         if not (isinstance(latest_tag, str) and is_fork_tag(latest_tag)):
