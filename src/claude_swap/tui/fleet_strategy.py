@@ -46,6 +46,8 @@ def _value_text(field: menus.StrategyField, value: object) -> str:
         return "on" if value else "off"
     if field.key == "prime.jitterS":
         return f"{value} {field.unit}".strip()
+    if field.key == "maximize.rideWindows":
+        return str(value) if value else "none"
     if isinstance(value, float):
         text = f"{value:.2f}" if field.key == "maximize.tieEpsilon" else f"{value:g}"
     else:

@@ -1143,6 +1143,27 @@ def check_idle_pattern(ctx: Context) -> list[Finding]:
     return [Finding("idle-pattern", "info", history.describe(slots, p.now, enabled=enabled))]
 
 
+def check_learned_ride(ctx: Context) -> list[Finding]:
+    """What the learned ride has learned, per window (info only; ``maximize``
+    strategy only): the share of the last point each window rides, and how
+    many rides switched before 100% or hit it. Reads the state file's
+    ``rideLearning``, writes nothing."""
+    from claude_swap import settings as st
+    from claude_swap.maximize import policy
+    from claude_swap.maximize import ride as learned_ride
+
+    if ctx.strategy != "maximize":
+        return []
+    try:
+        mx = st._section_from_raw(
+            (ctx.raw_settings or {}).get("maximize"), "maximize", st.MaximizeSettings
+        )
+    except TypeError:
+        mx = st.MaximizeSettings()
+    text = policy.ride_text(ctx.state.get(learned_ride.LEARN_KEY), mx)
+    return [Finding("learned-ride", "info", text)]
+
+
 def priming_guard(backup_root: Path) -> tuple[str | None, str | None]:
     """``(paused note, verified version)`` from the priming version guard's
     records — read-only, no ``claude --version``."""
@@ -1303,6 +1324,7 @@ ENV_CHECKS: tuple[Callable[[Context], list[Finding]], ...] = (
     check_settings,
     check_priming,
     check_idle_pattern,
+    check_learned_ride,
 )
 
 

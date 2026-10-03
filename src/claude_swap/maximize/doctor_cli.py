@@ -490,6 +490,10 @@ REASONS: dict[str, tuple[str, str]] = {
         "A hard mark is reached (or close at the recent pace), but no account under the hard caps has more room on that window than the active one, so maximize stays on it rather than move somewhere that would force a move straight back.",
         "Nothing; at 100% the at-limit switch moves you at once to whatever has quota left. cc-swap add another account for more room.",
     ),
+    "ride": (
+        "A window listed in maximize.rideWindows reached a hard mark of 99% or more but is under 100%. Usage is reported in whole percents, so up to one point is left: maximize keeps using it for a learned share of the time one point takes, then switches (at once if the account goes idle first, or if it hits 100%).",
+        "Nothing; cc-swap doctor shows what has been learned. Set maximize.learnedRide to false (or maximize.rideWindows to \"\") to switch at the hard mark, or lower maximize.rideMaxMin to cap the ride.",
+    ),
     "hold": (
         "You asked to stay on the active account (cc-swap hold, or Fleet: h) so a long task keeps its context: until the hold ends, maximize skips its soft, preempt and rebalance moves. A hard mark, 100% and a reset-wait still switch.",
         "Nothing; cc-swap hold off (or Fleet: h → o) lifts it. It ends by itself at its end time (at most 24h), or when the active account changes.",
@@ -596,6 +600,36 @@ def _pattern_line(pattern: dict) -> str:
     return dimmed(f"  pattern  {text}")
 
 
+def ride_learning(backup_root) -> dict:
+    """What the learned ride has learned (the state file's
+    ``rideLearning``) for ``why``: ``{"text", "windows", "learned"}``.
+    Reads the state file and settings, writes nothing."""
+    from claude_swap.maximize import policy
+    from claude_swap.maximize import ride as learned_ride
+    from claude_swap.maximize import view as mxview
+    from claude_swap.settings import MaximizeSettings, load_maximize_settings
+
+    try:
+        s = load_maximize_settings(backup_root)
+    except Exception:
+        s = MaximizeSettings()
+    try:
+        state = json.loads((backup_root / mxview.STATE_FILENAME).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        state = {}
+    raw = state.get(learned_ride.LEARN_KEY) if isinstance(state, dict) else None
+    return {
+        "text": policy.ride_text(raw, s),
+        "windows": list(policy.ride_windows(s)),
+        "learned": learned_ride.learned(raw),
+    }
+
+
+def _ride_line(ride: dict) -> str:
+    text = str(ride.get("text") or "").removeprefix("learned ride: ")
+    return dimmed(f"  ride     {text}")
+
+
 def _published_code(state: Mapping, published) -> str | None:
     """The ``code`` a published hold carries (a reset-aware wait), when it
     is the same record ``published`` was read from."""
@@ -700,6 +734,9 @@ def _why_lines(why: dict) -> list[str]:
     pattern = why.get("idlePattern")
     if pattern:
         lines.append(_pattern_line(pattern))
+    ride = why.get("learnedRide")
+    if ride:
+        lines.append(_ride_line(ride))
     return lines
 
 
@@ -754,6 +791,7 @@ def why_command(argv: list[str], *, clock: Callable[[], float] = time.time) -> N
     why = published_why(root, now=now)
     if why is not None:
         why["idlePattern"] = idle_pattern(root, now=now)
+        why["learnedRide"] = ride_learning(root)
     held, hold_line = account_hold_now(root, now=now)
     if args.json:
         payload = {"schemaVersion": SCHEMA_VERSION, **(why or {"source": "none"})}
@@ -779,6 +817,7 @@ def why_command(argv: list[str], *, clock: Callable[[], float] = time.time) -> N
         "is not maximize, or the login changed since)."
     )
     print(_pattern_line(idle_pattern(root, now=now)))
+    print(_ride_line(ride_learning(root)))
     if args.no_fallback:
         print(dimmed("Run cc-swap auto --once --dry-run to see what one would decide now."))
         sys.exit(0)

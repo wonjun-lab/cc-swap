@@ -253,6 +253,15 @@ STRATEGY_FIELDS: tuple[StrategyField, ...] = (
     StrategyField("maximize.resetWaitMin", "reset wait", "min",
                   "wait out a window that resets this soon instead of switching (0 = off)", 1,
                   "when to leave the active account"),
+    StrategyField("maximize.learnedRide", "learned ride", "",
+                  "past a hard mark of 99+, use a learned share of the last 1% first", 1,
+                  "when to leave the active account"),
+    StrategyField("maximize.rideWindows", "ride windows", "",
+                  "windows that ride (5h switches at its hard mark unless listed)", 1,
+                  "when to leave the active account"),
+    StrategyField("maximize.rideMaxMin", "ride max", "min",
+                  "a ride lasts at most this long (0 = no ride)", 5,
+                  "when to leave the active account"),
     StrategyField("maximize.rebalanceCooldownMin", "rebalance cooldown", "min", "", 5,
                   "when to leave the active account"),
     StrategyField("maximize.tieEpsilon", "tie epsilon", "", "scores this close count as a tie",
@@ -350,6 +359,10 @@ def help_entries(idle_pattern: str | None = None) -> list[tuple[str, str]]:
                            "maximize.resetWaitMin minutes: cc-swap waits for the reset "
                            "instead of switching (a switch makes Claude Code re-read the "
                            "whole context), and switches at once if it hits 100%"),
+        ("riding", "a window in maximize.rideWindows reads a hard mark of 99%+: usage is "
+                   "shown in whole percents, so up to a point is left; cc-swap uses a "
+                   "learned share of it, then switches (at once if you pause or it hits "
+                   "100%)"),
         ("quiet time", "when you are usually idle, learned from the last 14 days: an hour "
                        "or more that was busy less than 20% of the time (weekdays and "
                        "weekends apart, after 3 days)"),
