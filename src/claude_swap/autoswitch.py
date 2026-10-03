@@ -575,6 +575,8 @@ class MaximizeDecisionEvent(AutoSwitchEvent):
     rows: list[dict] = field(default_factory=list)
     dry_run: bool = False
     code: str | None = None
+    # A learned ride (code ``ride``): when it switches (epoch s).
+    ride_until: float | None = None
 
     def _fields(self) -> dict:
         fields = {
@@ -587,6 +589,8 @@ class MaximizeDecisionEvent(AutoSwitchEvent):
         }
         if self.code:
             fields["code"] = self.code
+        if self.ride_until is not None:
+            fields["rideUntil"] = self.ride_until
         if self.rows:
             fields["accounts"] = self.rows
         if self.dry_run:

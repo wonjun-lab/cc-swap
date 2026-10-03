@@ -22,6 +22,16 @@ becomes the Snapshot's ``hold_until``; a hold that no longer applies (past
 its end, or on a slot that is no longer active) is cleared here, and a
 switch the engine makes ends the hold on the account it leaves.
 
+The learned ride (maximize/ride.py) keeps three state-file records: the
+whole-point steps of each account while active (``rideSteps``, T1), the
+active account's ride (``maximizeRide``: when each window first read its
+hard mark, and which windows the last acted-on decision rode), and what was
+learned (``rideLearning``, q per window). A ride the engine ended with its
+hard switch before 100% raises q; 100% read while it rode halves q; an
+idle switch, a dry run, ``auto off`` and an unreadable tick teach nothing.
+A ride polls the active account at the urgent 60 s cadence over its last
+``RESET_WAIT_URGENT_S``, at ``pendingPollS`` before that.
+
 Per-engine state lives on a :class:`MaximizeRuntime` attached to the engine
 as ``_maximize_runtime`` (``attach_maximize`` / ``runtime_for``).
 """
@@ -42,6 +52,7 @@ from claude_swap import oauth, poll_policy
 from claude_swap.exceptions import ConfigError
 from claude_swap.maximize import history, idle, ledger, notify, pause, policy
 from claude_swap.maximize import hold as account_hold
+from claude_swap.maximize import ride as learned_ride
 from claude_swap.maximize.model import (
     AccountView,
     Decision,
@@ -94,6 +105,8 @@ PUBLISH_REFRESH_S = 300.0
 # over the last this-many seconds before the reset: at most 15 polls a wait,
 # the planner's own bound on an urgent episode, whatever resetWaitMin says.
 RESET_WAIT_URGENT_S = 900.0
+# The active account's learned ride (see the module docstring).
+RIDE_KEY = "maximizeRide"
 
 # Numeric ``maximize`` keys. The settings loader is lenient per key (wrong
 # type → default, out of range → clamped) and reports only pair repairs in
@@ -115,6 +128,7 @@ _NUMERIC_KEYS: tuple[tuple[str, str], ...] = (
     ("resetWaitMin", "reset_wait_min"),
     ("preemptHorizonMaxH", "preempt_horizon_max_h"),
     ("busyRebalanceGap", "busy_rebalance_gap"),
+    ("rideMaxMin", "ride_max_min"),
 )
 
 
@@ -143,6 +157,8 @@ class MaximizeRuntime:
     drift_seen: tuple[object, str] | None = None
     # The usage history writer (maximize/history.py), loaded on first use.
     history: history.Recorder | None = None
+    # Dry runs keep the learned ride's records here (never learning).
+    dry_ride: dict = field(default_factory=dict)
 
 
 # -- settings ------------------------------------------------------------------
@@ -656,6 +672,198 @@ def _reset_samples(engine: aw.AutoSwitchEngine, number: str) -> None:
     engine._mutate_state(lambda s: s.__setitem__(SAMPLES_KEY, record))
 
 
+# -- the learned ride ---------------------------------------------------------------
+
+
+def _finite(value: object) -> float | None:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    value = float(value)
+    return value if math.isfinite(value) else None
+
+
+def _new_sample(
+    before: list[Sample], samples: tuple[Sample, ...]
+) -> tuple[Sample | None, float | None]:
+    """``(sample, previous ts)``: the reading this tick added to the active
+    account's samples, and when the one before it was read (None when it
+    is the first since the account became active)."""
+    if not samples or (before and samples[-1].ts <= before[-1].ts):
+        return None, None
+    return samples[-1], (before[-1].ts if before else None)
+
+
+def _ride_record(raw: object, current: str) -> dict:
+    """The ``maximizeRide`` record for ``current``, leniently; a record
+    about another account starts over (a switch ends every ride)."""
+    out: dict = {"account": current, "armed": {}, "riding": []}
+    if not isinstance(raw, Mapping) or str(raw.get("account")) != current:
+        return out
+    armed = raw.get("armed")
+    for w in learned_ride.WINDOWS:
+        item = armed.get(w) if isinstance(armed, Mapping) else None
+        at = _finite(item.get("at")) if isinstance(item, Mapping) else None
+        if at is None:
+            continue
+        point = _finite(item.get("pointS"))
+        out["armed"][w] = {"at": at, "pointS": point if point and point > 0 else None}
+    riding = raw.get("riding")
+    if isinstance(riding, list):
+        out["riding"] = [w for w in learned_ride.WINDOWS if w in riding and w in out["armed"]]
+    return out
+
+
+def _velocity_point_s(
+    samples: tuple[Sample, ...], s: MaximizeSettings, now: float, window: str
+) -> float | None:
+    """Seconds per point at the recent velocity (fresh samples only)."""
+    if not samples or now - samples[-1].ts > s.idle_window_min * 60.0:
+        return None
+    v5, v7 = idle.velocity(samples, s)
+    rate = v5 if window == "5h" else v7
+    return 60.0 / rate if rate is not None and rate > 0 else None
+
+
+@dataclass
+class RideTick:
+    """This tick's learned-ride bookkeeping, written by :func:`_ride_commit`."""
+
+    steps: dict
+    record: dict
+    hits: tuple[str, ...]
+    stored_steps: object
+    stored_record: object
+    q: dict[str, float]
+
+    @property
+    def armed_at(self) -> dict[str, float]:
+        return {w: item["at"] for w, item in self.record["armed"].items()}
+
+    @property
+    def point_s(self) -> dict[str, float]:
+        return {
+            w: item["pointS"]
+            for w, item in self.record["armed"].items()
+            if item["pointS"] is not None
+        }
+
+
+def _ride_track(
+    engine: aw.AutoSwitchEngine,
+    rt: MaximizeRuntime,
+    state: Mapping,
+    current: str,
+    entry,
+    value: object,
+    samples: tuple[Sample, ...],
+    new: Sample | None,
+    prev_ts: float | None,
+    now: float,
+) -> RideTick:
+    """Record this tick's whole-point steps, arm or disarm each window that
+    may ride, and note a hit: a window that reads 100% while the last
+    acted-on decision rode it. Writes nothing (:func:`_ride_commit` does).
+
+    A window is armed when it first reads its hard mark under 100% (at the
+    reading's fetch time) with its T1 frozen then: the timed steps, else
+    the recent velocity, else unknown until one is. Under the mark again
+    (a reset) or at 100% disarms it."""
+    s = rt.settings
+    source = rt.dry_ride if engine.dry_run else state
+    stored_steps = source.get(learned_ride.STEPS_KEY)
+    stored_record = source.get(RIDE_KEY)
+    steps = (
+        {str(k): v for k, v in stored_steps.items()}
+        if isinstance(stored_steps, Mapping) else {}
+    )
+    if new is not None:
+        steps = learned_ride.observe(steps, current, new.pct5, new.pct7, new.ts, prev_ts)
+    record = _ride_record(stored_record, current)
+    armed = record["armed"]
+    rides = policy.ride_windows(s)
+    pct5, _, pct7, _ = usage_windows(value, now)
+    fetched_at = getattr(entry, "fetched_at", None)
+    hits: list[str] = []
+    for w, pct, cap in (("5h", pct5, s.hard_5h), ("7d", pct7, s.hard_7d)):
+        if pct is None:
+            continue  # unreadable this tick: keep what we had
+        if pct >= policy.LIMIT_PCT:
+            if w in record["riding"]:
+                hits.append(w)
+            armed.pop(w, None)
+        elif w in rides and cap >= policy.RIDE_FLOOR_PCT and pct >= cap:
+            item = armed.get(w)
+            if item is None:
+                read_at = _finite(fetched_at)
+                at = read_at if read_at is not None and read_at <= now else now
+                item = armed[w] = {"at": at, "pointS": None}
+            if item["pointS"] is None:
+                item["pointS"] = learned_ride.point_seconds(
+                    steps, current, w
+                ) or _velocity_point_s(samples, s, now, w)
+        else:
+            armed.pop(w, None)
+    record["riding"] = [w for w in record["riding"] if w in armed]
+    return RideTick(
+        steps=steps,
+        record=record,
+        hits=tuple(hits),
+        stored_steps=stored_steps,
+        stored_record=stored_record,
+        q=learned_ride.q_values(source.get(learned_ride.LEARN_KEY)),
+    )
+
+
+def _ride_commit(
+    engine: aw.AutoSwitchEngine,
+    rt: MaximizeRuntime,
+    tick: RideTick,
+    now: float,
+    *,
+    riding: tuple[str, ...] | None = None,
+    ok: tuple[str, ...] = (),
+) -> None:
+    """Persist this tick's ride records and learn from how a ride ended.
+
+    ``riding``: the windows the decision the engine acted on rides (None
+    keeps the previous ones: nothing was acted on this tick). ``ok``: the
+    windows whose ride the engine ended with its hard switch, before 100%.
+    A hit (:func:`_ride_track`) halves q, an ok raises it, both under the
+    state lock. A dry run keeps its records in memory and learns nothing.
+    Never raises: bookkeeping must not break a tick."""
+    record = dict(tick.record)
+    if riding is not None:
+        record["riding"] = [w for w in learned_ride.WINDOWS if w in riding]
+    if engine.dry_run:
+        rt.dry_ride = {
+            **rt.dry_ride, learned_ride.STEPS_KEY: tick.steps, RIDE_KEY: record,
+        }
+        return
+    outcomes = [(w, "hit") for w in tick.hits] + [(w, "ok") for w in ok]
+    if tick.steps == tick.stored_steps and record == tick.stored_record and not outcomes:
+        return
+
+    def mutate(st: dict) -> None:
+        st[learned_ride.STEPS_KEY] = tick.steps
+        st[RIDE_KEY] = record
+        if outcomes:
+            data: object = st.get(learned_ride.LEARN_KEY)
+            for w, outcome in outcomes:
+                data = learned_ride.learn(data, w, outcome, now)  # type: ignore[arg-type]
+            st[learned_ride.LEARN_KEY] = data
+
+    try:
+        engine._mutate_state(mutate)
+    except Exception as e:
+        _logger.debug("could not record the learned ride: %s", type(e).__name__)
+        return
+    for w, outcome in outcomes:
+        _logger.info(
+            "learned ride: %s %s", w,
+            "switched before 100%" if outcome == "ok" else "reached 100% while riding",
+        )
+
+
 # -- decision → engine ------------------------------------------------------------
 
 
@@ -687,6 +895,7 @@ def _decision_event(
         # The hold's own code, as published (``_publish_decision``): a TUI
         # hosting this engine words it like a viewer reading the state file.
         code=decision.code if isinstance(decision, Hold) else None,
+        ride_until=decision.ride_until if isinstance(decision, Hold) else None,
     )
 
 
@@ -735,6 +944,9 @@ def _publish_decision(
     }
     if isinstance(decision, Hold) and decision.code is not None:
         record["code"] = decision.code
+    if isinstance(decision, Hold) and decision.ride_until is not None:
+        # A ride's switch time, so a viewer counts its minutes down live.
+        record["rideUntil"] = decision.ride_until
     previous = state.get(DECISION_KEY)
     if isinstance(previous, Mapping):
         at = previous.get("at")
@@ -893,6 +1105,13 @@ def _hold(
         _pull_active_poll(engine, rt, current, entry, now)
     elif until is not None and until - now <= RESET_WAIT_URGENT_S:
         _pull_active_poll(engine, rt, current, entry, now, urgent=True)
+    elif decision.code == "ride" and decision.ride_until is not None:
+        # The urgent cadence over the ride's last RESET_WAIT_URGENT_S (the
+        # planner's bound on an urgent episode), pendingPollS before that.
+        _pull_active_poll(
+            engine, rt, current, entry, now,
+            urgent=decision.ride_until - now <= RESET_WAIT_URGENT_S,
+        )
     engine._emit(_hold_event(decision))
     return aw.TickOutcome.NO_ACTION
 
@@ -914,6 +1133,8 @@ def _hold_event(decision: Hold) -> aw.NoSwitchEvent:
         return aw.NoSwitchEvent(reason="hold", detail=detail)
     if decision.code == "hard-stay":
         return aw.NoSwitchEvent(reason="hard-stay", detail=detail)
+    if decision.code == "ride":
+        return aw.NoSwitchEvent(reason="ride", detail=detail)
     return aw.NoSwitchEvent(reason="maximize-hold", detail=detail)
 
 
@@ -1154,8 +1375,14 @@ def run_maximize_tick(
     deadlines = _login_deadlines(engine, rt, records, current, now)
     _warn_login_expiry(engine, rt, deadlines, now)
     _notify_tick(engine, rt, records, usage, state, deadlines, now)
+    before = _stored_samples(rt.dry_samples if engine.dry_run else state, current)
     samples, active_changed_at = _update_samples(
         engine, rt, state, current, entries.get(current), usage.get(current), now
+    )
+    new_sample, prev_ts = _new_sample(before, samples)
+    ride_tick = _ride_track(
+        engine, rt, state, current, entries.get(current), usage.get(current),
+        samples, new_sample, prev_ts, now,
     )
     forecast, rates7 = _history_inputs(
         engine, rt, entries, usage, current, samples, now
@@ -1183,6 +1410,9 @@ def run_maximize_tick(
         rates7=rates7,
         active_recent_429=_recent_429(entries.get(current), now),
         hold_until=held_until,
+        ride_armed_at=ride_tick.armed_at,
+        ride_point_s=ride_tick.point_s,
+        ride_q=ride_tick.q,
     )
     decision = policy.decide(snap)
     rt.last_snapshot, rt.last_decision = snap, decision
@@ -1192,8 +1422,11 @@ def run_maximize_tick(
     # acts on it — no switch, no failover, no prime.
     held = pause.auto_off_hold(engine, state)
     if held is not None:
+        # Nothing acts on the decision: no ride is under way to learn from.
+        _ride_commit(engine, rt, ride_tick, now, riding=())
         return held
     if isinstance(decision, Indeterminate):
+        _ride_commit(engine, rt, ride_tick, now)
         _run_primer(engine, rt, snap)
         return None
     # Readable active usage: clear upstream's unhealthy/idle-hold counters,
@@ -1201,15 +1434,22 @@ def run_maximize_tick(
     engine._unhealthy_ticks = 0
     engine._idle_hold_since = None
     landed: str | None = None
+    riding: tuple[str, ...] = ()
+    ok: tuple[str, ...] = ()
     if isinstance(decision, Switch):
         outcome, landed = _switch(
             engine, rt, snap, decision, usage, headroom, current, entries.get(current)
         )
         if landed:
             _end_hold_after_switch(engine, held_until, current, landed)
+            if decision.ride == "due":
+                ok = decision.ride_windows
     elif isinstance(decision, Hold):
         outcome = _hold(engine, rt, decision, current, entries.get(current), now)
+        if decision.code == "ride":
+            riding = decision.ride_windows
     else:
         outcome = _exhausted(engine, snap, decision, current)
+    _ride_commit(engine, rt, ride_tick, now, riding=riding, ok=ok)
     _run_primer(engine, rt, replace(snap, active=landed) if landed else snap)
     return outcome
