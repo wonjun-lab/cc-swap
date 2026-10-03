@@ -4,7 +4,7 @@ No Textual here, so every line can be checked without a terminal. The
 accounts are a table with a dim header (``home.COLUMNS``)::
 
     order  account          plan  5h            5h resets      …  status
-      ●    main@acme.dev #1  20x   ━━━┃━━━┃ 62%  1h47m · 07:10  …  ● active
+      ●    main@acme.dev #1  20x   ━━━┃━━━┃ 62%  1h47m      …  ● active
       1    side@acme.dev #2  5x    ───┃───┃  0%  not started    …  next
 
 laid out by ``home.table_plan``; under it, when there are rows to spare,

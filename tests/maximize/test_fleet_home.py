@@ -230,11 +230,22 @@ def test_every_row_says_when_both_windows_reset():
         cells = {n: (home.row_resets(r, "5h", NOW, clock=clock),
                      home.row_resets(r, "7d", NOW, clock=clock)) for n, r in rows.items()}
         assert all(a and b for a, b in cells.values())
-        assert cells["1"][0].startswith(home.countdown(2 * H))
+        # 5h: the countdown alone at every width, never the clock time.
+        assert cells["1"][0] == home.countdown(2 * H)
+        assert all(" · " not in a for a, _b in cells.values())
         assert cells["2"][0] == "not started"  # a cold 5h window
         assert cells["6"][0] == "not started"
         assert cells["3"] == ("—", "—")        # a dead login with no last reading
-        assert (" · " in cells["1"][1]) is clock
+        assert (" · " in cells["1"][1]) is clock  # 7d keeps its clock while it fits
+
+
+def test_the_5h_resets_column_is_as_wide_as_its_countdowns():
+    rows = _fleet()[3]
+    needs = home.table_needs(rows, {}, now=NOW)
+    assert needs.reset5 == needs.reset5_short
+    plan = home.table_plan(220, 40, needs)
+    assert plan.clock and plan.width("reset5") == max(needs.reset5_short,
+                                                      len(home.HEADERS["reset5"]))
 
 
 def test_a_dead_login_keeps_the_resets_of_its_last_reading():

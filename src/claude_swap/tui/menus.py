@@ -319,9 +319,10 @@ def help_entries(idle_pattern: str | None = None) -> list[tuple[str, str]]:
         ("bars", "┃ amber = the soft mark, ┃ red = the hard mark. The fill is green "
                  "under soft, amber from soft, red from hard; 5h and 7d each have "
                  "their own marks (m → s changes them)"),
-        ("5h / 7d resets", "when each window resets, for every account: 1h47m · 07:10 "
-                           "= in 1h47m, at 07:10. 'not started' = no 5h window is "
-                           "running; — = not known"),
+        ("5h / 7d resets", "when each window resets, for every account: 1h47m under 5h "
+                           "resets = in 1h47m (the panel below says at what time); "
+                           "3d19h · Oct 7 02:18 under 7d resets = in 3d19h, on Oct 7 at "
+                           "02:18. 'not started' = no 5h window is running; — = not known"),
         ("panel", "under the table when the terminal has room: the selected account "
                   "in full, with every usage window and its exact reset"),
         ("", ""),

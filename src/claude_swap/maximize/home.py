@@ -236,13 +236,15 @@ def exact_reset(reset: float | None, now: float) -> str:
 
 
 def row_resets(row: fx.FleetRow, window: str, now: float, *, clock: bool) -> str:
-    """One row's ``5h resets`` (``1h47m · 07:10``) or ``7d resets``
-    (``3d19h · Oct 7 02:18``) cell: ``not started`` for a 5h window that is
-    not running (a working login), else :func:`resets_text`."""
+    """One row's ``5h resets`` (``1h47m``: the countdown alone at every
+    width, ``clock`` or not — the detail panel has the exact time) or ``7d
+    resets`` (``3d19h · Oct 7 02:18``, the clock only while ``clock``) cell:
+    ``not started`` for a 5h window that is not running (a working login),
+    else :func:`resets_text`."""
     if window == "5h":
         if row.login == "ok" and row.pct5 is not None and row.state5 == "cold":
             return NOT_STARTED
-        return resets_text(row.reset5, now, clock=clock, date=False)
+        return resets_text(row.reset5, now, clock=False)
     return resets_text(row.reset7, now, clock=clock)
 
 
@@ -251,7 +253,7 @@ def row_resets(row: fx.FleetRow, window: str, now: float, *, clock: bool) -> str
 # One row per account, a header over it. The columns, left to right:
 #
 #   order  account           plan  5h            5h resets      7d  …  7d resets  status
-#     ●    main@acme.dev #1  20x   ━━━┃━━━┃ 62%  1h47m · 07:10  …      …          ● active
+#     ●    main@acme.dev #1  20x   ━━━┃━━━┃ 62%  1h47m      …      …          ● active
 #
 # ``status`` follows ``7d resets`` directly, never the terminal's right
 # edge. :func:`table_plan` fits the columns to the terminal.
