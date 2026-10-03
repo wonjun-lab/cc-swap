@@ -486,10 +486,14 @@ def _hard_or_ride(
     if any(p is None for p in plans):
         return replace(base, reason=f"{base.reason}; no ride (pace unknown)")
     until = min(p.until for p in plans if p is not None)
+    # ``rideMaxMin`` ends the ride before its learned share: the switch
+    # then says nothing about q (``Switch.ride_capped``, nothing learned).
+    capped = any(p.capped and p.until == until for p in plans if p is not None)
     if snap.now >= until:
+        over = "capped by rideMaxMin" if capped else "over"
         return replace(
-            base, reason=f"{base.reason}; learned ride over",
-            ride="due", ride_windows=windows,
+            base, reason=f"{base.reason}; learned ride {over}",
+            ride="due", ride_windows=windows, ride_capped=capped,
         )
     waited = _ride_reset_wait(snap, a, windows, until)
     if waited is not None:
@@ -499,7 +503,6 @@ def _hard_or_ride(
             base, reason=f"{base.reason}; idle during the learned ride",
             ride="idle", ride_windows=windows,
         )
-    capped = any(p.capped and p.until == until for p in plans if p is not None)
     label = " / ".join(f"{w} {_pct(_window_pct(a, w))}" for w in windows)
     return Hold(
         f"#{a.number} {label} — riding to the limit, switching in "

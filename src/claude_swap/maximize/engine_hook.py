@@ -1451,7 +1451,7 @@ def run_maximize_tick(
         )
         if landed:
             _end_hold_after_switch(engine, held_until, current, landed)
-            if decision.ride == "due":
+            if decision.ride == "due" and not decision.ride_capped:
                 ok = decision.ride_windows
     elif isinstance(decision, Hold):
         outcome = _hold(engine, rt, decision, current, entries.get(current), now)

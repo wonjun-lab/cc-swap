@@ -102,7 +102,13 @@ class TestEnd:
         d = decide(ride_snap(point_s=7200, ride_max_min=5))
         assert d.code == "ride" and d.ride_until == pytest.approx(NOW + 300)
         assert "(capped)" in d.reason
-        assert decide(ride_snap(armed=300, point_s=7200, ride_max_min=5)).ride == "due"
+        due = decide(ride_snap(armed=300, point_s=7200, ride_max_min=5))
+        assert (due.ride, due.ride_capped) == ("due", True)
+        assert due.reason.endswith("; learned ride capped by rideMaxMin")
+
+    def test_a_ride_that_ran_its_learned_course_is_not_capped(self):
+        d = decide(ride_snap(armed=0.3 * 1800 - RIDE_MARGIN_S))
+        assert (d.ride, d.ride_capped) == ("due", False)
 
     def test_ride_max_min_zero_never_rides(self):
         d = decide(ride_snap(ride_max_min=0))

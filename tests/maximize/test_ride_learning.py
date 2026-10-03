@@ -335,6 +335,22 @@ def test_an_idle_moment_switches_during_the_ride_without_learning(temp_home):
     assert (data["q"], data["n_ok"], data["n_hit"]) == (pytest.approx(0.9), 0, 0)
 
 
+def test_a_ride_cut_short_by_ride_max_min_teaches_nothing(temp_home):
+    # q 0.9 would ride 0.9 x T1 - 90 s, minutes; rideMaxMin 1 ends it after
+    # a minute. That switch says nothing about whether q was safe.
+    h = make(temp_home, maximize={**MARKS, "rideMaxMin": 1})
+    h.engine._mutate_state(lambda s: s.__setitem__(ride.LEARN_KEY, {"7d": {"q": 0.9}}))
+    c = Climb(h, {"2": win(0, 10), "3": win(0, 50)})
+    for p7 in (96, 97, 98):
+        c.tick(1, p7)
+    assert c.tick(1, 99, advance=300) is TickOutcome.NO_ACTION
+    assert "(capped)" in of(h, MaximizeDecisionEvent)[-1].reason
+    assert c.tick(1, 99, advance=60) is TickOutcome.SWITCHED
+    assert of(h, MaximizeDecisionEvent)[-1].reason.endswith("capped by rideMaxMin")
+    data = learning(h)["7d"]
+    assert (data["q"], data["n_ok"], data["n_hit"]) == (pytest.approx(0.9), 0, 0)
+
+
 def test_dry_runs_never_learn_or_write(temp_home):
     h = make(temp_home, maximize=MARKS)
     h.engine.dry_run = True

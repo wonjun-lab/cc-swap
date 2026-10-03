@@ -127,6 +127,9 @@ class Switch:
     # A hard switch that ends a learned ride, and on which window(s).
     ride: RideEnd | None = None
     ride_windows: tuple[str, ...] = ()
+    # A ``due`` ride that ``maximize.rideMaxMin`` ended before its learned
+    # share: it says nothing about q, so nothing is learned from it.
+    ride_capped: bool = False
 
 
 @dataclass(frozen=True)
