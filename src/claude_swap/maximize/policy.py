@@ -64,8 +64,9 @@ and still under 100%, the hard switch waits until
     t_switch = first reading at the mark + q × T1 − ``RIDE_MARGIN_S``
 
 (at most ``rideMaxMin`` after that first reading). ``T1`` is the time one
-point takes (``Snapshot.ride_point_s``, measured from whole-point steps;
-else the recent velocity; unknown = no ride), ``q`` the learned share
+point takes (the shorter of ``Snapshot.ride_point_s``, measured from
+whole-point steps, and the recent velocity's; unknown = no ride), ``q``
+the learned share
 (``Snapshot.ride_q``). Until then the decision is a ``Hold`` with code
 ``ride``, unless the account goes idle (the cheapest moment to switch: a
 hard switch at once, ``Switch.ride == "idle"``) or every ridden window
@@ -384,17 +385,20 @@ def rideable(snap: Snapshot, a: AccountView, window: Window) -> bool:
 
 
 def ride_point_s(snap: Snapshot, window: Window) -> float | None:
-    """``T1``, seconds per point on ``window``: the engine's measured steps
-    (``Snapshot.ride_point_s``), else the recent velocity; None when neither
-    is known (or the window is not climbing)."""
+    """``T1``, seconds per point on ``window``: the shorter of the engine's
+    (``Snapshot.ride_point_s``, measured steps) and the recent velocity's,
+    whichever are known; None when neither is (or the window is not
+    climbing). Shorter is safer: a T1 too long rides into 100%."""
+    out: list[float] = []
     known = snap.ride_point_s.get(window)
     if known is not None and math.isfinite(known) and known > 0:
-        return float(known)
-    if not _fresh_samples(snap):
-        return None
-    v5, v7 = idle.velocity(snap.samples, snap.settings)
-    rate = v5 if window == "5h" else v7
-    return 60.0 / rate if rate is not None and rate > 0 else None
+        out.append(float(known))
+    if _fresh_samples(snap):
+        v5, v7 = idle.velocity(snap.samples, snap.settings)
+        rate = v5 if window == "5h" else v7
+        if rate is not None and rate > 0:
+            out.append(60.0 / rate)
+    return min(out) if out else None
 
 
 def ride_armed_at(snap: Snapshot, window: Window) -> float:

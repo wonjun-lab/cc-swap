@@ -765,8 +765,8 @@ def _ride_track(
     acted-on decision rode it. Writes nothing (:func:`_ride_commit` does).
 
     A window is armed when it first reads its hard mark under 100% (at the
-    reading's fetch time) with its T1 frozen then: the timed steps, else
-    the recent velocity, else unknown until one is. Under the mark again
+    reading's fetch time) with its T1 frozen then: the shorter of the timed
+    steps' and the recent velocity's, else unknown until one is known. Under the mark again
     (a reset) or at 100% disarms it."""
     s = rt.settings
     source = rt.dry_ride if engine.dry_run else state
@@ -777,7 +777,10 @@ def _ride_track(
         if isinstance(stored_steps, Mapping) else {}
     )
     if new is not None:
-        steps = learned_ride.observe(steps, current, new.pct5, new.pct7, new.ts, prev_ts)
+        steps = learned_ride.observe(
+            steps, current, new.pct5, new.pct7, new.ts, prev_ts,
+            quiet_s=s.idle_window_min * 60.0,
+        )
     record = _ride_record(stored_record, current)
     armed = record["armed"]
     rides = policy.ride_windows(s)
@@ -798,9 +801,15 @@ def _ride_track(
                 at = read_at if read_at is not None and read_at <= now else now
                 item = armed[w] = {"at": at, "pointS": None}
             if item["pointS"] is None:
-                item["pointS"] = learned_ride.point_seconds(
-                    steps, current, w
-                ) or _velocity_point_s(samples, s, now, w)
+                # The shorter of the measured steps and the recent velocity:
+                # a T1 too long rides into 100%.
+                known = [
+                    x for x in (
+                        learned_ride.point_seconds(steps, current, w, now),
+                        _velocity_point_s(samples, s, now, w),
+                    ) if x is not None
+                ]
+                item["pointS"] = min(known) if known else None
         else:
             armed.pop(w, None)
     record["riding"] = [w for w in record["riding"] if w in armed]

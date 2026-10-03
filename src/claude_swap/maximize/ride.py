@@ -11,10 +11,11 @@ Two pure pieces live here; the engine (maximize/engine_hook.py) persists both
 in the state file:
 
 * **Steps** (``STEPS_KEY``): per account and window, the moments the reading
-  stepped up one whole point while that account was the active one. The
-  median of the last :data:`KEEP_INTERVALS` step intervals (per point) is
-  ``T1``. A step after a hole in the readings (``STEP_MAX_GAP_S``: a parked
-  account, a sleep, a 429 backoff) is not timed — its moment is unknown.
+  stepped up one whole point while that account was the active one and in
+  use. The median of the last :data:`KEEP_INTERVALS` step intervals (per
+  point) from the last :data:`INTERVAL_MAX_AGE_S` is the measured ``T1``
+  (:func:`observe` says which steps are timed). The engine and the policy
+  take the shorter of it and the recent velocity's.
 * **Learning** (``LEARN_KEY``): ``q`` per window, AIMD. A ride that switched
   before 100% adds :data:`Q_STEP`; one that saw 100% first halves it. A ride
   an idle switch ended early, and any dry run, teach nothing.
@@ -47,6 +48,12 @@ KEEP_INTERVALS = 3
 #: them unknown (the active account polls at most every 5 minutes, 30 after
 #: a run of 429s).
 STEP_MAX_GAP_S = 1800.0
+#: A timed step older than this says nothing about the pace now.
+INTERVAL_MAX_AGE_S = 6 * 3600.0
+#: ``maximize.idleWindowMin``'s default, in seconds: a stretch this long
+#: with no rise on either window is an idle period (``observe``'s
+#: ``quiet_s``; the engine passes the setting).
+DEFAULT_QUIET_S = 600.0
 
 
 def _num(value: object) -> float | None:
@@ -128,15 +135,25 @@ def describe(raw: object, windows: tuple[str, ...], off: str | None = None) -> s
 # -- steps ------------------------------------------------------------------------------
 
 
+def _intervals(listed: object) -> list[list[float]]:
+    """``[[at, seconds per point], ...]``, leniently; an interval without
+    its time (an older record's bare number) cannot be aged and is dropped."""
+    out: list[list[float]] = []
+    for item in listed if isinstance(listed, (list, tuple)) else ():
+        if not isinstance(item, (list, tuple)) or len(item) != 2:
+            continue
+        at, seconds = _num(item[0]), _num(item[1])
+        if at is not None and seconds is not None and seconds > 0:
+            out.append([at, seconds])
+    return out[-KEEP_INTERVALS:]
+
+
 def _window_steps(raw: object) -> dict:
     src = raw if isinstance(raw, Mapping) else {}
-    listed = src.get("intervals")
-    listed = listed if isinstance(listed, (list, tuple)) else ()
-    intervals = [x for x in (_num(v) for v in listed) if x is not None and x > 0]
     return {
         "pct": _num(src.get("pct")),
         "stepAt": _num(src.get("stepAt")),
-        "intervals": intervals[-KEEP_INTERVALS:],
+        "intervals": _intervals(src.get("intervals")),
     }
 
 
@@ -147,41 +164,68 @@ def observe(
     pct7: float,
     ts: float,
     prev_ts: float | None,
+    *,
+    quiet_s: float = DEFAULT_QUIET_S,
 ) -> dict:
     """The ``rideSteps`` record after the active account ``number`` read
     ``pct5``/``pct7`` at ``ts``, a new reading; ``prev_ts`` is when it was
     read before while active (None: not since it became the active one).
 
-    Per window: a rise from the previous reading is a step at ``ts``; the
-    time since the previous timed step, per point risen, is an interval.
-    A first reading, a drop (a reset) or a hole longer than
-    :data:`STEP_MAX_GAP_S` leaves the next step untimed. Unchanged readings
-    change nothing, so the record is only rewritten on a step."""
+    Per window, a rise from the previous reading is a step at ``ts``, and
+    the time since the window's previous step, per point risen, an interval
+    stamped ``ts``. Only time spent working counts, so a step is timed only
+    when the account was in use all the way to it:
+
+    * a new tenure (``prev_ts`` None: the account was parked in between) or
+      a hole longer than :data:`STEP_MAX_GAP_S` clears the account's history;
+    * a 7d reset clears the account's history, a 5h reset that window's;
+    * a stretch longer than ``quiet_s`` (``idleWindowMin``) with no rise on
+      either window is an idle period: the next step on every window is
+      not timed (an evening step and a morning one are not one interval).
+    """
     src = raw if isinstance(raw, Mapping) else {}
     out: dict = {str(k): dict(v) for k, v in src.items() if isinstance(v, Mapping)}
-    account = out.get(number, {})
     continuous = prev_ts is not None and 0 < ts - prev_ts <= STEP_MAX_GAP_S
+    account = out.get(number, {}) if continuous else {}
+    cur = {w: _window_steps(account.get(w)) for w in WINDOWS}
+    if cur["7d"]["pct"] is not None and pct7 < cur["7d"]["pct"]:
+        cur = {w: _window_steps(None) for w in WINDOWS}  # a 7d reset
+    elif cur["5h"]["pct"] is not None and pct5 < cur["5h"]["pct"]:
+        cur["5h"] = _window_steps(None)
+    rose = any(
+        c["pct"] is not None and pct > c["pct"]
+        for c, pct in ((cur["5h"], pct5), (cur["7d"], pct7))
+    )
+    active_at = _num(account.get("activeAt"))
+    if active_at is None:
+        active_at = ts  # observation starts here
+    if rose and ts - active_at > quiet_s:
+        for c in cur.values():
+            c["stepAt"] = None  # an idle period since the last rise
     for w, pct in (("5h", pct5), ("7d", pct7)):
-        cur = _window_steps(account.get(w))
-        if cur["pct"] is None or pct < cur["pct"] or not continuous:
-            cur.update(pct=pct, stepAt=None)
-        elif pct > cur["pct"]:
-            if cur["stepAt"] is not None and ts > cur["stepAt"]:
-                cur["intervals"] = [
-                    *cur["intervals"], (ts - cur["stepAt"]) / (pct - cur["pct"])
+        c = cur[w]
+        if c["pct"] is not None and pct > c["pct"]:
+            if c["stepAt"] is not None and ts > c["stepAt"]:
+                c["intervals"] = [
+                    *c["intervals"], [ts, (ts - c["stepAt"]) / (pct - c["pct"])]
                 ][-KEEP_INTERVALS:]
-            cur.update(pct=pct, stepAt=ts)
-        account[w] = cur
-    out[number] = account
+            c["stepAt"] = ts
+        c["pct"] = pct
+    out[number] = {**cur, "activeAt": ts if rose else active_at}
     return out
 
 
-def point_seconds(raw: object, number: str, window: Window) -> float | None:
+def point_seconds(raw: object, number: str, window: Window, now: float) -> float | None:
     """``T1``: seconds per point on ``window`` for account ``number``, the
-    median of its last timed steps; None before any step was timed."""
+    median of its timed steps from the last :data:`INTERVAL_MAX_AGE_S`;
+    None when there is none."""
     src = raw if isinstance(raw, Mapping) else {}
     account = src.get(number)
     if not isinstance(account, Mapping):
         return None
-    intervals = _window_steps(account.get(window))["intervals"]
-    return float(statistics.median(intervals)) if intervals else None
+    recent = [
+        seconds
+        for at, seconds in _window_steps(account.get(window))["intervals"]
+        if now - at <= INTERVAL_MAX_AGE_S
+    ]
+    return float(statistics.median(recent)) if recent else None

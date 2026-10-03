@@ -60,56 +60,136 @@ class TestLearn:
 # -- steps -------------------------------------------------------------------------------
 
 
-def feed(readings: list[tuple[float, float]], *, gap_after: int | None = None) -> dict:
-    """7d readings ``(ts, pct)`` of account 1, each the next fresh sample."""
-    raw: dict = {}
+POLL = 300.0  # the active account's slowest normal cadence
+
+
+def feed(
+    readings: list[tuple[float, float]],
+    *,
+    gap_after: int | None = None,
+    raw: dict | None = None,
+    busy: bool = True,
+) -> dict:
+    """7d readings ``(ts, pct)`` of account 1, each the next fresh sample;
+    the 5h rises by one point on every reading while ``busy``."""
+    raw = raw or {}
     prev = None
     for i, (ts, pct) in enumerate(readings):
-        raw = ride.observe(raw, "1", 10.0, pct, ts, None if i == gap_after else prev)
+        p5 = 10.0 + i if busy else 10.0
+        raw = ride.observe(raw, "1", p5, pct, ts, None if i == gap_after else prev)
         prev = ts
     return raw
+
+
+def polled(start: float, end: float, p7_at) -> list[tuple[float, float]]:
+    """Readings every :data:`POLL` from ``start`` to ``end`` inclusive, the
+    7d given by ``p7_at(ts)``."""
+    out, ts = [], start
+    while ts <= end:
+        out.append((ts, p7_at(ts)))
+        ts += POLL
+    return out
+
+
+def seconds(raw, now, window="7d", number="1"):
+    return ride.point_seconds(raw, number, window, now)
 
 
 class TestSteps:
     def test_the_first_step_is_not_timed_the_second_is(self):
         raw = feed([(0, 96), (300, 96), (600, 97)])
-        assert ride.point_seconds(raw, "1", "7d") is None
-        raw = feed([(0, 96), (300, 96), (600, 97), (900, 97), (1500, 98)])
-        assert ride.point_seconds(raw, "1", "7d") == 900.0
+        assert seconds(raw, 600) is None
+        raw = feed([(0, 96), (300, 96), (600, 97), (900, 97), (1200, 97), (1500, 98)])
+        assert seconds(raw, 1500) == 900.0
 
     def test_t1_is_the_median_of_the_last_three_intervals(self):
-        readings = [(0, 90), (100, 91), (700, 92), (1000, 93), (2200, 94), (2500, 95)]
+        readings = [(0, 90), (100, 91), (500, 92), (800, 93), (1300, 94), (1600, 95)]
         raw = feed(readings)
-        # intervals 600, 300, 1200, 300 -> the last three: 300, 1200, 300
-        assert raw["1"]["7d"]["intervals"] == [300.0, 1200.0, 300.0]
-        assert ride.point_seconds(raw, "1", "7d") == 300.0
+        # intervals 400, 300, 500, 300 -> the last three: 300, 500, 300
+        assert [s for _, s in raw["1"]["7d"]["intervals"]] == [300.0, 500.0, 300.0]
+        assert seconds(raw, 1600) == 300.0
 
     def test_a_jump_of_two_points_is_per_point(self):
-        raw = feed([(0, 95), (60, 96), (1260, 98)])
-        assert ride.point_seconds(raw, "1", "7d") == 600.0
+        raw = feed([(0, 95), (60, 96), (360, 97), (660, 97), (960, 99)])
+        assert seconds(raw, 960) == 300.0  # 300, then 600 s for two points
 
     def test_a_hole_or_a_new_tenure_leaves_the_next_step_untimed(self):
-        raw = feed([(0, 95), (60, 96), (600, 96), (900, 97)], gap_after=3)
-        assert ride.point_seconds(raw, "1", "7d") is None
+        raw = feed([(0, 95), (60, 96), (300, 96), (600, 97)], gap_after=3)
+        assert seconds(raw, 600) is None
         raw = feed([(0, 95), (60, 96), (60 + ride.STEP_MAX_GAP_S + 1, 97)])
-        assert ride.point_seconds(raw, "1", "7d") is None
-
-    def test_a_reset_starts_over_but_keeps_what_was_measured(self):
-        raw = feed([(0, 95), (60, 96), (660, 97), (700, 3), (800, 4)])
-        # 3% after the reset is untimed; 3 -> 4 is a step at 800, not timed.
-        assert raw["1"]["7d"]["stepAt"] == 800
-        assert ride.point_seconds(raw, "1", "7d") == 600.0
+        assert seconds(raw, 60 + ride.STEP_MAX_GAP_S + 1) is None
 
     def test_unchanged_readings_change_nothing(self):
         raw = feed([(0, 95), (60, 96)])
-        again = ride.observe(raw, "1", 10.0, 96.0, 120.0, 60.0)
-        assert again == raw
+        again = ride.observe(raw, "1", 11.0, 96.0, 120.0, 60.0)
+        assert again["1"]["7d"] == raw["1"]["7d"]
 
     def test_accounts_are_kept_apart(self):
-        raw = feed([(0, 95), (60, 96), (660, 97)])
+        raw = feed([(0, 95), (60, 96), (360, 97)])
         raw = ride.observe(raw, "2", 0.0, 50.0, 700.0, None)
-        assert ride.point_seconds(raw, "1", "7d") == 600.0
-        assert ride.point_seconds(raw, "2", "7d") is None
+        assert seconds(raw, 700) == 300.0
+        assert seconds(raw, 700, number="2") is None
+
+
+class TestStaleT1:
+    """Reviewer's case: a T1 hours too long rides into 100%."""
+
+    def test_an_overnight_idle_gap_is_never_timed(self):
+        # Busy 17:30-18:00 (7d 96 -> 97 at 18:00), idle all night (the
+        # service still polls every 300 s), busy again from 08:50 (7d 98 at
+        # 09:00, 99 at 09:20).
+        h = 3600.0
+        evening = polled(17.5 * h, 18 * h, lambda t: 96 if t < 18 * h else 97)
+        night = polled(18 * h + POLL, 8.75 * h + 24 * h, lambda t: 97)
+        morning = polled(8.75 * h + 24 * h + POLL, 9 * h + 24 * h + 1200,
+                         lambda t: 97 if t < 33 * h else 98 if t < 33 * h + 1200 else 99)
+        raw: dict = {}
+        prev = None
+        for i, (ts, p7) in enumerate(evening + night + morning):
+            busy = not (18 * h < ts <= 8.75 * h + 24 * h)
+            p5 = 10.0 + i if busy else 10.0 + len(evening)
+            raw = ride.observe(raw, "1", p5, p7, ts, prev)
+            prev = ts
+        now = 33 * h + 1200
+        # The 18:00 -> 09:00 interval spans the idle night: only 09:00 ->
+        # 09:20 is timed. (Untouched, the median was 7.67 h.)
+        assert seconds(raw, now) == 1200.0
+
+    def test_an_interval_spanning_a_pause_longer_than_the_idle_window_is_dropped(self):
+        raw: dict = {}
+        prev = None
+        p5 = 10.0
+        for ts, p7, rising in [(0, 96, True), (300, 96, True), (600, 97, True),
+                               (900, 97, False), (1200, 97, False), (1500, 97, False),
+                               (1800, 98, True), (2100, 98, True), (2400, 99, True)]:
+            p5 += 1 if rising else 0
+            raw = ride.observe(raw, "1", p5, p7, ts, prev, quiet_s=600.0)
+            prev = ts
+        # 600 -> 1800 had 900 s with no rise anywhere: dropped. 1800 -> 2400 counts.
+        assert seconds(raw, 2400) == 600.0
+
+    def test_intervals_older_than_six_hours_are_ignored(self):
+        raw = feed([(0, 95), (60, 96), (360, 97), (660, 98)])
+        assert seconds(raw, 660) == 300.0
+        assert seconds(raw, 660 + ride.INTERVAL_MAX_AGE_S - 1) == 300.0
+        assert seconds(raw, 360 + ride.INTERVAL_MAX_AGE_S + 1) == 300.0  # one left
+        assert seconds(raw, 660 + ride.INTERVAL_MAX_AGE_S + 1) is None
+
+    def test_a_7d_reset_clears_the_history(self):
+        raw = feed([(0, 95), (60, 96), (360, 97), (660, 98)])
+        raw = ride.observe(raw, "1", 30.0, 3.0, 960.0, 660.0)
+        assert seconds(raw, 960) is None
+        assert seconds(raw, 960, window="5h") is None
+
+    def test_a_new_tenure_clears_the_history(self):
+        raw = feed([(0, 95), (60, 96), (360, 97), (660, 98)])
+        assert seconds(raw, 660) == 300.0
+        raw = ride.observe(raw, "1", 40.0, 98.0, 5000.0, None)  # was parked
+        assert seconds(raw, 5000) is None
+
+    def test_old_unstamped_intervals_are_ignored(self):
+        raw = {"1": {"7d": {"pct": 98, "stepAt": 0.0, "intervals": [9000.0, 9000.0]}}}
+        assert seconds(raw, 100) is None
 
 
 # -- the engine --------------------------------------------------------------------------
@@ -137,6 +217,34 @@ class Climb:
 
 def learning(h) -> dict:
     return ride.learned(h.state().get(ride.LEARN_KEY))
+
+
+def test_the_reviewers_overnight_case_rides_minutes_not_hours(temp_home):
+    """7d 97 at 18:00, idle all night (polled every 300 s), busy from
+    08:50, 98 at 09:00, 99 at 09:20. Untouched, T1 was 7.67 h and even
+    q 0.05 rode 22 min."""
+    # soft7d 99 and peers at 7d 95: nothing soft-switches or rebalances
+    # overnight; at 99 the hard path lands on the roomier #2.
+    h = make(temp_home, maximize={**MARKS, "soft7d": 99, "rideMaxMin": 120})
+    h.engine._mutate_state(lambda s: s.__setitem__(ride.LEARN_KEY, {"7d": {"q": 0.05}}))
+    c = Climb(h, {"2": win(0, 95), "3": win(0, 95)})
+    for p7 in (96, 96, 97):                      # 17:50 - 18:00, busy
+        c.tick(1, p7, advance=300)
+    for _ in range(14 * 12 + 9):                  # 18:05 - 08:45, idle
+        c.tick(1, 97, advance=300, idle=True)
+    for p7 in (97, 98, 98, 98, 98):              # 08:50 - 09:15, busy
+        c.tick(1, p7, advance=300)
+    assert h.active_number() == 1
+    steps = h.state()[ride.STEPS_KEY]
+    assert ride.point_seconds(steps, "1", "7d", h.clock.now) is None  # 18:00 -> 09:00 dropped
+    c.tick(1, 99, advance=300)                   # 09:20
+    steps = h.state()[ride.STEPS_KEY]
+    assert ride.point_seconds(steps, "1", "7d", h.clock.now) == 1200.0
+    decision = of(h, MaximizeDecisionEvent)[-1]
+    # T1 is at most 20 min (the velocity's 10 min here), so q 0.05 rides
+    # at most a minute: it is due at once.
+    assert (decision.decision, decision.trigger) == ("switch", "hard")
+    assert h.active_number() == 2
 
 
 def test_q_rises_after_successes_and_halves_after_a_hit(temp_home):

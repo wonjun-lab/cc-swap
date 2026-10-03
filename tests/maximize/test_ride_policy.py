@@ -66,9 +66,11 @@ class TestArming:
         assert d.ride_until == pytest.approx(NOW - 400 + 0.5 * 1800 - RIDE_MARGIN_S)
 
     def test_without_an_engine_record_the_samples_say_when_it_first_read_99(self):
-        samples = rows((600, 37, 98), (300, 38.5, 99), (0, 40, 99))
-        d = decide(ride_snap(samples=samples, armed=None))
-        assert d.ride_until == pytest.approx(NOW - 300 + 0.3 * 1800 - RIDE_MARGIN_S)
+        # The 98 -> 99 step is older than the 10-minute velocity window, so
+        # only the engine's T1 (1 h) is known.
+        samples = rows((900, 36, 98), (600, 37, 99), (300, 38.5, 99), (0, 40, 99))
+        d = decide(ride_snap(samples=samples, armed=None, point_s=3600))
+        assert d.ride_until == pytest.approx(NOW - 600 + 0.3 * 3600 - RIDE_MARGIN_S)
 
     def test_q_is_clamped(self):
         assert decide(ride_snap(q=5.0)).ride_until == pytest.approx(
@@ -125,6 +127,16 @@ class TestNoRide:
         assert d.code == "ride"
         assert d.ride_until == pytest.approx(NOW + 0.3 * 600 - RIDE_MARGIN_S)
 
+    def test_t1_is_the_shorter_of_the_steps_and_the_velocity(self):
+        # 98 -> 99 over 10 minutes: the velocity says 600 s per point; the
+        # engine's steps say 2 h. The shorter one decides.
+        samples = rows((600, 37, 98), (300, 38.5, 98), (0, 40, 99))
+        d = decide(ride_snap(samples=samples, point_s=7200, armed=0))
+        assert d.ride_until == pytest.approx(NOW + 0.3 * 600 - RIDE_MARGIN_S)
+        # ... and the steps when they are the shorter.
+        d = decide(ride_snap(samples=samples, point_s=400, armed=0))
+        assert d.ride_until == pytest.approx(NOW + 0.3 * 400 - RIDE_MARGIN_S)
+
     def test_a_recent_429_switches_at_hard(self):
         s = replace(ride_snap(), active_recent_429=True)
         d = decide(s)
@@ -152,7 +164,7 @@ class TestWindows:
 
     def test_5h_at_99_does_not_ride_unless_listed(self):
         kw = dict(p5=99, p7=40, window="5h", hard_5h=99.0,
-                  samples=rows((600, 97, 40), (300, 98, 40), (0, 99, 40)))
+                  samples=rows((600, 97.5, 40), (300, 98, 40), (0, 99, 40)))
         d = decide(ride_snap(**kw))
         assert isinstance(d, Switch) and d.trigger == "hard" and d.ride is None
         assert decide(ride_snap(**kw, ride_windows="5h,7d")).code == "ride"
