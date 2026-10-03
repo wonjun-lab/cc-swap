@@ -18,7 +18,14 @@ Trigger = Literal["at-limit", "hard", "soft", "preempt", "rebalance"]
 # ``hold``: an account hold (``cc-swap hold``, maximize/hold.py) set aside a
 # soft, preempt or rebalance move. ``hard-stay``: a hard trigger fired but
 # no account has more room than the active, so it stays until 100%.
-HoldCode = Literal["reset-wait", "preempt", "rebalance-deferred", "hold", "hard-stay"]
+# ``ride``: a hard mark in the last point is reached and the learned ride
+# keeps using it a little longer (``maximize.learnedRide``).
+HoldCode = Literal[
+    "reset-wait", "preempt", "rebalance-deferred", "hold", "hard-stay", "ride"
+]
+# How a learned ride ended in a switch: its time was up (``due``), or an
+# idle moment came first (``idle``; nothing is learned from it).
+RideEnd = Literal["due", "idle"]
 
 # Lower sorts first. ``excluded`` is listed only so every tier has an order;
 # an excluded account is never landable (score.landable).
@@ -93,6 +100,14 @@ class Snapshot:
     # (epoch s) the soft, preempt and rebalance triggers are set aside. None
     # = no hold; the engine passes one only while its slot is the active one.
     hold_until: float | None = None
+    # The learned ride (maximize/ride.py), by window ("5h"/"7d"): when the
+    # engine first saw the window at its hard mark (epoch s; absent = the
+    # policy reads it off the samples), its seconds per point measured from
+    # whole-point steps (absent = the recent velocity), and the learned
+    # share of the last point to ride (absent = ``ride.Q_DEFAULT``).
+    ride_armed_at: Mapping[str, float] = field(default_factory=dict)
+    ride_point_s: Mapping[str, float] = field(default_factory=dict)
+    ride_q: Mapping[str, float] = field(default_factory=dict)
 
     def view(self, number: str | None) -> AccountView | None:
         """The account with this slot number, or None."""
@@ -109,6 +124,9 @@ class Switch:
     target: str
     trigger: Trigger
     reason: str
+    # A hard switch that ends a learned ride, and on which window(s).
+    ride: RideEnd | None = None
+    ride_windows: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -120,6 +138,10 @@ class Hold:
     reset_wait_until: float | None = None
     # The reason code when it is none of maximize-pending/-hold.
     code: HoldCode | None = None
+    # A learned ride (code ``ride``): when it switches unless an idle moment
+    # comes first (epoch s), and the window(s) it rides.
+    ride_until: float | None = None
+    ride_windows: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)

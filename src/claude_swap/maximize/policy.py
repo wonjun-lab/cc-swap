@@ -55,6 +55,26 @@ aside — the decision is a ``Hold`` with code ``hold`` whose reason also says
 what would have happened. At-limit, hard (reached or ETA-forced) and the
 reset-aware wait decide exactly as without a hold: safety always wins.
 
+Learned ride (``learnedRide``, ``rideWindows``, ``rideMaxMin``;
+maximize/ride.py): usage is reported in whole percents, floored, so a hard
+mark in the last point (99 or more) fires with up to a whole point left.
+When every window that reached its hard mark is listed in ``rideWindows``
+and still under 100%, the hard switch waits until
+
+    t_switch = first reading at the mark + q × T1 − ``RIDE_MARGIN_S``
+
+(at most ``rideMaxMin`` after that first reading). ``T1`` is the time one
+point takes (``Snapshot.ride_point_s``, measured from whole-point steps;
+else the recent velocity; unknown = no ride), ``q`` the learned share
+(``Snapshot.ride_q``). Until then the decision is a ``Hold`` with code
+``ride``, unless the account goes idle (the cheapest moment to switch: a
+hard switch at once, ``Switch.ride == "idle"``) or every ridden window
+resets first (a ``reset-wait``). At ``t_switch`` it is the hard switch
+(``Switch.ride == "due"``). 100% is the at-limit trigger as always, a
+recent 429 on the active token never rides (it cannot be polled every
+60 s), an ETA-forced hard trigger never rides, and an account hold sets
+none of it aside: the ride is the hard path, only later.
+
 Unknown active usage is ``Indeterminate`` (the engine's upstream failover
 path counts it).
 """
@@ -62,11 +82,13 @@ path counts it).
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Literal
 
+from claude_swap import poll_policy
 from claude_swap.maximize import hold as account_hold
 from claude_swap.maximize import idle
+from claude_swap.maximize import ride as learned_ride
 from claude_swap.maximize.history import QUIET_P
 from claude_swap.maximize.model import (
     TIER_ORDER,
@@ -91,6 +113,11 @@ RESET_WAIT_MARGIN_MIN = 2.0
 NO_PATTERN_HORIZON_H = 4.0
 # A rebalance in a busy slot waits only for a quiet window this close.
 DEFER_WITHIN_S = 6 * 3600.0
+# The learned ride only rides a hard mark in the last whole point.
+RIDE_FLOOR_PCT = LIMIT_PCT - 1.0
+# A ride switches this long before its learned end: one urgent poll
+# interval (the reading that would show 100% can be that old) plus 30 s.
+RIDE_MARGIN_S = poll_policy.URGENT_INTERVAL_S + 30.0
 
 
 def _pct(value: float) -> str:
@@ -251,6 +278,8 @@ class _Force:
 
     reason: str
     windows: tuple[Window, ...]
+    # The caps are reached (not merely close at the recent pace).
+    reached: bool = False
 
 
 def _fresh_samples(snap: Snapshot) -> bool:
@@ -297,7 +326,7 @@ def _force(
             why = f"#{a.number} 5h {_pct(a.pct5)} >= hard {_pct(s.hard_5h)}"
         else:
             why = f"#{a.number} 7d {_pct(a.pct7)} >= hard {_pct(s.hard_7d)}"
-        return _Force(why, reached)
+        return _Force(why, reached, reached=True)
     if forced:
         eta = min(forced.values())
         return _Force(
@@ -311,6 +340,172 @@ def _force(
 def _hard_force(snap: Snapshot, a: AccountView) -> _Force | None:
     reached = _reached(snap, a)
     return _force(snap, a, reached, {} if reached else _eta_forced(snap))
+
+
+# -- the learned ride -------------------------------------------------------------------
+
+
+def ride_windows(s) -> tuple[Window, ...]:
+    """The windows the learned ride may apply to (``rideWindows``); none
+    while ``learnedRide`` is off or ``rideMaxMin`` is 0."""
+    if not s.learned_ride or s.ride_max_min <= 0:
+        return ()
+    listed = {part.strip() for part in str(s.ride_windows or "").split(",")}
+    return tuple(w for w in ("5h", "7d") if w in listed)
+
+
+def ride_text(learning: object, s) -> str:
+    """What the learned ride has learned (the ``rideLearning`` record) under
+    settings ``s``, for doctor and ``cc-swap why``."""
+    off = None
+    if not s.learned_ride:
+        off = "maximize.learnedRide is false"
+    elif s.ride_max_min <= 0:
+        off = "maximize.rideMaxMin is 0"
+    return learned_ride.describe(learning, ride_windows(s), off)
+
+
+def _hard_cap(s, window: Window) -> float:
+    return s.hard_5h if window == "5h" else s.hard_7d
+
+
+def rideable(snap: Snapshot, a: AccountView, window: Window) -> bool:
+    """``window`` is listed in ``rideWindows``, its hard mark is in the last
+    whole point, and it reads at that mark but under 100%."""
+    s = snap.settings
+    cap = _hard_cap(s, window)
+    pct = _window_pct(a, window)
+    return (
+        window in ride_windows(s)
+        and cap >= RIDE_FLOOR_PCT
+        and pct is not None
+        and cap <= pct < LIMIT_PCT
+    )
+
+
+def ride_point_s(snap: Snapshot, window: Window) -> float | None:
+    """``T1``, seconds per point on ``window``: the engine's measured steps
+    (``Snapshot.ride_point_s``), else the recent velocity; None when neither
+    is known (or the window is not climbing)."""
+    known = snap.ride_point_s.get(window)
+    if known is not None and math.isfinite(known) and known > 0:
+        return float(known)
+    if not _fresh_samples(snap):
+        return None
+    v5, v7 = idle.velocity(snap.samples, snap.settings)
+    rate = v5 if window == "5h" else v7
+    return 60.0 / rate if rate is not None and rate > 0 else None
+
+
+def ride_armed_at(snap: Snapshot, window: Window) -> float:
+    """When ``window`` was first seen at its hard mark: the engine's record
+    (``Snapshot.ride_armed_at``), else the oldest sample of the newest run
+    at the mark, else ``now``."""
+    armed = snap.ride_armed_at.get(window)
+    if armed is not None and math.isfinite(armed):
+        return min(float(armed), snap.now)
+    cap = _hard_cap(snap.settings, window)
+    first = snap.now
+    for x in reversed(snap.samples):
+        pct = x.pct5 if window == "5h" else x.pct7
+        if not cap <= pct < LIMIT_PCT:
+            break
+        first = min(first, x.ts)
+    return first
+
+
+@dataclass(frozen=True)
+class RidePlan:
+    """One window's ride: until when (``t_switch``), and from what."""
+
+    until: float
+    capped: bool          # ``rideMaxMin`` ends it before the learned share
+    q: float
+    point_s: float
+    armed_at: float
+
+
+def ride_plan(snap: Snapshot, window: Window) -> RidePlan | None:
+    """``window``'s ride, or None when ``T1`` is unknown (no ride)."""
+    point = ride_point_s(snap, window)
+    if point is None:
+        return None
+    q = learned_ride.clamp_q(float(snap.ride_q.get(window, learned_ride.Q_DEFAULT)))
+    armed = ride_armed_at(snap, window)
+    learned_until = armed + q * point - RIDE_MARGIN_S
+    cap_until = armed + snap.settings.ride_max_min * 60.0
+    return RidePlan(
+        until=min(learned_until, cap_until),
+        capped=cap_until < learned_until,
+        q=q,
+        point_s=point,
+        armed_at=armed,
+    )
+
+
+def _ride_reset_wait(
+    snap: Snapshot, a: AccountView, windows: tuple[Window, ...], until: float
+) -> Hold | None:
+    """Every ridden window resets before the ride ends: wait the reset out
+    (worded as ``_reset_wait`` words it)."""
+    resets = [_window_reset(a, w) for w in windows]
+    if not all(r is not None and snap.now < r <= until for r in resets):
+        return None
+    held = ", ".join(
+        f"{w} {_pct(_window_pct(a, w))} — resets in {max(1, round((r - snap.now) / 60.0))}m"
+        for w, r in zip(windows, resets)
+        if r is not None
+    )
+    return Hold(
+        f"#{a.number} {held}, waiting it out (switches at once if it hits 100%)",
+        pending=False,
+        reset_wait_until=max(r for r in resets if r is not None),
+        code="reset-wait",
+    )
+
+
+def _hard_or_ride(
+    snap: Snapshot, a: AccountView, landing: list[AccountView], force: _Force
+) -> Decision:
+    """The hard decision, or the learned ride that delays its switch."""
+    base = _hard(snap, a, landing, force)
+    if not isinstance(base, Switch) or not force.reached:
+        return base
+    windows = force.windows
+    if not all(rideable(snap, a, w) for w in windows):
+        return base
+    if any(w not in windows for w in _eta_forced(snap)):
+        return base  # another window is about to force the switch anyway
+    if snap.active_recent_429:
+        return replace(base, reason=f"{base.reason}; no ride after a recent 429")
+    plans = [ride_plan(snap, w) for w in windows]
+    if any(p is None for p in plans):
+        return replace(base, reason=f"{base.reason}; no ride (pace unknown)")
+    until = min(p.until for p in plans if p is not None)
+    if snap.now >= until:
+        return replace(
+            base, reason=f"{base.reason}; learned ride over",
+            ride="due", ride_windows=windows,
+        )
+    waited = _ride_reset_wait(snap, a, windows, until)
+    if waited is not None:
+        return waited
+    if idle.is_idle(snap.samples, snap.now, snap.settings):
+        return replace(
+            base, reason=f"{base.reason}; idle during the learned ride",
+            ride="idle", ride_windows=windows,
+        )
+    capped = any(p.capped and p.until == until for p in plans if p is not None)
+    label = " / ".join(f"{w} {_pct(_window_pct(a, w))}" for w in windows)
+    return Hold(
+        f"#{a.number} {label} — riding to the limit, switching in "
+        f"~{max(1, round((until - snap.now) / 60.0))}m "
+        f"({'capped' if capped else 'learned'}) or at your next pause",
+        pending=False,
+        code="ride",
+        ride_until=until,
+        ride_windows=windows,
+    )
 
 
 def _soft_reason(
@@ -401,7 +596,7 @@ def _reset_wait(
         {w: eta for w, eta in forced.items() if w not in waits},
     )
     if force is not None:
-        return _hard(snap, a, landing, force)
+        return _hard_or_ride(snap, a, landing, force)
     other = _soft_reason(a, snap, skip=tuple(waits))
     if other is not None:
         return _held(snap, a, _soft(snap, landing, other))
@@ -749,7 +944,7 @@ def decide(snap: Snapshot) -> Decision:
         if waited is not None:
             return waited
     if force is not None:
-        return _hard(snap, a, landing, force)
+        return _hard_or_ride(snap, a, landing, force)
     # Below every hard trigger: an account hold sets the rest aside.
     if soft is not None:
         return _held(snap, a, _soft(snap, landing, soft))

@@ -76,6 +76,9 @@ def build_snapshot(
     rates7: Mapping[str, float] | None = None,
     active_recent_429: bool = False,
     hold_until: float | None = None,
+    ride_armed_at: Mapping[str, float] | None = None,
+    ride_point_s: Mapping[str, float] | None = None,
+    ride_q: Mapping[str, float] | None = None,
 ) -> Snapshot:
     """One view per ``records`` entry, in ``records`` order (sequence order)."""
     last_resort = parse_account_list(settings.last_resort)
@@ -113,4 +116,7 @@ def build_snapshot(
         rates7=dict(rates7 or {}),
         active_recent_429=active_recent_429,
         hold_until=hold_until,
+        ride_armed_at=dict(ride_armed_at or {}),
+        ride_point_s=dict(ride_point_s or {}),
+        ride_q=dict(ride_q or {}),
     )
