@@ -127,6 +127,10 @@ EMAILS = [
     "dev.shared@example.com", "dev.master@example.com", "jordan.lee@example.com",
     "jordan.lee@uni.example", "dev.llm0@example.com", "nightowl@example.com",
 ]
+#: What the table, the sentence and the attention line call them: the part
+#: before the @, the two jordan.lee told apart (maximize/names.py).
+NAMES = ["dev.shared", "dev.master", "jordan.lee@example", "jordan.lee@uni", "dev.llm0",
+         "nightowl"]
 
 
 def _six(root) -> FakeSwitcher:
@@ -355,7 +359,7 @@ class TestFleetScreen:
         async with app.run_test(size=(160, 40)) as pilot:
             await _open(pilot)
             assert _status(app).startswith(
-                "Auto ON · switching #1 main → #2 user2@example.com now (soft)"
+                "Auto ON · switching #1 main → #2 user2 now (soft)"
             )
             assert _cell(app, "1", "plan") == "20x"
             assert _cell(app, "2", "plan") == "—"  # nothing says
@@ -582,7 +586,7 @@ async def test_every_size_shows_the_table_with_headers_and_both_resets(
         assert _status(app).startswith("Auto ON · ")
         assert "#2" in _status(app) and "when you pause" in _status(app)
         assert _plain(app, "#fx-attention").startswith(
-            f"! #5 {EMAILS[4]} needs re-login — select it, press r"
+            f"! #5 {NAMES[4]} needs re-login — select it, press r"
         )
         assert _plain(app, "#fx-keys") == FOOTER
         # The headers, each over its column (plan only when it fits).
@@ -614,7 +618,7 @@ async def test_every_size_shows_the_table_with_headers_and_both_resets(
             assert all(len(line.rstrip()) < width - 3 for line in _rows(app).values())
         if width >= 160:
             assert all(len(line.rstrip()) <= plan.total for line in _rows(app).values())
-            assert _cell(app, "1", "account") == f"{EMAILS[0]} #1"  # whole names
+            assert _cell(app, "1", "account") == f"{NAMES[0]} #1"  # whole short names
         # The selected account in full under the table, when it fits.
         assert detail.display
         assert detail.region.y == scroll.region.bottom
@@ -666,6 +670,23 @@ async def test_a_very_short_terminal_drops_the_panel_but_keeps_the_table(
         assert screen.query_one("#fx-scroll").region.height >= 2
         assert not screen.query_one("#fx-detail").display  # it goes first
         assert screen.query_one("#fx-head").display and screen._plan is not None
+
+
+@pytest.mark.asyncio
+async def test_short_names_everywhere_but_the_panel(tmp_path, held_by_service):
+    app = make_app(_six(tmp_path))
+    async with app.run_test(size=(160, 45)) as pilot:
+        await _open(pilot)
+        screen = app.screen
+        # The account column is as wide as the longest short name plus " #N".
+        assert screen._plan.width("account") == max(len(n) for n in NAMES) + 3
+        assert {n: _cell(app, n, "account") for n in SIX_ORDER} == {
+            str(i + 1): f"{name} #{i + 1}" for i, name in enumerate(NAMES)
+            if str(i + 1) in SIX_ORDER
+        }
+        for selector in ("#fx-status", "#fx-attention", "#fx-body"):
+            assert "example.com" not in _plain(app, selector), selector
+        assert EMAILS[0] in _plain(app, "#fx-detail")  # the whole address: the panel only
 
 
 @pytest.mark.asyncio
@@ -903,7 +924,7 @@ class TestHoldKey:
             await pilot.press("h")
             await _open(pilot)
             assert isinstance(app.screen, MenuModal)
-            assert app.screen._title == f"Hold #1 {EMAILS[0]} — stay on this account"
+            assert app.screen._title == f"Hold #1 {NAMES[0]} — stay on this account"
             started = time.time()
             await pilot.press("t")  # two hours
             await _open(pilot)
@@ -912,7 +933,7 @@ class TestHoldKey:
             assert held.slot == "1" and held.by == "fleet"
             assert started + 7200 - 5 <= held.until <= time.time() + 7200
             status = _status(app)
-            assert status.startswith(f"Holding #1 {EMAILS[0]} until ")
+            assert status.startswith(f"Holding #1 {NAMES[0]} until ")
             assert "(2h left) — only hard 98%/100% will move you (h to change)" in status
             # h → o lifts it; the sentence goes back to the engine's word.
             await pilot.press("h", "o")

@@ -313,8 +313,10 @@ def help_entries(idle_pattern: str | None = None) -> list[tuple[str, str]]:
         ("order", "● the active account; 1, 2, 3 … where automatic switching goes "
                   "next, in that order; – never (a dead login, an excluded account). "
                   "The table lists the accounts in this order"),
-        ("account", "the alias, else the email, then #N: its slot number, which the "
-                    "attention line and cc-swap commands use"),
+        ("account", "the alias, else the part of the address before the @ (two alike "
+                    "say where they are from: jordan.lee@uni), then #N: its slot number, "
+                    "which the attention line and cc-swap commands use. The panel below "
+                    "shows the whole address"),
         ("plan", "20x / 5x; team is an organization account"),
         ("bars", "┃ amber = the soft mark, ┃ red = the hard mark. The fill is green "
                  "under soft, amber from soft, red from hard; 5h and 7d each have "

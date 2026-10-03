@@ -417,7 +417,8 @@ class TestRelogin:
         async with app.run_test(size=(160, 40)) as pilot:
             await _open(pilot)
             attention = app.screen.query_one("#fx-attention", Static).render().plain
-            assert "#2 user2@example.com login ends in 2d 0h" in attention
+            assert "#2 user2 login ends in 2d 0h" in attention
+            assert "@" not in attention  # the short name, never the address
             assert _tag(app, "2") == "login 2d left"
             await _to_row(pilot, "2")
             await pilot.press("r")

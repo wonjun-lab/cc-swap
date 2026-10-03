@@ -59,7 +59,7 @@ from claude_swap.json_output import (
     USAGE_NO_CREDENTIALS,
     USAGE_RELOGIN_REQUIRED,
 )
-from claude_swap.maximize.hold import short_name
+from claude_swap.maximize.hold import record_names
 
 _logger = logging.getLogger("claude-swap")
 
@@ -136,7 +136,9 @@ class Note:
 
 # -- text ---------------------------------------------------------------------------
 
-_EMAIL_RE = re.compile(r"\S+@\S+")
+#: A whole address (a dot after the @). A short name that tells two
+#: accounts apart (``jordan.lee@uni``, maximize/names.py) is not one.
+_EMAIL_RE = re.compile(r"[^\s@]+@[\w-]+(?:\.[\w-]+)+")
 _TOKEN_RE = re.compile(r"sk-ant-[A-Za-z0-9_\-]{6,}|\b(?:sk|rt)-[A-Za-z0-9_\-]{12,}")
 TEXT_MAX = 200
 
@@ -392,10 +394,7 @@ class EngineNotifier:
             data = self.engine.switcher._get_sequence_data() or {}
         except Exception:
             return {}
-        accounts = data.get("accounts") or {}
-        return {
-            str(n): short_name(r) for n, r in accounts.items() if isinstance(r, Mapping)
-        }
+        return record_names(data.get("accounts"))
 
     def send(self, note: Note, now: float) -> bool:
         last = self._weighed.get(note.key)

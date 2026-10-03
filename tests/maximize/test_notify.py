@@ -107,6 +107,7 @@ def test_control_characters_never_reach_the_notifier(monkeypatch):
 
 @pytest.mark.parametrize(("text", "expected"), [
     ("switched to dev.shared@example.com", "switched to …"),
+    ("switched to #4 jordan.lee@uni", "switched to #4 jordan.lee@uni"),  # a short name
     ("token sk-ant-oat01-ABCDEFGHIJ leaked", "token … leaked"),
     ("line one\nline two", "line one line two"),
     ("x" * 300, "x" * 199 + "…"),

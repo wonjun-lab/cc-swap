@@ -399,10 +399,20 @@ def _names(root: Path) -> dict[str, str]:
         data = json.loads((Path(root) / "sequence.json").read_text(encoding="utf-8"))
     except (OSError, ValueError, RecursionError):
         return {}
-    accounts = data.get("accounts") if isinstance(data, dict) else None
-    if not isinstance(accounts, dict):
+    return record_names(data.get("accounts") if isinstance(data, dict) else None)
+
+
+def record_names(accounts: object) -> dict[str, str]:
+    """``{slot: display name}`` for ``sequence.json``'s account records
+    (maximize/names.py: the alias, else the short name, made unique)."""
+    from claude_swap.maximize.names import display_names
+
+    if not isinstance(accounts, Mapping):
         return {}
-    return {str(n): short_name(r) for n, r in accounts.items() if isinstance(r, Mapping)}
+    return display_names(
+        (str(n), str(r.get("email") or ""), str(r.get("alias") or ""))
+        for n, r in accounts.items() if isinstance(r, Mapping)
+    )
 
 
 def _label(slot: str, names: Mapping[str, str]) -> str:
