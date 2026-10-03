@@ -948,6 +948,26 @@ def test_safety_decisions_are_never_hidden_by_a_hold(dv):
     assert not _plain(_held_sentence(dv)[0]).startswith("Holding")
 
 
+HARD_STAY = fx.DecisionView(
+    "hold", "1", None, None,
+    "#1 5h 99% >= hard 98%; nothing landable and no account under the hard caps has more "
+    "5h room than #1; staying",
+    at=NOW - 5, source="engine", code="hard-stay",
+)
+
+
+def test_past_hard_with_nowhere_roomier_is_worded_and_never_a_hold():
+    for hold in (HOLD, None):  # held or not: the hard mark is what it is
+        variants = _held_sentence(HARD_STAY, hold=hold)
+        assert _plain(variants[0]) == (
+            "Auto ON · using #1 main · 5h 99% >= hard 98% — no account has more room, "
+            "it stays (switches at once at 100%)"
+        )
+        assert not any("Holding" in _plain(v) or "only hard" in _plain(v) for v in variants)
+        lengths = [home.seg_len(v) for v in variants]
+        assert lengths == sorted(lengths, reverse=True)
+
+
 @pytest.mark.parametrize(("hold", "sit", "es"), [
     (account_hold.AccountHold("2", NOW + H), "live", SERVICE),         # another slot
     (account_hold.AccountHold("1", NOW - 1), "live", SERVICE),         # ended

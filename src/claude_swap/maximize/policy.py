@@ -33,9 +33,9 @@ The destination is always the top of ``landing_candidates``. With none:
   ``Exhausted``.
 * hard: an eligible account under both hard caps with strictly more room
   than the active on every window that forced the switch (most room
-  first); else ``Hold`` — the active is still under 100% (at 100% the
-  at-limit trigger wins), and moving to less room would bounce straight
-  back.
+  first); else ``Hold`` with code ``hard-stay`` — the active is still
+  under 100% (at 100% the at-limit trigger wins), and moving to less room
+  would bounce straight back.
 * soft/rebalance: ``Hold``.
 
 Reset-aware wait (``resetWaitMin``, 0 = off): a hard or soft trigger whose
@@ -461,11 +461,13 @@ def _hard(
             f"{windows} room under the hard caps ({_usage(top)})",
         )
     # Every reachable account would hit a cap no later than the active: stay
-    # on it while it lasts. At 100% the at-limit trigger takes over.
+    # on it while it lasts. At 100% the at-limit trigger takes over. A hard
+    # decision of its own (``hard-stay``): an account hold never words it.
     return Hold(
         f"{force.reason}; nothing landable and no account under the hard caps "
         f"has more {windows} room than #{a.number}; staying",
         pending=False,
+        code="hard-stay",
     )
 
 

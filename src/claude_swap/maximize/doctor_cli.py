@@ -486,6 +486,10 @@ REASONS: dict[str, tuple[str, str]] = {
         "A better-scored account exists, but this is usually a busy time and the gain is under maximize.busyRebalanceGap, so the move waits for your next quiet window (at most 6 hours away).",
         "Nothing; lower maximize.busyRebalanceGap, or set maximize.learnIdlePattern to false, to rebalance at any idle moment.",
     ),
+    "hard-stay": (
+        "A hard mark is reached (or close at the recent pace), but no account under the hard caps has more room on that window than the active one, so maximize stays on it rather than move somewhere that would force a move straight back.",
+        "Nothing; at 100% the at-limit switch moves you at once to whatever has quota left. cc-swap add another account for more room.",
+    ),
     "hold": (
         "You asked to stay on the active account (cc-swap hold, or Fleet: h) so a long task keeps its context: until the hold ends, maximize skips its soft, preempt and rebalance moves. A hard mark, 100% and a reset-wait still switch.",
         "Nothing; cc-swap hold off (or Fleet: h → o) lifts it. It ends by itself at its end time (at most 24h), or when the active account changes.",

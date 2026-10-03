@@ -159,7 +159,8 @@ class TestSoftAndHard:
         h = make(temp_home)
         outcome = h.tick_with_usage({"1": win(96, 40), "2": win(97, 10), "3": win(10, 99)})
         assert outcome is TickOutcome.NO_ACTION
-        assert no_switch_reasons(h) == ["maximize-hold"]
+        assert no_switch_reasons(h) == ["hard-stay"]
+        assert h.state()[DECISION_KEY]["code"] == "hard-stay"
         assert not of(h, AllExhaustedEvent)
         assert h.active_number() == 1
 
@@ -611,7 +612,7 @@ class TestUpstreamPaths:
         assert outcome is TickOutcome.NO_ACTION
         assert not of(h, ErrorEvent)
         [event] = of(h, NoSwitchEvent)
-        assert event.reason == "maximize-hold"
+        assert event.reason == "hard-stay"  # a hold of the hard trigger's own
         assert "no account under the hard caps has more 5h room than #1" in event.detail
         assert f"set aside #2 ({status})" in event.detail
         assert h.active_number() == 1

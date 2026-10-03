@@ -912,6 +912,8 @@ def _hold_event(decision: Hold) -> aw.NoSwitchEvent:
         return aw.NoSwitchEvent(reason="rebalance-deferred", detail=detail)
     if decision.code == "hold":
         return aw.NoSwitchEvent(reason="hold", detail=detail)
+    if decision.code == "hard-stay":
+        return aw.NoSwitchEvent(reason="hard-stay", detail=detail)
     return aw.NoSwitchEvent(reason="maximize-hold", detail=detail)
 
 

@@ -779,10 +779,25 @@ _HELD_RE = re.compile(r"held until (.+?) \((\w+) left\)")
 
 def _safety_moving(dv: fx.DecisionView) -> bool:
     """The decision is one an account hold never sets aside: a switch, a
-    reset-aware wait, every account at its limit, unreadable usage."""
+    reset-aware wait, a hard mark with nowhere roomier to go, every account
+    at its limit, unreadable usage."""
     return dv.kind in ("switch", "exhausted", "indeterminate") or (
-        dv.kind == "hold" and dv.code == "reset-wait"
+        dv.kind == "hold" and dv.code in ("reset-wait", "hard-stay")
     )
+
+
+def _hard_stay_variants(
+    head: Seg, act: fx.FleetRow, dv: fx.DecisionView, name
+) -> list[list[Seg]]:
+    """Past a hard mark, but no account has more room: it stays until 100%."""
+    why = _quoted((dv.reason or "").split(";", 1)[0])
+    return [
+        [head, (f" · using {name(act.number)} · {why} — no account has more room, it stays ",
+                "plain"), ("(switches at once at 100%)", "dim")],
+        [head, (f" · #{act.number} {why} — no account has more room, it stays", "plain")],
+        [head, (f" · #{act.number} past hard — nowhere roomier, it stays", "plain")],
+        [head],
+    ]
 
 
 def _hold_variants(
@@ -945,6 +960,8 @@ def status_variants(
             return _preempt_hold_variants(head, act, dv, name, dry)
         if dv.code == "rebalance-deferred":
             return _deferred_variants(head, act, dv, name)
+        if dv.code == "hard-stay":
+            return _hard_stay_variants(head, act, dv, name)
     if dv.kind == "switch":
         trigger = f" ({dv.trigger})" if dv.trigger else ""
         verb = "would switch" if dry else "switching"

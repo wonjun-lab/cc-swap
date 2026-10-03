@@ -16,8 +16,9 @@ Tier = Literal["normal", "last_resort", "excluded"]
 Trigger = Literal["at-limit", "hard", "soft", "preempt", "rebalance"]
 # A hold's reason code beyond pending/plain (engine NoSwitchEvent reason).
 # ``hold``: an account hold (``cc-swap hold``, maximize/hold.py) set aside a
-# soft, preempt or rebalance move.
-HoldCode = Literal["reset-wait", "preempt", "rebalance-deferred", "hold"]
+# soft, preempt or rebalance move. ``hard-stay``: a hard trigger fired but
+# no account has more room than the active, so it stays until 100%.
+HoldCode = Literal["reset-wait", "preempt", "rebalance-deferred", "hold", "hard-stay"]
 
 # Lower sorts first. ``excluded`` is listed only so every tier has an order;
 # an excluded account is never landable (score.landable).

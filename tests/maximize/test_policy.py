@@ -935,7 +935,7 @@ HOLD_CASES = [
              Switch, trigger="hard"),
     HoldCase("hard-staying-without-a-roomier-account",
              held(snap("1", acct("1", 96, 40), acct("2", 97, 10), acct("3", 10, 99))),
-             Hold, code=None),
+             Hold, code="hard-stay"),
     HoldCase("reset-wait",
              held(snap("1", resets(acct("1", 96, 40), m5=8), acct("2", 10, 10),
                        samples=SLOW5)),
@@ -964,6 +964,13 @@ def test_a_hold_sets_aside_soft_preempt_and_rebalance_but_never_safety(case: Hol
         assert "only a hard mark (5h 95%, 7d 98%) or 100% will move you" in got.reason
 
 
+def test_a_hard_mark_with_nowhere_roomier_to_go_has_its_own_code():
+    got = decide(snap("1", acct("1", 96, 40), acct("2", 97, 10), acct("3", 10, 99)))
+    assert isinstance(got, Hold) and got.code == "hard-stay" and not got.pending
+    assert got.reason.startswith("#1 5h 96% >= hard 95%; nothing landable")
+    assert got.reason.endswith("than #1; staying")
+
+
 def test_a_held_reason_says_what_would_have_happened():
     plain = snap("1", acct("1", 62, 40), acct("2", 10, 10), samples="idle")
     without = decide(plain)
@@ -983,7 +990,7 @@ def test_a_hold_leaves_every_safety_decision_of_the_table_alone():
             (isinstance(before, Switch) and before.trigger in ("at-limit", "hard"))
             or isinstance(before, (Exhausted, Indeterminate))
             or (isinstance(before, Hold) and before.code == "reset-wait")
-            or (isinstance(before, Hold) and "no account under the hard caps" in before.reason)
+            or (isinstance(before, Hold) and before.code == "hard-stay")
         )
         if safety:
             assert after == before, case.id
