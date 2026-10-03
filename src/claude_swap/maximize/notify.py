@@ -26,7 +26,9 @@ delivery off for a process. ``notify.enabled`` (default true) and one
 **Dedupe and rate limit.** ``<backup root>/notify_state.json`` remembers when
 each key was last sent (the event plus its account, e.g.
 ``login-expiring:3``) and the recent sends: a key is not repeated within its
-own interval, and at most :data:`RATE_MAX` go out per :data:`RATE_WINDOW_S`.
+own interval, and at most :data:`RATE_MAX` go out per :data:`RATE_WINDOW_S`
+in each of two rooms — alerts (switch, keychain) and reminders — so a burst
+of reminders never crowds out a switch.
 
 **Privacy.** A notification names accounts by slot number and short name
 (the alias, else the part of the address before the ``@``) — never an
@@ -66,10 +68,17 @@ ENV = "CC_SWAP_NOTIFY"
 STATE_FILENAME = "notify_state.json"
 #: One delivery never takes longer than this.
 TIMEOUT_S = 2.0
-#: At most this many notifications …
+#: At most this many notifications per room …
 RATE_MAX = 6
 #: … per this many seconds.
 RATE_WINDOW_S = 600.0
+#: Rate-limit rooms: a switch or a stuck Keychain is never crowded out by a
+#: burst of reminders (re-logins, expiring logins, paused priming).
+ALERTS = frozenset({"switch", "keychain"})
+
+
+def room(event: str) -> str:
+    return "alerts" if event in ALERTS else "reminders"
 #: Keys not sent for this long are forgotten.
 KEEP_S = 8 * 86400.0
 DAY_S = 86400.0
@@ -252,31 +261,37 @@ def state_path(root: Path) -> Path:
     return Path(root) / STATE_FILENAME
 
 
+def _stamps(value: object) -> list[float]:
+    return [
+        float(t) for t in (value if isinstance(value, list) else ())
+        if isinstance(t, (int, float)) and not isinstance(t, bool)
+    ]
+
+
 def read_state(root: Path) -> dict:
-    """``{"sent": {key: ts}, "recent": [ts, …]}`` (empty when unreadable)."""
+    """``{"sent": {key: ts}, "recent": {room: [ts, …]}}`` (empty when
+    unreadable; an older file's single ``recent`` list is the reminders')."""
     try:
         raw = json.loads(state_path(root).read_text(encoding="utf-8"))
-    except (OSError, ValueError):
+    except (OSError, ValueError, RecursionError):
         raw = {}
     raw = raw if isinstance(raw, dict) else {}
     sent = raw.get("sent")
     recent = raw.get("recent")
+    rooms = recent if isinstance(recent, dict) else {"reminders": recent}
     return {
         "sent": {
             str(k): float(v) for k, v in (sent.items() if isinstance(sent, dict) else ())
             if isinstance(v, (int, float)) and not isinstance(v, bool)
         },
-        "recent": [
-            float(t) for t in (recent if isinstance(recent, list) else ())
-            if isinstance(t, (int, float)) and not isinstance(t, bool)
-        ],
+        "recent": {name: _stamps(rooms.get(name)) for name in ("alerts", "reminders")},
     }
 
 
-def _write_state(root: Path, sent: dict[str, float], recent: list[float]) -> None:
+def _write_state(root: Path, sent: dict[str, float], recent: dict[str, list[float]]) -> None:
     from claude_swap.settings import atomic_write_json
 
-    atomic_write_json(state_path(root), {"schemaVersion": 1, "sent": sent, "recent": recent})
+    atomic_write_json(state_path(root), {"schemaVersion": 2, "sent": sent, "recent": recent})
 
 
 def allowed(note: Note, settings) -> bool:
@@ -307,15 +322,19 @@ def deliver(
             return False
         state = read_state(Path(root))
         sent = {k: t for k, t in state["sent"].items() if 0 <= now - t < KEEP_S}
-        recent = [t for t in state["recent"] if 0 <= now - t < RATE_WINDOW_S]
+        recent = {
+            name: [t for t in stamps if 0 <= now - t < RATE_WINDOW_S]
+            for name, stamps in state["recent"].items()
+        }
         last = sent.get(note.key)
         if last is not None and now - last < note.every_s:
             return False
-        if len(recent) >= RATE_MAX:
+        mine = recent[room(note.event)]
+        if len(mine) >= RATE_MAX:
             _logger.debug("notification rate-limited: %s", note.event)
             return False
         sent[note.key] = now
-        recent.append(now)
+        mine.append(now)
         _write_state(Path(root), sent, recent)
         return bool(backend.send(scrub(note.title), scrub(note.body)))
     except Exception as e:  # a notification must never break a tick

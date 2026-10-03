@@ -133,6 +133,30 @@ def test_at_most_six_in_ten_minutes(tmp_path):
     assert notify.deliver(tmp_path, note("relogin:9"), now=NOW + 601, **kw)
 
 
+def test_reminders_never_crowd_out_a_switch_or_a_stuck_keychain(tmp_path):
+    f = Fake()
+    kw = dict(backend=f.backend, settings=NotifySettings())
+    for n in range(6):  # a burst of reminders fills their own room
+        assert notify.deliver(tmp_path, note(f"relogin:{n}"), now=NOW + n, **kw)
+    assert not notify.deliver(tmp_path, note("login-expiring:9", "login-expiring"),
+                              now=NOW + 10, **kw)
+    assert notify.deliver(tmp_path, note("switch:1>2", "switch"), now=NOW + 11, **kw)
+    assert notify.deliver(tmp_path, note("keychain", "keychain"), now=NOW + 12, **kw)
+    # Alerts have a room of their own, so a flapping engine is still bounded.
+    sent = [notify.deliver(tmp_path, note(f"switch:{n}>x", "switch"), now=NOW + 20 + n, **kw)
+            for n in range(6)]
+    assert sent == [True] * 4 + [False] * 2
+
+
+def test_an_old_state_file_with_one_shared_list_still_reads(tmp_path):
+    (tmp_path / notify.STATE_FILENAME).write_text(json.dumps(
+        {"sent": {}, "recent": [NOW - 10] * 6}))
+    f = Fake()
+    kw = dict(backend=f.backend, settings=NotifySettings())
+    assert not notify.deliver(tmp_path, note(), now=NOW, **kw)          # reminders: full
+    assert notify.deliver(tmp_path, note("switch:1>2", "switch"), now=NOW, **kw)
+
+
 @pytest.mark.parametrize(("settings", "event", "sent"), [
     (NotifySettings(enabled=False), "relogin", False),
     (NotifySettings(relogin=False), "relogin", False),
