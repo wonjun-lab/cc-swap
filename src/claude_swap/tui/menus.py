@@ -51,8 +51,10 @@ BY_ACTION: dict[str, MenuEntry] = {e.action: e for e in MAIN_MENU}
 
 #: The home screen's own keys: exactly its footer.
 HOME_KEYS: tuple[str, ...] = ("enter", "r", "l", "h", "m", "?", "q")
-#: Keys that act on the selected account.
-ROW_KEYS: tuple[str, ...] = ("enter", "l", "x", "r")
+#: Keys that act on the selected account. ``n`` (name it) is not in the
+#: footer, which would no longer fit 80 columns: ``?`` help lists it, and
+#: Account settings (m → a) has the same ``n``.
+ROW_KEYS: tuple[str, ...] = ("enter", "l", "x", "r", "n")
 #: Menu letters that also work from the home screen without the menu.
 SHORTCUT_KEYS: tuple[str, ...] = tuple(k for k in MAIN_KEYS if k not in ("o", "m", "q"))
 #: Keys that are deliberately not menu items (navigation, help, theme).
@@ -377,7 +379,10 @@ def help_entries(idle_pattern: str | None = None) -> list[tuple[str, str]]:
         ("enter", "switch to it (asks first when switching would not land there)"),
         ("r", "re-login it (guided; cc-swap launches nothing)"),
         ("l", "last resort on/off"),
-        ("h", "hold: stay on the active account for 1, 2 or 4 hours (h, t, f) or until a "
+        ("n", "name the selected account: an alias shown instead of its short name "
+              "(enter saves, an empty name brings the short name back, esc cancels; the "
+              "rules of cc-swap alias). Account settings (m → a) has it too"),
+        ("h", "hold:stay on the active account for 1, 2 or 4 hours (h, t, f) or until a "
               "time (u, or just type it: 12:00), or lift the hold (o)"),
         ("m", "menu: o automatic switching on/off · m mode · s strategy · p prime · "
               "f fetch · x exclude · a accounts · e engine log · v history · "

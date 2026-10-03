@@ -312,6 +312,7 @@ class FleetScreen(Screen):
         Binding("r", "relogin", "Re-login", show=False),
         Binding("l", "last_resort", "Last resort", show=False),
         Binding("h", "hold", "Hold", show=False),
+        Binding("n", "rename", "Name", show=False),  # a row key, not in the footer
         Binding("m", "open_menu", "Menu", show=False),
         Binding("question_mark", "help", "Help", show=False),
         Binding("q", "quit", "Quit", show=False),
@@ -1013,6 +1014,39 @@ class FleetScreen(Screen):
     def _after_setting(self, message: str) -> None:
         self.notify(message, timeout=3)
         self._on_snapshot(self.app.snapshot)
+
+    # -- name (n) -----------------------------------------------------------------------
+
+    def action_rename(self) -> None:
+        """n: name the selected account (``cc-swap alias``): a small input
+        prefilled with the name the table shows. Enter saves (the switcher
+        checks it as the CLI does), empty clears the alias, esc cancels."""
+        from claude_swap.tui.fleet_modals import TextInputModal
+
+        row = self.current_row()
+        if row is None:
+            return
+        self.app.push_screen(
+            TextInputModal(
+                f"Name #{row.number}",
+                "Letters, digits, - _ . (no @ or comma, not taken). Empty: back to the "
+                "part of the address before the @.",
+                row.name,
+            ),
+            partial(self._on_rename, row.number, row.name),
+        )
+
+    def _on_rename(self, number: str, shown: str, typed: str | None) -> None:
+        acc = self._accounts.get(number)
+        request = fx.name_request(acc.alias if acc is not None else "", shown, typed)
+        if request is None:
+            return
+        switcher = self.app.switcher
+        verb, name = request
+        if verb == "set":
+            self.app._start_action(f"Name #{number}", partial(switcher.set_alias, number, name))
+        else:
+            self.app._start_action(f"Name #{number}", partial(switcher.unset_alias, number))
 
     # -- hold (h) -----------------------------------------------------------------------
 

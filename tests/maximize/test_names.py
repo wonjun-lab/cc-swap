@@ -42,6 +42,52 @@ def test_names_are_unique_and_never_a_whole_address():
     assert (got["1"], got["4"]) == ("same@host1·1", "same@host1·4")
 
 
+@pytest.mark.parametrize(("alias", "shown", "typed", "expected"), [
+    ("", "dev.shared", "work", ("set", "work")),
+    ("old", "old", "  new  ", ("set", "new")),
+    ("old", "old", "", ("unset", None)),          # empty: back to the short name
+    ("", "dev.shared", "", None),                 # nothing to clear
+    ("", "jordan.lee@uni", "jordan.lee@uni", None),  # unchanged: never sent (has an @)
+    ("old", "old", "old", None),
+    ("old", "old", None, None),                   # esc
+])
+def test_what_fleets_name_key_asks_for(alias, shown, typed, expected):
+    from claude_swap.maximize import fleet as fx
+
+    assert fx.name_request(alias, shown, typed) == expected
+
+
+def test_clearing_an_alias_brings_the_short_name_back(temp_home, monkeypatch, capsys):
+    import json
+    import sys
+
+    from claude_swap import cli, paths
+    from claude_swap.maximize.hold import record_names
+
+    root = paths.get_backup_root()
+    root.mkdir(parents=True, exist_ok=True)
+    (root / "sequence.json").write_text(json.dumps({
+        "activeAccountNumber": 1, "sequence": [1, 2],
+        "accounts": {"1": {"email": "dev.shared@example.com", "uuid": "u1"},
+                     "2": {"email": "dev.master@example.com", "uuid": "u2"}},
+    }))
+
+    def run(*argv):
+        monkeypatch.setattr(sys, "argv", ["cc-swap", "alias", *argv])
+        try:
+            cli.main()
+        except SystemExit as e:
+            assert e.code in (0, None)
+
+    def shown():
+        return record_names(json.loads((root / "sequence.json").read_text())["accounts"])
+
+    run("1", "main")
+    assert shown() == {"1": "main", "2": "dev.master"}
+    run("1", "--unset")
+    assert shown() == {"1": "dev.shared", "2": "dev.master"}
+
+
 def test_short_name():
     assert names.short_name("dev.shared@example.com") == "dev.shared"
     assert names.short_name("") == ""

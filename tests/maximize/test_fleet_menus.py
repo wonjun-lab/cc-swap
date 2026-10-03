@@ -33,7 +33,11 @@ def test_the_menu_holds_every_former_fleet_menu_action():
 
 def test_home_keys_are_the_footer_and_do_not_collide():
     assert menus.HOME_KEYS == ("enter", "r", "l", "h", "m", "?", "q")
-    assert set(menus.ROW_KEYS) - {"x"} <= set(menus.HOME_KEYS)
+    # x (exclude) is a menu item too; n (name) is a row key the footer does
+    # not list: it would not fit 80 columns (? help and Account settings do).
+    assert set(menus.ROW_KEYS) - {"x", "n"} <= set(menus.HOME_KEYS)
+    assert "n" in menus.ROW_KEYS
+    assert "n" not in (*menus.MAIN_KEYS, *menus.RESERVED_KEYS)
     # Shortcuts: the menu's letters that also work from home, never o (one
     # stray key must not turn switching off) nor m (the menu itself).
     assert "o" not in menus.SHORTCUT_KEYS and "m" not in menus.SHORTCUT_KEYS
@@ -243,6 +247,20 @@ def test_the_hold_picker_offers_1_2_4_hours_until_and_off():
     for row in rows:
         if row.key.isalpha():
             assert menus.bold_spans(row.title, row.key) is not None
+
+
+def test_n_names_the_selected_account_and_help_says_so():
+    from claude_swap.maximize import home
+
+    entries = dict(menus.help_entries())
+    assert entries["n"].startswith("name the selected account")
+    assert "cc-swap alias" in entries["n"]
+    # Why it is not in the footer: with it the footer no longer fits 80 columns.
+    with_n = " · ".join(f"{k} {w}" for k, w in (*home.KEY_HINTS, ("n", "name")))
+    assert len(with_n) > home.text_width(80)
+    assert "n" not in dict(home.KEY_HINTS)
+    account_settings = {key for key, _t, _a in menus.ACCOUNT_ITEMS}
+    assert "n" in account_settings  # m → a → n names an account too
 
 
 def test_help_explains_the_hold_and_the_summary():

@@ -905,6 +905,104 @@ class TestKeys:
         assert app.return_code == 0
 
 
+# -- n: name the selected account ------------------------------------------------------------------
+
+
+class AliasSwitcher(FakeSwitcher):
+    """FakeSwitcher with `cc-swap alias`'s rules: models.normalize_alias,
+    and no alias two accounts share."""
+
+    def set_alias(self, identifier: str, alias: str):
+        import dataclasses
+
+        from claude_swap.exceptions import ConfigError, ValidationError
+        from claude_swap.models import normalize_alias
+
+        try:
+            name = normalize_alias(alias)
+        except ValueError as e:
+            raise ValidationError(str(e)) from e
+        if any(a.alias == name and a.number != identifier for a in self._accounts):
+            raise ConfigError(f"Alias '{name}' is already used")
+        self.calls.append(("set_alias", identifier, name))
+        self._accounts = [dataclasses.replace(a, alias=name) if a.number == identifier else a
+                          for a in self._accounts]
+        return identifier, name
+
+    def unset_alias(self, identifier: str):
+        import dataclasses
+
+        self.calls.append(("unset_alias", identifier))
+        self._accounts = [dataclasses.replace(a, alias="") if a.number == identifier else a
+                          for a in self._accounts]
+        return identifier
+
+
+def _six_aliasable(root) -> AliasSwitcher:
+    six = _six(root)
+    return AliasSwitcher(six._accounts, root)
+
+
+@pytest.mark.asyncio
+class TestNameKey:
+    async def test_n_names_the_selected_account(self, tmp_path, held_by_service):
+        from claude_swap.tui.fleet_modals import TextInputModal
+
+        fake = _six_aliasable(tmp_path)
+        app = make_app(fake)
+        async with app.run_test(size=(160, 45)) as pilot:
+            await _open(pilot)
+            await pilot.press("down", "n")  # #2, the row below the active one
+            await _open(pilot)
+            assert isinstance(app.screen, TextInputModal)
+            box = app.screen.query_one("#fx-text-input")
+            assert box.value == NAMES[1]  # prefilled with what the table shows
+            await pilot.press(*"side", "enter")  # typing replaces it
+            await _open(pilot)
+            assert ("set_alias", "2", "side") in fake.calls
+            assert _cell(app, "2", "account") == "side #2"
+
+    async def test_an_empty_name_brings_the_short_name_back(self, tmp_path, held_by_service):
+        import dataclasses
+
+        fake = _six_aliasable(tmp_path)
+        fake._accounts = [dataclasses.replace(a, alias="side") if a.number == "2" else a
+                          for a in fake._accounts]
+        app = make_app(fake)
+        async with app.run_test(size=(160, 45)) as pilot:
+            await _open(pilot)
+            await pilot.press("down", "n", "backspace", "enter")  # clear it, save
+            await _open(pilot)
+            assert ("unset_alias", "2") in fake.calls
+            assert _cell(app, "2", "account") == f"{NAMES[1]} #2"
+
+    async def test_esc_and_an_unchanged_name_change_nothing(self, tmp_path, held_by_service):
+        fake = _six_aliasable(tmp_path)
+        app = make_app(fake)
+        async with app.run_test(size=(160, 45)) as pilot:
+            await _open(pilot)
+            await pilot.press("down", "down", "down", "down", "n")  # #4 jordan.lee@uni
+            await _open(pilot)
+            await pilot.press("escape")
+            await _open(pilot)
+            await pilot.press("n", "enter")  # unchanged: never sent (it has an @)
+            await _open(pilot)
+            assert not [c for c in fake.calls if "alias" in c[0]]
+
+    async def test_a_name_the_alias_rules_refuse_says_why(self, tmp_path, held_by_service):
+        from claude_swap.tui.modals import OutputModal
+
+        fake = _six_aliasable(tmp_path)
+        app = make_app(fake)
+        async with app.run_test(size=(160, 45)) as pilot:
+            await _open(pilot)
+            await pilot.press("down", "n", *"a,b", "enter")
+            await _open(pilot)
+            assert isinstance(app.screen, OutputModal)
+            assert "may only contain letters" in app.screen._output
+            assert not [c for c in fake.calls if c[0] == "set_alias"]
+
+
 # -- h: hold the active account ------------------------------------------------------------------
 
 

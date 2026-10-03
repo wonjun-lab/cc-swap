@@ -748,6 +748,24 @@ def clip(text: str, width: int) -> str:
     return text if len(text) <= width else text[: max(width - 1, 0)] + "…"
 
 
+def name_request(
+    alias: str, shown: str, typed: str | None
+) -> tuple[str, str | None] | None:
+    """What Fleet's ``n`` asks of ``cc-swap alias`` for what was ``typed``
+    over the name ``shown``: ``("set", name)``, ``("unset", None)`` (empty:
+    back to the short name, maximize/names.py), or None — esc, nothing
+    changed, or nothing to clear. The alias rules themselves are the
+    switcher's (``set_alias``), exactly as the CLI's."""
+    if typed is None:
+        return None
+    typed = typed.strip()
+    if not typed:
+        return ("unset", None) if alias else None
+    if typed == shown:
+        return None
+    return "set", typed
+
+
 def switch_warning(row: FleetRow, mx: MaximizeSettings) -> str | None:
     """Why switching to ``row`` deserves a confirmation, or None (switching
     is reversible, so a landable target switches at once)."""

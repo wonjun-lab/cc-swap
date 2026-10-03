@@ -37,8 +37,10 @@ from claude_swap.tui.fleet import FleetScreen
 #: another command: ``upgrade`` gained ``--check`` and the service refresh;
 #: ``auto on|off|status`` is caught before the ``auto`` parser; ``prime
 #: verify`` is a ``prime`` subcommand.
+#: Upstream's ``alias`` is here too: the short names Fleet shows are the
+#: alias first (maximize/names.py), and Fleet's ``n`` edits it.
 EXTRA_FORK_ACTIONS: tuple[str, ...] = (
-    "upgrade", "auto on", "auto off", "auto status", "prime verify",
+    "upgrade", "auto on", "auto off", "auto status", "prime verify", "alias",
 )
 
 #: CLI action -> the Fleet key path that performs the same thing.
@@ -53,6 +55,7 @@ FLEET_ROUTES: dict[str, str] = {
     # The home sentence says Auto OFF; menu → Mode's facts say by whom and since when.
     "auto status": "m m",
     "hold": "h",  # home key: hold the active account (1h/2h/4h/until/off)
+    "alias": "n",  # row key: name the selected account (also m → a → n)
 }
 
 #: CLI action -> why Fleet deliberately has no twin.
@@ -162,7 +165,7 @@ def _sub_keys(path: tuple[str, ...]) -> set[str]:
 def test_a_routed_fleet_key_path_is_bound_at_every_step(action, route):
     first, *rest = route.split()
     assert first in _fleet_keys(), f"Fleet binds no `{first}` for `cc-swap {action}`"
-    assert first in menus.HOME_KEYS, (
+    assert first in (*menus.HOME_KEYS, *menus.ROW_KEYS), (
         f"`{first}` (for `cc-swap {action}`) is not one of the home screen's keys"
     )
     path = (first,)
