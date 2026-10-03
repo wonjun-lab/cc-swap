@@ -7,15 +7,21 @@ switching doing, and is anything wrong":
 
 * one plain-English sentence about the engine, with who runs it on the
   right, and at most one attention line (``maximize/home.py``);
-* every account as a block in the upstream dashboard's look — active first,
-  then the engine's pick order — with one tag each and 5h/7d bars carrying
-  the soft and hard marks;
+* every account as one row of a table under dim column headers — ``order ·
+  account · plan · 5h · 5h resets · 7d · 7d resets · status``: the active
+  account first, then the engine's pick order numbered 1, 2, 3 …; 5h/7d
+  bars carrying the soft and hard marks; when both windows reset, for every
+  account; and one tag each, right after the resets;
+* under the table, when there are rows to spare, the selected account in
+  full (organization, plan, login deadline, priming, every usage window
+  with its exact reset);
 * a footer of six keys; everything else is in the ``m`` menu popup.
 
-The layout follows the terminal size only (``home.home_layout``): two
-columns of blocks when wide, one when medium, and one line per account plus
-the selected account in full when narrow or short. The sentence, the
-attention line and the footer never scroll away.
+The table is used at every terminal size; ``home.table_plan`` fits its
+columns to the width (shorter bars, then no reset clocks, no plan column,
+shorter names) and drops the detail panel first when the terminal is
+short. The sentence, the attention line, the column headers and the footer
+never scroll away.
 
 Viewer by default: the screen never takes the engine lease on its own. It
 probes the lease every few seconds (a free lease is taken and dropped at
@@ -304,8 +310,6 @@ class FleetScreen(Screen):
         Binding("q", "quit", "Quit", show=False),
         Binding("down,j", "move('down')", show=False),
         Binding("up,k", "move('up')", show=False),
-        Binding("right", "move('right')", show=False),
-        Binding("left", "move('left')", show=False),
         # The menu's letters, straight from here (menus.SHORTCUT_KEYS).
         Binding("s", "menu('strategy')", "Swap strategy", show=False),
         Binding("p", "menu('prime')", "Prime now", show=False),
@@ -341,7 +345,7 @@ class FleetScreen(Screen):
         self._holder_pid: int | None = None
         self._service: dict | None = None
         self._fetched_on_open = False
-        self._layout: home.HomeLayout | None = None
+        self._plan: home.TablePlan | None = None
         self._situation: home.Situation | None = None
         self._hostname = host_name()
         self._fx_timers: list = []
@@ -352,9 +356,10 @@ class FleetScreen(Screen):
     def compose(self) -> ComposeResult:
         yield Static("", id="fx-status", markup=False)
         yield Static("", id="fx-attention", markup=False)
+        yield Static("", id="fx-head", markup=False)
         with VerticalScroll(id="fx-scroll", can_focus=False):
             yield FleetBody(id="fx-body")
-        yield Static("", id="fx-expanded", markup=False)
+        yield Static("", id="fx-detail", markup=False)
         yield Static("", id="fx-keys", markup=False)
 
     def on_mount(self) -> None:
@@ -545,7 +550,7 @@ class FleetScreen(Screen):
     def _width(self) -> int:
         """The text width every line is laid out in (the screen minus one
         column of padding each side and one for the accounts' scrollbar)."""
-        return max((self.size.width or 120) - 3, 20)
+        return home.text_width(self.size.width or 120)
 
     def _selected_bg(self, palette: Palette) -> str:
         panel = getattr(self.app.current_theme, "panel", None)
@@ -555,9 +560,7 @@ class FleetScreen(Screen):
         if not self.is_attached:
             return
         size = self.size
-        layout = home.home_layout(size.width or 120, size.height or 36)
-        self._layout = layout
-        self.set_class(not layout.blanks, "-compact")
+        self.set_class((size.height or 36) < home.BLANKS_MIN_ROWS, "-compact")
         palette = self._palette()
         width = self._width()
         now = time.time()
@@ -572,7 +575,7 @@ class FleetScreen(Screen):
             published_at=published.at if published else None, now=now, poll_s=self._poll_s,
         )
         self._situation = sit
-        self._render_top(es, dv, sit, now, width, palette)
+        attention = self._render_top(es, dv, sit, now, width, palette)
         ctx = render.Ctx(
             palette=palette,
             ticks=mxview.window_ticks(self._mx),
@@ -580,14 +583,14 @@ class FleetScreen(Screen):
             next_no=home.next_number(dv, picks, sit),
             priming=self._priming(es, sit),
         )
-        rows = home.ordered_rows(self._rows, picks)
+        rows = home.ordered_rows(self._rows, picks, now=now)
         self._order = [r.number for r in rows]
         if self._sel not in self._order:
             self._sel = next((r.number for r in rows if r.active), None) or (
                 self._order[0] if self._order else None
             )
             self._scroll_to_sel = True
-        self._render_accounts(rows, ctx, layout, width, palette)
+        self._render_accounts(rows, ctx, attention, palette)
         self.query_one("#fx-keys", Static).update(render.keys_text(width, palette))
 
     def _priming(self, es: fx.EngineStatus, sit: home.Situation) -> bool:
@@ -597,7 +600,9 @@ class FleetScreen(Screen):
     def _render_top(
         self, es: fx.EngineStatus, dv: fx.DecisionView, sit: home.Situation,
         now: float, width: int, palette: Palette,
-    ) -> None:
+    ) -> bool:
+        """The status sentence and the attention line; whether the
+        attention line shows."""
         published = self._state.decision
         variants = home.status_variants(
             es, dv, self._rows, self._mx, sit, now=now,
@@ -618,64 +623,64 @@ class FleetScreen(Screen):
         if attention is not None:
             parts, tone = attention
             widget.update(render.attention_text(parts, tone, width, palette))
+        return attention is not None
 
     def _render_accounts(
-        self, rows: list[fx.FleetRow], ctx: render.Ctx, layout: home.HomeLayout,
-        width: int, palette: Palette,
+        self, rows: list[fx.FleetRow], ctx: render.Ctx, attention: bool, palette: Palette,
     ) -> None:
+        """The column headers, the table and the selected account's panel,
+        laid out by ``home.table_plan`` for this terminal."""
         body = self.query_one("#fx-body", FleetBody)
-        expanded = self.query_one("#fx-expanded", Static)
-        bg = self._selected_bg(palette)
+        head = self.query_one("#fx-head", Static)
+        detail = self.query_one("#fx-detail", Static)
+        size = self.size
+        width, height = size.width or 120, size.height or 36
         if not rows:
+            self._plan = None
             body.layout_map = render.Body()
             body.update(Text(
                 "loading…" if self.app.snapshot is None
                 else "No managed accounts yet: m → a (Account settings) adds one.",
                 style=palette.muted,
             ))
-            expanded.display = False
+            head.display = detail.display = False
+            self._fit_scroll(height, attention, 0)
             return
-        expanded_lines = 0
-        if layout.mode == "narrow":
-            layout_map = render.render_list(rows, width, ctx, selected=self._sel, selected_bg=bg)
-            row = self.current_row()
-            detail = render.render_expanded(
-                row, self._accounts.get(row.number) if row else None, width, ctx,
-                max_bar=layout.max_bar,
-            )
-            expanded.update(detail)
-            expanded.display = True
-            expanded_lines = len(detail.plain.splitlines())
-        else:
-            layout_map = render.render_blocks(
-                rows, self._accounts, width, ctx, layout, selected=self._sel, selected_bg=bg,
-            )
-            expanded.display = False
+        row = self.current_row()
+        acc = self._accounts.get(row.number) if row is not None else None
+        statuses = {r.number: ctx.status(r) for r in rows}
+        needs = home.table_needs(
+            rows, statuses, now=ctx.now, detail=render.detail_height(row, acc, ctx),
+        )
+        plan = home.table_plan(width, height, needs, attention=attention)
+        self._plan = plan
+        head.update(render.table_header(plan, palette))
+        head.display = True
+        layout_map = render.render_table(
+            rows, plan, ctx, selected=self._sel, selected_bg=self._selected_bg(palette),
+        )
         body.layout_map = layout_map
         body.update(layout_map.text)
-        self._fit_scroll(layout, expanded_lines)
+        detail.display = plan.detail
+        if plan.detail:
+            detail.update(render.render_detail(row, acc, plan.room, ctx))
+        self._fit_scroll(height, attention, needs.detail if plan.detail else 0)
         if self._scroll_to_sel:
             self._scroll_to_sel = False
             self.call_after_refresh(self._scroll_selected_into_view)
 
-    def _fit_scroll(self, layout: home.HomeLayout, expanded_lines: int) -> None:
-        """Cap the account area at the rows the fixed lines leave: the
-        status line, the attention line, the blank lines, the narrow
-        layout's expanded account and the footer always stay on screen.
-        When even that does not fit, the expanded account gives up rows
-        first (the list keeps two)."""
-        fixed = 1 + 1  # status line, footer
-        if self.query_one("#fx-attention").display:
+    def _fit_scroll(self, height: int, attention: bool, detail_lines: int) -> None:
+        """Cap the table at the rows the fixed lines leave: the status line,
+        the attention line, the blank lines, the column headers, the
+        selected account's panel (``table_plan`` shows it only when every
+        row fits above it) and the footer always stay on screen."""
+        fixed = 1 + 1 + 1  # status line, column headers, footer
+        if attention:
             fixed += 1
-        if layout.blanks:
-            fixed += 2  # above the status line and above the accounts
-        rest = (self.size.height or 36) - fixed
-        expanded = min(expanded_lines, max(rest - 2, 0))
-        detail = self.query_one("#fx-expanded")
-        detail.styles.max_height = expanded if expanded_lines else None
-        if expanded_lines and not expanded:
-            detail.display = False
-        self.query_one("#fx-scroll", VerticalScroll).styles.max_height = max(rest - expanded, 2)
+        if height >= home.BLANKS_MIN_ROWS:
+            fixed += 2  # above the status line and above the table
+        rest = height - fixed - detail_lines
+        self.query_one("#fx-scroll", VerticalScroll).styles.max_height = max(rest, 2)
 
     def _scroll_selected_into_view(self) -> None:
         if not self.is_attached:
@@ -698,9 +703,7 @@ class FleetScreen(Screen):
             self._render_all()
 
     def action_move(self, direction: str) -> None:
-        layout = self._layout
-        columns = layout.columns if layout is not None and layout.mode != "narrow" else 1
-        target = home.step_selection(self._order, self._sel, direction, columns)
+        target = home.step_selection(self._order, self._sel, direction)
         if target is not None and target != self._sel:
             self._sel = target
             self._scroll_to_sel = True

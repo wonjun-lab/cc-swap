@@ -6,9 +6,15 @@ Fleet (``tui/fleet.py``) is the maximize home screen. It shows:
   a dim note on the right saying who runs it (:func:`holder_variants`);
 * at most one attention line, only when something needs you
   (:func:`attention_parts`);
-* every account as a block in the upstream dashboard's style, in the order
-  :func:`ordered_rows` gives, each with at most one tag (:func:`tag_for`);
-* a layout picked from the terminal size alone (:func:`home_layout`).
+* every account as one row of a table with column headers (``order ·
+  account · plan · 5h · 5h resets · 7d · 7d resets · status``), in the order
+  :func:`ordered_rows` gives: the ``order`` column numbers where automatic
+  switching would go (:func:`order_marks`), every row says when both of its
+  windows reset (:func:`resets_text`), and the status column, right after
+  ``7d resets``, holds at most one tag (:func:`tag_for`);
+* the table's columns picked from the terminal size and what the rows need
+  (:func:`table_plan`), and under the table the selected account in full
+  when there are rows to spare.
 
 The sentence never presents an old decision as the engine's current one:
 :func:`situation` tells a live decision from one the engine has not
@@ -27,7 +33,9 @@ Tones are ``maximize/fleet.py``'s (``ok``, ``warn``, ``crit``, ``dim``,
 from __future__ import annotations
 
 import re
-from collections.abc import Sequence
+import time
+import unicodedata
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Literal
 
@@ -35,101 +43,81 @@ from claude_swap import oauth
 from claude_swap.maximize import fleet as fx
 from claude_swap.settings import MaximizeSettings
 
-Mode = Literal["wide", "medium", "narrow"]
 Tone = str
 Seg = tuple[str, Tone]
 
-#: At least this many columns (and NARROW_MAX_ROWS rows): two columns of blocks.
-WIDE_MIN_COLS = 140
-#: Below this many columns: one line per account plus the selected one expanded.
-MEDIUM_MIN_COLS = 100
-#: Fewer rows than this is narrow whatever the width (blocks would not fit).
-NARROW_MAX_ROWS = 30
 #: Fewer rows than this drops the blank lines around the status block.
 BLANKS_MIN_ROWS = 20
 
 
-# -- layout -----------------------------------------------------------------------------
-
-
-def layout_mode(width: int, height: int) -> Mode:
-    """``wide`` (≥140 cols), ``medium`` (100–139) or ``narrow`` (<100 cols or
-    <30 rows). Depends only on the terminal size."""
-    if width < MEDIUM_MIN_COLS or height < NARROW_MAX_ROWS:
-        return "narrow"
-    if width >= WIDE_MIN_COLS:
-        return "wide"
-    return "medium"
-
-
-@dataclass(frozen=True)
-class HomeLayout:
-    mode: Mode
-    columns: int   # account blocks side by side (narrow: the one-line list)
-    gap: int       # spaces between two columns of blocks
-    max_bar: int   # the longest a usage bar gets
-    blanks: bool   # blank lines around the status block
-
-
-def home_layout(width: int, height: int) -> HomeLayout:
-    """Everything about the layout that follows from the terminal size."""
-    mode = layout_mode(width, height)
-    return HomeLayout(
-        mode=mode,
-        columns=2 if mode == "wide" else 1,
-        gap=4,
-        max_bar={"wide": 34, "medium": 60, "narrow": 40}[mode],
-        blanks=height >= BLANKS_MIN_ROWS,
-    )
-
-
-def column_width(width: int, layout: HomeLayout) -> int:
-    """One block's width when ``layout.columns`` blocks share ``width``."""
-    return (width - layout.gap * (layout.columns - 1)) // layout.columns
-
-
-def step_selection(
-    order: Sequence[str], selected: str | None, direction: str, columns: int = 1
-) -> str | None:
-    """The account selected after one arrow key. ``order`` is the display
-    order, laid out row by row in ``columns`` columns: up/down move a whole
-    row (to the block above or below, or to the last block when the row
-    below is shorter), left/right one block within a row. Never wraps; an
-    unknown selection starts at the first account."""
+def step_selection(order: Sequence[str], selected: str | None, direction: str) -> str | None:
+    """The account selected after one arrow key: up/down move one row of
+    the table (``order`` is the display order). Never wraps; an unknown
+    selection starts at the first account."""
     if not order:
         return None
     if selected not in order:
         return order[0]
     i = order.index(selected)
-    cols = max(columns, 1)
-    last = len(order) - 1
     if direction == "down":
-        j = min(i + cols, last) if i // cols < last // cols else i
+        i = min(i + 1, len(order) - 1)
     elif direction == "up":
-        j = i - cols if i - cols >= 0 else i
-    elif direction == "right":
-        j = i + 1 if cols > 1 and i % cols < cols - 1 and i + 1 < len(order) else i
-    elif direction == "left":
-        j = i - 1 if cols > 1 and i % cols > 0 else i
-    else:
-        j = i
-    return order[j]
+        i = max(i - 1, 0)
+    return order[i]
 
 
 # -- order and tags --------------------------------------------------------------------
 
 
-def ordered_rows(rows: Sequence[fx.FleetRow], picks: Sequence[str]) -> list[fx.FleetRow]:
+def unusable(row: fx.FleetRow, now: float | None = None) -> bool:
+    """Automatic switching never goes here: a dead login (re-login), an
+    excluded account, or (given ``now``) a login past its deadline."""
+    if row.login == "relogin" or row.tier == "excluded":
+        return True
+    left = fx.login_left(row, now) if now is not None else None
+    return left is not None and left <= 0 and row.login != "api"
+
+
+def ordered_rows(
+    rows: Sequence[fx.FleetRow], picks: Sequence[str], *, now: float | None = None
+) -> list[fx.FleetRow]:
     """The active account, then the engine's pick order (``picks``:
-    ``policy.landing_candidates``), then the rest by rank and slot, with
+    ``policy.landing_candidates``), then the rest by rank and slot; the
+    accounts switching never goes to (:func:`unusable`) after those, and
     excluded accounts last."""
     by_number = {r.number: r for r in rows}
     out = [r for r in rows if r.active]
     out += [by_number[n] for n in picks if n in by_number and not by_number[n].active]
     seen = {r.number for r in out}
     rest = [r for r in rows if r.number not in seen]
-    rest.sort(key=lambda r: (r.tier == "excluded", r.rank is None, r.rank or 0))
+    rest.sort(key=lambda r: (
+        r.tier == "excluded", unusable(r, now), r.rank is None, r.rank or 0,
+    ))
     return out + rest
+
+
+#: The ``order`` column: the active account, and an account switching never
+#: goes to.
+ORDER_ACTIVE = "●"
+ORDER_NONE = "–"
+
+
+def order_marks(rows: Sequence[fx.FleetRow], now: float) -> dict[str, str]:
+    """The ``order`` column for ``rows`` in display order
+    (:func:`ordered_rows`): ``●`` on the active account, ``1``, ``2``, ``3``
+    … on the others in the order automatic switching would try them, and
+    ``–`` on an account it never goes to (:func:`unusable`)."""
+    out: dict[str, str] = {}
+    n = 0
+    for row in rows:
+        if row.active:
+            out[row.number] = ORDER_ACTIVE
+        elif unusable(row, now):
+            out[row.number] = ORDER_NONE
+        else:
+            n += 1
+            out[row.number] = str(n)
+    return out
 
 
 def short_left(seconds: float) -> str:
@@ -150,7 +138,7 @@ TAG_PRIORITY: tuple[str, ...] = (
 def tag_for(
     row: fx.FleetRow, *, is_next: bool, now: float, priming: bool = True
 ) -> tuple[str, Tone] | None:
-    """The one right-aligned tag: the most important thing about the
+    """The one tag in the status column: the most important thing about the
     account (:data:`TAG_PRIORITY`). ``priming`` False hides the next prime
     time (priming does not run while automatic switching is off)."""
     if row.active:
@@ -176,6 +164,285 @@ def tag_for(
             when = fx.hhmm(cell.lo)
         return (f"5h off · prime {when}" if when else "5h off"), "dim"
     return None
+
+
+def status_for(
+    row: fx.FleetRow, *, is_next: bool, now: float, priming: bool = True
+) -> tuple[str, Tone] | None:
+    """The status column: the account's tag (:func:`tag_for`), else a dim
+    ``primed`` when priming opened the 5h window it is in."""
+    tag = tag_for(row, is_next=is_next, now=now, priming=priming)
+    if tag is None and row.state5 == "primed" and row.login == "ok":
+        return "primed", "dim"
+    return tag
+
+
+# -- when the windows reset ----------------------------------------------------------------
+
+#: A reset nothing says anything about, and a 5h window that is not running.
+NOT_KNOWN = "—"
+NOT_STARTED = "not started"
+
+
+def countdown(seconds: float) -> str:
+    """``47m`` / ``1h47m`` / ``3d19h``: the time left until a reset."""
+    s = max(int(seconds), 0)
+    if s < 3600:
+        return f"{max(s // 60, 1)}m"
+    if s < 86400:
+        h, m = divmod(s // 60, 60)
+        return f"{h}h{m:02d}m"
+    d, h = divmod(s // 3600, 24)
+    return f"{d}d{h}h"
+
+
+def reset_clock(ts: float, now: float, *, date: bool = True) -> str:
+    """Local ``07:10`` today (or always, without ``date``), else ``Oct 7
+    02:18``."""
+    at = time.localtime(ts)
+    if not date or at[:3] == time.localtime(now)[:3]:
+        return time.strftime("%H:%M", at)
+    return time.strftime("%b ", at) + str(at.tm_mday) + time.strftime(" %H:%M", at)
+
+
+def resets_text(reset: float | None, now: float, *, clock: bool, date: bool = True) -> str:
+    """``3d19h · Oct 7 02:18`` (``clock``) or ``3d19h``; ``now`` once it
+    has passed, ``—`` when unknown. ``date`` False never names the day (a
+    5h window is at most five hours away: ``1h47m · 07:10``)."""
+    if reset is None:
+        return NOT_KNOWN
+    if reset <= now:
+        return "now"
+    left = countdown(reset - now)
+    return f"{left} · {reset_clock(reset, now, date=date)}" if clock else left
+
+
+def exact_reset(reset: float | None, now: float) -> str:
+    """The detail panel's ``resets 07:10 (in 1h47m)``."""
+    if reset is None:
+        return NOT_KNOWN
+    if reset <= now:
+        return "resets now"
+    return f"resets {reset_clock(reset, now)} (in {countdown(reset - now)})"
+
+
+def row_resets(row: fx.FleetRow, window: str, now: float, *, clock: bool) -> str:
+    """One row's ``5h resets`` (``1h47m · 07:10``) or ``7d resets``
+    (``3d19h · Oct 7 02:18``) cell: ``not started`` for a 5h window that is
+    not running (a working login), else :func:`resets_text`."""
+    if window == "5h":
+        if row.login == "ok" and row.pct5 is not None and row.state5 == "cold":
+            return NOT_STARTED
+        return resets_text(row.reset5, now, clock=clock, date=False)
+    return resets_text(row.reset7, now, clock=clock)
+
+
+# -- the table ----------------------------------------------------------------------------------
+#
+# One row per account, a header over it. The columns, left to right:
+#
+#   order  account           plan  5h            5h resets      7d  …  7d resets  status
+#     ●    main@acme.dev #1  20x   ━━━┃━━━┃ 62%  1h47m · 07:10  …      …          ● active
+#
+# ``status`` follows ``7d resets`` directly, never the terminal's right
+# edge. :func:`table_plan` fits the columns to the terminal.
+
+#: Column keys in order, and their headers.
+COLUMNS: tuple[tuple[str, str], ...] = (
+    ("order", "order"), ("account", "account"), ("plan", "plan"), ("5h", "5h"),
+    ("reset5", "5h resets"), ("7d", "7d"), ("reset7", "7d resets"), ("status", "status"),
+)
+HEADERS = dict(COLUMNS)
+#: Columns (and the text the screen lays out) leave this many terminal
+#: columns: one of padding on the left, two on the right (the scrollbar).
+MARGIN = 3
+#: The widest a usage bar gets, and the narrowest before it gives way.
+MAX_BAR = 24
+MIN_BAR = 6
+#: The percentage after a bar: `` 62%``.
+PCT_W = 4
+#: The account column is never wider than this for the name itself (the
+#: dim `` #4`` slot after it comes on top), …
+NAME_CAP = 32
+#: … and gives up characters only down to this before the bars go (the
+#: percentages stay): ``team.shared@…`` tells accounts apart, ``team.s…``
+#: does not.
+MIN_NAME = 13
+#: Blank columns between two columns, and when room is tight.
+GAP, TIGHT_GAP = 2, 1
+
+
+def cells(text: str) -> int:
+    """Terminal cells ``text`` takes (wide East Asian characters take two)."""
+    return sum(2 if unicodedata.east_asian_width(c) in ("W", "F") else 1 for c in text)
+
+
+def text_width(width: int) -> int:
+    """The width every line of the home screen is laid out in."""
+    return max(width - MARGIN, 20)
+
+
+@dataclass(frozen=True)
+class TableNeeds:
+    """What the rows need, measured from them (:func:`table_needs`)."""
+
+    rows: int = 0
+    name: int = 0          # the longest display name, in cells
+    slot: int = 3          # the longest `` #4`` after a name, its space included
+    plan: int = 0          # the longest plan label
+    reset5: int = 0        # the longest 5h resets cell, with the clock …
+    reset5_short: int = 0  # … and without it
+    reset7: int = 0
+    reset7_short: int = 0
+    status: int = 0        # the longest tag
+    detail: int = 0        # lines the selected account's panel takes (0: none)
+
+
+def plan_text(row: fx.FleetRow) -> str:
+    return NOT_KNOWN if row.plan == "?" else row.plan
+
+
+def account_slot(row: fx.FleetRow) -> str:
+    """The dim slot number after the name: `` #4`` (what the attention line
+    and the CLI call it)."""
+    return f" #{row.number}"
+
+
+def table_needs(
+    rows: Sequence[fx.FleetRow],
+    statuses: Mapping[str, tuple[str, Tone] | None],
+    *,
+    now: float,
+    detail: int = 0,
+) -> TableNeeds:
+    """Measure ``rows`` (``statuses``: number -> :func:`status_for`)."""
+    def widest(texts) -> int:
+        return max((cells(t) for t in texts), default=0)
+
+    return TableNeeds(
+        rows=len(rows),
+        name=widest(r.name for r in rows),
+        slot=widest(account_slot(r) for r in rows),
+        plan=widest(plan_text(r) for r in rows),
+        reset5=widest(row_resets(r, "5h", now, clock=True) for r in rows),
+        reset5_short=widest(row_resets(r, "5h", now, clock=False) for r in rows),
+        reset7=widest(row_resets(r, "7d", now, clock=True) for r in rows),
+        reset7_short=widest(row_resets(r, "7d", now, clock=False) for r in rows),
+        status=widest(s[0] for s in statuses.values() if s),
+        detail=detail,
+    )
+
+
+@dataclass(frozen=True)
+class TablePlan:
+    """How the table fits the terminal (:func:`table_plan`)."""
+
+    bar: int                                  # cells per usage bar (0: the % only)
+    clock: bool                               # reset clocks after the countdowns
+    plan: bool                                # the plan column is shown
+    gap: int                                  # blank columns between columns
+    columns: tuple[tuple[str, int], ...]      # (key, width) left to right
+    detail: bool                              # the selected account's panel shows
+    blanks: bool                              # blank lines around the status block
+    room: int                                 # the width the screen lays text out in
+
+    def width(self, key: str) -> int:
+        return dict(self.columns)[key]
+
+    def x(self, key: str) -> int:
+        """Where column ``key`` starts."""
+        x = 0
+        for k, w in self.columns:
+            if k == key:
+                return x
+            x += w + self.gap
+        raise KeyError(key)
+
+    @property
+    def total(self) -> int:
+        """The table's width."""
+        return sum(w for _k, w in self.columns) + self.gap * (len(self.columns) - 1)
+
+    @property
+    def keys(self) -> tuple[str, ...]:
+        return tuple(k for k, _w in self.columns)
+
+
+def _columns(
+    needs: TableNeeds, *, bar: int, clock: bool, plan: bool, name: int
+) -> list[tuple[str, int]]:
+    def head(key: str, width: int) -> tuple[str, int]:
+        return key, max(width, cells(HEADERS[key]))
+
+    usage = bar + 1 + PCT_W if bar else PCT_W
+    out = [head("order", 1), head("account", name + needs.slot)]
+    if plan:
+        out.append(head("plan", needs.plan))
+    out += [
+        head("5h", usage),
+        head("reset5", needs.reset5 if clock else needs.reset5_short),
+        head("7d", usage),
+        head("reset7", needs.reset7 if clock else needs.reset7_short),
+        head("status", needs.status),
+    ]
+    return out
+
+
+def _span(columns: Sequence[tuple[str, int]], gap: int) -> int:
+    return sum(w for _k, w in columns) + gap * (len(columns) - 1)
+
+
+def _name_room(room: int, needs: TableNeeds, columns: Sequence[tuple[str, int]], gap: int) -> int:
+    """Cells left for the name when every other column takes its width."""
+    return room - (_span(columns, gap) - dict(columns)["account"]) - needs.slot
+
+
+def table_plan(
+    width: int, height: int, needs: TableNeeds, *, attention: bool = False
+) -> TablePlan:
+    """The table's columns for a ``width`` x ``height`` terminal.
+
+    Everything shows while it fits: bars up to :data:`MAX_BAR`, the reset
+    clocks, the plan, the whole name (up to :data:`NAME_CAP`). When it does
+    not, in this order: the bars shorten to :data:`MIN_BAR`; the columns
+    move closer (:data:`TIGHT_GAP`); the reset clocks go (the countdowns
+    stay); the plan column goes; the name shortens with … (to
+    :data:`MIN_NAME`); then the bars go, leaving the percentages, and the
+    name takes what is left. ``order``, the resets and the status columns
+    never go, so a terminal too narrow even for that clips the row's end.
+
+    Height: the selected account's panel (``needs.detail`` lines) shows
+    under the table only when every row fits above it; on a short terminal
+    it goes first. The table itself is used at every size."""
+    room = text_width(width)
+    name = min(needs.name, NAME_CAP)
+    columns: list[tuple[str, int]] | None = None
+    for clock, plan, gap in ((True, True, GAP), (True, True, TIGHT_GAP),
+                             (False, True, TIGHT_GAP), (False, False, TIGHT_GAP)):
+        # Everything but the two bars, at the full name.
+        fixed = _span(_columns(needs, bar=0, clock=clock, plan=plan, name=name), gap)
+        bar = min((room - fixed) // 2 - 1, MAX_BAR)
+        if bar >= MIN_BAR:
+            columns = _columns(needs, bar=bar, clock=clock, plan=plan, name=name)
+            break
+    if columns is None:  # the name shortens, then the bars go
+        clock, plan, gap = False, False, TIGHT_GAP
+        bar = MIN_BAR
+        fit = _name_room(room, needs, _columns(needs, bar=bar, clock=False, plan=False,
+                                               name=0), gap)
+        if fit < min(name, MIN_NAME):
+            bar = 0
+            fit = _name_room(room, needs, _columns(needs, bar=0, clock=False, plan=False,
+                                                   name=0), gap)
+        columns = _columns(needs, bar=bar, clock=clock, plan=plan,
+                           name=max(min(name, fit), 1))
+    blanks = height >= BLANKS_MIN_ROWS
+    fixed_lines = 1 + 1 + 1 + int(attention) + 2 * int(blanks)  # status, header, footer
+    detail = needs.detail > 0 and needs.rows + needs.detail <= height - fixed_lines
+    return TablePlan(
+        bar=bar, clock=clock, plan=plan, gap=gap, columns=tuple(columns),
+        detail=detail, blanks=blanks, room=room,
+    )
 
 
 # -- how live the engine's word is ------------------------------------------------------

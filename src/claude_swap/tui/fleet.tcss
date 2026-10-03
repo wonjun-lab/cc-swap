@@ -2,10 +2,10 @@
    Colors come from the registered cswap themes (theme.py).
 
    Every line is laid out FleetScreen._width() = width - 3 cells wide: one
-   column of padding on the left, two on the right. The account area pads
+   column of padding on the left, two on the right. The account table pads
    one column each side, so its spare column on the right is where the
-   scrollbar goes when the accounts scroll; the tags on the right line up
-   with the status note above them either way. */
+   scrollbar goes when the accounts scroll; its column headers (#fx-head)
+   sit above the scrolling area and never scroll away. */
 
 /* The screen itself never scrolls (Textual's default is overflow-y: auto):
    on a terminal too short for everything, the status line stays pinned and
@@ -27,12 +27,19 @@ FleetScreen {
     padding: 0 2 0 1;
 }
 
+#fx-head {
+    height: 1;
+    margin-top: 1;
+    padding: 0 1 0 1;
+    text-wrap: nowrap;
+    text-overflow: clip;
+}
+
 /* Sized to its content; FleetScreen caps max-height at what is left, so
-   the narrow layout's expanded account sits right under the list. */
+   the selected account's panel sits right under the table. */
 #fx-scroll {
     height: auto;
     min-height: 2;
-    margin-top: 1;
     padding: 0 1 0 1;
     background: $background;
     overflow-x: hidden;
@@ -45,7 +52,7 @@ FleetScreen {
     text-overflow: clip;
 }
 
-#fx-expanded {
+#fx-detail {
     height: auto;
     padding: 0 2 0 1;
     text-wrap: nowrap;
@@ -59,7 +66,7 @@ FleetScreen {
 }
 
 FleetScreen.-compact #fx-status,
-FleetScreen.-compact #fx-scroll {
+FleetScreen.-compact #fx-head {
     margin-top: 0;
 }
 

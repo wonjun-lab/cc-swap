@@ -1,6 +1,6 @@
 """The Fleet home screen: app wiring, the status sentence, the account
-blocks and their tags, the layout at four terminal sizes, selection and
-key routing. Pilot tests against FakeSwitcher, temp backup roots, a fake
+table and its tags, the table at five terminal sizes, selection and key
+routing. Pilot tests against FakeSwitcher, temp backup roots, a fake
 service probe."""
 
 from __future__ import annotations
@@ -88,10 +88,17 @@ def _body(app) -> str:
 
 
 def _block(app, number: str) -> str:
-    """The body lines of one account (its block, or its line)."""
+    """One account's row of the table."""
     body = app.screen.query_one("#fx-body")
     first, count = body.layout_map.spans[number]
     return "\n".join(_body(app).splitlines()[first:first + count])
+
+
+def _cell(app, number: str, key: str) -> str:
+    """One cell of account ``number``'s row, by the screen's table plan."""
+    plan = app.screen._plan
+    x = plan.x(key)
+    return _block(app, number)[x:x + plan.width(key)].strip()
 
 
 def _decision(**fields) -> dict:
@@ -107,7 +114,7 @@ async def _open(pilot) -> None:
     await settle(pilot)
 
 
-# -- the POC's six accounts, for the size tests --------------------------------------------------
+# -- six accounts like a real fleet, for the size tests -------------------------------------------
 
 
 def _iso(ts: float) -> str:
@@ -115,44 +122,62 @@ def _iso(ts: float) -> str:
         "+00:00", "Z")
 
 
+#: Full emails, no aliases (``tools/fleet_screenshots.py``'s fleet).
+EMAILS = [
+    "dev.shared@example.com", "dev.master@example.com", "jordan.lee@example.com",
+    "jordan.lee@uni.example", "dev.llm0@example.com", "nightowl@example.com",
+]
+
+
 def _six(root) -> FakeSwitcher:
+    """#1 active past its 5h soft mark (with a Fable window); #2 next, 5h
+    not started; #3 login ends in a day; #4 Team, last resort; #5 a dead
+    login; #6 primed."""
     now = time.time()
 
-    def entry(p5, r5, p7, days7):
-        return UsageEntry(
-            last_good={
-                "five_hour": {"pct": p5, "resets_at": _iso(now + r5) if r5 else None},
-                "seven_day": {"pct": p7, "resets_at": _iso(now + days7 * 86400)},
-            },
-            fetched_at=now - 40, age_s=40.0,
-        )
+    def window(pct, reset_in):
+        return {"pct": pct, "resets_at": _iso(now + reset_in) if reset_in else None}
 
-    def account(n, alias, usage, *, active=False, org="", login_days=None, disabled=False):
+    def entry(p5, r5, p7, days7, *, fable=None, sentinel=None, age=40.0):
+        last_good = {"five_hour": window(p5, r5), "seven_day": window(p7, days7 * 86400)}
+        if fable is not None:
+            last_good["scoped"] = [{"name": "Fable", **window(fable, days7 * 86400)}]
+        return UsageEntry(sentinel=sentinel, last_good=last_good, fetched_at=now - age,
+                          age_s=age)
+
+    def account(n, usage, *, active=False, org="", login_days=None):
         return AccountSnapshot(
-            number=str(n), email=f"{alias}@acme.dev", org_name=org,
+            number=str(n), email=EMAILS[n - 1], org_name=org,
             org_uuid="org-1" if org else "", is_active=active, kind="oauth", switchable=True,
-            usage=usage, alias=alias, disabled=disabled,
+            usage=usage, alias="",
             login_expires_at=(now + login_days * 86400) * 1000.0 if login_days else None,
         )
 
     (root / "settings.json").write_text(json.dumps({
         "schemaVersion": 1, "autoswitch": {"strategy": "maximize"},
-        "maximize": {"lastResort": "team@acme.dev", "soft5h": 50, "hard5h": 98,
+        "maximize": {"lastResort": EMAILS[3], "soft5h": 50, "hard5h": 98,
                      "soft7d": 90, "hard7d": 98},
         "prime": {"enabled": True, "jitterS": "45-300"},
     }))
-    _state(root, maximizeDecision=_decision(
-        at=now - 50, decision="hold", trigger=None, pending=True,
-        reason="#1 5h 62% >= soft 50%; waiting for idle to move to #2",
-        plans={"1": "20x", "2": "5x", "3": "5x", "4": "20x", "5": "5x", "6": "team"},
-    ))
+    reset6 = now + 3.3 * 3600
+    _state(
+        root,
+        quarantine={"5": {"email": EMAILS[4], "reason": "invalid_grant"}},
+        primes={EMAILS[5]: {"windowKey": "w", "attempts": 1,
+                            "lastAttemptAt": reset6 - 5 * 3600 + 60, "lastOutcome": "primed"}},
+        maximizeDecision=_decision(
+            at=now - 50, decision="hold", trigger=None, pending=True,
+            reason="#1 5h 62% >= soft 50%; waiting for idle to move to #2",
+            plans={"1": "20x", "2": "20x", "3": "5x", "4": "team", "5": "5x", "6": "20x"},
+        ),
+    )
     return FakeSwitcher([
-        account(1, "main", entry(62.0, 1.8 * 3600, 41.0, 3.8), active=True, login_days=21),
-        account(2, "side", entry(0.0, None, 35.0, 2.2), login_days=20),
-        account(3, "old", UsageEntry(sentinel=USAGE_RELOGIN_REQUIRED)),
-        account(4, "work", entry(3.0, 3.3 * 3600, 22.0, 5.1), login_days=1.2),
-        account(5, "alt", entry(48.0, 0.5 * 3600, 71.0, 1.5), login_days=14, disabled=True),
-        account(6, "team", entry(0.0, None, 30.0, 4.0), org="Acme Team", login_days=29),
+        account(1, entry(62.0, 1.8 * 3600, 41.0, 3.8, fable=38.0), active=True, login_days=21),
+        account(2, entry(0.0, None, 35.0, 2.2), login_days=20),
+        account(3, entry(22.0, 2.6 * 3600, 18.0, 5.4), login_days=1.2),
+        account(4, entry(0.0, None, 30.0, 4.0), org="Acme Team", login_days=29),
+        account(5, entry(0.0, None, 57.0, 1.6, sentinel=USAGE_RELOGIN_REQUIRED, age=9 * 3600)),
+        account(6, entry(3.0, 3.3 * 3600, 22.0, 5.1), login_days=14),
     ], root)
 
 
@@ -228,13 +253,15 @@ class TestFleetScreen:
             screen = app.screen
             assert screen._order == ["1", "2", "3", "4"]  # active, the pick, the rest
             assert screen._sel == "1"  # starts on the active account
-            assert _block(app, "1").splitlines()[0].rstrip().endswith("● active")
+            assert _block(app, "1").rstrip().endswith("● active")
             assert "62%" in _block(app, "1")
-            assert _block(app, "2").splitlines()[0].rstrip().endswith("last resort")
-            assert _block(app, "3").splitlines()[0].rstrip().endswith("re-login (r)")
-            assert "⚠ needs re-login — select it and press r" in _block(app, "3")
-            assert _block(app, "4").splitlines()[0].rstrip().endswith("excluded")
-            assert "not started" in _block(app, "4")
+            assert _block(app, "2").rstrip().endswith("last resort")
+            assert _block(app, "3").rstrip().endswith("re-login (r)")
+            assert _cell(app, "3", "5h") in ("⚠ needs re-login", "⚠ re-login")
+            assert _block(app, "4").rstrip().endswith("excluded")
+            assert _cell(app, "4", "reset5") == "not started"
+            orders = [_cell(app, n, "order") for n in screen._order]
+            assert orders == ["●", "1", "–", "–"]  # #3 a dead login, #4 excluded
 
     async def test_selection_stays_on_the_same_account_when_the_snapshot_changes(
         self, tmp_path
@@ -330,8 +357,9 @@ class TestFleetScreen:
             assert _status(app).startswith(
                 "Auto ON · switching #1 main → #2 user2@example.com now (soft)"
             )
-            assert "[20x]" in _block(app, "1").splitlines()[0]
-            assert _block(app, "2").splitlines()[0].rstrip().endswith("next")
+            assert _cell(app, "1", "plan") == "20x"
+            assert _cell(app, "2", "plan") == "—"  # nothing says
+            assert _block(app, "2").rstrip().endswith("next")
 
     async def test_a_stale_published_decision_says_the_engine_is_silent(
         self, tmp_path, held_by_service
@@ -504,88 +532,114 @@ class TestFleetScreen:
             assert app._store_only is False  # Fleet took the lane back
 
 
-# -- the layout at four sizes -----------------------------------------------------------------------
+# -- the table at every size ---------------------------------------------------------------------------
 
 
-SIZES = [((160, 45), "wide"), ((120, 36), "medium"), ((90, 28), "narrow"), ((80, 24), "narrow")]
+SIZES = [(160, 45), (120, 36), (100, 30), (80, 24), (200, 16)]
+HEADERS = ("order", "account", "5h", "5h resets", "7d", "7d resets", "status")
+SIX_ORDER = ["1", "2", "6", "3", "4", "5"]
+
+
+def _rows(app) -> dict[str, str]:
+    return {n: _block(app, n) for n in app.screen._order}
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(("size", "mode"), SIZES, ids=[f"{w}x{h}" for (w, h), _ in SIZES])
-async def test_every_size_keeps_the_sentence_the_attention_line_and_the_footer(
-    tmp_path, held_by_service, size, mode
+@pytest.mark.parametrize("size", SIZES, ids=[f"{w}x{h}" for w, h in SIZES])
+async def test_every_size_shows_the_table_with_headers_and_both_resets(
+    tmp_path, held_by_service, size
 ):
     width, height = size
     app = make_app(_six(tmp_path))
     async with app.run_test(size=size) as pilot:
         await _open(pilot)
         screen = app.screen
-        assert screen._layout.mode == mode
+        plan = screen._plan
         status = screen.query_one("#fx-status")
         attention = screen.query_one("#fx-attention")
+        head = screen.query_one("#fx-head")
         keys = screen.query_one("#fx-keys")
         scroll = screen.query_one("#fx-scroll")
-        # The top two lines and the footer are on screen, outside the scroll.
-        assert status.region.y == 1 and attention.region.y == 2
-        assert keys.region.y == height - 1
-        assert scroll.region.y > attention.region.y
-        assert scroll.region.bottom <= keys.region.y
+        detail = screen.query_one("#fx-detail")
+        # The sentence, the attention line, the headers and the footer are
+        # on screen, outside the scroll; blank lines only when tall enough.
+        top = 1 if height >= 20 else 0
+        assert status.region.y == top and attention.region.y == top + 1
+        assert head.region.y == attention.region.y + 1 + top
+        assert scroll.region.y == head.region.y + 1
+        assert keys.region.y == height - 1 and scroll.region.bottom <= keys.region.y
         assert _status(app).startswith("Auto ON · ")
-        assert "#2 side when you pause" in _status(app)
+        assert "#2" in _status(app) and "when you pause" in _status(app)
         assert _plain(app, "#fx-attention").startswith(
-            "! #3 old needs re-login — select it, press r"
+            f"! #5 {EMAILS[4]} needs re-login — select it, press r"
         )
         assert _plain(app, "#fx-keys") == FOOTER
-        # Order and tags (same in every layout).
-        assert screen._order == ["1", "2", "4", "6", "3", "5"]
-        body = _body(app)
-        for tag in ("● active", "next", "login 1d left", "last resort", "re-login (r)",
-                    "excluded"):
-            assert tag in body, tag
-        lines = body.splitlines()
-        assert all(len(line) <= width - 3 for line in lines)
-        expanded = screen.query_one("#fx-expanded")
-        if mode == "wide":
-            assert " 1  main" in lines[0] and " 2  side" in lines[0]
-            assert not expanded.display
-        elif mode == "medium":
-            assert lines[0].startswith(" 1  main (main@acme.dev)  [personal] [20x]")
-            assert "side" not in lines[0]
-            assert not expanded.display
-        else:
-            assert len(lines) == 6 and lines[0].startswith("● 1 main")
-            assert expanded.display
-            detail = _plain(app, "#fx-expanded").splitlines()
-            assert detail[1].startswith(" 1  main (main@acme.dev)")
-            assert expanded.region.bottom <= keys.region.y
-            # The expanded account sits right under the list.
-            assert expanded.region.y == scroll.region.bottom
+        # The headers, each over its column (plan only when it fits).
+        header = _plain(app, "#fx-head")
+        for word in HEADERS:
+            assert word in header, word
+        assert header.index("order") < header.index("account") < header.index("5h")
+        assert header.index("7d resets") < header.index("status")
+        assert header[plan.x("status"):].strip() == "status"
+        # Every row: its order, both resets, its status right after them.
+        assert screen._order == SIX_ORDER
+        orders = {n: _cell(app, n, "order") for n in SIX_ORDER}
+        assert orders == {"1": "●", "2": "1", "6": "2", "3": "3", "4": "4", "5": "–"}
+        for number, line in _rows(app).items():
+            assert len(line) <= width - 3
+            assert _cell(app, number, "account").endswith(f"#{number}")
+            assert _cell(app, number, "reset5"), number
+            assert _cell(app, number, "reset7"), number
+        assert _cell(app, "2", "reset5") == "not started"
+        assert _cell(app, "4", "reset5") == "not started"
+        assert _cell(app, "5", "reset5") == "—"            # dead login, 5h unknown
+        assert _cell(app, "5", "reset7").startswith("1d")  # its last reading's 7d
+        assert _cell(app, "1", "reset7").startswith("3d")
+        tags = {n: _cell(app, n, "status") for n in SIX_ORDER}
+        assert tags == {"1": "● active", "2": "next", "6": "primed", "3": "login 1d left",
+                        "4": "last resort", "5": "re-login (r)"}
+        # No tag at the terminal's right edge when the table is narrower.
+        if plan.total < plan.room:
+            assert all(len(line.rstrip()) < width - 3 for line in _rows(app).values())
+        if width >= 160:
+            assert all(len(line.rstrip()) <= plan.total for line in _rows(app).values())
+            assert _cell(app, "1", "account") == f"{EMAILS[0]} #1"  # whole names
+        # The selected account in full under the table, when it fits.
+        assert detail.display
+        assert detail.region.y == scroll.region.bottom
+        assert detail.region.bottom <= keys.region.y
+        panel = _plain(app, "#fx-detail")
+        assert f"{EMAILS[0]} #1  personal · 20x  ● active" in panel
+        assert "Fable" in panel and "Fable" not in header  # per-model: the panel only
+        assert "login ends " in panel
 
 
 @pytest.mark.asyncio
-async def test_the_layout_follows_a_live_resize(tmp_path, held_by_service):
+async def test_the_table_follows_a_live_resize(tmp_path, held_by_service):
     app = make_app(_six(tmp_path))
     async with app.run_test(size=(160, 45)) as pilot:
         await _open(pilot)
         screen = app.screen
-        await pilot.press("down")  # #4, below #1 in two columns
+        await pilot.press("down")  # the row below #1
         await pilot.pause()
-        assert screen._layout.mode == "wide" and screen._sel == "4"
-        for size, mode in (((120, 36), "medium"), ((80, 24), "narrow"), ((160, 45), "wide")):
+        assert screen._sel == "2" and screen._plan.clock
+        for size, clock in (((120, 36), True), ((80, 24), False), ((200, 16), True),
+                            ((160, 45), True)):
             await pilot.resize_terminal(*size)
             await _open(pilot)
-            assert screen._layout.mode == mode
-            assert screen._sel == "4"  # the selection survives the change
+            assert screen._plan.clock is clock
+            assert screen._sel == "2"  # the selection survives the change
             assert _status(app).startswith("Auto ON · ")
-            assert screen.query_one("#fx-status").region.y == 1
+            assert screen.query_one("#fx-status").region.y == (1 if size[1] >= 20 else 0)
             assert screen.query_one("#fx-keys").region.y == size[1] - 1
-            assert screen.query_one("#fx-expanded").display is (mode == "narrow")
+            assert "7d resets" in _plain(app, "#fx-head")
             assert all(len(line) <= size[0] - 3 for line in _body(app).splitlines())
+            assert EMAILS[1] in _plain(app, "#fx-detail")
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("height", [14, 10, 8, 6])
-async def test_a_very_short_terminal_clips_but_never_scrolls_the_header(
+async def test_a_very_short_terminal_drops_the_panel_but_keeps_the_table(
     tmp_path, held_by_service, height
 ):
     app = make_app(_six(tmp_path))
@@ -594,38 +648,56 @@ async def test_a_very_short_terminal_clips_but_never_scrolls_the_header(
         screen = app.screen
         status = screen.query_one("#fx-status")
         keys = screen.query_one("#fx-keys")
-        expanded = screen.query_one("#fx-expanded")
         # The mouse wheel never moves the screen itself, only the accounts.
         assert not screen.allow_vertical_scroll and screen.scroll_offset.y == 0
         assert status.region.y == 0 and status.region.height == 1  # no blank lines
         assert keys.region.y == height - 1
         assert screen.query_one("#fx-scroll").region.height >= 2
-        if expanded.display:
-            assert expanded.region.bottom <= keys.region.y
+        assert not screen.query_one("#fx-detail").display  # it goes first
+        assert screen.query_one("#fx-head").display and screen._plan is not None
 
 
 @pytest.mark.asyncio
-async def test_80x24_with_many_accounts_scrolls_the_list_but_never_the_header(tmp_path):
+async def test_200x16_is_still_the_table(tmp_path, held_by_service):
+    """Wide but short (the real install's terminal): the table with its
+    headers and every reset, no blank lines; the panel only when it fits."""
+    app = make_app(_six(tmp_path))
+    async with app.run_test(size=(200, 16)) as pilot:
+        await _open(pilot)
+        screen = app.screen
+        assert screen.has_class("-compact")
+        assert screen._plan.clock and screen._plan.plan and screen._plan.bar == 24
+        assert screen.query_one("#fx-head").region.y == 2
+        assert all(_cell(app, n, "reset5") and _cell(app, n, "reset7") for n in SIX_ORDER)
+        assert screen._plan.total < screen._plan.room
+
+
+@pytest.mark.asyncio
+async def test_80x24_with_many_accounts_scrolls_the_table_but_never_the_header(tmp_path):
     _settings(tmp_path)
     accounts = [make_account(1, active=True, entry=make_entry(30.0, 20.0), alias="main")]
-    accounts += [make_account(n, entry=make_entry(5.0 + n, 10.0)) for n in range(2, 17)]
+    accounts += [make_account(n, entry=make_entry(5.0 + n, 10.0)) for n in range(2, 26)]
     app = make_app(FakeSwitcher(accounts, tmp_path))
     async with app.run_test(size=(80, 24)) as pilot:
         await _open(pilot)
         screen = app.screen
         scroll = screen.query_one("#fx-scroll")
-        for _ in range(15):
+        head = screen.query_one("#fx-head")
+        head_y = head.region.y
+        for _ in range(24):
             await pilot.press("down")
         await _open(pilot)
         last = screen._order[-1]
         assert screen._sel == last
         first, _count = screen.query_one("#fx-body").layout_map.spans[last]
         top = scroll.scroll_offset.y
+        assert top > 0
         assert top <= first < top + scroll.scrollable_content_region.height
         assert screen.query_one("#fx-status").region.y == 1
+        assert head.region.y == head_y and "order" in _plain(app, "#fx-head")
         assert _plain(app, "#fx-keys") == FOOTER
         assert screen.query_one("#fx-keys").region.y == 23
-        assert _plain(app, "#fx-expanded").splitlines()[1].startswith(f"{last:>2}  ")
+        assert not screen.query_one("#fx-detail").display  # 25 rows: no room for it
 
 
 # -- keys -----------------------------------------------------------------------------------------------
@@ -639,21 +711,25 @@ class TestKeys:
         async with app.run_test(size=(160, 45)) as pilot:
             await _open(pilot)
             screen = app.screen
-            assert screen._layout.columns == 2
-            await pilot.press("down")      # 1 2 / 4 6 / 3 5: below #1 is #4
-            await pilot.pause()
-            assert screen._sel == "4"
-            await pilot.press("right")
-            await pilot.pause()
-            assert screen._sel == "6"
-            await pilot.press("k")
+            assert screen._order == SIX_ORDER
+            await pilot.press("down")      # one row down the table
             await pilot.pause()
             assert screen._sel == "2"
-            body = screen.query_one("#fx-body")
-            first, _ = body.layout_map.spans["3"]
-            await pilot.click("#fx-body", offset=(4, first))
+            await pilot.press("j", "j")
             await pilot.pause()
             assert screen._sel == "3"
+            await pilot.press("right")     # no columns to move across
+            await pilot.pause()
+            assert screen._sel == "3"
+            await pilot.press("k")
+            await pilot.pause()
+            assert screen._sel == "6"
+            body = screen.query_one("#fx-body")
+            first, _ = body.layout_map.spans["5"]
+            await pilot.click("#fx-body", offset=(60, first))
+            await pilot.pause()
+            assert screen._sel == "5"
+            assert EMAILS[4] in _plain(app, "#fx-detail")
 
     async def test_enter_switches_the_selected_account(self, tmp_path):
         _settings(tmp_path)
