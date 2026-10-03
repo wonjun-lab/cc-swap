@@ -147,6 +147,34 @@ class TestMaximizeAutoScreen:
             assert order == sorted(order)
             assert "waiting for idle: 5h 72%, +3%p/10min" in plain
 
+    @pytest.mark.parametrize(
+        ("code", "reason"),
+        [
+            ("reset-wait", "#1 5h 72% — resets in 8m; waiting it out instead of switching"),
+            ("preempt", "#1 5h 72% >= soft 50%; moving to #2 once idle (preempt)"),
+            ("rebalance-deferred", "rebalance to #2 deferred: the 5h window resets soon"),
+        ],
+    )
+    async def test_a_coded_hold_shows_the_published_reason_not_waiting_for_idle(
+        self, tmp_path, fake_engine, code, reason
+    ):
+        _settings(tmp_path)
+        _state(tmp_path)
+        path = tmp_path / "autoswitch_state.json"
+        state = json.loads(path.read_text())
+        state["maximizeDecision"] = {
+            "at": time.time(), "pid": 4242, "active": "1", "decision": "hold",
+            "trigger": None, "target": None, "reason": reason, "pending": False,
+            "code": code,
+        }
+        path.write_text(json.dumps(state))
+        app = make_app(_fleet(tmp_path))
+        async with app.run_test(size=(160, 40)) as pilot:
+            await _open_auto(pilot)
+            plain = app.screen.query_one("#candidates", Static).render().plain
+            assert reason in plain
+            assert "waiting for idle:" not in plain
+
     async def test_summary_shows_soft_and_hard_per_window(self, tmp_path, fake_engine):
         _settings(tmp_path)
         app = make_app(_fleet(tmp_path))

@@ -34,6 +34,7 @@ from claude_swap.autoswitch import (
     binding_pct,
     pct_label,
 )
+from claude_swap.maximize import fleet as mxfleet
 from claude_swap.maximize import view as mxview
 from claude_swap.models import AccountsSnapshot
 from claude_swap.settings import (
@@ -541,7 +542,8 @@ class AutoScreen(Screen):
         return text
 
     def _maximize_text(self, snap: AccountsSnapshot) -> Text:
-        """Every account as maximize ranks it, plus the pending-switch line.
+        """Every account as maximize ranks it, plus the decision line (the coded
+        hold's reason, else the pending-switch line).
 
         Built from the store snapshot and the state file the engine itself
         reads, so it reads the same whether the engine runs here or elsewhere.
@@ -555,6 +557,9 @@ class AutoScreen(Screen):
             msnap = mxview.snapshot_from_accounts(snap, self._mx, state, now=now)
             ranked = mxview.rows(msnap, state.primes)
             waiting = mxview.pending(msnap)
+            decided = mxfleet.decision_view(
+                state, msnap, now=now, poll_s=self._settings.interval_seconds
+            )
         except Exception as exc:  # a display aid must never take the screen down
             text.append(f"\n  unavailable: {exc}", style=palette.muted)
             return text
@@ -577,7 +582,13 @@ class AutoScreen(Screen):
             )
             line.append(mxview.format_state5(row), style=palette.muted)
             text.append(line)
-        if waiting is not None:
+        if decided.code:
+            # A coded hold (reset-wait, preempt, rebalance-deferred, account
+            # hold) says why in its own words: the decision's reason, not a
+            # "waiting for idle" line derived from the soft mark alone.
+            text.append("\n")
+            text.append(decided.reason, style=palette.sev_warn)
+        elif waiting is not None:
             text.append("\n")
             text.append(mxview.format_pending(waiting), style=palette.sev_warn)
         return text
