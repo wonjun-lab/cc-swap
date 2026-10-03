@@ -191,6 +191,97 @@ class TestCheckForUpdate:
         assert "0.4.0" in result
 
 
+class TestFailedPassiveCheckKeepsTheGoodTag:
+    """A failed passive lookup must not overwrite a good cached tag with null:
+    a later ``upgrade`` that cannot reach GitHub falls back on that tag."""
+
+    @patch(
+        "claude_swap.update_check.urllib.request.urlopen",
+        side_effect=OSError("offline"),
+    )
+    def test_failure_keeps_previous_tag_and_timestamp(self, _urlopen):
+        stamp = time.time() - CACHE_TTL - 100
+        _write_cache(_cache_path(), "cc-v0.5.0", timestamp=stamp)
+
+        check_for_update("0.3.2")
+
+        cache = json.loads(_cache_path().read_text())
+        assert cache["data"] == "cc-v0.5.0"
+        assert cache["timestamp"] == stamp
+        assert "offline" in cache["lastError"]
+        assert cache["lastErrorAt"] >= time.time() - 5
+
+    @patch(
+        "claude_swap.update_check.urllib.request.urlopen",
+        side_effect=OSError("offline"),
+    )
+    def test_failure_still_notifies_from_the_stale_tag(self, _urlopen):
+        _write_cache(_cache_path(), "cc-v0.5.0", timestamp=time.time() - 5 * CACHE_TTL)
+
+        result = check_for_update("0.3.2")
+
+        assert result is not None and "0.5.0" in result
+
+    @patch("claude_swap.update_check.urllib.request.urlopen")
+    def test_recent_failure_suppresses_retry_for_the_ttl(self, mock_urlopen):
+        _cache_path().write_text(json.dumps({
+            "timestamp": time.time() - 5 * CACHE_TTL,
+            "data": "cc-v0.5.0",
+            "lastError": "timed out",
+            "lastErrorAt": time.time() - 60,
+        }))
+
+        result = check_for_update("0.3.2")
+
+        mock_urlopen.assert_not_called()
+        assert result is not None and "0.5.0" in result
+
+    @patch("claude_swap.update_check.urllib.request.urlopen")
+    def test_failure_older_than_the_ttl_is_retried(self, mock_urlopen):
+        _cache_path().write_text(json.dumps({
+            "timestamp": time.time() - 5 * CACHE_TTL,
+            "data": "cc-v0.5.0",
+            "lastError": "timed out",
+            "lastErrorAt": time.time() - CACHE_TTL - 1,
+        }))
+        mock_urlopen.return_value = _make_release_response("0.6.0")
+
+        result = check_for_update("0.3.2")
+
+        mock_urlopen.assert_called_once()
+        assert result is not None and "0.6.0" in result
+        cache = json.loads(_cache_path().read_text())
+        assert cache["data"] == "cc-v0.6.0"
+        assert "lastError" not in cache
+
+    @patch(
+        "claude_swap.update_check.urllib.request.urlopen",
+        side_effect=OSError("offline"),
+    )
+    def test_upgrade_fallback_still_finds_the_tag_after_a_failed_check(
+        self, _urlopen
+    ):
+        import claude_swap.update_check as uc
+
+        _write_cache(_cache_path(), "cc-v0.5.0", timestamp=time.time() - 5 * CACHE_TTL)
+        check_for_update("0.3.2")
+
+        cached = uc._cached_tag_and_age()
+
+        assert cached is not None and cached[0] == "cc-v0.5.0"
+
+    @patch(
+        "claude_swap.update_check.urllib.request.urlopen",
+        side_effect=OSError("offline"),
+    )
+    def test_failure_with_no_good_tag_still_caches_a_null(self, _urlopen):
+        check_for_update("0.3.2")
+
+        cache = json.loads(_cache_path().read_text())
+        assert cache["data"] is None
+        assert "offline" in cache["lastError"]
+
+
 class TestGitHubReleaseSource:
     """cc-swap polls its own GitHub Releases, never upstream's PyPI project."""
 
