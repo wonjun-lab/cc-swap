@@ -109,6 +109,15 @@ class MaximizeSettings:
     # In a usually-busy time, rebalance at once only for a score gain this
     # large; smaller ones wait for the next quiet window.
     busy_rebalance_gap: float = 0.5
+    # Learned ride: once a window in ``ride_windows`` first reads its hard
+    # mark, and that mark is in the last whole point (99 or more), keep
+    # using it for a learned share of the last point instead of switching at
+    # once (maximize/policy.py, maximize/ride.py). Off: switch at the mark.
+    learned_ride: bool = True
+    # Which windows ride: "7d", "5h", "5h,7d", or "" for none.
+    ride_windows: str = "7d"
+    # A ride never lasts longer than this many minutes (0 = no ride).
+    ride_max_min: int = 30
 
 
 @dataclass(frozen=True)
@@ -169,6 +178,16 @@ class SettingSpec:
     @property
     def default(self):
         return getattr(_SECTION_DEFAULT_SOURCES[self.section](), self.field)
+
+
+#: ``maximize.rideWindows``: the windows the learned ride applies to; ""
+#: rides none.
+RIDE_WINDOW_CHOICES: tuple[str, ...] = ("7d", "5h", "5h,7d", "")
+
+
+def choice_text(choice: str) -> str:
+    """A choice as a message lists it: an empty one reads ``""``."""
+    return choice if choice else '""'
 
 
 # settings.json uses camelCase (matching the repo's other JSON artifacts);
@@ -284,6 +303,19 @@ SETTING_SPECS: dict[str, SettingSpec] = {
         SettingSpec(
             "maximize", "busyRebalanceGap", "busy_rebalance_gap", "float", 0.0, 5.0,
             help="maximize: in a usually-busy time, rebalance only for a score gain this large",
+        ),
+        SettingSpec(
+            "maximize", "learnedRide", "learned_ride", "bool",
+            help="maximize: past a hard mark of 99+, use a learned share of the last 1% before switching",
+        ),
+        SettingSpec(
+            "maximize", "rideWindows", "ride_windows", "choice",
+            choices=RIDE_WINDOW_CHOICES,
+            help='maximize: the windows that ride: 7d, 5h, 5h,7d, or "" for none',
+        ),
+        SettingSpec(
+            "maximize", "rideMaxMin", "ride_max_min", "int", 0, 120,
+            help="maximize: a learned ride lasts at most this many minutes (0 = no ride)",
         ),
         SettingSpec(
             "maximize", "lastResort", "last_resort", "string",
@@ -488,8 +520,8 @@ def _clamped(settings, section: str = "autoswitch", repairs: list[str] | None = 
                     )
                 else:
                     problem = (
-                        f"must be one of: {', '.join(spec.choices)}, got "
-                        f"{_describe(value)}; using default {spec.default}"
+                        f"must be one of: {', '.join(choice_text(c) for c in spec.choices)}, "
+                        f"got {_describe(value)}; using default {choice_text(spec.default)}"
                     )
                 value = spec.default
             kwargs[spec.field] = value
@@ -597,7 +629,8 @@ def parse_setting_value(spec: SettingSpec, raw_value: str):
     if spec.kind == "choice":
         if raw_value not in spec.choices:
             raise ConfigError(
-                f"{spec.dotted} must be one of: {', '.join(spec.choices)}"
+                f"{spec.dotted} must be one of: "
+                f"{', '.join(choice_text(c) for c in spec.choices)}"
             )
         return raw_value
     if spec.kind == "string":

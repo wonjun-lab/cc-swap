@@ -388,6 +388,9 @@ class DecisionView:
     # reset-wait: ``(window, pct, reset epoch)`` for each window being waited
     # out, read from the current snapshot so the minutes left stay live.
     waits: tuple[tuple[str, float, float], ...] = ()
+    # ride: when the learned ride switches (epoch s), so the minutes left
+    # stay live; None when unknown.
+    ride_until: float | None = None
 
 
 _SLOT_RE = re.compile(r"#(\w+)")
@@ -435,9 +438,11 @@ def _enrich(dv: DecisionView, msnap: Snapshot) -> DecisionView:
     what ends it is the reset or 100%, not the cap."""
     waiting = mxview.pending(msnap) if dv.kind == "pending" else None
     reset_wait = dv.kind == "hold" and dv.code == "reset-wait"
+    # A ride is past its hard mark already: what ends it is its own time.
+    past_hard = reset_wait or (dv.kind == "hold" and dv.code == "ride")
     eta = (
         idle.eta_to_hard_min(msnap.samples, msnap.settings)
-        if dv.kind in ("pending", "hold") and msnap.samples and not reset_wait
+        if dv.kind in ("pending", "hold") and msnap.samples and not past_hard
         else None
     )
     return replace(
@@ -462,6 +467,7 @@ def _hold_target(code: str | None, reason: str, active: str | None) -> str | Non
 def _computed(msnap: Snapshot, *, now: float) -> DecisionView:
     decision = policy.decide(msnap)
     code: str | None = None
+    ride_until = decision.ride_until if isinstance(decision, Hold) else None
     if isinstance(decision, Switch):
         target, trigger = decision.target, decision.trigger
         kind: DecisionKind = "switch"
@@ -481,6 +487,7 @@ def _computed(msnap: Snapshot, *, now: float) -> DecisionView:
     return DecisionView(
         kind=kind, active=msnap.active, target=target, trigger=trigger,
         reason=decision.reason, at=now, source="computed", code=code,
+        ride_until=ride_until,
     )
 
 
@@ -520,6 +527,7 @@ def decision_view(
     return replace(
         dv, kind="off", target=None, trigger=None, would=would,
         at=state.auto_off_since, reason=state.auto_off_by or "", code=None, waits=(),
+        ride_until=None,
     )
 
 
@@ -552,6 +560,7 @@ def _decision_view(
             at=own_at if own_at is not None else now,
             source="here",
             code=code if own.decision == "hold" and code in mxview.HOLD_CODES else None,
+            ride_until=getattr(own, "ride_until", None) if code == "ride" else None,
         )
         return _enrich(dv, msnap)
     published = state.decision
@@ -569,6 +578,7 @@ def _decision_view(
             at=published.at,
             source="engine",
             code=published.code,
+            ride_until=published.ride_until,
         )
         return _enrich(dv, msnap)
     return _enrich(_computed(msnap, now=now), msnap)
@@ -981,7 +991,8 @@ def strategy_step(
 ) -> dict[str, object]:
     """One ←/→ step on ``key``: thresholds through ``view.step_knob`` (soft
     never passes hard), numbers clamped into their ``SETTING_SPECS`` range,
-    booleans toggled; text values do not step."""
+    booleans toggled, choices cycled (→ next, ← previous); text values do
+    not step."""
     out = dict(values)
     spec = SETTING_SPECS[key]
     if key in _THRESHOLD_KEYS:
@@ -990,6 +1001,11 @@ def strategy_step(
         out[key] = getattr(stepped, knob)
     elif spec.kind == "bool":
         out[key] = not bool(values.get(key))
+    elif spec.kind == "choice":
+        choices = spec.choices
+        current = values.get(key)
+        i = choices.index(current) if current in choices else 0
+        out[key] = choices[(i + (1 if delta > 0 else -1)) % len(choices)]
     elif spec.kind in ("float", "int"):
         current = float(values.get(key) or 0.0)
         lo = spec.lo if spec.lo is not None else -math.inf

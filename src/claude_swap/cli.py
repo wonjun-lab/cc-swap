@@ -606,6 +606,28 @@ def _finite_float(value: str) -> float:
     return number
 
 
+def _mark_pct(flag: str):
+    """argparse ``type=`` for ``auto --soft5h/--hard5h/--soft7d/--hard7d``:
+    a finite number inside that setting's range (maximize.<flag>). Out of
+    range is rejected here, with the range, instead of being clamped into it
+    and reported later as a soft/hard conflict."""
+    from claude_swap.settings import SETTING_SPECS
+
+    spec = SETTING_SPECS[f"maximize.{flag.lstrip('-')}"]
+
+    def parse(value: str) -> float:
+        number = _finite_float(value)
+        if not spec.lo <= number <= spec.hi:
+            raise argparse.ArgumentTypeError(
+                f"{value!r} is out of range: expected a percentage between "
+                f"{spec.lo:g} and {spec.hi:g}"
+            )
+        return number
+
+    parse.__name__ = "percentage"
+    return parse
+
+
 def _auto_command(argv: list[str]) -> None:
     """Handle `cswap auto [--once] [--json] [...]`.
 
@@ -727,7 +749,7 @@ Defaults live in settings.json in the backup root; flags override them.
         when = "at the next idle moment" if kind == "soft" else "immediately"
         parser.add_argument(
             flag,
-            type=_finite_float,
+            type=_mark_pct(flag),
             metavar="PCT",
             help=(
                 f"maximize only: {window} {kind} mark, switch {when} once the "
@@ -752,7 +774,8 @@ Defaults live in settings.json in the backup root; flags override them.
         EngineBusyError,
         claim_for_auto,
     )
-    from claude_swap.autoswitch import AutoSwitchEngine, AutoSwitchEvent
+    from claude_swap.autoswitch import AutoSwitchEngine, AutoSwitchEvent, account_names
+    from claude_swap.maximize.hold import display_name_hook
     from claude_swap.maximize.logrotate import LogRotator
     from claude_swap.printer import accent, print_line, stdout_gone, yellowed
     from claude_swap.settings import (
@@ -779,7 +802,15 @@ Defaults live in settings.json in the backup root; flags override them.
 
     def human_emit(event: AutoSwitchEvent) -> None:
         stamp = _time.strftime("%H:%M:%S")
-        line = event.human()
+        # cc-swap: under maximize, name accounts by alias / short name, not
+        # address (auto.log gets pasted into issues). The strategy is read per
+        # line: a hot reload can change it.
+        live = running[0].settings if running else settings
+        if live.strategy == "maximize":
+            with account_names(display_name_hook(switcher.backup_dir)):
+                line = event.human()
+        else:
+            line = event.human()
         if event.kind == "switch":
             line = accent(line)
         elif event.kind in ("error", "account-quarantined"):
@@ -811,7 +842,8 @@ Defaults live in settings.json in the backup root; flags override them.
         ]
         if given and settings.strategy != "maximize":
             parser.error(
-                f"{', '.join(given)} only apply to the maximize strategy "
+                f"{', '.join(given)} only {'applies' if len(given) == 1 else 'apply'}"
+                " to the maximize strategy "
                 "(--strategy maximize or autoswitch.strategy maximize)"
             )
         maximize = None

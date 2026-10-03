@@ -59,6 +59,7 @@ class TestRegistry:
             "maximize.loginExpiryGuardMin", "maximize.resetWaitMin",
             "maximize.preempt", "maximize.learnIdlePattern",
             "maximize.preemptHorizonMaxH", "maximize.busyRebalanceGap",
+            "maximize.learnedRide", "maximize.rideWindows", "maximize.rideMaxMin",
             "prime.enabled", "prime.model", "prime.jitterS", "prime.maxAttempts",
             "prime.claudePath",
         } <= keys
@@ -85,6 +86,7 @@ class TestRegistry:
             "maximize.resetWaitMin": (0, 60),
             "maximize.preemptHorizonMaxH": (1, 48),
             "maximize.busyRebalanceGap": (0.0, 5.0),
+            "maximize.rideMaxMin": (0, 120),
             "prime.maxAttempts": (1, 5),
         }
 

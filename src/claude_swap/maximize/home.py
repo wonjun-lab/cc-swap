@@ -26,8 +26,9 @@ The sentence never presents an old decision as the engine's current one:
 confirmed yet (``waiting``) and from an engine that stopped reporting
 (``stale``). A hold with its own code (``model.Hold.code``) gets its own
 words: waiting out a reset (``reset-wait``, minutes counted from ``now``),
-a pre-emptive move waiting for idle (``preempt``) and a rebalance deferred
-to your quiet time (``rebalance-deferred``); a ``preempt`` switch says why
+a pre-emptive move waiting for idle (``preempt``), a rebalance deferred
+to your quiet time (``rebalance-deferred``) and a learned ride through the
+last point (``ride``, minutes counted from ``now``); a ``preempt`` switch says why
 it moved early. Everything here takes ``now``; the widget only lays it out.
 
 Tones are ``maximize/fleet.py``'s (``ok``, ``warn``, ``crit``, ``dim``,
@@ -781,11 +782,50 @@ _HELD_RE = re.compile(r"held until (.+?) \((\w+) left\)")
 
 def _safety_moving(dv: fx.DecisionView) -> bool:
     """The decision is one an account hold never sets aside: a switch, a
-    reset-aware wait, a hard mark with nowhere roomier to go, every account
-    at its limit, unreadable usage."""
+    reset-aware wait, a hard mark with nowhere roomier to go, a learned
+    ride (the hard switch, later), every account at its limit, unreadable
+    usage."""
     return dv.kind in ("switch", "exhausted", "indeterminate") or (
-        dv.kind == "hold" and dv.code in ("reset-wait", "hard-stay")
+        dv.kind == "hold" and dv.code in ("reset-wait", "hard-stay", "ride")
     )
+
+
+#: ``#1 7d 99% — riding to the limit, switching in ~2m (learned) or at your
+#: next pause`` (``policy._hard_or_ride``): the windows, the minutes, how.
+_RIDE_RE = re.compile(
+    r"#\w+ ((?:5h|7d) [\d.]+%(?: / (?:5h|7d) [\d.]+%)*) — riding to the limit, "
+    r"switching in ~(\d+)m \((\w+)\)"
+)
+
+
+def _ride_variants(
+    head: Seg, act: fx.FleetRow, dv: fx.DecisionView, name, now: float
+) -> list[list[Seg]]:
+    """A learned ride: ``7d 99% — riding to the limit, switching in ~2m
+    (learned) or at your next pause``, the minutes counted from ``now``."""
+    m = _RIDE_RE.search(dv.reason or "")
+    if m is None:
+        return [
+            [head, (f" · using {name(act.number)} · {_quoted(dv.reason)}", "plain")],
+            [head, (f" · #{act.number} riding to the limit", "plain")],
+            [head],
+        ]
+    label, how = m.group(1), m.group(3)
+    if dv.ride_until is not None:
+        left = dv.ride_until - now
+        when = "switching now" if left <= 0 else f"switching in ~{max(1, round(left / 60.0))}m"
+    else:
+        when = f"switching in ~{m.group(2)}m"
+    short = when.replace("switching in ", "")
+    return [
+        [head, (f" · using {name(act.number)} · {label} — riding to the limit, {when} "
+                f"({how}) or at your next pause", "plain")],
+        [head, (f" · #{act.number} {label} — riding to the limit, {when} ({how}) "
+                "or at your next pause", "plain")],
+        [head, (f" · #{act.number} {label} — riding, {when} or on pause", "plain")],
+        [head, (f" · #{act.number} riding, {short}", "plain")],
+        [head],
+    ]
 
 
 def _hard_stay_variants(
@@ -964,6 +1004,8 @@ def status_variants(
             return _deferred_variants(head, act, dv, name)
         if dv.code == "hard-stay":
             return _hard_stay_variants(head, act, dv, name)
+        if dv.code == "ride":
+            return _ride_variants(head, act, dv, name, now)
     if dv.kind == "switch":
         trigger = f" ({dv.trigger})" if dv.trigger else ""
         verb = "would switch" if dry else "switching"

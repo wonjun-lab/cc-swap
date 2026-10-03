@@ -415,6 +415,19 @@ def record_names(accounts: object) -> dict[str, str]:
     )
 
 
+def display_name_hook(root: Path):
+    """``autoswitch.account_names`` hook: ``(slot, email) -> short name``
+    (alias, else the part before the ``@``), read fresh from sequence.json so
+    a new alias shows on the next line. An unknown slot gets the short name of
+    its address."""
+    from claude_swap.maximize.names import short_name as local_part
+
+    def name(slot: str, email: str) -> str:
+        return _names(root).get(str(slot)) or local_part(email) or email
+
+    return name
+
+
 def _label(slot: str, names: Mapping[str, str]) -> str:
     name = names.get(slot)
     return f"#{slot} {name}" if name else f"#{slot}"

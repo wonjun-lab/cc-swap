@@ -37,7 +37,8 @@ import os
 import random
 import threading
 import time
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterator, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -316,6 +317,34 @@ def pct_label(value: float) -> str:
 # Events
 # ---------------------------------------------------------------------------
 
+# cc-swap: how a ``human()`` line names an account. Upstream prints the
+# address; ``auto`` installs a short-name function under the maximize
+# strategy (``account_names``). JSON output never goes through it.
+_name_hook: Callable[[str, str], str] | None = None
+
+
+@contextmanager
+def account_names(hook: Callable[[str, str], str] | None) -> Iterator[None]:
+    """Name accounts in ``human()`` lines with ``hook(number, email)``."""
+    global _name_hook
+    previous, _name_hook = _name_hook, hook
+    try:
+        yield
+    finally:
+        _name_hook = previous
+
+
+def _who(number: object, email: object) -> object:
+    """What a ``human()`` line prints for an account: the address, or the
+    installed hook's name for it."""
+    if _name_hook is not None:
+        try:
+            return _name_hook(str(number), str(email or "")) or email
+        except Exception:
+            pass
+    return email
+
+
 
 @dataclass(frozen=True)
 class AutoSwitchEvent:
@@ -401,7 +430,7 @@ class PollEvent(AutoSwitchEvent):
         tail = f" | others: {others}" if others else ""
         label = self.marks or f"switch at {pct_label(self.threshold)}%"
         return (
-            f"Account-{num} ({self.active.get('email')}): {used} "
+            f"Account-{num} ({_who(num, self.active.get('email'))}): {used} "
             f"({label}){tail}"
         )
 
@@ -429,7 +458,8 @@ class SwitchEvent(AutoSwitchEvent):
             f"Account-{self.from_ref.get('number')}" if self.from_ref else "(none)"
         )
         dst = (
-            f"Account-{self.to_ref.get('number')} ({self.to_ref.get('email')})"
+            f"Account-{self.to_ref.get('number')} "
+            f"({_who(self.to_ref.get('number'), self.to_ref.get('email'))})"
             if self.to_ref
             else "?"
         )
@@ -462,7 +492,7 @@ class QuarantineEvent(AutoSwitchEvent):
 
     def human(self) -> str:
         return (
-            f"Account-{self.number} ({self.email}) quarantined: {self.reason}. "
+            f"Account-{self.number} ({_who(self.number, self.email)}) quarantined: {self.reason}. "
             f"To recover, {oauth.relogin_fix(self.number)}"
         )
 
@@ -478,7 +508,10 @@ class UnquarantineEvent(AutoSwitchEvent):
         return {"number": self.number, "email": self.email, "reason": self.reason}
 
     def human(self) -> str:
-        return f"Account-{self.number} ({self.email}) back in rotation ({self.reason})"
+        return (
+            f"Account-{self.number} ({_who(self.number, self.email)}) "
+            f"back in rotation ({self.reason})"
+        )
 
 
 @dataclass(frozen=True)
@@ -575,6 +608,8 @@ class MaximizeDecisionEvent(AutoSwitchEvent):
     rows: list[dict] = field(default_factory=list)
     dry_run: bool = False
     code: str | None = None
+    # A learned ride (code ``ride``): when it switches (epoch s).
+    ride_until: float | None = None
 
     def _fields(self) -> dict:
         fields = {
@@ -587,6 +622,8 @@ class MaximizeDecisionEvent(AutoSwitchEvent):
         }
         if self.code:
             fields["code"] = self.code
+        if self.ride_until is not None:
+            fields["rideUntil"] = self.ride_until
         if self.rows:
             fields["accounts"] = self.rows
         if self.dry_run:
