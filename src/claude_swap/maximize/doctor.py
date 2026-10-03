@@ -1023,8 +1023,9 @@ def check_hold(ctx: Context) -> list[Finding]:
     found = account_hold.read_hold(p.backup_root, now=p.now, state=ctx.state)
     if found is None:
         return []
-    active = (ctx.sequence or {}).get("activeAccountNumber")
-    active = str(active) if active is not None else None
+    # The active slot the way the CLI, Fleet and the engine resolve it: the
+    # live login first, sequence.json only when nobody is logged in.
+    active = account_hold.live_slot(p.backup_root, config_path=_global_config_path(p))
     if found.slot != active:
         return [Finding(
             "hold", "info",

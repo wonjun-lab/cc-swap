@@ -707,7 +707,7 @@ def account_hold_now(backup_root, *, now: float) -> tuple[dict | None, str | Non
     try:
         pinned = account_hold.holding(
             account_hold.read_hold(backup_root, now=now),
-            account_hold.active_slot(backup_root), now,
+            account_hold.live_slot(backup_root), now,
         )
         line = account_hold.status_line(backup_root, now)
     except Exception:

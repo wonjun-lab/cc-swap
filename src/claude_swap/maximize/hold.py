@@ -147,17 +147,55 @@ def read_hold(root: Path, *, now: float, state: Mapping | None = None) -> Accoun
     return current(marker(root, read_state(root) if state is None else state), now)
 
 
-def active_slot(root: Path) -> str | None:
-    """The active slot as ``sequence.json`` records it (what ``cc-swap why``
-    reads), or None."""
+def _sequence(root: Path) -> dict:
     try:
         data = json.loads((Path(root) / "sequence.json").read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return None
-    number = data.get("activeAccountNumber") if isinstance(data, dict) else None
+    except (OSError, ValueError, RecursionError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def active_slot(root: Path) -> str | None:
+    """The active slot as ``sequence.json`` records it, or None."""
+    number = _sequence(root).get("activeAccountNumber")
     if isinstance(number, bool) or not isinstance(number, (int, str)) or str(number) == "":
         return None
     return str(number)
+
+
+def live_identity(config_path: Path | None = None) -> tuple[str, str] | None:
+    """``(email, organizationUuid)`` of the live login in ``~/.claude.json``
+    (``paths.get_global_config_path``), or None when nobody is logged in."""
+    from claude_swap.paths import get_global_config_path
+
+    path = config_path if config_path is not None else get_global_config_path()
+    try:
+        raw = json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, ValueError, RecursionError):
+        return None
+    account = raw.get("oauthAccount") if isinstance(raw, dict) else None
+    email = account.get("emailAddress") if isinstance(account, dict) else None
+    if not isinstance(email, str) or not email:
+        return None
+    org = account.get("organizationUuid")
+    return email, org if isinstance(org, str) else ""
+
+
+def live_slot(root: Path, *, config_path: Path | None = None) -> str | None:
+    """The active slot the way ``ClaudeAccountSwitcher.current_account_number``
+    resolves it — the slot holding the live login's (email, organization) —
+    read-only (no switcher is built: ``why`` and ``doctor`` write nothing).
+    A live login no slot holds is None, never a guess; only with nobody
+    logged in does ``sequence.json``'s ``activeAccountNumber`` count. The
+    CLI, ``auto status``, ``why`` and ``doctor`` all read the active slot
+    here, so they agree with Fleet and the engine."""
+    from claude_swap.switcher import ClaudeAccountSwitcher
+
+    identity = live_identity(config_path)
+    if identity is None:
+        return active_slot(root)
+    found = ClaudeAccountSwitcher._find_account_slot(_sequence(root), *identity)
+    return None if found is None else str(found)
 
 
 # -- writing -------------------------------------------------------------------------
@@ -339,8 +377,9 @@ def status_payload(hold: AccountHold | None, now: float) -> dict | None:
 
 def status_line(root: Path, now: float, *, state: Mapping | None = None) -> str | None:
     """``Holding #1 main until 15:30 (2h left) — only hard 98%/100% will
-    move you`` while a hold pins the active account, else None."""
-    hold = holding(read_hold(root, now=now, state=state), active_slot(root), now)
+    move you`` while a hold pins the active account (:func:`live_slot`),
+    else None."""
+    hold = holding(read_hold(root, now=now, state=state), live_slot(root), now)
     if hold is None:
         return None
     hard5, hard7 = _marks(root)
@@ -406,17 +445,17 @@ def hold_command(argv: list[str], *, clock=None) -> None:
         action = "set"
     names = _names(root)
     changed = False
+    active = live_slot(root)
     if action == "set":
-        slot = active_slot(root)
-        if slot is None:
+        if active is None:
             print("No active account to hold (log in and cc-swap add first).", file=sys.stderr)
             sys.exit(1)
         host = socket.gethostname().split(".")[0] or None
-        set_hold(root, slot, until, by="cli", now=now, host=host)
+        set_hold(root, active, until, by="cli", now=now, host=host)
         changed = True
     elif action == "off":
         changed = clear_hold(root)
-    live = holding(read_hold(root, now=now), active_slot(root), now)
+    live = holding(read_hold(root, now=now), active, now)
     if args.json:
         print(json.dumps({
             "schemaVersion": 1, "action": action, "changed": changed,
@@ -432,7 +471,7 @@ def hold_command(argv: list[str], *, clock=None) -> None:
         if stale is not None:
             print(
                 f"No hold: the hold on {_label(stale.slot, names)} no longer applies "
-                f"({_label(active_slot(root) or '?', names)} is the active account)."
+                f"({_label(active or '?', names)} is the active account)."
             )
         else:
             print("No hold. cc-swap hold 2h keeps you on the active account for two hours.")

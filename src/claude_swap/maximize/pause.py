@@ -280,7 +280,7 @@ def auto_command(argv: list[str]) -> None:
 
     try:
         pinned = account_hold.holding(
-            account_hold.read_hold(root, now=now), account_hold.active_slot(root), now
+            account_hold.read_hold(root, now=now), account_hold.live_slot(root), now
         )
         hold_line = account_hold.status_line(root, now) if pinned is not None else None
     except Exception:

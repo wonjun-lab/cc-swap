@@ -280,6 +280,56 @@ def test_hold_without_an_active_account_fails(root, monkeypatch, capsys):
     assert not (root / h.HOLD_FILENAME).exists()
 
 
+def _live(temp_home, email: str | None, org: str = "") -> None:
+    """The live login ``~/.claude.json`` names (None: nobody is logged in)."""
+    path = temp_home / ".claude.json"
+    if email is None:
+        path.unlink(missing_ok=True)
+        return
+    path.write_text(json.dumps({"oauthAccount": {
+        "emailAddress": email, "organizationUuid": org, "accountUuid": "uuid-x"}}))
+
+
+def test_hold_pins_the_live_login_not_the_recorded_slot(root, temp_home, monkeypatch, capsys):
+    # sequence.json still says #1, but a /login outside cc-swap made #2 live.
+    _live(temp_home, "side@example.com")
+    code, out = _main(monkeypatch, capsys, "hold", "1h")
+    assert code == 0 and out.startswith("Holding #2 side until ")
+    assert h.read_hold(root, now=NOW).slot == "2"
+    assert "Holding #2 side" in _main(monkeypatch, capsys, "auto", "status")[1]
+
+
+def test_an_unmanaged_live_login_is_never_held(root, temp_home, monkeypatch, capsys):
+    _live(temp_home, "stranger@example.com")
+    code, out = _main(monkeypatch, capsys, "hold", "1h")
+    assert code == 1 and "No active account to hold" in out
+    assert not (root / h.HOLD_FILENAME).exists()
+
+
+@pytest.mark.parametrize(("email", "org"), [
+    ("main@example.com", ""), ("side@example.com", ""), ("stranger@example.com", ""),
+    ("side@example.com", "org-other"), (None, ""),
+])
+def test_live_slot_agrees_with_the_switcher(root, temp_home, email, org):
+    from claude_swap.switcher import ClaudeAccountSwitcher
+
+    _live(temp_home, email, org)
+    switcher = ClaudeAccountSwitcher()
+    expected = switcher.current_account_number()
+    if expected is None and not switcher.has_live_login():
+        expected = "1"  # nobody logged in: what sequence.json recorded
+    assert h.live_slot(root) == expected
+
+
+def test_why_names_the_hold_on_the_live_login(root, temp_home, monkeypatch, capsys):
+    monkeypatch.setattr(doctor_cli.paths, "get_backup_root", lambda: root)
+    _live(temp_home, "side@example.com")
+    h.set_hold(root, "2", NOW + H, by="cli", now=NOW)
+    with pytest.raises(SystemExit):
+        doctor_cli.why_command(["--no-fallback", "--json"], clock=lambda: NOW)
+    assert json.loads(capsys.readouterr().out)["hold"]["slot"] == "2"
+
+
 def test_auto_status_names_the_hold(root, monkeypatch, capsys):
     h.set_hold(root, "1", NOW + 2 * H, by="fleet", now=NOW)
     code, out = _main(monkeypatch, capsys, "auto", "status")
@@ -361,6 +411,16 @@ def test_doctor_names_a_left_over_hold(tmp_path):
     h.set_hold(world.root, "2", DNOW + H, by="cli", now=DNOW)
     [finding] = [f for f in _doctor(world) if f.check == "hold"]
     assert "left over" in finding.detail and finding.fix == "cc-swap hold off"
+
+
+def test_doctor_reads_the_live_login_for_the_held_slot(tmp_path):
+    from tests.maximize.doctor_support import NOW as DNOW
+
+    world = World(tmp_path).healthy()   # sequence.json says #1 ...
+    world.login(2)                      # ... but #2 is the live login
+    h.set_hold(world.root, "2", DNOW + H, by="cli", now=DNOW)
+    [finding] = [f for f in _doctor(world) if f.check == "hold"]
+    assert finding.detail.startswith("holding #2 until ")
 
 
 def test_doctor_says_nothing_without_a_hold(tmp_path):
