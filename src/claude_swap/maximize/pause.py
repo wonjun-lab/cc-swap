@@ -48,6 +48,20 @@ def active_pause(state: Mapping, now: float) -> tuple[float, str] | None:
     return until, reason if isinstance(reason, str) and reason else "paused"
 
 
+def status_line(state: Mapping, now: float) -> str | None:
+    """``paused for a re-login until 15:30`` while a pause marker holds at
+    ``now`` (the re-login pause is the only writer; any other reason is
+    quoted as written), else None."""
+    active = active_pause(state, now)
+    if active is None:
+        return None
+    from claude_swap.maximize.hold import clock_text
+
+    until, reason = active
+    why = "a re-login" if reason == "relogin" else reason
+    return f"paused for {why} until {clock_text(until, now)}"
+
+
 class _StateFile:
     """The engine's own state-file helpers (same lock, same atomic write,
     same schema stamp), without an engine."""
@@ -286,6 +300,9 @@ def auto_command(argv: list[str]) -> None:
         hold_line = account_hold.status_line(root, now) if pinned is not None else None
     except Exception:
         pinned, hold_line = None, None
+    state = account_hold.read_state(root)
+    paused = active_pause(state, now)
+    pause_line = status_line(state, now)
     if args.json:
         print(json.dumps({
             "schemaVersion": 1,
@@ -294,16 +311,23 @@ def auto_command(argv: list[str]) -> None:
             "since": off.since if off else None,
             "by": off.by if off else None,
             "hold": account_hold.status_payload(pinned, now),
+            "pause": {"until": paused[0], "reason": paused[1]} if paused else None,
         }))
         sys.exit(0)
     if off is None:
-        print("Automatic switching is ON." + ("" if changed or args.action == "status" else " (already)"))
+        already = "" if changed or args.action == "status" else " (already)"
+        if pause_line:
+            print(f"Automatic switching is ON, but {pause_line}.{already}")
+        else:
+            print("Automatic switching is ON." + already)
     else:
         print(
             "Automatic switching is OFF: the engine keeps polling but never "
             "switches or primes." + ("" if changed or args.action == "status" else " (already)")
         )
         print(auto_off_detail(off))
+        if pause_line:
+            print(f"Also {pause_line}.")
     if hold_line:
         print(f"{hold_line} (cc-swap hold off lifts it).")
     sys.exit(0)
