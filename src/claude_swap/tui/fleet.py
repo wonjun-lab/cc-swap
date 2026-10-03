@@ -1084,7 +1084,7 @@ class FleetScreen(Screen):
                 hold = account_hold.set_hold(
                     self._root, slot, until, by="fleet", now=now, host=self._hostname,
                 )
-                message = f"Holding #{slot} {account_hold.until_text(hold, now)}"
+                message = account_hold.held_message(hold, now, asked=until)
         except Exception as e:
             self.app.call_from_thread(
                 self.notify, f"Could not change the hold: {e}", severity="error", timeout=8,

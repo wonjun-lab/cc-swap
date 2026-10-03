@@ -277,21 +277,31 @@ def parse_duration(text: str) -> float:
 
 def parse_until(text: str, now: float) -> float:
     """``23:00`` (local time) as the next such moment after ``now``: later
-    today, else tomorrow. Raises ValueError for anything else."""
+    today, else tomorrow, by the calendar (``date + 1 day``, never ``now +
+    86400 s``: a daylight-saving day has 23 or 25 hours). On a fall-back
+    day a time that happens twice is its next occurrence; a time the clocks
+    skip (02:30 on a spring-forward day) is the next day it exists, which
+    can be more than 24 hours away. Raises ValueError for anything else."""
+    from datetime import date, timedelta
+
     m = _CLOCK_RE.fullmatch(text.strip()) if isinstance(text, str) else None
     if m is None:
         raise ValueError(f"expected a local time like 23:00, got {text!r}")
     hour, minute = int(m.group(1)), int(m.group(2))
     if hour > 23 or minute > 59:
         raise ValueError(f"expected a local time like 23:00, got {text!r}")
-    today = time.localtime(now)
-    at = time.mktime((today.tm_year, today.tm_mon, today.tm_mday, hour, minute, 0, 0, 0, -1))
-    if at <= now:
-        tomorrow = time.localtime(now + 86400)
-        at = time.mktime(
-            (tomorrow.tm_year, tomorrow.tm_mon, tomorrow.tm_mday, hour, minute, 0, 0, 0, -1)
-        )
-    return at
+    today = date.fromtimestamp(now)
+    for offset in range(3):
+        day = today + timedelta(days=offset)
+        wanted = (day.year, day.month, day.day, hour, minute)
+        found = []
+        for isdst in (-1, 0, 1):  # both readings of an hour that happens twice
+            at = time.mktime((*wanted, 0, 0, 0, isdst))
+            if time.localtime(at)[:5] == wanted and at > now:  # it exists that day
+                found.append(at)
+        if found:
+            return min(found)
+    raise ValueError(f"{text} does not occur in the next days")
 
 
 def left_text(seconds: float) -> str:
@@ -314,6 +324,16 @@ def clock_text(ts: float, now: float) -> str:
 def until_text(hold: AccountHold, now: float) -> str:
     """``until 15:30 (2h left)``."""
     return f"until {clock_text(hold.until, now)} ({left_text(hold.until - now)} left)"
+
+
+def held_message(hold: AccountHold, now: float, *, asked: float | None = None) -> str:
+    """``Holding #1 until 15:30 (2h left)``, saying so when the end that
+    was ``asked`` for lay more than 24h away and the hold was capped."""
+    text = f"Holding #{hold.slot} {until_text(hold, now)}"
+    if asked is not None and asked - now > MAX_HOLD_S:
+        clock = time.strftime("%H:%M", time.localtime(asked))
+        text += f" ({clock} is {left_text(asked - now)} away; a hold is at most 24h)"
+    return text
 
 
 def safety_text(hard_5h: float, hard_7d: float) -> str:
@@ -425,7 +445,7 @@ def hold_command(argv: list[str], *, clock=None) -> None:
     words = [w.strip() for w in args.what if w.strip()]
     action = "status"
     until: float | None = None
-    capped = False
+    capped = ""
     if words in ([], ["status"]):
         action = "status"
     elif words == ["off"]:
@@ -434,9 +454,12 @@ def hold_command(argv: list[str], *, clock=None) -> None:
         try:
             if len(words) == 2 and words[0].lower() == "until":
                 until = parse_until(words[1], now)
+                if until - now > MAX_HOLD_S:  # a daylight-saving day: say so
+                    capped = f"{words[1]} is {left_text(until - now)} away; a hold is at most 24h"
+                    until = now + MAX_HOLD_S
             elif len(words) == 1:
                 seconds = parse_duration(words[0])
-                capped = seconds > MAX_HOLD_S
+                capped = "a hold is at most 24h" if seconds > MAX_HOLD_S else ""
                 until = now + min(seconds, MAX_HOLD_S)
             else:
                 raise ValueError(f"expected one of: {USAGE.removeprefix('cc-swap hold ')}")
@@ -451,7 +474,11 @@ def hold_command(argv: list[str], *, clock=None) -> None:
             print("No active account to hold (log in and cc-swap add first).", file=sys.stderr)
             sys.exit(1)
         host = socket.gethostname().split(".")[0] or None
-        set_hold(root, active, until, by="cli", now=now, host=host)
+        try:
+            set_hold(root, active, until, by="cli", now=now, host=host)
+        except ValueError as e:
+            print(f"cc-swap hold: {e}", file=sys.stderr)
+            sys.exit(2)
         changed = True
     elif action == "off":
         changed = clear_hold(root)
@@ -478,7 +505,7 @@ def hold_command(argv: list[str], *, clock=None) -> None:
         sys.exit(0)
     head = f"Holding {_label(live.slot, names)} {until_text(live, now)}"
     if capped:
-        head += " (a hold is at most 24h)"
+        head += f" ({capped})"
     print(f"{head} — {safety_text(hard5, hard7)}.")
     print(
         "Soft, preempt and rebalance moves wait; it ends by itself, or when the "

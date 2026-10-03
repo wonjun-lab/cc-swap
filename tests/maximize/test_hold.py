@@ -149,6 +149,69 @@ def test_parse_until_is_the_next_such_local_time():
             h.parse_until(bad, morning)
 
 
+@pytest.fixture
+def new_york():
+    """Local time with daylight saving: America/New_York (the ``utc``
+    fixture restores the zone afterwards)."""
+    os.environ["TZ"] = "America/New_York"
+    time.tzset()
+
+
+def _local(ts: float) -> str:
+    return time.strftime("%Y-%m-%d %H:%M %Z", time.localtime(ts))
+
+
+@pytest.mark.parametrize(("now", "text", "expected"), [
+    # Fall-back day 2026-11-01 (25 hours): 01:00-02:00 happens twice.
+    ((2026, 11, 1, 0, 30, 1), "00:15", "2026-11-02 00:15 EST"),   # never in the past
+    ((2026, 11, 1, 0, 30, 1), "00:29", "2026-11-02 00:29 EST"),
+    ((2026, 11, 1, 0, 30, 1), "23:45", "2026-11-01 23:45 EST"),
+    ((2026, 11, 1, 0, 30, 1), "01:30", "2026-11-01 01:30 EDT"),   # the first 01:30
+    ((2026, 11, 1, 1, 10, 1), "01:05", "2026-11-01 01:05 EST"),   # the second 01:05
+    # Spring-forward eve 2026-03-07 (the 8th has 23 hours, no 02:xx).
+    ((2026, 3, 7, 23, 30, 0), "23:15", "2026-03-08 23:15 EDT"),
+    ((2026, 3, 7, 23, 30, 0), "02:30", "2026-03-09 02:30 EDT"),   # the next real 02:30
+    ((2026, 3, 7, 23, 30, 0), "23:45", "2026-03-07 23:45 EST"),
+])
+def test_parse_until_across_daylight_saving(new_york, now, text, expected):
+    y, mo, d, hh, mm, dst = now
+    at = h.parse_until(text, time.mktime((y, mo, d, hh, mm, 0, 0, 0, dst)))
+    start = time.mktime((y, mo, d, hh, mm, 0, 0, 0, dst))
+    assert at > start
+    assert _local(at) == expected
+
+
+def test_until_more_than_24h_away_says_so(root, new_york, monkeypatch, capsys):
+    now = time.mktime((2026, 11, 1, 0, 30, 0, 0, 0, 1))  # fall-back day, 00:30 EDT
+    monkeypatch.setattr(time, "time", lambda: now)
+    code, out = _main(monkeypatch, capsys, "hold", "until", "00:15")
+    assert code == 0
+    assert "(00:15 is 24h45m away; a hold is at most 24h)" in out
+    assert h.read_hold(root, now=now).until == now + 24 * H
+
+
+def test_fleet_says_so_when_it_caps_a_hold(new_york):
+    now = time.mktime((2026, 11, 1, 0, 30, 0, 0, 0, 1))
+    asked = h.parse_until("00:15", now)
+    hold = h.AccountHold("1", now + 24 * H, now)
+    assert h.held_message(hold, now, asked=asked) == (
+        "Holding #1 until 23:30 (24h left) (00:15 is 24h45m away; a hold is at most 24h)"
+    )
+    assert h.held_message(h.AccountHold("1", now + H, now), now, asked=now + H) == (
+        "Holding #1 until 01:30 (1h left)"
+    )
+
+
+def test_a_refused_hold_is_a_clean_error(root, monkeypatch, capsys):
+    def refuse(*_a, **_k):
+        raise ValueError("a hold must end in the future")
+
+    monkeypatch.setattr(h, "set_hold", refuse)
+    code, out = _main(monkeypatch, capsys, "hold", "1h")
+    assert code == 2 and "cc-swap hold: a hold must end in the future" in out
+    assert "Traceback" not in out
+
+
 def test_words():
     morning = time.mktime((2026, 10, 3, 13, 30, 0, 0, 0, -1))
     assert [h.left_text(s) for s in (30, 25 * 60, 2 * H, 90 * 60, 2 * H - 20)] == [
