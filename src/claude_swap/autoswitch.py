@@ -2266,6 +2266,9 @@ class AutoSwitchEngine:
         decision values and ``headroom`` the derived headroom per account.
         """
         now = self.clock()
+        # cc-swap: this tick's start, before its fetch (no extra clock read):
+        # the maximize hook never clears an account hold written after it.
+        self._tick_started_at = now
         # Quarantined accounts can never be switch targets, so spending the
         # single alternate poll slot (or an escalation fetch) on one is wasted.
         candidates = [

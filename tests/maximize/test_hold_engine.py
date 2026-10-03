@@ -4,10 +4,13 @@ the hold ends at its end time or with any change of the active account."""
 
 from __future__ import annotations
 
+from unittest.mock import patch
+
 from claude_swap.autoswitch import ConfigWarningEvent, SwitchEvent, TickOutcome
 from claude_swap.maximize import hold
 from claude_swap.maximize.engine_hook import DECISION_KEY
 from tests.maximize.test_engine_maximize import EMAILS, make, no_switch_reasons, of, win
+from tests.test_autoswitch import _entry_for
 from tests.maximize.test_history_engine import (  # noqa: F401 (utc is an autouse fixture)
     FRIDAY_NOON,
     USAGE,
@@ -132,6 +135,91 @@ def test_a_dry_run_honours_the_hold_but_never_clears_it(temp_home):
     pin(h, "3")
     h.tick_with_usage(SOFT)
     assert marker(h) is not None and marker(h).slot == "3"  # not ours to clear
+
+
+# -- a hold set while a tick runs (its usage fetch takes seconds) ------------------------------
+
+
+def tick_during(h, usage: dict, during) -> TickOutcome:
+    """One tick whose usage fetch first runs ``during()``: the user acting
+    while the engine waits on the network. The tick read its active
+    account before that."""
+    entries = {num: _entry_for(value, h.clock.now) for num, value in usage.items()}
+    done: list[bool] = []
+
+    def fetch(*_a, **_k):
+        if not done:
+            done.append(True)
+            during()
+        return entries
+
+    with patch.object(h.switcher, "usage_entries_by_account", side_effect=fetch):
+        return h.engine.tick()
+
+
+def test_a_hold_set_during_the_tick_is_never_wiped(temp_home):
+    # Mid-fetch the user switches to #2 and holds it: the tick still thinks
+    # #1 is active, but the hold is the user's newest word.
+    h = make(temp_home)
+
+    def switch_and_hold():
+        h.clock.advance(5)
+        h.make_live(EMAILS[2], 2)
+        pin(h, "2")
+
+    tick_during(h, SOFT, switch_and_hold)
+    assert marker(h) is not None and marker(h).slot == "2"
+    assert not lifted(h)
+    h.clock.advance(60)
+    h.tick_with_usage({"1": win(10, 10), "2": win(62, 40), "3": win(0, 50)})
+    assert no_switch_reasons(h)[-1] == "hold"  # the next tick honours it
+
+
+def test_the_live_login_is_read_again_before_a_hold_is_cleared(temp_home):
+    # An older hold on #2; mid-fetch #2 becomes the live login again.
+    h = make(temp_home)
+    pin(h, "2", now=h.clock.now - 120)
+    tick_during(h, SOFT, lambda: h.make_live(EMAILS[2], 2))
+    assert marker(h) is not None and marker(h).slot == "2" and not lifted(h)
+
+
+def test_a_marker_newer_than_the_tick_is_left_for_the_next_one(temp_home):
+    h = make(temp_home)
+
+    def hold_three():
+        h.clock.advance(5)
+        pin(h, "3")  # never the live login: the next tick lifts it
+
+    tick_during(h, SOFT, hold_three)
+    assert marker(h) is not None and not lifted(h)
+    h.clock.advance(60)
+    h.tick_with_usage(SOFT)
+    assert marker(h) is None
+    assert lifted(h) == ["hold on #3 lifted: #1 is the active account now"]
+
+
+def test_the_lifted_note_names_the_live_account_not_the_ticks(temp_home):
+    h = make(temp_home)
+    pin(h, "3", now=h.clock.now - 120)
+    tick_during(h, SOFT, lambda: h.make_live(EMAILS[2], 2))
+    assert marker(h) is None
+    assert lifted(h) == ["hold on #3 lifted: #2 is the active account now"]
+
+
+def test_a_forced_switch_leaves_a_hold_renewed_during_its_tick_to_the_next_tick(temp_home):
+    h = make(temp_home)
+    pin(h, now=h.clock.now - 120)
+
+    def renew():
+        h.clock.advance(5)
+        pin(h, hours=3)
+
+    assert tick_during(h, HARD, renew) is TickOutcome.SWITCHED
+    assert marker(h) is not None and not lifted(h)   # the user's newer word, for now
+    h.clock.advance(60)
+    h.tick_with_usage({"1": win(96, 40), "2": win(10, 10), "3": win(0, 50)})
+    assert marker(h) is None
+    assert lifted(h) == ["hold on #1 lifted: #2 is the active account now"]
 
 
 def test_a_damaged_hold_file_is_no_hold(temp_home):

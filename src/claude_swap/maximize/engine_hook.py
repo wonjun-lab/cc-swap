@@ -1011,7 +1011,13 @@ def _account_hold(
     A marker that no longer applies is cleared here (never on dry runs):
     one past its end, or one on a slot that is not the active account any
     more (a manual switch, an external ``/login``, a forced switch all end
-    a hold). A hold on the active account is never touched."""
+    a hold). A hold on the active account is never touched.
+
+    ``current`` was read before the tick's usage fetch, which can take
+    seconds: the user may have switched and held the new account
+    meanwhile. So a marker on another slot is cleared only once the live
+    login, read again now, is not its slot either, and never when it was
+    written after this tick began (the next tick decides about it)."""
     root = engine.switcher.backup_dir
     try:
         found = account_hold.marker(root, state)
@@ -1024,6 +1030,17 @@ def _account_hold(
         return pinned.until
     if engine.dry_run:
         return None
+    started = getattr(engine, "_tick_started_at", None)
+    if found.since is not None and started is not None and found.since > started:
+        return None
+    live = current
+    if account_hold.current(found, now) is not None:
+        try:
+            live = engine.switcher.current_account_number() or current
+        except Exception:
+            live = current
+        if live == found.slot:
+            return None
     try:
         account_hold.clear_hold(root)
     except Exception as e:
@@ -1031,7 +1048,7 @@ def _account_hold(
         return None
     if account_hold.current(found, now) is not None:
         engine._emit(aw.ConfigWarningEvent(
-            message=f"hold on #{found.slot} lifted: #{current} is the active account now"
+            message=f"hold on #{found.slot} lifted: #{live} is the active account now"
         ))
     return None
 
@@ -1040,11 +1057,22 @@ def _end_hold_after_switch(
     engine: aw.AutoSwitchEngine, held_until: float | None, current: str, landed: str
 ) -> None:
     """A switch the engine made (hard, at-limit, …) ends the hold on the
-    account it left."""
+    account it left — that hold only: a marker on another slot, or one
+    written after this tick began, is the user's newer word."""
     if held_until is None or engine.dry_run:
         return
+    root = engine.switcher.backup_dir
     try:
-        account_hold.clear_hold(engine.switcher.backup_dir)
+        found = account_hold.marker(root, account_hold.read_state(root))
+    except Exception:
+        return
+    started = getattr(engine, "_tick_started_at", None)
+    if found is None or found.slot != current or (
+        found.since is not None and started is not None and found.since > started
+    ):
+        return
+    try:
+        account_hold.clear_hold(root)
     except Exception as e:
         _logger.debug("could not clear the account hold: %s", type(e).__name__)
         return
