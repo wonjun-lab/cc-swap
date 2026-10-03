@@ -131,9 +131,8 @@ def _ride_fleet(*, armed_ago: float = 0.0, q: float = 0.35):
         samples_account="5",
         samples=(Sample(NOW - 660, 37, 99), Sample(NOW - 60, 40, 99)),
         ride_q={"7d": q, "5h": 0.3},
-        ride_account="5",
-        ride_armed_at={"7d": NOW - armed_ago},
-        ride_point_s={"7d": 600.0},
+        ride_armed_at={"5": {"7d": NOW - armed_ago}, "2": {"7d": NOW - 9999}},
+        ride_point_s={"5": {"7d": 600.0}},
     )
     msnap = fx.fleet_snapshot(snap, LIVE_MX, state, now=NOW)
     dv = replace(fx.preview_decision(msnap, LIVE_MX), source="engine", at=NOW - 20)
@@ -196,16 +195,18 @@ def test_the_published_ride_is_read_back(tmp_path: Path):
         },
         learned_ride.LEARN_KEY: {"7d": {"q": 0.45, "n_ok": 3, "n_hit": 0}},
         "maximizeRide": {
-            "account": "5", "armed": {"7d": {"at": NOW - 30, "pointS": 900.0}},
-            "riding": ["7d"],
+            "account": "5", "riding": ["7d"],
+            "accounts": {
+                "5": {"7d": {"at": NOW - 30, "pointS": 900.0, "reset": None}},
+                "2": {"7d": {"at": NOW - 900, "pointS": None}, "5h": "junk"},
+            },
         },
     }))
     state = read_state(tmp_path)
     assert state.decision.code == "ride" and state.decision.ride_until == NOW + 120
     assert state.ride_q == {"5h": 0.3, "7d": 0.45}
-    assert (state.ride_account, state.ride_armed_at, state.ride_point_s) == (
-        "5", {"7d": NOW - 30}, {"7d": 900.0},
-    )
+    assert state.ride_armed_at == {"5": {"7d": NOW - 30}, "2": {"7d": NOW - 900}}
+    assert state.ride_point_s == {"5": {"7d": 900.0}}
 
 
 # -- why and doctor ----------------------------------------------------------------------

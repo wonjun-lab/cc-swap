@@ -105,13 +105,12 @@ class MaximizeState:
     # whether or not it still holds (readers ask ``hold.holding``); None once
     # the switch ledger saw the account leave the held slot after it was set.
     hold: account_hold.AccountHold | None = None
-    # The learned ride (maximize/ride.py): q per window, and the active
-    # account's armed windows (``maximizeRide``) — first seen at the hard
-    # mark and seconds per point — so Fleet decides a ride as the engine does.
+    # The learned ride (maximize/ride.py): q per window, and each account's
+    # armed windows (``maximizeRide``: slot -> window -> arm time, and
+    # seconds per point) so Fleet decides a ride as the engine does.
     ride_q: Mapping[str, float] = field(default_factory=dict)
-    ride_account: str | None = None
-    ride_armed_at: Mapping[str, float] = field(default_factory=dict)
-    ride_point_s: Mapping[str, float] = field(default_factory=dict)
+    ride_armed_at: Mapping[str, Mapping[str, float]] = field(default_factory=dict)
+    ride_point_s: Mapping[str, Mapping[str, float]] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -145,25 +144,23 @@ def _text(value) -> str | None:
     return str(value) if isinstance(value, (str, int)) and not isinstance(value, bool) else None
 
 
-def _ride_armed(raw: object) -> tuple[str | None, dict[str, float], dict[str, float]]:
-    """``(account, armed_at, point_s)`` from ``maximizeRide``, leniently."""
-    if not isinstance(raw, dict) or raw.get("account") is None:
-        return None, {}, {}
-    armed = raw.get("armed")
-    at: dict[str, float] = {}
-    point: dict[str, float] = {}
-    for w in learned_ride.WINDOWS:
-        item = armed.get(w) if isinstance(armed, dict) else None
-        if not isinstance(item, dict):
-            continue
-        ts = _num(item.get("at"))
-        if ts is None:
-            continue
-        at[w] = ts
-        seconds = _num(item.get("pointS"))
-        if seconds is not None and seconds > 0:
-            point[w] = seconds
-    return str(raw["account"]), at, point
+def _ride_armed(raw: object) -> tuple[dict[str, dict[str, float]], dict[str, dict[str, float]]]:
+    """``(armed_at, point_s)``, each slot -> window -> value, from
+    ``maximizeRide``'s ``accounts``, leniently."""
+    accounts = raw.get("accounts") if isinstance(raw, dict) else None
+    at: dict[str, dict[str, float]] = {}
+    point: dict[str, dict[str, float]] = {}
+    for number, windows in (accounts.items() if isinstance(accounts, dict) else ()):
+        for w in learned_ride.WINDOWS:
+            item = windows.get(w) if isinstance(windows, dict) else None
+            ts = _num(item.get("at")) if isinstance(item, dict) else None
+            if ts is None:
+                continue
+            at.setdefault(str(number), {})[w] = ts
+            seconds = _num(item.get("pointS"))
+            if seconds is not None and seconds > 0:
+                point.setdefault(str(number), {})[w] = seconds
+    return at, point
 
 
 def _published(raw: object) -> tuple[PublishedDecision | None, dict[str, str | None]]:
@@ -249,10 +246,9 @@ def read_state(backup_root: Path) -> MaximizeState:
     off_set = flag_off or (AUTO_OFF_KEY in raw and off is not None and off is not False)
     off_map = flag_map if flag_off and flag_map else (off if isinstance(off, dict) else {})
     off_by = off_map.get("by")
-    ride_account, ride_armed_at, ride_point_s = _ride_armed(raw.get("maximizeRide"))
+    ride_armed_at, ride_point_s = _ride_armed(raw.get("maximizeRide"))
     return MaximizeState(
         ride_q=learned_ride.q_values(raw.get(learned_ride.LEARN_KEY)),
-        ride_account=ride_account,
         ride_armed_at=ride_armed_at,
         ride_point_s=ride_point_s,
         auto_off=off_set,
@@ -385,11 +381,8 @@ def snapshot_from_accounts(
         rates7=rates7,
         hold_until=pinned.until if pinned is not None else None,
         ride_q=state.ride_q,
-        **(
-            {"ride_armed_at": state.ride_armed_at, "ride_point_s": state.ride_point_s}
-            if state.ride_account == snap.active_number
-            else {}
-        ),
+        ride_armed_at=state.ride_armed_at.get(snap.active_number or "", {}),
+        ride_point_s=state.ride_point_s.get(snap.active_number or "", {}),
     )
 
 

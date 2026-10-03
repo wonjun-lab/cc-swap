@@ -24,9 +24,10 @@ switch the engine makes ends the hold on the account it leaves.
 
 The learned ride (maximize/ride.py) keeps three state-file records: the
 whole-point steps of each account while active (``rideSteps``, T1), the
-active account's ride (``maximizeRide``: when each window first read its
-hard mark, and which windows the last acted-on decision rode), and what was
-learned (``rideLearning``, q per window). A ride the engine ended with its
+rides (``maximizeRide``: each account's arm time and T1 per window at its
+mark, kept until that window resets, and which windows the active
+account's last acted-on decision rode), and what was learned
+(``rideLearning``, q per window). A ride the engine ended with its
 hard switch before 100% raises q; 100% read while it rode halves q; an
 idle switch, a dry run, ``auto off`` and an unreadable tick teach nothing.
 A ride polls the active account at the urgent 60 s cadence over its last
@@ -693,24 +694,69 @@ def _new_sample(
     return samples[-1], (before[-1].ts if before else None)
 
 
-def _ride_record(raw: object, current: str) -> dict:
-    """The ``maximizeRide`` record for ``current``, leniently; a record
-    about another account starts over (a switch ends every ride)."""
-    out: dict = {"account": current, "armed": {}, "riding": []}
-    if not isinstance(raw, Mapping) or str(raw.get("account")) != current:
-        return out
-    armed = raw.get("armed")
+def _armed_windows(raw: object) -> dict:
+    """One account's armed windows, leniently: ``{window: {"at", "pointS",
+    "reset"}}``."""
+    out: dict = {}
     for w in learned_ride.WINDOWS:
-        item = armed.get(w) if isinstance(armed, Mapping) else None
+        item = raw.get(w) if isinstance(raw, Mapping) else None
         at = _finite(item.get("at")) if isinstance(item, Mapping) else None
         if at is None:
             continue
         point = _finite(item.get("pointS"))
-        out["armed"][w] = {"at": at, "pointS": point if point and point > 0 else None}
-    riding = raw.get("riding")
-    if isinstance(riding, list):
-        out["riding"] = [w for w in learned_ride.WINDOWS if w in riding and w in out["armed"]]
+        out[w] = {
+            "at": at,
+            "pointS": point if point and point > 0 else None,
+            "reset": _finite(item.get("reset")),
+        }
     return out
+
+
+def _ride_record(raw: object, current: str) -> dict:
+    """The ``maximizeRide`` record, leniently: ``{"account": current,
+    "riding": [...], "accounts": {slot: {window: {...}}}}``.
+
+    Arm times are kept per account, so a switch away mid-ride and back to
+    the same window at its mark does not start the ride over (each
+    window's entry ends with that window's reset, :func:`_ride_track`).
+    ``riding`` belongs to the account the record names: another active
+    account starts it empty (a switch ends the ride under way)."""
+    out: dict = {"account": current, "riding": [], "accounts": {}}
+    if not isinstance(raw, Mapping):
+        return out
+    accounts = raw.get("accounts")
+    for number, windows in (accounts.items() if isinstance(accounts, Mapping) else ()):
+        parsed = _armed_windows(windows)
+        if parsed:
+            out["accounts"][str(number)] = parsed
+    riding = raw.get("riding")
+    mine = out["accounts"].get(current, {})
+    if str(raw.get("account")) == current and isinstance(riding, list):
+        out["riding"] = [w for w in learned_ride.WINDOWS if w in riding and w in mine]
+    return out
+
+
+def _disarm_parked(
+    record: dict, usage: Mapping[str, object], s: MaximizeSettings, current: str, now: float
+) -> None:
+    """Drop each parked account's armed window once that window reset: its
+    recorded reset time passed, or it reads under its mark (or at 100%)."""
+    for number in list(record["accounts"]):
+        if number == current:
+            continue
+        windows = record["accounts"][number]
+        pct5, _, pct7, _ = usage_windows(usage.get(number), now)
+        for w, pct, cap in (("5h", pct5, s.hard_5h), ("7d", pct7, s.hard_7d)):
+            item = windows.get(w)
+            if item is None:
+                continue
+            reset = item.get("reset")
+            if (reset is not None and now >= reset) or (
+                pct is not None and not cap <= pct < policy.LIMIT_PCT
+            ):
+                del windows[w]
+        if not windows:
+            del record["accounts"][number]
 
 
 def _velocity_point_s(
@@ -736,15 +782,17 @@ class RideTick:
     q: dict[str, float]
 
     @property
+    def _mine(self) -> dict:
+        return self.record["accounts"].get(self.record["account"], {})
+
+    @property
     def armed_at(self) -> dict[str, float]:
-        return {w: item["at"] for w, item in self.record["armed"].items()}
+        return {w: item["at"] for w, item in self._mine.items()}
 
     @property
     def point_s(self) -> dict[str, float]:
         return {
-            w: item["pointS"]
-            for w, item in self.record["armed"].items()
-            if item["pointS"] is not None
+            w: item["pointS"] for w, item in self._mine.items() if item["pointS"] is not None
         }
 
 
@@ -754,7 +802,7 @@ def _ride_track(
     state: Mapping,
     current: str,
     entry,
-    value: object,
+    usage: Mapping[str, object],
     samples: tuple[Sample, ...],
     new: Sample | None,
     prev_ts: float | None,
@@ -782,12 +830,15 @@ def _ride_track(
             quiet_s=s.idle_window_min * 60.0,
         )
     record = _ride_record(stored_record, current)
-    armed = record["armed"]
+    _disarm_parked(record, usage, s, current, now)
+    armed = record["accounts"].setdefault(current, {})
     rides = policy.ride_windows(s)
-    pct5, _, pct7, _ = usage_windows(value, now)
+    pct5, reset5, pct7, reset7 = usage_windows(usage.get(current), now)
     fetched_at = getattr(entry, "fetched_at", None)
     hits: list[str] = []
-    for w, pct, cap in (("5h", pct5, s.hard_5h), ("7d", pct7, s.hard_7d)):
+    for w, pct, cap, reset in (
+        ("5h", pct5, s.hard_5h, reset5), ("7d", pct7, s.hard_7d, reset7)
+    ):
         if pct is None:
             continue  # unreadable this tick: keep what we had
         if pct >= policy.LIMIT_PCT:
@@ -803,7 +854,10 @@ def _ride_track(
                 # the window may have crossed its mark right after it.
                 previous = max((x.ts for x in samples if x.ts < read_at), default=None)
                 at = learned_ride.arm_time(read_at, previous)
-                item = armed[w] = {"at": at, "pointS": None}
+                item = armed[w] = {"at": at, "pointS": None, "reset": None}
+            # When this window resets (it drops the arm time even while
+            # the account is parked and unread).
+            item["reset"] = reset if reset is not None and reset > now else None
             # An arm time ahead of now (the clock stepped back) is pulled to
             # now and kept there: clamped only when deciding, the ride
             # would count from "now" on every tick and never end.
@@ -821,6 +875,8 @@ def _ride_track(
         else:
             armed.pop(w, None)
     record["riding"] = [w for w in record["riding"] if w in armed]
+    if not armed:
+        del record["accounts"][current]
     return RideTick(
         steps=steps,
         record=record,
@@ -1398,7 +1454,7 @@ def run_maximize_tick(
     )
     new_sample, prev_ts = _new_sample(before, samples)
     ride_tick = _ride_track(
-        engine, rt, state, current, entries.get(current), usage.get(current),
+        engine, rt, state, current, entries.get(current), usage,
         samples, new_sample, prev_ts, now,
     )
     forecast, rates7 = _history_inputs(

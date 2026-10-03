@@ -334,8 +334,8 @@ def test_the_ride_is_published_with_its_switch_time(temp_home):
     assert entry.next_poll_at == pytest.approx(h.clock.now + 60)
 
 
-def armed(h, window: str = "7d") -> dict:
-    return h.state()[RIDE_KEY]["armed"][window]
+def armed(h, window: str = "7d", account: str = "1") -> dict:
+    return h.state()[RIDE_KEY]["accounts"][account][window]
 
 
 class TestArmTime:
@@ -367,9 +367,57 @@ class TestArmTime:
 
 def seed_armed(h, at: float, *, account: str = "1", point_s: float = 600.0) -> None:
     """A ``maximizeRide`` record arming account ``account``'s 7d at ``at``."""
-    record = {"account": account, "armed": {"7d": {"at": at, "pointS": point_s}},
-              "riding": []}
+    record = {"account": account, "riding": [],
+              "accounts": {account: {"7d": {"at": at, "pointS": point_s}}}}
     h.engine._mutate_state(lambda s: s.__setitem__(RIDE_KEY, record))
+
+
+class TestAwayAndBack:
+    """Each account keeps its own arm time: a switch away mid-ride and back
+    to the same 99 window does not start the ride over."""
+
+    @staticmethod
+    def setup(temp_home):
+        h = make(temp_home, maximize={**MARKS, "rideMaxMin": 120})
+        set_q(h, 0.9)                                  # a 450 s ride
+        c = busy(h, {"2": win(0, 10), "3": win(0, 50)})
+        assert approach(c, 1) is TickOutcome.NO_ACTION
+        return h, c, armed(h)["at"]
+
+    def test_a_return_to_the_same_99_keeps_the_arm_time(self, temp_home):
+        h, c, first = self.setup(temp_home)
+        h.make_live(EMAILS[2], 2)                      # a manual switch away
+        c.peers["1"] = win(30, 99)
+        c.tick(2, 10, advance=URGENT)
+        assert h.state()[RIDE_KEY]["account"] == "2"
+        assert h.state()[RIDE_KEY]["riding"] == []
+        assert armed(h)["at"] == first                 # #1's is kept
+        h.make_live(EMAILS[1], 1)                      # ... and back
+        c.peers["2"] = win(30, 10)
+        assert c.tick(1, 99, advance=URGENT) is TickOutcome.NO_ACTION
+        assert armed(h)["at"] == first
+        decision = of(h, MaximizeDecisionEvent)[-1]
+        assert decision.ride_until == pytest.approx(first + 0.9 * 600 - 90)
+
+    def test_a_reset_while_away_drops_it(self, temp_home):
+        h, c, first = self.setup(temp_home)
+        h.make_live(EMAILS[2], 2)
+        c.peers["1"] = win(30, 3)                      # #1's 7d reset meanwhile
+        c.tick(2, 10, advance=URGENT)
+        assert "1" not in h.state()[RIDE_KEY]["accounts"]
+        h.make_live(EMAILS[1], 1)
+        c.tick(1, 99, advance=URGENT)                  # at 99 again: a new ride
+        assert armed(h)["at"] == pytest.approx(h.clock.now - ride.ARM_UNKNOWN_GAP_S)
+
+    def test_a_reset_time_passed_drops_it_without_a_reading(self, temp_home):
+        h, c, first = self.setup(temp_home)
+        seeded = h.state()[RIDE_KEY]
+        seeded["accounts"]["1"]["7d"]["reset"] = h.clock.now + 60
+        h.engine._mutate_state(lambda s: s.__setitem__(RIDE_KEY, seeded))
+        h.make_live(EMAILS[2], 2)
+        assert "1" not in c.peers                      # #1 unread this tick
+        c.tick(2, 10, advance=120)
+        assert "1" not in h.state()[RIDE_KEY]["accounts"]
 
 
 def test_an_arm_time_in_the_future_is_pulled_back_and_kept(temp_home):
