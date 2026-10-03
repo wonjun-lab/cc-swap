@@ -22,6 +22,7 @@ from pathlib import Path
 from typing import Literal, get_args
 
 from claude_swap.maximize import history as usage_history
+from claude_swap.maximize import hold as account_hold
 from claude_swap.maximize.auto_off_flag import read_flag
 from claude_swap.maximize.model import AccountView, Forecast, HoldCode, Sample, Snapshot
 from claude_swap.maximize.score import landable, rank, score
@@ -97,6 +98,9 @@ class MaximizeState:
     auto_off: bool = False
     auto_off_since: float | None = None
     auto_off_by: str | None = None
+    # The account hold marker as recorded (maximize/hold.py ``marker``),
+    # whether or not it still holds: readers ask ``hold.holding``.
+    hold: account_hold.AccountHold | None = None
 
 
 @dataclass(frozen=True)
@@ -178,6 +182,7 @@ def read_state(backup_root: Path) -> MaximizeState:
         raw = json.loads((Path(backup_root) / STATE_FILENAME).read_text(encoding="utf-8"))
     except (OSError, ValueError):
         raw = None
+    hold = account_hold.marker(Path(backup_root), raw if isinstance(raw, dict) else None)
     if not isinstance(raw, dict):
         if flag_off:
             by = flag_map.get("by")
@@ -185,8 +190,9 @@ def read_state(backup_root: Path) -> MaximizeState:
                 auto_off=True,
                 auto_off_since=_num(flag_map.get("since")),
                 auto_off_by=by if isinstance(by, str) and by else None,
+                hold=hold,
             )
-        return MaximizeState()
+        return MaximizeState(hold=hold)
     account: str | None = None
     found: list[Sample] = []
     block = raw.get("maximizeSamples")
@@ -225,6 +231,7 @@ def read_state(backup_root: Path) -> MaximizeState:
         plans=plans,
         paused_until=_num(raw.get("pausedUntil")),
         paused_reason=reason if isinstance(reason, str) else None,
+        hold=hold,
     )
 
 
@@ -309,9 +316,12 @@ def snapshot_from_accounts(
     ``history`` (:func:`read_history`) feeds the idle pattern and the 7d
     burn rates under ``settings`` (:func:`history_inputs`); without it the
     Snapshot has none, which is what the engine decides with on a cold start.
+    An account hold on the active account (``state.hold``) is honoured as
+    the engine honours it.
     """
     accounts = snap.accounts
     forecast, rates7 = history_inputs(history, settings, now)
+    pinned = account_hold.holding(state.hold, snap.active_number, now)
     return build_snapshot(
         now=now,
         active=snap.active_number,
@@ -333,6 +343,7 @@ def snapshot_from_accounts(
         },
         forecast=forecast,
         rates7=rates7,
+        hold_until=pinned.until if pinned is not None else None,
     )
 
 

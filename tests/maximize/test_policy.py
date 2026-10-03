@@ -878,3 +878,132 @@ class TestNoPreemptRebalancePingPong:
         resort_2 = acct("2", 0, 30, reset7_d=6.0, tier="last_resort")
         got = decide(ping("2", PING_1, resort_2))
         assert isinstance(got, Switch) and got.trigger == "rebalance" and got.target == "1"
+
+
+# -- account hold (cc-swap hold; Snapshot.hold_until) -------------------------------------
+
+
+def held(s: Snapshot, hours: float = 2.0) -> Snapshot:
+    from dataclasses import replace
+
+    return replace(s, hold_until=NOW + hours * H)
+
+
+SLOW5 = rows((600, 94, 40), (0, 96, 40))  # 0.2 pt/min of 5h: 100% in 20 min
+
+
+@dataclass(frozen=True)
+class HoldCase:
+    id: str
+    snap: Snapshot
+    kind: type
+    trigger: str | None = None   # a Switch's trigger
+    code: str | None = None      # a Hold's code
+
+
+HOLD_CASES = [
+    # Set aside: soft (idle or not), preempt, rebalance (b) and (a).
+    HoldCase("soft-idle",
+             held(snap("1", acct("1", 62, 40), acct("2", 10, 10), samples="idle")),
+             Hold, code="hold"),
+    HoldCase("soft-busy",
+             held(snap("1", acct("1", 62, 40), acct("2", 10, 10), samples="busy")),
+             Hold, code="hold"),
+    HoldCase("soft-nothing-landable",
+             held(snap("1", acct("1", 62, 40), acct("2", 80, 10), samples="idle")),
+             Hold, code="hold"),
+    HoldCase("preempt-idle", held(preempt_snap()), Hold, code="hold"),
+    HoldCase("preempt-busy", held(preempt_snap(samples=BUSY5)), Hold, code="hold"),
+    HoldCase("rebalance-better-score", held(ping("2", rates={})), Hold, code="hold"),
+    HoldCase("rebalance-off-last-resort",
+             held(snap("1", acct("1", 10, 20, tier="last_resort"), acct("2", 10, 10),
+                       samples="idle")),
+             Hold, code="hold"),
+    HoldCase("all-fine",
+             held(snap("1", acct("1", 10, 20), acct("2", 10, 30), samples="idle")),
+             Hold, code="hold"),
+    # Safety wins: at-limit, hard (reached or by ETA), the reset-aware wait.
+    HoldCase("at-limit",
+             held(snap("1", acct("1", 100, 40), acct("2", 10, 10), samples="busy")),
+             Switch, trigger="at-limit"),
+    HoldCase("hard-reached",
+             held(snap("1", acct("1", 96, 40), acct("2", 10, 10), samples="busy")),
+             Switch, trigger="hard"),
+    HoldCase("hard-by-eta",
+             held(snap("1", acct("1", 80, 40), acct("2"),
+                       samples=rows((600, 60, 40), (0, 80, 40)))),
+             Switch, trigger="hard"),
+    HoldCase("hard-staying-without-a-roomier-account",
+             held(snap("1", acct("1", 96, 40), acct("2", 97, 10), acct("3", 10, 99))),
+             Hold, code=None),
+    HoldCase("reset-wait",
+             held(snap("1", resets(acct("1", 96, 40), m5=8), acct("2", 10, 10),
+                       samples=SLOW5)),
+             Hold, code="reset-wait"),
+    HoldCase("exhausted",
+             held(snap("1", acct("1", 100, 60), acct("2", 100, 10), acct("3", 10, 100))),
+             Exhausted),
+    HoldCase("usage-unknown",
+             held(snap("1", acct("1", None, None), acct("2"))),
+             Indeterminate),
+]
+
+
+@pytest.mark.parametrize("case", HOLD_CASES, ids=lambda c: c.id)
+def test_a_hold_sets_aside_soft_preempt_and_rebalance_but_never_safety(case: HoldCase):
+    got = decide(case.snap)
+    assert isinstance(got, case.kind), got
+    if case.trigger is not None:
+        assert got.trigger == case.trigger, got
+    if isinstance(got, Hold):
+        assert got.code == case.code, got
+        assert not got.pending
+    if case.code == "hold":
+        assert got.reason.startswith(f"#{case.snap.active} held until ")
+        assert "(2h left)" in got.reason
+        assert "only a hard mark (5h 95%, 7d 98%) or 100% will move you" in got.reason
+
+
+def test_a_held_reason_says_what_would_have_happened():
+    plain = snap("1", acct("1", 62, 40), acct("2", 10, 10), samples="idle")
+    without = decide(plain)
+    assert isinstance(without, Switch) and without.trigger == "soft"
+    got = decide(held(plain))
+    assert got.reason.endswith(f"; otherwise: {without.reason}")
+
+
+def test_a_hold_leaves_every_safety_decision_of_the_table_alone():
+    """Across the whole table: a decision a hold never sets aside (at-limit,
+    hard, reset-wait, exhausted, unknown usage, a hard trigger staying put)
+    is the same with one; every other one becomes a ``hold``."""
+    for case in CASES:
+        before = decide(case.snap)
+        after = decide(held(case.snap))
+        safety = (
+            (isinstance(before, Switch) and before.trigger in ("at-limit", "hard"))
+            or isinstance(before, (Exhausted, Indeterminate))
+            or (isinstance(before, Hold) and before.code == "reset-wait")
+            or (isinstance(before, Hold) and "no account under the hard caps" in before.reason)
+        )
+        if safety:
+            assert after == before, case.id
+        else:
+            assert isinstance(after, Hold) and after.code == "hold", case.id
+            assert after.reason.endswith(f"otherwise: {before.reason}"), case.id
+            assert "@" not in after.reason
+
+
+def test_the_other_window_of_a_reset_wait_is_held_too():
+    # 5h waits out its reset; the 7d soft trigger would move at idle — not on hold.
+    s = snap("1", resets(acct("1", 96, 92), m5=8), acct("2", 10, 10),
+             samples=rows((600, 94, 92), (300, 95, 92), (0, 96, 92)))
+    without = decide(s)
+    assert isinstance(without, (Switch, Hold)) and getattr(without, "code", None) != "reset-wait"
+    got = decide(held(s))
+    assert isinstance(got, Hold) and got.code == "hold"
+
+
+def test_an_ended_hold_is_no_hold():
+    plain = snap("1", acct("1", 62, 40), acct("2", 10, 10), samples="idle")
+    assert decide(held(plain, hours=0)) == decide(plain)
+    assert decide(held(plain, hours=-1)) == decide(plain)

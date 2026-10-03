@@ -417,7 +417,8 @@ class MenuModal(ModalScreen["str | None"]):
     """The home screen's ``m`` menu: every item with its key, its state and
     a short note. A letter picks its item at once; ↑↓ then enter work too
     (it opens with nothing highlighted, so enter alone does nothing).
-    Dismisses with the item's action, or None (esc / b)."""
+    Dismisses with the item's action, or None (esc / b). ``title`` names
+    another picker built the same way (``h``'s hold choices)."""
 
     DEFAULT_CSS = """
     MenuModal { align: center middle; background: $background 60%; }
@@ -439,9 +440,11 @@ class MenuModal(ModalScreen["str | None"]):
     """
     BINDINGS = [Binding("escape,b", "close", "Close", show=False)]
 
-    def __init__(self, rows: list[MenuRow]) -> None:
+    def __init__(self, rows: list[MenuRow], *, title: str = "Menu", note: str = "") -> None:
         super().__init__()
         self._rows = rows
+        self._title = title
+        self._note = note
         self._by_key = {r.key: r.action for r in rows}
 
     def compose(self) -> ComposeResult:
@@ -452,7 +455,9 @@ class MenuModal(ModalScreen["str | None"]):
             pass
         title_w = min(max((len(r.title) for r in self._rows), default=0) + 3, 40)
         with Vertical(id="fx-menu-box"):
-            yield Label("Menu", classes="modal-title")
+            yield Label(self._title, classes="modal-title")
+            if self._note:
+                yield Static(self._note, classes="modal-body", markup=False)
             # Nothing highlighted until ↑/↓: a stray enter (the home
             # screen's switch key) must not run the first item, which turns
             # automatic switching off.

@@ -49,6 +49,12 @@ account. The other window's triggers still apply; with none left the
 decision is a ``Hold`` carrying ``reset_wait_until``, which the at-limit
 trigger ends at 100%. At-limit and rebalance never wait.
 
+Account hold (``Snapshot.hold_until``, maximize/hold.py): while the user
+pins the active account, the soft, preempt and rebalance triggers are set
+aside — the decision is a ``Hold`` with code ``hold`` whose reason also says
+what would have happened. At-limit, hard (reached or ETA-forced) and the
+reset-aware wait decide exactly as without a hold: safety always wins.
+
 Unknown active usage is ``Indeterminate`` (the engine's upstream failover
 path counts it).
 """
@@ -59,6 +65,7 @@ import math
 from dataclasses import dataclass
 from typing import Literal
 
+from claude_swap.maximize import hold as account_hold
 from claude_swap.maximize import idle
 from claude_swap.maximize.history import QUIET_P
 from claude_swap.maximize.model import (
@@ -397,7 +404,7 @@ def _reset_wait(
         return _hard(snap, a, landing, force)
     other = _soft_reason(a, snap, skip=tuple(waits))
     if other is not None:
-        return _soft(snap, landing, other)
+        return _held(snap, a, _soft(snap, landing, other))
     held = ", ".join(
         f"{w} {_pct(_window_pct(a, w))} — resets in {max(1, round(left))}m"
         for w, left in waits.items()
@@ -698,6 +705,31 @@ def _rebalance(
     return Switch(top.number, "rebalance", f"{why}; idle")
 
 
+def hold_left(snap: Snapshot) -> float | None:
+    """Seconds an account hold still pins the active account, or None."""
+    until = snap.hold_until
+    if until is None or not math.isfinite(until) or until <= snap.now:
+        return None
+    return until - snap.now
+
+
+def _held(snap: Snapshot, a: AccountView, inner: Decision) -> Decision:
+    """``inner`` (a soft, preempt or rebalance decision) as the account hold
+    leaves it: a ``hold`` that says what would have happened, or ``inner``
+    itself when no hold is in force."""
+    left = hold_left(snap)
+    if left is None:
+        return inner
+    s = snap.settings
+    hold = account_hold.AccountHold(a.number, snap.now + left)
+    return Hold(
+        f"#{a.number} held {account_hold.until_text(hold, snap.now)} — "
+        f"{account_hold.safety_text(s.hard_5h, s.hard_7d)}; otherwise: {inner.reason}",
+        pending=False,
+        code="hold",
+    )
+
+
 def decide(snap: Snapshot) -> Decision:
     a = snap.view(snap.active)
     if a is None:
@@ -716,9 +748,10 @@ def decide(snap: Snapshot) -> Decision:
             return waited
     if force is not None:
         return _hard(snap, a, landing, force)
+    # Below every hard trigger: an account hold sets the rest aside.
     if soft is not None:
-        return _soft(snap, landing, soft)
+        return _held(snap, a, _soft(snap, landing, soft))
     pre = _preempt(snap, a, landing)
     if pre is not None:
-        return pre
-    return _rebalance(snap, a, landing)
+        return _held(snap, a, pre)
+    return _held(snap, a, _rebalance(snap, a, landing))

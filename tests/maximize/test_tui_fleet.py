@@ -29,7 +29,7 @@ from tests.test_tui import (  # noqa: F401 (fake_engine is a fixture)
     settle,
 )
 
-FOOTER = "enter switch · r re-login · l last resort · m menu · ? help · q quit"
+FOOTER = "enter switch · r re-login · l last resort · h hold · m menu · ? help · q quit"
 
 
 def _settings(root, **maximize) -> None:
@@ -561,11 +561,22 @@ async def test_every_size_shows_the_table_with_headers_and_both_resets(
         keys = screen.query_one("#fx-keys")
         scroll = screen.query_one("#fx-scroll")
         detail = screen.query_one("#fx-detail")
-        # The sentence, the attention line, the headers and the footer are
-        # on screen, outside the scroll; blank lines only when tall enough.
+        summary = screen.query_one("#fx-summary")
+        # The sentence, the attention line, the capacity summary, the
+        # headers and the footer are on screen, outside the scroll; blank
+        # lines only when tall enough.
         top = 1 if height >= 20 else 0
         assert status.region.y == top and attention.region.y == top + 1
-        assert head.region.y == attention.region.y + 1 + top
+        # 200x16 has the rows for the panel but not for the summary too:
+        # the summary goes first.
+        assert plan.summary is (height >= 20)
+        if plan.summary:
+            assert summary.display and summary.region.y == attention.region.y + 1 + top
+            assert head.region.y == summary.region.y + 1
+            assert _plain(app, "#fx-summary").startswith("5h free: ")
+        else:
+            assert not summary.display
+            assert head.region.y == attention.region.y + 1 + top
         assert scroll.region.y == head.region.y + 1
         assert keys.region.y == height - 1 and scroll.region.bottom <= keys.region.y
         assert _status(app).startswith("Auto ON · ")
@@ -871,3 +882,109 @@ class TestKeys:
             await pilot.press("q")
             await pilot.pause()
         assert app.return_code == 0
+
+
+# -- h: hold the active account ------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestHoldKey:
+    async def test_h_holds_the_active_account_and_the_sentence_says_so(
+        self, tmp_path, held_by_service
+    ):
+        from claude_swap.maximize import hold
+        from claude_swap.tui.fleet import FleetScreen
+        from claude_swap.tui.fleet_modals import MenuModal
+
+        app = make_app(_six(tmp_path))
+        async with app.run_test(size=(200, 40)) as pilot:
+            await _open(pilot)
+            await pilot.press("down", "down")  # the selection never matters: the active one
+            await pilot.press("h")
+            await _open(pilot)
+            assert isinstance(app.screen, MenuModal)
+            assert app.screen._title == f"Hold #1 {EMAILS[0]} — stay on this account"
+            started = time.time()
+            await pilot.press("2")
+            await _open(pilot)
+            assert isinstance(app.screen, FleetScreen)
+            held = hold.read_hold(tmp_path, now=time.time())
+            assert held.slot == "1" and held.by == "fleet"
+            assert started + 7200 - 5 <= held.until <= time.time() + 7200
+            status = _status(app)
+            assert status.startswith(f"Holding #1 {EMAILS[0]} until ")
+            assert "(2h left) — only hard 98%/100% will move you (h to change)" in status
+            # h → o lifts it; the sentence goes back to the engine's word.
+            await pilot.press("h", "o")
+            await _open(pilot)
+            assert hold.read_hold(tmp_path, now=time.time()) is None
+            assert _status(app).startswith("Auto ON · ")
+
+    async def test_h_until_a_time(self, tmp_path, held_by_service):
+        from claude_swap.maximize import hold
+        from claude_swap.tui.fleet_modals import TextInputModal
+
+        app = make_app(_six(tmp_path))
+        async with app.run_test(size=(160, 45)) as pilot:
+            await _open(pilot)
+            await pilot.press("h", "u")
+            await _open(pilot)
+            assert isinstance(app.screen, TextInputModal)
+            await pilot.press(*"23:00", "enter")
+            await _open(pilot)
+            held = hold.read_hold(tmp_path, now=time.time())
+            assert held is not None
+            assert held.until == hold.parse_until("23:00", held.since)
+            # A time it cannot read changes nothing.
+            await pilot.press("h", "u")
+            await _open(pilot)
+            await pilot.press(*"later", "enter")
+            await _open(pilot)
+            assert hold.read_hold(tmp_path, now=time.time()) == held
+
+    async def test_esc_closes_the_picker_without_a_hold(self, tmp_path, held_by_service):
+        from claude_swap.maximize import hold
+        from claude_swap.tui.fleet import FleetScreen
+
+        app = make_app(_six(tmp_path))
+        async with app.run_test(size=(160, 45)) as pilot:
+            await _open(pilot)
+            await pilot.press("h", "escape")
+            await _open(pilot)
+            assert isinstance(app.screen, FleetScreen)
+            assert not (tmp_path / hold.HOLD_FILENAME).exists()
+
+    async def test_question_mark_is_help_and_h_is_not(self, tmp_path):
+        from claude_swap.tui.fleet_help import HelpScreen
+        from claude_swap.tui.fleet_modals import MenuModal
+
+        _settings(tmp_path)
+        app = make_app(_fleet(tmp_path))
+        async with app.run_test(size=(140, 40)) as pilot:
+            await _open(pilot)
+            await pilot.press("question_mark")
+            await pilot.pause()
+            assert isinstance(app.screen, HelpScreen)
+            await pilot.press("escape", "h")
+            await pilot.pause()
+            assert isinstance(app.screen, MenuModal)
+
+
+@pytest.mark.asyncio
+async def test_the_capacity_summary_sits_over_the_headers(tmp_path, held_by_service):
+    app = make_app(_six(tmp_path))
+    async with app.run_test(size=(160, 45)) as pilot:
+        await _open(pilot)
+        screen = app.screen
+        summary = _plain(app, "#fx-summary")
+        # Usable: #1 (62% 5h, past soft), #2, #3, #4, #6 (#5's login is dead).
+        assert summary.startswith("5h free: 4 accounts · next 5h back ")
+        assert "(#1) · 7d left this week ≈ 3.5 accounts · next 7d reset " in summary
+        assert screen.query_one("#fx-head").region.y == screen.query_one(
+            "#fx-summary").region.y + 1
+        await pilot.resize_terminal(80, 24)
+        await _open(pilot)
+        assert _plain(app, "#fx-summary") == "5h free: 4 accounts · 7d left this week ≈ 3.5 accounts"
+        await pilot.resize_terminal(80, 10)
+        await _open(pilot)
+        assert not screen.query_one("#fx-summary").display

@@ -12,6 +12,7 @@ from rich.text import Text
 
 from claude_swap.json_output import USAGE_RELOGIN_REQUIRED
 from claude_swap.maximize import fleet as fx
+from claude_swap.maximize import hold as account_hold
 from claude_swap.maximize import home, policy
 from claude_swap.maximize.model import Forecast, QuietWindow, Sample
 from claude_swap.maximize.view import MaximizeState, window_ticks
@@ -681,14 +682,19 @@ def test_attention_tone_and_extra_parts():
 # -- footer --------------------------------------------------------------------------------------------
 
 
-def test_footer_is_six_keys():
+def test_footer_is_seven_keys():
     full = home.key_hints(120)
     assert " · ".join(f"{k} {w}" for k, w in full) == (
-        "enter switch · r re-login · l last resort · m menu · ? help · q quit"
+        "enter switch · r re-login · l last resort · h hold · m menu · ? help · q quit"
     )
-    short = home.key_hints(40)
-    assert [k for k, _ in short] == ["enter", "r", "l", "m", "?", "q"]
-    assert render.keys_text(40, P).cell_len <= 40
+    short = home.key_hints(50)
+    assert [k for k, _ in short] == ["enter", "r", "l", "h", "m", "?", "q"]
+    assert render.keys_text(50, P).plain == "enter · r · l · h · m menu · ? help · q quit"
+    assert render.keys_text(40, P).plain == "enter · r · l · h · m · ? · q"
+    for width in (40, 50, 77):
+        assert render.keys_text(width, P).cell_len <= width
+    # The whole footer still fits an 80-column terminal.
+    assert home.key_hints(home.text_width(80)) == list(home.KEY_HINTS)
 
 
 # -- colours -------------------------------------------------------------------------------------------
@@ -886,3 +892,181 @@ def test_stale_reading_dims_the_bars_and_shows_its_age():
     assert "dim" in _styles_of(line, "30%")
     detail = render.render_detail(rows[0], snap.accounts[0], 110, ctx).plain
     assert "reading 15m old" in detail
+
+
+# -- the account hold sentence (cc-swap hold, h) ---------------------------------------------
+
+HOLD =account_hold.AccountHold("1", NOW + 2 * H, NOW - 60, "fleet")
+
+
+def _held_sentence(dv, *, hold=HOLD, sit="live", es=SERVICE, mx=None, hold_read=True):
+    rows = _fleet()[3]
+    mx = mx or replace(MX, hard_5h=98.0)
+    return home.status_variants(es, dv, rows, mx, sit, now=NOW, hold=hold, hold_read=hold_read)
+
+
+def test_a_hold_on_the_active_account_is_the_sentence():
+    clock = account_hold.clock_text(NOW + 2 * H, NOW)
+    variants = _held_sentence(_pending())
+    assert _plain(variants[0]) == (
+        f"Holding #1 main until {clock} (2h left) — only hard 98%/100% will move you "
+        "(h to change)"
+    )
+    assert variants[0][0] == ("Holding", "okb") and variants[0][-1] == ("(h to change)", "dim")
+    # The wording the user asked for, at a narrower width.
+    assert _plain(variants[1]) == (
+        f"Holding #1 until {clock} (2h left) — only hard 98%/100% will move you"
+    )
+    lengths = [home.seg_len(v) for v in variants]
+    assert lengths == sorted(lengths, reverse=True)
+    assert _plain(variants[-1]) == "Holding #1"
+    different = _held_sentence(_pending(), mx=MX)
+    assert "only a hard mark (5h 95%, 7d 98%) or 100% will move you" in _plain(different[0])
+
+
+@pytest.mark.parametrize("dv", [
+    fx.DecisionView("hold", "1", None, None, "under soft", at=NOW - 10, source="engine"),
+    fx.DecisionView("hold", "1", "2", None, "#1 7d …", at=NOW - 10, source="engine",
+                    code="preempt"),
+    fx.DecisionView("hold", "1", None, None, "#1 x", at=NOW - 10, source="engine", code="hold"),
+    replace(_pending(), source="computed"),
+])
+def test_the_hold_is_worded_for_every_decision_it_sets_aside(dv):
+    sit = "waiting" if dv.source == "computed" else "live"
+    assert _plain(_held_sentence(dv, sit=sit)[0]).startswith("Holding #1 main until ")
+
+
+@pytest.mark.parametrize("dv", [
+    fx.DecisionView("switch", "1", "2", "hard", "#1 5h 99%", at=NOW - 5, source="engine"),
+    fx.DecisionView("hold", "1", None, None, "#1 5h 96% — resets in 8m, waiting it out",
+                    at=NOW - 5, source="engine", code="reset-wait"),
+    fx.DecisionView("exhausted", "1", None, None, "", at=NOW - 5, source="engine"),
+    fx.DecisionView("indeterminate", "1", None, None, "#1 usage unknown", at=NOW - 5,
+                    source="engine"),
+])
+def test_safety_decisions_are_never_hidden_by_a_hold(dv):
+    assert not _plain(_held_sentence(dv)[0]).startswith("Holding")
+
+
+@pytest.mark.parametrize(("hold", "sit", "es"), [
+    (account_hold.AccountHold("2", NOW + H), "live", SERVICE),         # another slot
+    (account_hold.AccountHold("1", NOW - 1), "live", SERVICE),         # ended
+    (None, "live", SERVICE),
+    (HOLD, "auto-off", replace(SERVICE, auto_off=True)),               # off wins
+    (HOLD, "no-engine", NONE),
+    (HOLD, "stale", SERVICE),
+])
+def test_no_hold_sentence_when_the_hold_does_not_apply(hold, sit, es):
+    dv = replace(_pending(), kind="off") if sit == "auto-off" else _pending()
+    assert not _plain(_held_sentence(dv, hold=hold, sit=sit, es=es)[0]).startswith("Holding")
+
+
+def test_a_lifted_hold_is_not_worded_from_a_stale_engine_word():
+    coded = fx.DecisionView("hold", "1", None, None, "#1 held until 15:30 (2h left) — x",
+                            at=NOW - 10, source="engine", code="hold")
+    assert not _plain(_held_sentence(coded, hold=None)[0]).startswith("Holding")
+    # A caller that never read the marker words the engine's own code.
+    said = _plain(_held_sentence(coded, hold=None, hold_read=False)[1])
+    assert said == "Holding #1 until 15:30 (2h left) — only hard 98%/100% will move you"
+
+
+def test_a_dry_run_hold_says_dry_run():
+    first = _held_sentence(_pending(source="here"), es=HERE_DRY)[0]
+    assert first[0] == ("Dry run", "warnb")
+    assert _plain(first).startswith("Dry run · holding #1 main until ")
+
+
+@pytest.mark.parametrize("width", [157, 117, 77, 60, 40, 20])
+def test_the_hold_sentence_never_exceeds_the_width(width):
+    variants = _held_sentence(_pending())
+    sentence, note = home.status_line(variants, home.holder_variants(SERVICE, "live"), width)
+    assert home.seg_len(sentence) <= width
+    assert render.status_text(sentence, note, width, P).cell_len <= width
+
+
+# -- the capacity summary -------------------------------------------------------------------------
+
+
+def _cap_row(n, pct5, pct7, *, reset5=None, reset7=None, login="ok", tier="normal",
+             active=False, deadline=None) -> fx.FleetRow:
+    return fx.FleetRow(
+        number=str(n), name=f"acct{n}", email=f"acct{n}@example.com", org="personal",
+        active=active, rank=1, plan="20x", tier=tier, pct5=pct5, pct7=pct7, days7=3.0,
+        score=1.0, landable=True, land="yes", state5="running", reset5=reset5,
+        prime=fx.PrimeCell("active", None, None, "—"), login=login, stale=False,
+        login_deadline=deadline, reset7=reset7,
+    )
+
+
+CAP_ROWS = [
+    _cap_row(1, 62, 40, reset5=NOW + 2 * H, reset7=NOW + 3 * DAY, active=True),  # past soft
+    _cap_row(2, 10, 20, reset7=NOW + 2 * DAY),
+    _cap_row(3, 0, 30, reset7=NOW + 5 * DAY),
+    _cap_row(4, 70, 50, reset5=NOW + 1 * H, reset7=NOW + 4 * DAY),            # back first
+    _cap_row(5, None, None, login="relogin", reset7=NOW + 0.5 * DAY),          # not counted
+    _cap_row(6, 0, 0, tier="excluded", reset7=NOW + 0.2 * DAY),                # not counted
+    _cap_row(7, None, None, login="api"),                                      # not counted
+    _cap_row(8, 10, 99, reset5=NOW + 0.5 * H, reset7=NOW + 6 * DAY),           # week spent
+    _cap_row(9, 0, 10, deadline=NOW - 60, reset7=NOW + 0.1 * DAY),             # login lapsed
+]
+
+
+def test_capacity_counts_the_accounts_switching_can_use():
+    cap = home.capacity(CAP_ROWS, MX, NOW)
+    assert cap.usable == 5                         # 1, 2, 3, 4, 8
+    assert cap.free5 == 2                          # 2 and 3 (8's week is spent)
+    assert cap.back5 == (NOW + 1 * H, "4")         # 1 is back later, 8's week is spent
+    assert cap.left7 == pytest.approx((60 + 80 + 70 + 50 + 1) / 100)
+    assert cap.next7 == NOW + 2 * DAY              # the dead/excluded/lapsed ones skipped
+
+
+def test_capacity_with_nothing_to_count_is_none():
+    assert home.capacity([_cap_row(5, None, None, login="relogin")], MX, NOW) is None
+    assert home.capacity([], MX, NOW) is None
+
+
+def test_the_summary_line_and_how_it_gives_way():
+    cap = home.capacity(CAP_ROWS, MX, NOW)
+    back = home.reset_clock(NOW + H, NOW, date=False)
+    week = home.reset_clock(NOW + 2 * DAY, NOW)
+    variants = [_plain(v) for v in home.summary_variants(cap, NOW)]
+    assert variants == [
+        f"5h free: 2 accounts · next 5h back {back} (#4) · 7d left this week ≈ 2.6 accounts"
+        f" · next 7d reset {week}",
+        f"5h free: 2 accounts · next 5h back {back} (#4) · 7d left this week ≈ 2.6 accounts",
+        "5h free: 2 accounts · 7d left this week ≈ 2.6 accounts",
+        "5h free: 2 accounts",
+    ]
+    for width in (200, 90, 70, 40, 15):
+        line = render.summary_text(cap, width, NOW, P)
+        assert line.cell_len <= width or width < len(variants[-1])
+    assert render.summary_text(cap, 70, NOW, P).plain == variants[2]
+    assert render.summary_text(cap, 40, NOW, P).plain == variants[3]
+
+
+def test_the_summary_says_none_free_in_amber_and_one_account_in_the_singular():
+    spent = [_cap_row(1, 70, 40, reset5=NOW + H, active=True), _cap_row(2, 80, 20)]
+    first = home.summary_variants(home.capacity(spent, MX, NOW), NOW)[0]
+    assert first[1] == ("none", "warn")
+    one = home.summary_variants(home.capacity([_cap_row(1, 10, 40, active=True)], MX, NOW),
+                                NOW)
+    assert _plain(one[0]).startswith("5h free: 1 account · 7d left this week ≈ 0.6 accounts")
+
+
+@pytest.mark.parametrize(("size", "attention", "rows", "detail", "summary"), [
+    ((160, 45), True, 6, True, True),
+    ((80, 24), True, 6, True, True),
+    ((200, 16), True, 6, True, False),    # the panel fits, the summary too would not: it goes
+    ((200, 16), False, 6, True, True),    # no attention line: room for both
+    ((200, 16), True, 7, False, True),    # no room for the panel anyway: the summary stays
+    ((80, 12), True, 8, False, True),
+    ((80, 11), True, 8, False, False),    # very short: never
+    ((120, 8), True, 6, False, False),
+])
+def test_the_summary_goes_before_the_panel(size, attention, rows, detail, summary):
+    plan = home.table_plan(*size, replace(NEEDS, rows=rows), attention=attention, summary=True)
+    assert (plan.detail, plan.summary) == (detail, summary)
+    # The panel is exactly what it would be without a summary.
+    assert plan.detail == home.table_plan(*size, replace(NEEDS, rows=rows),
+                                          attention=attention).detail
+    assert not home.table_plan(*size, replace(NEEDS, rows=rows), attention=attention).summary

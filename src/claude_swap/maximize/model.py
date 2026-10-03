@@ -15,7 +15,9 @@ from claude_swap.settings import MaximizeSettings
 Tier = Literal["normal", "last_resort", "excluded"]
 Trigger = Literal["at-limit", "hard", "soft", "preempt", "rebalance"]
 # A hold's reason code beyond pending/plain (engine NoSwitchEvent reason).
-HoldCode = Literal["reset-wait", "preempt", "rebalance-deferred"]
+# ``hold``: an account hold (``cc-swap hold``, maximize/hold.py) set aside a
+# soft, preempt or rebalance move.
+HoldCode = Literal["reset-wait", "preempt", "rebalance-deferred", "hold"]
 
 # Lower sorts first. ``excluded`` is listed only so every tier has an order;
 # an excluded account is never landable (score.landable).
@@ -86,6 +88,10 @@ class Snapshot:
     # The active account's usage token 429'd recently (``UsageEntry.recent_429``):
     # it keeps the post-429 cadence, so it cannot be polled every 60 s.
     active_recent_429: bool = False
+    # An account hold on the active account (maximize/hold.py): until then
+    # (epoch s) the soft, preempt and rebalance triggers are set aside. None
+    # = no hold; the engine passes one only while its slot is the active one.
+    hold_until: float | None = None
 
     def view(self, number: str | None) -> AccountView | None:
         """The account with this slot number, or None."""

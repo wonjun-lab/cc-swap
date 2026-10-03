@@ -2685,6 +2685,11 @@ class AutoSwitchEngine:
 
     def _emit(self, event: AutoSwitchEvent) -> None:
         self.on_event(event)
+        # cc-swap: desktop notifications (maximize/notify.py EngineNotifier,
+        # set by engine_hook.attach_maximize); it never raises.
+        tap = getattr(self, "_event_tap", None)
+        if tap is not None:
+            tap(event)
 
     # -- loop -------------------------------------------------------------------
 

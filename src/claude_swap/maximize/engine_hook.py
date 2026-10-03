@@ -17,6 +17,11 @@ and maps the decision back onto those upstream paths:
 * ``Exhausted``     → ``AllExhaustedEvent`` + reset-aware sleep, or a
                       normal-cadence ``NoSwitchEvent`` when not provable
 
+An account hold (``cc-swap hold``, maximize/hold.py) on the active account
+becomes the Snapshot's ``hold_until``; a hold that no longer applies (past
+its end, or on a slot that is no longer active) is cleared here, and a
+switch the engine makes ends the hold on the account it leaves.
+
 Per-engine state lives on a :class:`MaximizeRuntime` attached to the engine
 as ``_maximize_runtime`` (``attach_maximize`` / ``runtime_for``).
 """
@@ -35,7 +40,8 @@ from typing import Any, Protocol
 from claude_swap import autoswitch as aw
 from claude_swap import oauth, poll_policy
 from claude_swap.exceptions import ConfigError
-from claude_swap.maximize import history, idle, ledger, pause, policy
+from claude_swap.maximize import history, idle, ledger, notify, pause, policy
+from claude_swap.maximize import hold as account_hold
 from claude_swap.maximize.model import (
     AccountView,
     Decision,
@@ -63,6 +69,9 @@ from claude_swap.settings import (
 _logger = logging.getLogger("claude-swap")
 
 RUNTIME_ATTR = "_maximize_runtime"
+# ``AutoSwitchEngine._emit`` calls this attribute with every event (the
+# engine's desktop notifications, maximize/notify.py).
+NOTIFY_ATTR = "_event_tap"
 SAMPLES_KEY = "maximizeSamples"
 # Inside the SAMPLES_KEY record: when its account became the active one.
 CHANGED_KEY = "activeChangedAt"
@@ -250,6 +259,9 @@ def attach_maximize(
     )
     rt.primer = _build_primer(engine, prime)
     setattr(engine, RUNTIME_ATTR, rt)
+    if not isinstance(getattr(engine, NOTIFY_ATTR, None), notify.EngineNotifier):
+        # AutoSwitchEngine._emit hands it every event (desktop notifications).
+        setattr(engine, NOTIFY_ATTR, notify.EngineNotifier(engine))
     _apply_poll_inputs(engine, settings)
     if problems:
         engine._emit(aw.ConfigWarningEvent(
@@ -472,6 +484,35 @@ def _warn_login_expiry(
         ))
 
 
+def _notify_tick(
+    engine: aw.AutoSwitchEngine,
+    rt: MaximizeRuntime,
+    records: Mapping[str, Mapping],
+    usage: Mapping[str, dict | str | None],
+    state: Mapping,
+    deadlines: Mapping[str, float],
+    now: float,
+) -> None:
+    """This tick's desktop notifications about logins and priming
+    (maximize/notify.py); its events reach the notifier through ``_emit``.
+    Never on dry runs; never raises."""
+    tap = getattr(engine, NOTIFY_ATTR, None)
+    if engine.dry_run or not isinstance(tap, notify.EngineNotifier):
+        return
+    prime_note: str | None = None
+    if rt.prime_settings.enabled:
+        try:
+            from claude_swap.maximize.prime_verify import paused_note
+
+            prime_note = paused_note(engine.switcher.backup_dir)
+        except Exception:
+            prime_note = None
+    tap.tick(
+        records=records, usage=usage, state=state, deadlines=deadlines,
+        prime_note=prime_note, now=now,
+    )
+
+
 def _stored_samples(source: Mapping, current: str) -> list[Sample]:
     raw = source.get(SAMPLES_KEY)
     if not isinstance(raw, Mapping) or str(raw.get("account")) != current:
@@ -670,8 +711,8 @@ def _publish_decision(
 
     Slot numbers and the policy's own reason only — no emails, no raw
     ``rateLimitTier`` strings; a hold with its own code (``reset-wait``,
-    ``preempt``, ``rebalance-deferred``) adds ``code`` so ``cc-swap why`` can
-    name it. Rewritten when the decision changes, or when
+    ``preempt``, ``rebalance-deferred``, ``hold``) adds ``code`` so
+    ``cc-swap why`` can name it. Rewritten when the decision changes, or when
     the stored one is :data:`PUBLISH_REFRESH_S` old (the TUI's freshness
     clock); never on dry runs, which write nothing."""
     if engine.dry_run:
@@ -869,6 +910,8 @@ def _hold_event(decision: Hold) -> aw.NoSwitchEvent:
         return aw.NoSwitchEvent(reason="preempt", detail=detail)
     if decision.code == "rebalance-deferred":
         return aw.NoSwitchEvent(reason="rebalance-deferred", detail=detail)
+    if decision.code == "hold":
+        return aw.NoSwitchEvent(reason="hold", detail=detail)
     return aw.NoSwitchEvent(reason="maximize-hold", detail=detail)
 
 
@@ -959,6 +1002,57 @@ def _run_primer(
         engine._emit(event)
 
 
+def _account_hold(
+    engine: aw.AutoSwitchEngine, state: Mapping, current: str, now: float
+) -> float | None:
+    """When the account hold (maximize/hold.py) on ``current`` ends — the
+    Snapshot's ``hold_until`` — or None.
+
+    A marker that no longer applies is cleared here (never on dry runs):
+    one past its end, or one on a slot that is not the active account any
+    more (a manual switch, an external ``/login``, a forced switch all end
+    a hold). A hold on the active account is never touched."""
+    root = engine.switcher.backup_dir
+    try:
+        found = account_hold.marker(root, state)
+    except Exception:  # a convenience must never break a tick
+        return None
+    if found is None:
+        return None
+    pinned = account_hold.holding(found, current, now)
+    if pinned is not None:
+        return pinned.until
+    if engine.dry_run:
+        return None
+    try:
+        account_hold.clear_hold(root)
+    except Exception as e:
+        _logger.debug("could not clear the account hold: %s", type(e).__name__)
+        return None
+    if account_hold.current(found, now) is not None:
+        engine._emit(aw.ConfigWarningEvent(
+            message=f"hold on #{found.slot} lifted: #{current} is the active account now"
+        ))
+    return None
+
+
+def _end_hold_after_switch(
+    engine: aw.AutoSwitchEngine, held_until: float | None, current: str, landed: str
+) -> None:
+    """A switch the engine made (hard, at-limit, …) ends the hold on the
+    account it left."""
+    if held_until is None or engine.dry_run:
+        return
+    try:
+        account_hold.clear_hold(engine.switcher.backup_dir)
+    except Exception as e:
+        _logger.debug("could not clear the account hold: %s", type(e).__name__)
+        return
+    engine._emit(aw.ConfigWarningEvent(
+        message=f"hold on #{current} lifted: the engine switched to #{landed}"
+    ))
+
+
 def _note_drift(engine: aw.AutoSwitchEngine, rt: MaximizeRuntime, current: str) -> None:
     """Record a live login that changed with no switch in the ledger (a
     ``/login`` inside a Claude Code session). Only once the mismatch shows
@@ -1018,9 +1112,11 @@ def run_maximize_tick(
         ))
         return aw.TickOutcome.NO_ACTION
     _note_drift(engine, rt, current)
+    held_until = _account_hold(engine, state, current, now)
     records = _records(engine, current)
     deadlines = _login_deadlines(engine, rt, records, current, now)
     _warn_login_expiry(engine, rt, deadlines, now)
+    _notify_tick(engine, rt, records, usage, state, deadlines, now)
     samples, active_changed_at = _update_samples(
         engine, rt, state, current, entries.get(current), usage.get(current), now
     )
@@ -1049,6 +1145,7 @@ def run_maximize_tick(
         forecast=forecast,
         rates7=rates7,
         active_recent_429=_recent_429(entries.get(current), now),
+        hold_until=held_until,
     )
     decision = policy.decide(snap)
     rt.last_snapshot, rt.last_decision = snap, decision
@@ -1071,6 +1168,8 @@ def run_maximize_tick(
         outcome, landed = _switch(
             engine, rt, snap, decision, usage, headroom, current, entries.get(current)
         )
+        if landed:
+            _end_hold_after_switch(engine, held_until, current, landed)
     elif isinstance(decision, Hold):
         outcome = _hold(engine, rt, decision, current, entries.get(current), now)
     else:

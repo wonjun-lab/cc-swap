@@ -1,8 +1,8 @@
-"""Fleet help (``?`` / ``h``): how to read the home screen, what each tag
-and word means (soft/hard, next, last resort, pace, priming, viewer/lease,
-waiting out a reset, preempt, quiet time), what the engine has learned of
-your busy and quiet times, and every key. A popup over the home screen; it
-scrolls when short."""
+"""Fleet help (``?``): how to read the home screen, what each tag and word
+means (soft/hard, next, last resort, pace, priming, viewer/lease, waiting
+out a reset, preempt, quiet time, holding, the capacity summary), what the
+engine has learned of your busy and quiet times, and every key. A popup
+over the home screen; it scrolls when short."""
 
 from __future__ import annotations
 
@@ -53,7 +53,7 @@ class HelpScreen(ModalScreen[None]):
     HelpScreen #fx-help { height: auto; }
     """
     BINDINGS = [
-        Binding("b,escape,left,question_mark,h", "back", "Back", show=False),
+        Binding("b,escape,left,question_mark", "back", "Back", show=False),
         Binding("q", "quit", "Quit", show=False),
         Binding("j,down", "scroll_down", show=False),
         Binding("k,up", "scroll_up", show=False),

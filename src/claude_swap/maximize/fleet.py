@@ -508,7 +508,10 @@ def decision_view(
     would = {
         "switch": f"switch ({dv.trigger}){target}",
         "pending": f"switch at the next idle moment{target}",
-        "hold": f"hold ({dv.code})" if dv.code else "hold",
+        "hold": (
+            "hold (account hold)" if dv.code == "hold"
+            else f"hold ({dv.code})" if dv.code else "hold"
+        ),
         "exhausted": "every account is at its limit",
         "indeterminate": "fail over (usage unreadable)",
     }.get(dv.kind)

@@ -1,7 +1,8 @@
 """Fleet's menus, keys and help text (pure, no Textual).
 
-The home screen has six keys, all in its footer: ``enter`` switch, ``r``
-re-login, ``l`` last resort, ``m`` menu, ``?`` help, ``q`` quit. Everything
+The home screen has seven keys, all in its footer: ``enter`` switch, ``r``
+re-login, ``l`` last resort, ``h`` hold (stay on the active account: a small
+picker, :func:`hold_rows`), ``m`` menu, ``?`` help, ``q`` quit. Everything
 else is an item of the ``m`` menu (a popup), one letter each, shown in a key
 column with a short note on what it does. The menu's letters also work
 straight from the home screen (:data:`SHORTCUT_KEYS`), except ``o``
@@ -49,13 +50,13 @@ MAIN_KEYS: tuple[str, ...] = tuple(e.key for e in MAIN_MENU)
 BY_ACTION: dict[str, MenuEntry] = {e.action: e for e in MAIN_MENU}
 
 #: The home screen's own keys: exactly its footer.
-HOME_KEYS: tuple[str, ...] = ("enter", "r", "l", "m", "?", "q")
+HOME_KEYS: tuple[str, ...] = ("enter", "r", "l", "h", "m", "?", "q")
 #: Keys that act on the selected account.
 ROW_KEYS: tuple[str, ...] = ("enter", "l", "x", "r")
 #: Menu letters that also work from the home screen without the menu.
 SHORTCUT_KEYS: tuple[str, ...] = tuple(k for k in MAIN_KEYS if k not in ("o", "m", "q"))
 #: Keys that are deliberately not menu items (navigation, help, theme).
-RESERVED_KEYS: tuple[str, ...] = ("w", "?", "h", "j", "k", "b", "g")
+RESERVED_KEYS: tuple[str, ...] = ("w", "?", "j", "k", "b", "g")
 
 ACCOUNT_ITEMS: tuple[tuple[str, str, str], ...] = (
     ("a", "Add current login", "add"),
@@ -147,6 +148,40 @@ def menu_rows(
             tone = "warn"
         out.append(MenuRow(e.key, title, note, e.action, tone))
     return out
+
+
+#: ``h``'s fixed choices: (key, hours).
+HOLD_HOURS: tuple[tuple[str, int], ...] = (("1", 1), ("2", 2), ("4", 4))
+#: The hold picker's actions: ``hold:<seconds>``, then these two.
+HOLD_UNTIL, HOLD_OFF = "hold:until", "hold:off"
+
+
+def hold_rows(held_until: float | None, now: float) -> list[MenuRow]:
+    """The ``h`` picker: 1h / 2h / 4h / until a time / off, each with when
+    it would end. ``held_until`` is the end of the hold on the active
+    account (None: no hold)."""
+    from claude_swap.maximize.hold import clock_text
+
+    rows = [
+        MenuRow(key, f"Hold for {hours} hour{'s' if hours != 1 else ''}",
+                f"until {clock_text(now + hours * 3600, now)}", f"hold:{hours * 3600}")
+        for key, hours in HOLD_HOURS
+    ]
+    rows.append(MenuRow("u", "Until a time…", "HH:MM, local time (the next one)", HOLD_UNTIL))
+    if held_until is not None:
+        rows.append(MenuRow("o", "Off", f"lift the hold (it ends {clock_text(held_until, now)})",
+                            HOLD_OFF, "warn"))
+    else:
+        rows.append(MenuRow("o", "Off", "no hold now", HOLD_OFF))
+    return rows
+
+
+HOLD_TITLE = "Hold #{number} {name} — stay on this account"
+#: Under the hold picker's title: what a hold does and does not stop.
+HOLD_NOTE = (
+    "soft, preempt and rebalance moves wait; a hard mark, 100% and a reset wait "
+    "still switch"
+)
 
 
 def bold_spans(title: str, key: str) -> tuple[int, int] | None:
@@ -255,11 +290,20 @@ def help_entries(idle_pattern: str | None = None) -> list[tuple[str, str]]:
         ("", "How to read Fleet"),
         ("top line", "what automatic switching is doing now, in one sentence. "
                      "'engine silent' or 'waiting for the engine' means the engine "
-                     "has not confirmed it: nothing there is live"),
+                     "has not confirmed it: nothing there is live. 'Holding #1 until "
+                     "15:30' means you asked to stay on it (h)"),
         ("right note", "who runs the engine — viewer · service pid N is switching: the "
                        "background service switches, this screen only watches"),
         ("! line", "only when something needs you: a dead or expiring login, priming "
                    "paused after a Claude Code update, a service that stops at logout"),
+        ("summary", "the line over the table, over the accounts automatic switching can "
+                    "use (not a dead, expired or excluded login, not an API key). 5h free: "
+                    "those whose 5h is under its soft mark (the active one included; a "
+                    "spent 7d does not count). next 5h back: the soonest 5h reset among the "
+                    "rest. 7d left this week ≈ N accounts: the 7d room left, (100 − 7d%)/100 "
+                    "per account added up as whole accounts — not weighted by plan, so a "
+                    "20x and a 5x account count alike. next 7d reset: the soonest weekly "
+                    "reset. A short terminal drops it first"),
         ("order", "● the active account; 1, 2, 3 … where automatic switching goes "
                   "next, in that order; – never (a dead login, an excluded account). "
                   "The table lists the accounts in this order"),
@@ -303,6 +347,10 @@ def help_entries(idle_pattern: str | None = None) -> list[tuple[str, str]]:
                     "in a busy stretch"),
         ("rebalance deferred", "a slightly better account exists but this is usually a "
                                "busy time: the move waits for your quiet time"),
+        ("holding", "you asked to stay on the active account (h, or cc-swap hold) so a long "
+                    "task keeps its context: soft, preempt and rebalance moves wait until the "
+                    "hold ends (at most 24h). A hard mark, 100% and a reset wait still "
+                    "switch, and any change of the active account ends the hold"),
         ("pace / score", "how the next account is picked: the 7d quota left per day left "
                          "(above 1 = quota to spare)"),
         ("landable", "an account switching may move you to: under both soft marks minus "
@@ -320,12 +368,14 @@ def help_entries(idle_pattern: str | None = None) -> list[tuple[str, str]]:
         ("enter", "switch to it (asks first when switching would not land there)"),
         ("r", "re-login it (guided; cc-swap launches nothing)"),
         ("l", "last resort on/off"),
+        ("h", "hold: stay on the active account for 1, 2 or 4 hours or until a time, "
+              "or lift the hold (o)"),
         ("m", "menu: o automatic switching on/off · m mode · s strategy · p prime · "
               "f fetch · x exclude · a accounts · e engine log · v history · "
               "u update · c classic · q quit"),
         (" ".join(SHORTCUT_KEYS), "those menu letters also work straight from here"),
         ("w / g", "watch every account / engine log"),
-        ("? / h", "this help"),
+        ("?", "this help"),
         ("ctrl+f", "back to Fleet from any screen"),
         ("ctrl+t", "theme"),
         ("b / esc", "back, on every sub-screen"),

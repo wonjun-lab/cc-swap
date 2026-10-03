@@ -163,6 +163,54 @@ def test_readme_home_sentences_are_the_ones_fleet_prints():
     assert f"`{first}`" in _readme_text()
 
 
+def test_readme_quotes_the_hold_sentence_and_the_summary_line_fleet_prints():
+    """The hold sentence and the capacity summary, built by maximize/home.py
+    for the README's example (marks 98/98, a hold until 15:30 local, a 5h
+    back at 07:10, a 7d reset on Oct 5 12:51)."""
+    import time
+    from dataclasses import replace
+
+    from claude_swap.maximize import fleet as fx
+    from claude_swap.maximize import home
+    from claude_swap.maximize.hold import AccountHold
+    from claude_swap.settings import MaximizeSettings
+
+    now = time.mktime((2026, 10, 3, 5, 0, 0, 0, 0, -1))
+    mx = replace(MaximizeSettings(), hard_5h=98.0, hard_7d=98.0)
+
+    def row(n, pct5, pct7, *, reset5=None, reset7=None, active=False):
+        return fx.FleetRow(
+            number=str(n), name=f"acct{n}", email=f"acct{n}@example.com", org="personal",
+            active=active, rank=1, plan="20x", tier="normal", pct5=pct5, pct7=pct7,
+            days7=3.0, score=1.0, landable=True, land="yes", state5="running", reset5=reset5,
+            prime=fx.PrimeCell("active", None, None, "—"), login="ok", stale=False,
+            reset7=reset7,
+        )
+
+    later = now + 5 * 86400
+    rows = [
+        row(1, 30, 30, reset7=later, active=True),
+        row(2, 10, 40, reset7=time.mktime((2026, 10, 5, 12, 51, 0, 0, 0, -1))),
+        row(3, 70, 60, reset5=time.mktime((2026, 10, 3, 7, 10, 0, 0, 0, -1)), reset7=later),
+        row(4, 0, 70, reset7=later),
+        row(5, 20, 70, reset7=later),
+    ]
+    text = _readme_text()
+    summary = home.summary_variants(home.capacity(rows, mx, now), now)[0]
+    assert f"`{''.join(t for t, _ in summary)}`" in text
+    until = time.mktime((2026, 10, 3, 15, 30, 0, 0, 0, -1))
+    dv = fx.DecisionView("hold", "1", None, None, "#1 x", at=until - 7200, source="engine",
+                         code="hold")
+    es = fx.EngineStatus("service", 4121, {"running": True, "pid": 4121})
+    variants = home.status_variants(
+        es, dv, rows, mx, "live", now=until - 7200,
+        hold=AccountHold("1", until), hold_read=True,
+    )
+    held = "".join(t for t, _ in variants[1])
+    assert held == "Holding #1 until 15:30 (2h left) — only hard 98%/100% will move you"
+    assert f"`{held}`" in text
+
+
 def test_readme_names_every_fleet_footer_key():
     from claude_swap.maximize import home
 

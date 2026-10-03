@@ -32,7 +32,7 @@ def test_the_menu_holds_every_former_fleet_menu_action():
 
 
 def test_home_keys_are_the_footer_and_do_not_collide():
-    assert menus.HOME_KEYS == ("enter", "r", "l", "m", "?", "q")
+    assert menus.HOME_KEYS == ("enter", "r", "l", "h", "m", "?", "q")
     assert set(menus.ROW_KEYS) - {"x"} <= set(menus.HOME_KEYS)
     # Shortcuts: the menu's letters that also work from home, never o (one
     # stray key must not turn switching off) nor m (the menu itself).
@@ -219,3 +219,32 @@ def test_swap_strategy_writes_the_new_settings_as_config_set_reads_them():
     ]
     s = fx.strategy_settings(edited)
     assert (s.preempt, s.busy_rebalance_gap, s.reset_wait_min) == (False, 0.6, 14)
+
+
+def test_the_hold_picker_offers_1_2_4_hours_until_and_off():
+    from claude_swap.maximize.hold import clock_text
+
+    now = 1_790_000_000.0
+    rows = menus.hold_rows(None, now)
+    assert [r.key for r in rows] == ["1", "2", "4", "u", "o"]
+    assert [r.action for r in rows] == [
+        "hold:3600", "hold:7200", "hold:14400", menus.HOLD_UNTIL, menus.HOLD_OFF]
+    assert rows[1].title == "Hold for 2 hours" and rows[0].title == "Hold for 1 hour"
+    assert rows[1].note == f"until {clock_text(now + 7200, now)}"
+    assert (rows[-1].note, rows[-1].tone) == ("no hold now", "plain")
+    held = menus.hold_rows(now + 1800, now)[-1]
+    assert held.note == f"lift the hold (it ends {clock_text(now + 1800, now)})"
+    assert held.tone == "warn"
+    keys = [r.key for r in rows]
+    assert len(set(keys)) == len(keys) and "b" not in keys  # b and esc close it
+    for row in rows:
+        if row.key.isalpha():
+            assert menus.bold_spans(row.title, row.key) is not None
+
+
+def test_help_explains_the_hold_and_the_summary():
+    entries = dict(menus.help_entries())
+    assert "h" in entries and "1, 2 or 4 hours" in entries["h"]
+    assert entries["holding"].startswith("you asked to stay on the active account")
+    assert "not weighted by plan" in entries["summary"]
+    assert "? / h" not in entries and entries["?"] == "this help"

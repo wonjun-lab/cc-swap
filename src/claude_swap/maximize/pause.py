@@ -276,6 +276,15 @@ def auto_command(argv: list[str]) -> None:
     else:
         changed = False
     off = read_auto_off(root)
+    from claude_swap.maximize import hold as account_hold
+
+    try:
+        pinned = account_hold.holding(
+            account_hold.read_hold(root, now=now), account_hold.active_slot(root), now
+        )
+        hold_line = account_hold.status_line(root, now) if pinned is not None else None
+    except Exception:
+        pinned, hold_line = None, None
     if args.json:
         print(json.dumps({
             "schemaVersion": 1,
@@ -283,6 +292,7 @@ def auto_command(argv: list[str]) -> None:
             "changed": changed,
             "since": off.since if off else None,
             "by": off.by if off else None,
+            "hold": account_hold.status_payload(pinned, now),
         }))
         sys.exit(0)
     if off is None:
@@ -293,4 +303,6 @@ def auto_command(argv: list[str]) -> None:
             "switches or primes." + ("" if changed or args.action == "status" else " (already)")
         )
         print(auto_off_detail(off))
+    if hold_line:
+        print(f"{hold_line} (cc-swap hold off lifts it).")
     sys.exit(0)

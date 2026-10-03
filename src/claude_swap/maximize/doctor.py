@@ -1012,6 +1012,40 @@ def check_lease(ctx: Context) -> list[Finding]:
     return out
 
 
+def check_hold(ctx: Context) -> list[Finding]:
+    """An account hold (``cc-swap hold``; info only): the active account it
+    pins and until when, or one left over on a slot that is no longer
+    active (no engine has cleared it yet). Writes nothing."""
+    from claude_swap import settings as st
+    from claude_swap.maximize import hold as account_hold
+
+    p = ctx.probes
+    found = account_hold.read_hold(p.backup_root, now=p.now, state=ctx.state)
+    if found is None:
+        return []
+    active = (ctx.sequence or {}).get("activeAccountNumber")
+    active = str(active) if active is not None else None
+    if found.slot != active:
+        return [Finding(
+            "hold", "info",
+            f"a hold on #{found.slot} is left over; #{active or '?'} is the active account, "
+            "so it no longer applies (the engine clears it on its next tick)",
+            "cc-swap hold off",
+        )]
+    try:
+        mx = st._section_from_raw(
+            (ctx.raw_settings or {}).get("maximize"), "maximize", st.MaximizeSettings
+        )
+    except TypeError:
+        mx = st.MaximizeSettings()
+    return [Finding(
+        "hold", "info",
+        f"holding #{found.slot} {account_hold.until_text(found, p.now)}: soft, preempt and "
+        f"rebalance moves wait — {account_hold.safety_text(mx.hard_5h, mx.hard_7d)} "
+        "(cc-swap hold off lifts it)",
+    )]
+
+
 def check_settings(ctx: Context) -> list[Finding]:
     from claude_swap import settings as st
 
@@ -1028,6 +1062,7 @@ def check_settings(ctx: Context) -> list[Finding]:
         ("autoswitch", st.AutoSwitchSettings),
         ("ui", st.UiSettings),
         ("maximize", st.MaximizeSettings),
+        ("notify", st.NotifySettings),
     )
     loaded = {}
     for name, cls in sections:
@@ -1256,6 +1291,7 @@ ENV_CHECKS: tuple[Callable[[Context], list[Finding]], ...] = (
     check_upstream,
     check_service,
     check_lease,
+    check_hold,
     check_settings,
     check_priming,
     check_idle_pattern,
