@@ -804,6 +804,10 @@ def _ride_track(
                 previous = max((x.ts for x in samples if x.ts < read_at), default=None)
                 at = learned_ride.arm_time(read_at, previous)
                 item = armed[w] = {"at": at, "pointS": None}
+            # An arm time ahead of now (the clock stepped back) is pulled to
+            # now and kept there: clamped only when deciding, the ride
+            # would count from "now" on every tick and never end.
+            item["at"] = min(item["at"], now)
             if item["pointS"] is None:
                 # The shorter of the measured steps and the recent velocity:
                 # a T1 too long rides into 100%.

@@ -365,6 +365,28 @@ class TestArmTime:
         assert armed(h)["at"] == pytest.approx(h.clock.now - ride.ARM_UNKNOWN_GAP_S)
 
 
+def seed_armed(h, at: float, *, account: str = "1", point_s: float = 600.0) -> None:
+    """A ``maximizeRide`` record arming account ``account``'s 7d at ``at``."""
+    record = {"account": account, "armed": {"7d": {"at": at, "pointS": point_s}},
+              "riding": []}
+    h.engine._mutate_state(lambda s: s.__setitem__(RIDE_KEY, record))
+
+
+def test_an_arm_time_in_the_future_is_pulled_back_and_kept(temp_home):
+    # The clock stepped back an hour after the window was armed. Clamping
+    # only at decision time would count the ride from "now" on every tick:
+    # it would slide forward forever.
+    h = make(temp_home, maximize=MARKS)
+    seed_armed(h, h.clock.now + 3600)
+    c = busy(h, {"2": win(0, 10), "3": win(0, 50)})
+    assert c.tick(1, 99, advance=URGENT) is TickOutcome.NO_ACTION   # due in 90 s
+    pulled = h.clock.now
+    assert armed(h)["at"] == pytest.approx(pulled)
+    assert c.tick(1, 99, advance=URGENT) is TickOutcome.NO_ACTION
+    assert armed(h)["at"] == pytest.approx(pulled)
+    assert c.tick(1, 99, advance=URGENT) is TickOutcome.SWITCHED
+
+
 def test_an_idle_moment_switches_during_the_ride_without_learning(temp_home):
     h = make(temp_home, maximize={**MARKS, "rideMaxMin": 120})
     set_q(h, 0.9)                                     # a 0.9 x 600 - 90 = 450 s ride
