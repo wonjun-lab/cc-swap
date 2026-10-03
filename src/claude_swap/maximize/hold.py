@@ -125,12 +125,49 @@ def current(hold: AccountHold | None, now: float) -> AccountHold | None:
     return hold
 
 
-def holding(hold: AccountHold | None, active: object, now: float) -> AccountHold | None:
-    """The hold that pins ``active`` at ``now``, else None."""
+def holding(
+    hold: AccountHold | None, active: object, now: float, *, root: Path | None = None
+) -> AccountHold | None:
+    """The hold that pins ``active`` at ``now``, else None. With ``root``,
+    also none once the switch ledger saw the active account leave the held
+    slot after the hold was set (:func:`moved_away`), even if it is back."""
     live = current(hold, now)
     if live is None or active is None or live.slot != str(active):
         return None
+    if root is not None and moved_away(root, live):
+        return None
     return live
+
+
+def moved_away(root: Path, hold: AccountHold) -> bool:
+    """Whether the switch ledger (``switches.jsonl``, maximize/ledger.py)
+    records the active account off ``hold.slot`` after ``hold.since``: an
+    entry since then that leaves another slot or lands on one. A switch
+    away and back between two engine ticks ends a hold too. Without a
+    ledger (or a ``since``) nothing says it moved: False."""
+    if hold.since is None:
+        return False
+    try:
+        from claude_swap.maximize import ledger
+
+        for path in ledger._generations(Path(root)):  # newest first
+            try:
+                text = path.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+            for line in reversed(text.splitlines()):
+                entry = ledger._parse(line)
+                ts = _number(entry.get("ts")) if entry is not None else None
+                if ts is None:
+                    continue
+                if ts <= hold.since:
+                    return False
+                src, dst = entry.get("from"), entry.get("to")
+                if str(dst) != hold.slot or (src is not None and str(src) != hold.slot):
+                    return True
+    except Exception:  # an unreadable ledger says nothing
+        return False
+    return False
 
 
 def read_state(root: Path) -> dict:
@@ -399,7 +436,7 @@ def status_line(root: Path, now: float, *, state: Mapping | None = None) -> str 
     """``Holding #1 main until 15:30 (2h left) — only hard 98%/100% will
     move you`` while a hold pins the active account (:func:`live_slot`),
     else None."""
-    hold = holding(read_hold(root, now=now, state=state), live_slot(root), now)
+    hold = holding(read_hold(root, now=now, state=state), live_slot(root), now, root=root)
     if hold is None:
         return None
     hard5, hard7 = _marks(root)
@@ -482,7 +519,7 @@ def hold_command(argv: list[str], *, clock=None) -> None:
         changed = True
     elif action == "off":
         changed = clear_hold(root)
-    live = holding(read_hold(root, now=now), active, now)
+    live = holding(read_hold(root, now=now), active, now, root=root)
     if args.json:
         print(json.dumps({
             "schemaVersion": 1, "action": action, "changed": changed,

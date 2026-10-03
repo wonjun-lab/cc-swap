@@ -99,7 +99,8 @@ class MaximizeState:
     auto_off_since: float | None = None
     auto_off_by: str | None = None
     # The account hold marker as recorded (maximize/hold.py ``marker``),
-    # whether or not it still holds: readers ask ``hold.holding``.
+    # whether or not it still holds (readers ask ``hold.holding``); None once
+    # the switch ledger saw the account leave the held slot after it was set.
     hold: account_hold.AccountHold | None = None
 
 
@@ -183,6 +184,8 @@ def read_state(backup_root: Path) -> MaximizeState:
     except (OSError, ValueError):
         raw = None
     hold = account_hold.marker(Path(backup_root), raw if isinstance(raw, dict) else None)
+    if hold is not None and account_hold.moved_away(Path(backup_root), hold):
+        hold = None  # the ledger saw the account leave the held slot: it ended
     if not isinstance(raw, dict):
         if flag_off:
             by = flag_map.get("by")

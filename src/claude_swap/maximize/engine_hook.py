@@ -1028,7 +1028,10 @@ def _account_hold(
     if found is None:
         return None
     pinned = account_hold.holding(found, current, now)
-    if pinned is not None:
+    # The switch ledger may have seen the account leave and come back
+    # between two ticks: that ends the hold too.
+    moved = pinned is not None and account_hold.moved_away(root, pinned)
+    if pinned is not None and not moved:
         return pinned.until
     if engine.dry_run:
         return None
@@ -1036,7 +1039,7 @@ def _account_hold(
     if found.since is not None and started is not None and found.since > started:
         return None
     live = current
-    if account_hold.current(found, now) is not None:
+    if not moved and account_hold.current(found, now) is not None:
         try:
             live = engine.switcher.current_account_number() or current
         except Exception:
@@ -1048,7 +1051,11 @@ def _account_hold(
     except Exception as e:
         _logger.debug("could not clear the account hold: %s", type(e).__name__)
         return None
-    if account_hold.current(found, now) is not None:
+    if moved:
+        engine._emit(aw.ConfigWarningEvent(
+            message=f"hold on #{found.slot} lifted: the active account changed since it was set"
+        ))
+    elif account_hold.current(found, now) is not None:
         engine._emit(aw.ConfigWarningEvent(
             message=f"hold on #{found.slot} lifted: #{live} is the active account now"
         ))

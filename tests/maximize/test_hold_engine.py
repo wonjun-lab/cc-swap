@@ -222,6 +222,24 @@ def test_a_forced_switch_leaves_a_hold_renewed_during_its_tick_to_the_next_tick(
     assert lifted(h) == ["hold on #1 lifted: #2 is the active account now"]
 
 
+def test_a_switch_away_and_back_between_ticks_ends_the_hold(temp_home):
+    from claude_swap.maximize import ledger
+
+    h = make(temp_home)
+    pin(h)
+    assert h.tick_with_usage(SOFT) is TickOutcome.NO_ACTION
+    root = h.switcher.backup_dir
+    for src, dst in ((1, 2), (2, 1)):  # no engine tick sees #2
+        h.clock.advance(30)
+        ledger.record_switch(root, from_slot=src, to_slot=dst, actor="user",
+                             trigger="manual", source="cli", now=h.clock.now)
+    h.clock.advance(240)
+    h.tick_with_usage(SOFT)
+    assert no_switch_reasons(h)[-1] != "hold"
+    assert marker(h) is None
+    assert lifted(h) == ["hold on #1 lifted: the active account changed since it was set"]
+
+
 def test_a_damaged_hold_file_is_no_hold(temp_home):
     h = make(temp_home)
     (h.switcher.backup_dir / hold.HOLD_FILENAME).write_text("{damaged")

@@ -122,6 +122,51 @@ def test_holding_needs_the_slot_to_be_the_active_account():
     assert h.holding(None, "1", NOW) is None
 
 
+# -- a switch away the ledger saw (and no engine tick did) ----------------------------------
+
+
+def _switch(root, src, dst, at) -> None:
+    from claude_swap.maximize import ledger
+
+    ledger.record_switch(root, from_slot=src, to_slot=dst, actor="user", trigger="manual",
+                         source="cli", now=at)
+
+
+def test_a_switch_away_and_back_after_the_hold_ends_it(tmp_path):
+    hold = h.set_hold(tmp_path, "1", NOW + 2 * H, by="cli", now=NOW)
+    _switch(tmp_path, 2, 1, NOW - H)          # before the hold: how #1 became active
+    assert h.holding(hold, "1", NOW + 60, root=tmp_path) == hold
+    assert not h.moved_away(tmp_path, hold)
+    _switch(tmp_path, 1, 2, NOW + 600)        # away …
+    _switch(tmp_path, 2, 1, NOW + 900)        # … and back, between two engine ticks
+    assert h.moved_away(tmp_path, hold)
+    assert h.holding(hold, "1", NOW + 1000, root=tmp_path) is None
+    assert h.holding(hold, "1", NOW + 1000) == hold  # without the ledger: the marker alone
+    assert mxview.read_state(tmp_path).hold is None
+    assert h.read_hold(tmp_path, now=NOW + 1000) == hold  # the raw marker stays readable
+
+
+def test_any_ledger_entry_off_the_held_slot_after_it_was_set_counts(tmp_path):
+    hold = h.set_hold(tmp_path, "1", NOW + 2 * H, by="cli", now=NOW)
+    _switch(tmp_path, 2, 3, NOW + 600)  # #1 must have been left before this
+    assert h.moved_away(tmp_path, hold)
+
+
+def test_no_ledger_or_no_since_keeps_the_hold(tmp_path):
+    assert not h.moved_away(tmp_path, h.AccountHold("1", NOW + H, NOW))
+    _switch(tmp_path, 1, 2, NOW + 600)
+    assert not h.moved_away(tmp_path, h.AccountHold("1", NOW + H, None))
+
+
+def test_the_cli_reports_a_hold_the_ledger_ended(root, monkeypatch, capsys):
+    h.set_hold(root, "1", NOW + 2 * H, by="cli", now=NOW - 600)
+    _switch(root, 1, 2, NOW - 300)
+    _switch(root, 2, 1, NOW - 200)
+    code, out = _main(monkeypatch, capsys, "hold", "status", "--json")
+    assert code == 0 and json.loads(out)["hold"] is None
+    assert json.loads(_main(monkeypatch, capsys, "auto", "status", "--json")[1])["hold"] is None
+
+
 # -- words ------------------------------------------------------------------------------------
 
 
@@ -484,6 +529,19 @@ def test_doctor_reads_the_live_login_for_the_held_slot(tmp_path):
     h.set_hold(world.root, "2", DNOW + H, by="cli", now=DNOW)
     [finding] = [f for f in _doctor(world) if f.check == "hold"]
     assert finding.detail.startswith("holding #2 until ")
+
+
+def test_doctor_says_a_hold_the_ledger_ended_no_longer_applies(tmp_path):
+    from tests.maximize.doctor_support import NOW as DNOW
+
+    world = World(tmp_path).healthy()
+    h.set_hold(world.root, "1", DNOW + 2 * H, by="cli", now=DNOW - 600)
+    _switch(world.root, 1, 2, DNOW - 300)
+    _switch(world.root, 2, 1, DNOW - 200)
+    [finding] = [f for f in _doctor(world) if f.check == "hold"]
+    assert finding.detail.startswith("a hold on #1 no longer applies: the active account "
+                                     "changed since it was set")
+    assert finding.fix == "cc-swap hold off"
 
 
 def test_doctor_says_nothing_without_a_hold(tmp_path):

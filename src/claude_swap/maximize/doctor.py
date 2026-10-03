@@ -1033,6 +1033,13 @@ def check_hold(ctx: Context) -> list[Finding]:
             "so it no longer applies (the engine clears it on its next tick)",
             "cc-swap hold off",
         )]
+    if account_hold.moved_away(p.backup_root, found):
+        return [Finding(
+            "hold", "info",
+            f"a hold on #{found.slot} no longer applies: the active account changed since it "
+            "was set (switches.jsonl); the engine clears it on its next tick",
+            "cc-swap hold off",
+        )]
     try:
         mx = st._section_from_raw(
             (ctx.raw_settings or {}).get("maximize"), "maximize", st.MaximizeSettings
