@@ -635,3 +635,158 @@ class TestReloginBacksUpTheActiveAccountFirst:
             await pilot.press("escape")
             await _open(pilot)
         assert fake.synced == ["4"]
+
+
+# -- r launches claude's own login (maximize/relogin.py) --------------------------------
+
+
+class StoringSwitcher(IdentitySwitcher):
+    """IdentitySwitcher plus ``store_relogin`` (records, stores nothing real)."""
+
+    def __init__(self, *a, **kw):
+        super().__init__(*a, **kw)
+        self.stored: list[tuple[str, str, str]] = []
+
+    def store_relogin(self, number, credentials, oauth_account):
+        rt = json.loads(credentials)["claudeAiOauth"]["refreshToken"]
+        self.stored.append((str(number), oauth_account["emailAddress"], rt))
+
+
+def _fake_claude_login(email: str, *, code=0, seen: list | None = None):
+    """What ``claude auth login`` leaves in its CLAUDE_CONFIG_DIR."""
+    from pathlib import Path
+
+    def run(argv, env, cwd):
+        profile = Path(env["CLAUDE_CONFIG_DIR"])
+        if seen is not None:
+            seen.append((list(argv), profile))
+        (profile / ".claude.json").write_text(json.dumps({"oauthAccount": {
+            "emailAddress": email, "organizationUuid": "", "accountUuid": "uuid-4"}}))
+        (profile / ".credentials.json").write_text(json.dumps({"claudeAiOauth": {
+            "accessToken": "sk-ant-oat01-new", "refreshToken": "rt-new",
+            "expiresAt": 99999999999000}}))
+        return code
+
+    return run
+
+
+def _launchable(monkeypatch, app, run, *, supported=True):
+    import contextlib
+
+    from claude_swap.maximize import relogin as rl
+    from claude_swap.tui import fleet as tui_fleet
+
+    monkeypatch.setattr(tui_fleet, "_resolve_claude", lambda app: "/opt/fake/claude")
+    monkeypatch.setattr(rl, "login_supported", lambda claude, **k: supported)
+    monkeypatch.setattr(tui_fleet, "_run_login", run)
+    suspended: list[bool] = []
+
+    @contextlib.contextmanager
+    def suspend():
+        suspended.append(True)
+        yield
+
+    app.suspend = suspend
+    return suspended
+
+
+async def _press_r_on(pilot, number: str) -> None:
+    await _open(pilot)
+    await _to_row(pilot, number)
+    await pilot.press("r")
+    for _ in range(4):
+        await _open(pilot)
+        await pilot.app.workers.wait_for_complete()
+
+
+@pytest.mark.asyncio
+class TestLaunchedRelogin:
+    async def test_r_runs_claude_login_for_the_slot_and_stores_it(self, tmp_path, monkeypatch):
+        from claude_swap.tui.fleet import FleetScreen
+
+        _settings(tmp_path)
+        fake = StoringSwitcher(_accounts(), tmp_path)
+        app = make_app(fake)
+        seen: list = []
+        async with app.run_test(size=(140, 40)) as pilot:
+            suspended = _launchable(
+                monkeypatch, app, _fake_claude_login("user4@example.com", seen=seen)
+            )
+            toasts = _toasts(app)
+            await _press_r_on(pilot, "4")
+            assert suspended == [True]
+            assert isinstance(app.screen, FleetScreen)  # no guide modal
+            assert fake.stored == [("4", "user4@example.com", "rt-new")]
+            assert ("#4 login stored (user4@example.com)", "information") in toasts
+            assert not app.busy
+        argv, profile = seen[0]
+        assert argv[1:] == ["auth", "login", "--claudeai", "--email", "user4@example.com"]
+        assert not profile.exists() and not list(tmp_path.glob("relogin-*"))
+        assert not any(c[0] == "switch_to" for c in fake.calls)  # nothing switched
+        state = tmp_path / "autoswitch_state.json"
+        assert not state.exists() or "pausedUntil" not in json.loads(state.read_text())
+
+    async def test_wrong_account_stores_nothing_and_says_who(self, tmp_path, monkeypatch):
+        _settings(tmp_path)
+        fake = StoringSwitcher(_accounts(), tmp_path)
+        app = make_app(fake)
+        async with app.run_test(size=(140, 40)) as pilot:
+            _launchable(monkeypatch, app, _fake_claude_login("user2@example.com"))
+            toasts = _toasts(app)
+            await _press_r_on(pilot, "4")
+            assert fake.stored == []
+            [(message, severity)] = [t for t in toasts if "not #4's account" in t[0]]
+            assert severity == "error"
+            assert "user2@example.com" in message and "user4@example.com" in message
+        assert not list(tmp_path.glob("relogin-*"))
+
+    async def test_a_cancelled_login_stores_nothing(self, tmp_path, monkeypatch):
+        _settings(tmp_path)
+        fake = StoringSwitcher(_accounts(), tmp_path)
+        app = make_app(fake)
+        async with app.run_test(size=(140, 40)) as pilot:
+            _launchable(monkeypatch, app, _fake_claude_login("user4@example.com", code=None))
+            toasts = _toasts(app)
+            await _press_r_on(pilot, "4")
+            assert fake.stored == []
+            assert any("cancelled" in t[0] for t in toasts)
+            assert not app.busy
+        assert not list(tmp_path.glob("relogin-*"))
+
+    async def test_claude_without_auth_login_falls_back_to_the_guide(self, tmp_path, monkeypatch):
+        from claude_swap.tui.fleet_modals import ReloginModal
+
+        _settings(tmp_path)
+        fake = StoringSwitcher(_accounts(), tmp_path)
+        app = make_app(fake)
+        async with app.run_test(size=(140, 40)) as pilot:
+            suspended = _launchable(
+                monkeypatch, app, _fake_claude_login("user4@example.com"), supported=False
+            )
+            await _press_r_on(pilot, "4")
+            assert isinstance(app.screen, ReloginModal)
+            assert suspended == [] and fake.stored == []
+            await pilot.press("escape")
+            await _open(pilot)
+
+    async def test_a_terminal_that_cannot_suspend_falls_back_to_the_guide(
+        self, tmp_path, monkeypatch
+    ):
+        from claude_swap.maximize import relogin as rl
+        from claude_swap.tui import fleet as tui_fleet
+        from claude_swap.tui.fleet_modals import ReloginModal
+
+        _settings(tmp_path)
+        fake = StoringSwitcher(_accounts(), tmp_path)
+        app = make_app(fake)
+        ran: list = []
+        monkeypatch.setattr(tui_fleet, "_resolve_claude", lambda app: "/opt/fake/claude")
+        monkeypatch.setattr(rl, "login_supported", lambda claude, **k: True)
+        monkeypatch.setattr(tui_fleet, "_run_login", lambda *a: ran.append(a) or 0)
+        async with app.run_test(size=(140, 40)) as pilot:  # headless: no suspend
+            await _press_r_on(pilot, "4")
+            assert isinstance(app.screen, ReloginModal)
+            assert ran == [] and fake.stored == []
+            await pilot.press("escape")
+            await _open(pilot)
+        assert not list(tmp_path.glob("relogin-*"))

@@ -248,12 +248,12 @@ def deadline_text(epoch_s: float, now_s: float | None = None) -> str:
 
 
 #: How to re-login an account, the same words on every surface.
-RELOGIN_STEPS = "Fleet → select → r, or claude → /login → cc-swap add"
+RELOGIN_STEPS = "cc-swap login <N>, or Fleet → select → r"
 
 
 def relogin_fix(number: str | int) -> str:
     """The one re-login instruction every surface prints for slot ``number``."""
-    return f"re-login #{number}: {RELOGIN_STEPS}"
+    return f"re-login #{number}: cc-swap login {number}, or Fleet → select → r"
 
 
 def is_oauth_token_expired(expires_at: object) -> bool:

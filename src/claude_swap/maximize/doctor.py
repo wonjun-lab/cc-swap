@@ -1244,7 +1244,7 @@ def check_slots(ctx: Context) -> list[Finding]:
         if not creds:
             out.append(Finding(
                 "stored-login", "error", "no stored login",
-                f"log in as this account (claude → /login) and run cc-swap add --slot {slot.number}",
+                f"cc-swap login {slot.number} (or Fleet → select → r)",
                 scope,
             ))
             continue

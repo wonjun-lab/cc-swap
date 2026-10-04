@@ -448,6 +448,15 @@ def _scrubbed(name: str) -> bool:
     )
 
 
+def isolated_env(base_env: Mapping[str, str], config_dir: Path) -> dict[str, str]:
+    """``base_env`` minus every auth/endpoint override, plus exactly
+    ``CLAUDE_CONFIG_DIR``: a claude child confined to ``config_dir``'s
+    profile. ``cc-swap login`` runs ``claude auth login`` in one."""
+    env = {key: value for key, value in base_env.items() if not _scrubbed(key)}
+    env["CLAUDE_CONFIG_DIR"] = str(config_dir)
+    return env
+
+
 def build_prime_env(
     base_env: Mapping[str, str], config_dir: Path, access_token: str
 ) -> dict[str, str]:

@@ -2238,6 +2238,70 @@ class ClaudeAccountSwitcher:
             )
             return "error"
 
+    def store_relogin(
+        self, account_num: str, credentials: str, oauth_account: dict
+    ) -> None:
+        """Store a fresh login for slot ``account_num`` that was made OUTSIDE
+        the live store: ``cc-swap login`` runs ``claude auth login`` in a
+        throwaway profile, so the live login is never touched here.
+
+        ``oauth_account`` is that profile's ``oauthAccount``. It must be the
+        slot's account — (email, org) and, when both sides carry one, the
+        account uuid — re-checked here under the lock, so a remove / move /
+        re-add landing since the caller's check cannot receive another
+        account's login. Writes the slot's credential and config backup the
+        way ``add``'s in-place refresh does (the config keeps the slot's
+        stored file with only ``oauthAccount`` replaced; switching splices
+        nothing else) and lifts the slot's dead-token strike. A quarantine is
+        keyed by the old refresh token's fingerprint, so it no longer matches.
+
+        ``ConfigError`` for an identity that is not the slot's,
+        ``AccountNotFoundError`` for a missing slot, ``CredentialReadError``
+        for anything but a full OAuth token pair.
+        """
+        num = str(account_num)
+        email = str(oauth_account.get("emailAddress") or "").strip()
+        org = str(oauth_account.get("organizationUuid") or "")
+        uuid = str(oauth_account.get("accountUuid") or "").strip()
+        pair = None if looks_like_api_key(credentials) else oauth.extract_oauth_data(credentials)
+        if not (pair and pair.get("accessToken") and pair.get("refreshToken")):
+            raise CredentialReadError("the new login carries no OAuth token pair")
+        self._setup_directories()
+        with FileLock(self.lock_file):
+            data = self._get_sequence_data() or {}
+            record = data.get("accounts", {}).get(num)
+            if not isinstance(record, dict):
+                raise AccountNotFoundError(f"Account-{num} does not exist")
+            rec_email = str(record.get("email") or "")
+            rec_org = str(record.get("organizationUuid") or "")
+            rec_uuid = str(record.get("uuid") or "").strip()
+            if (
+                email.lower() != rec_email.strip().lower()
+                or org != rec_org
+                or (rec_uuid and uuid and uuid != rec_uuid)
+            ):
+                raise ConfigError(
+                    f"the new login is {email or 'unknown'}, not Account-{num}'s "
+                    f"account; nothing stored"
+                )
+            try:
+                config = json.loads(self._read_account_config(num, rec_email) or "{}")
+            except ValueError:
+                config = {}
+            if not isinstance(config, dict):
+                config = {}
+            config["oauthAccount"] = dict(oauth_account)
+            self._write_account_credentials(num, rec_email, credentials)
+            self._write_account_config(num, rec_email, json.dumps(config, indent=2))
+            if not rec_uuid and uuid:
+                record["uuid"] = uuid
+                data["lastUpdated"] = get_timestamp()
+                self._write_json(self.sequence_file, data)
+        self._usage_store.clear_dead_token([num], {num: (rec_email, rec_org)})
+        self._logger.info(
+            "stored a new login for #%s (rt %s)", num, oauth.fingerprint8(credentials)
+        )
+
     def backfill_account_uuid(
         self,
         account_num: str,

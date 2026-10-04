@@ -56,6 +56,7 @@ FLEET_ROUTES: dict[str, str] = {
     "auto status": "m m",
     "hold": "h",  # home key: hold the active account (1h/2h/4h/until/off)
     "alias": "n",  # row key: name the selected account (also m → a → n)
+    "login": "r",  # row key: re-login the selected account (launches claude's login)
 }
 
 #: CLI action -> why Fleet deliberately has no twin.

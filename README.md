@@ -278,9 +278,9 @@ A soft threshold can't be set above its hard one. In Fleet, `m` → `s` (Swap st
 
 Every Claude Code login has a fixed deadline, about 27 to 30 days after you logged in. Using the account does not extend it. Once it passes, the account stops working until you log in again. cc-swap warns you from 7 days out: Fleet tags the account `login 3d left`, `cc-swap list` shows `login expires …`, and you get a notification in the last 24 hours.
 
-To renew early, in Fleet select the account and press `r`, then follow the steps shown: in another terminal run `claude`, type `/login`, sign in as that account, quit `claude`, and press `enter` in Fleet. cc-swap stores the new login and switches you back to the account you were on.
+To renew (early, or once it has expired), run `cc-swap login 4`, or in Fleet select the account and press `r`. cc-swap launches Claude Code's own login for that account's email (`claude auth login`) in a throwaway profile; you only sign in in the browser (over SSH, open the printed URL on any device and paste the code back). It stores the new login into the slot only if it is that account, and leaves the login you are using alone, unless the account you renewed is the one you are on: then that gets the new login too. Ctrl-C cancels and stores nothing.
 
-Without Fleet: run `claude`, `/login` as that account, then `cc-swap add`. cc-swap recognises the account and updates its slot instead of adding a duplicate.
+When claude can't be launched (not found, or too old for `claude auth login`), cc-swap shows the manual steps instead: run `claude`, `/login` as that account, then `cc-swap add`. cc-swap recognises the account and updates its slot instead of adding a duplicate.
 
 ### Use several machines
 
@@ -358,7 +358,7 @@ cc-swap why      # the engine's last decision and its reason code, explained
 
 **"Keychain unreadable; holding" or `rc=36` (macOS).** The login Keychain is locked, the session can't reach it (for example over SSH), or a `/login` is still being written. cc-swap stops switching rather than overwrite a login it can't see, and resumes by itself once the Keychain answers. Unlock the login keychain. If it lasts more than 15 minutes you get a notification and the service restarts itself.
 
-**`re-login needed — login expired` or `invalid_grant`.** The login passed its fixed deadline, or its refresh token was revoked. Log in again: Fleet → select the account → `r`, or `claude` → `/login` → `cc-swap add`.
+**`re-login needed — login expired` or `invalid_grant`.** The login passed its fixed deadline, or its refresh token was revoked. Log in again: `cc-swap login N`, or Fleet → select the account → `r`.
 
 **`unmanaged login, run cc-swap add`.** You are logged in to Claude Code as an account cc-swap doesn't have, or as a different account than the slot expects. Check which account you are logged in as, then run `cc-swap add`.
 

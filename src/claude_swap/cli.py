@@ -86,6 +86,7 @@ _FORK_COMMANDS: dict[str, str] = {
     "history": "_history_command",
     "hold": "_hold_command",
     "notify": "_notify_command",
+    "login": "_login_command",
 }
 
 
@@ -1466,6 +1467,87 @@ menu bar only display. Re-run `cc-swap service install` after upgrading.
     sys.exit(0)
 
 
+def _login_command(argv: list[str]) -> None:
+    """Handle `cc-swap login NUM|EMAIL|ALIAS`.
+
+    Runs ``claude auth login --email <the account's email>`` in a throwaway
+    profile, checks the new login is that account, and stores it into its
+    slot (maximize/relogin.py). The live login is untouched unless the
+    account IS the live one; then it gets the new login too. Without a
+    usable claude it prints the manual steps instead (exit 1).
+    """
+    parser = argparse.ArgumentParser(
+        prog="cc-swap login",
+        description=(
+            "Re-login an account: launches Claude Code's own login for it "
+            "(sign in in the browser; over SSH paste the code), checks the new "
+            "login is that account and stores it into its slot."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  cc-swap login 4
+  cc-swap login team@example.com
+
+Logins expire about a month after they were made; a fresh login starts a
+new deadline. Other machines keep their own logins: run this there too.
+        """,
+    )
+    parser.add_argument("account", metavar="NUM|EMAIL|ALIAS")
+    parser.add_argument(
+        "--claude-path", metavar="PATH", default=None,
+        help="claude executable (default: prime.claudePath, else ~/.local/bin/claude)",
+    )
+    parser.add_argument("--debug", action="store_true", help="Enable debug logging")
+    args = parser.parse_args(argv)
+
+    from claude_swap.maximize import relogin as rl
+    from claude_swap.maximize.primer import resolve_claude_path
+    from claude_swap.settings import load_prime_settings
+
+    try:
+        switcher = ClaudeAccountSwitcher(debug=args.debug)
+        _guard_root(switcher)
+        num, email, _ = switcher.resolve_account(args.account)
+        rl.target_for(switcher, num)  # an API-key slot has no login to renew
+        configured = args.claude_path
+        if configured is None:
+            try:
+                configured = load_prime_settings(switcher.backup_dir).claude_path
+            except Exception:
+                configured = None
+        claude = resolve_claude_path(configured)
+        if claude is None or not rl.login_supported(claude):
+            why = (
+                f"{claude} has no `auth login --email` (update Claude Code)"
+                if claude else "claude was not found (pass --claude-path)"
+            )
+            warning(f"Cannot launch the login here: {why}.")
+            for line in rl.guided_steps(num, email, claude):
+                print(line)
+            sys.exit(1)
+        outcome = rl.relogin(switcher, num, claude=claude)
+    except ClaudeSwitchError as e:
+        error(f"Error: {e}")
+        sys.exit(1)
+    except KeyboardInterrupt:
+        print(f"\n{dimmed('Operation cancelled')}")
+        sys.exit(130)
+    if outcome.ok:
+        print(f"{accent('Stored')} {outcome.message}")
+        sys.exit(0)
+    if outcome.status == rl.UNAVAILABLE:
+        warning(f"Cannot launch the login here: {outcome.message}.")
+        for line in rl.guided_steps(num, email, claude):
+            print(line)
+        sys.exit(1)
+    if outcome.status == rl.CANCELLED:
+        print(dimmed(outcome.message))
+        sys.exit(130)
+    error(f"Re-login #{num}: {outcome.message}")
+    sys.exit(1)
+
+
 def main() -> None:
     """Main entry point for the CLI."""
     force_utf8_output()
@@ -1579,6 +1661,7 @@ cc-swap:
   %(prog)s last-resort list           list last-resort accounts
   %(prog)s prime [N ...] [--dry-run]  open idle accounts' 5h windows now
   %(prog)s prime verify [--live]      re-check priming isolation after a claude update
+  %(prog)s login <num|email>          re-login an account (launches claude's login)
   %(prog)s service install            run auto-switch as a background service
   %(prog)s doctor [--json]            check logins, Keychain, service; say what to fix
   %(prog)s init [--apply]             onboarding/migration checklist (ok/FIX/TODO)

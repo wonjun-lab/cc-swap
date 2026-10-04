@@ -177,7 +177,7 @@ def relogin_note(slot: str, cause: str, names: Mapping[str, str]) -> Note:
     return Note(
         "relogin", f"relogin:{slot}",
         f"cc-swap: {label(slot, names)} needs a re-login",
-        f"{cause} — Fleet: select it, press r (or claude → /login → cc-swap add)",
+        f"{cause} — cc-swap login {slot}, or Fleet: select it, press r",
     )
 
 
