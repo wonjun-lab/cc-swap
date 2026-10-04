@@ -766,6 +766,10 @@ class Primer:
         # builds the zero-cost verify's VerifyDeps (prime_verify.default_deps).
         self._gate_verdict = None
         self._verify_deps = verify_deps
+        # `(version, not before)`: set before each automatic verify runs, so
+        # one whose outcome could not be recorded (a write error) still
+        # waits AUTO_RETRY_S instead of probing on every tick.
+        self._auto_backoff: tuple[str, float] | None = None
 
     @property
     def profile_dir(self) -> Path:
@@ -985,6 +989,9 @@ class Primer:
         root = self.engine.switcher.backup_dir
         try:
             now = self._clock()
+            backoff = self._auto_backoff
+            if backoff is not None and backoff[0] == verdict.current and now < backoff[1]:
+                return []
             if pv.auto_verify_due(root, verdict, now) is None or pv.update_in_progress(root):
                 return []
             lock = pv.verify_lock(root)
@@ -998,6 +1005,7 @@ class Primer:
                 if version is None or pv.update_in_progress(root):
                     return []
                 _logger.info("prime: claude %s changed; verifying priming isolation", version)
+                self._auto_backoff = (version, now + pv.AUTO_RETRY_S)
                 deps = (self._verify_deps or pv.default_deps)()
                 try:
                     report = pv.run_verify(

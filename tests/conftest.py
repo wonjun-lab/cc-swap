@@ -741,13 +741,19 @@ def _no_real_prime_verify(monkeypatch):
     """The engine's automatic ``prime verify`` (``prime.autoVerify``) runs
     ``claude`` and reads Keychain item attributes through
     ``prime_verify.default_deps``; no test reaches the real ones. Tests that
-    exercise it inject a fake ``VerifyDeps`` (the engine skips the verify
-    when building its deps raises)."""
+    exercise it inject a fake ``VerifyDeps``. The engine swallows the error
+    raised here (it never lets a verify break a tick), so a test that forgot
+    to inject one fails at teardown instead."""
+    reached: list[int] = []
 
     def refuse():
+        reached.append(1)
         raise AssertionError("a test reached prime_verify.default_deps; inject VerifyDeps")
 
     monkeypatch.setattr("claude_swap.maximize.prime_verify.default_deps", refuse)
+    yield
+    if reached:
+        pytest.fail("a test reached prime_verify.default_deps; inject VerifyDeps")
 
 
 # No test ever pops a real desktop notification (``osascript`` /

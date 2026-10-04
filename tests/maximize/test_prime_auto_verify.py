@@ -261,9 +261,7 @@ class TestTransientClassification:
         TIMEOUT,
         NETWORK_DOWN,
         PrimeRunResult(None, False, "OSError: busy", "", None),  # could not start
-        PrimeRunResult(1, False, "", '{"is_error":true,"api_error_status":429,"result":"x"}',
-                       True, 429, "x"),
-    ], ids=["timeout", "network", "spawn", "429"])
+    ], ids=["timeout", "network", "spawn"])
     def test_transient(self, tmp_path, result):
         system = FakeSystem(tmp_path)
         system.result = result
@@ -279,13 +277,20 @@ class TestTransientClassification:
         report = pv.run_verify(root, "/opt/claude", deps=deps, record=False)
         assert report.transient
 
-    @pytest.mark.parametrize("what", ["accepted", "keychain", "credentials", "login"])
+    @pytest.mark.parametrize("what", ["accepted", "429", "keychain", "credentials", "login"])
     def test_isolation_failures_are_not(self, tmp_path, what):
         from claude_swap.session import keychain_service_name
 
         system = FakeSystem(tmp_path)
         if what == "accepted":
             system.result = PrimeRunResult(0, False, "", '{"is_error":false}', False)
+        elif what == "429":
+            # An invalid token is refused (401) before any rate limit: a 429
+            # means claude authenticated with some other credential.
+            system.result = PrimeRunResult(
+                1, False, "", '{"is_error":true,"api_error_status":429,"result":"x"}',
+                True, 429, "x",
+            )
         elif what == "keychain":
             system.during_run = lambda env, cwd: system.items.__setitem__(
                 keychain_service_name(cwd), "attrs")
@@ -416,3 +421,205 @@ def test_manual_verify_refuses_while_another_verify_runs(temp_home, tmp_path, mo
         assert system.calls == []
     finally:
         lock.release()
+
+
+# -- review fixes ----------------------------------------------------------------------------
+
+
+class Unreadable:
+    """``keychain_attrs`` for a locked keychain: reads of ``services`` (all
+    when None) fail from the ``after``-th call on."""
+
+    def __init__(self, system: FakeSystem, *, after: int = 0, services=None):
+        self.system, self.after, self.services, self.calls = system, after, services, 0
+
+    def __call__(self, service: str):
+        self.calls += 1
+        if self.calls > self.after and (self.services is None or service in self.services):
+            raise pv.KeychainUnreadable("security exited 36")
+        return self.system.items.get(service)
+
+
+def _deps_with(system: FakeSystem, attrs):
+    def deps():
+        d = system.deps()
+        d.keychain_attrs = attrs
+        return d
+
+    return deps
+
+
+class TestUnreadableKeychain:
+    @pytest.mark.parametrize("after", [0, 1], ids=["before-and-after", "after-only"])
+    def test_an_unreadable_active_item_never_passes(self, tmp_path, after):
+        system = FakeSystem(tmp_path)
+        root = tmp_path / "root"
+        root.mkdir()
+        attrs = Unreadable(system, after=after, services={"Claude Code-credentials"})
+        report = pv.run_verify(root, "/opt/claude", deps=_deps_with(system, attrs)(), record=False)
+        [check] = [c for c in report.checks if c.name == "active login unchanged"]
+        assert not check.ok and check.transient and "could not read" in check.detail
+        assert not report.ok and report.transient
+
+    def test_an_unreadable_probe_item_never_passes(self, tmp_path):
+        from claude_swap.session import keychain_service_name
+
+        system = FakeSystem(tmp_path)
+        root = tmp_path / "root"
+        root.mkdir()
+        probe: list[str] = []
+
+        def attrs(service):
+            if probe and service == probe[0]:
+                raise pv.KeychainUnreadable("security timed out after 5s")
+            return system.items.get(service)
+
+        system.during_run = lambda env, cwd: probe.append(keychain_service_name(cwd))
+        report = pv.run_verify(root, "/opt/claude", deps=_deps_with(system, attrs)(), record=False)
+        [check] = [c for c in report.checks if c.name == "no Keychain item left behind"]
+        assert not check.ok and check.transient
+        assert report.transient
+        assert probe[0] in system.deleted  # still cleaned up
+
+    def test_manual_verify_fails_and_records_it(self, tmp_path):
+        system = FakeSystem(tmp_path)
+        root = tmp_path / "root"
+        root.mkdir()
+        report = pv.run_verify(
+            root, "/opt/claude", deps=_deps_with(system, Unreadable(system))(), now=1.0,
+        )
+        assert not report.ok and not report.recorded
+        assert pv.failed_verify(root) is not None
+
+    def test_the_engine_retries_it_later(self, rig, system, monkeypatch):
+        _changed(rig, monkeypatch)
+        primer = rig.primer(runner=StubRunner(rig))
+        primer._verify_deps = _deps_with(system, Unreadable(system))
+        assert _outcomes(primer.run_due(rig.snap())) == ["auto-verify-retry"]
+        assert pv.verified_version(_root(rig)) == "2.1.3"  # never a pass
+        assert pv.failed_verify(_root(rig)) is None
+
+    @pytest.mark.parametrize(("rc", "expected"), [(0, "attrs"), (44, None)])
+    def test_security_exit_codes(self, monkeypatch, rc, expected):
+        import subprocess
+
+        monkeypatch.setattr(
+            subprocess, "run",
+            lambda *a, **k: subprocess.CompletedProcess(a[0], rc, stdout="attrs", stderr=""),
+        )
+        assert pv.keychain_attributes("svc") == expected
+
+    @pytest.mark.parametrize("rc", [36, 51, 1])
+    def test_other_security_exits_are_unreadable(self, monkeypatch, rc):
+        import subprocess
+
+        monkeypatch.setattr(
+            subprocess, "run",
+            lambda *a, **k: subprocess.CompletedProcess(a[0], rc, stdout="", stderr="locked"),
+        )
+        with pytest.raises(pv.KeychainUnreadable, match=str(rc)):
+            pv.keychain_attributes("svc")
+
+    def test_a_security_timeout_is_unreadable(self, monkeypatch):
+        import subprocess
+
+        def slow(*a, **k):
+            raise subprocess.TimeoutExpired(a[0], k.get("timeout"))
+
+        monkeypatch.setattr(subprocess, "run", slow)
+        with pytest.raises(pv.KeychainUnreadable):
+            pv.keychain_attributes("svc")
+
+
+class TestFailedHistory:
+    def test_a_rollback_to_a_failed_version_waits_for_a_manual_verify(
+        self, rig, system, monkeypatch
+    ):
+        root = _root(rig)
+        _changed(rig, monkeypatch)
+        pv.record_failed(root, "2.1.4", ["no Keychain item left behind"], now=1.0)
+        pv.record_verified(root, "2.1.5", by=pv.VERIFIED_BY_CLI)  # a later build passed
+        assert pv.failed_verify(root) is None
+        assert pv.failed_versions(root) == ["2.1.4"]
+        # Rolled back to 2.1.4: the gate closes, but the engine does not verify it.
+        primer = _primer(rig, system)
+        events = primer.run_due(rig.snap())
+        assert [type(e) for e in events] == [ConfigWarningEvent]
+        assert system.calls == []
+        assert pv.paused_note(root, auto_verify=True) == (
+            "paused: claude 2.1.5 -> 2.1.4 (cc-swap prime verify)"
+        )
+        # A manual verify of 2.1.4 clears it from the history.
+        pv.record_verified(root, "2.1.4", by=pv.VERIFIED_BY_CLI)
+        assert pv.failed_versions(root) == []
+
+    def test_the_history_is_bounded(self, tmp_path):
+        for i in range(pv.FAILED_HISTORY_MAX + 5):
+            pv.record_failed(tmp_path, f"2.1.{i}", ["x"], now=1.0)
+        history = pv.failed_versions(tmp_path)
+        assert len(history) == pv.FAILED_HISTORY_MAX
+        assert history[-1] == f"2.1.{pv.FAILED_HISTORY_MAX + 4}"
+
+
+class TestBackoffWithoutAWritableRecord:
+    def test_a_verify_whose_outcome_cannot_be_written_still_backs_off(
+        self, rig, system, monkeypatch
+    ):
+        _changed(rig, monkeypatch)
+        system.result = TIMEOUT
+        primer = _primer(rig, system)
+
+        def readonly(*_a, **_k):
+            raise OSError("read-only file system")
+
+        monkeypatch.setattr(pv, "note_auto_retry", readonly)
+        monkeypatch.setattr(pv, "record_failed", readonly)
+        monkeypatch.setattr(pv, "record_verified", readonly)
+        primer.run_due(rig.snap())
+        assert len(system.calls) == 1
+        rig.clock.advance(60)
+        primer.run_due(rig.snap())
+        assert len(system.calls) == 1  # not every tick
+        rig.clock.advance(pv.AUTO_RETRY_S)
+        primer.run_due(rig.snap())
+        assert len(system.calls) == 2
+
+
+def test_the_lock_wait_covers_a_whole_verify():
+    worst = (
+        2 * pv.VERSION_TIMEOUT_S + pv.PROBE_TIMEOUT_S + 5.0
+        + 8 * pv.KEYCHAIN_TIMEOUT_S
+    )
+    assert pv.VERIFY_LOCK_WAIT_S > worst
+
+
+def test_note_seen_keys_the_version_by_the_identity_read_before_it(tmp_path):
+    from pathlib import Path
+
+    claude = _claude(tmp_path)
+    old_key = pv.identity(claude)
+    Path(claude).write_text("#!/bin/sh\n# replaced by a self-update\n")  # after the read
+    pv.note_seen(tmp_path, claude, "2.1.3", key=old_key)
+    reader_calls = []
+    assert pv.current_version(
+        tmp_path, claude, reader=lambda _p: reader_calls.append(1) or "2.1.4"
+    ) == "2.1.4"
+    assert reader_calls == [1]  # the new binary missed the cache
+
+
+def test_run_verify_reads_the_identity_before_the_version(tmp_path):
+    from pathlib import Path
+
+    system = FakeSystem(tmp_path)
+    claude = _claude(tmp_path)
+    root = tmp_path / "root"
+    root.mkdir()
+    deps = system.deps()
+
+    def version_then_update(_p):
+        Path(claude).write_text("#!/bin/sh\n# 2.1.5, a longer file\n")  # updated right after
+        return "2.1.4"
+
+    deps.version = version_then_update
+    pv.run_verify(root, claude, deps=deps, record=False)
+    assert pv.current_version(root, claude, reader=lambda _p: "2.1.5") == "2.1.5"

@@ -260,7 +260,7 @@ class TestPrimerGate:
     def test_verify_lifts_the_pause_without_a_restart(self, rig, monkeypatch):
         self._changed(rig, monkeypatch)
         runner = StubRunner(rig)
-        primer = rig.primer(runner=runner)
+        primer = rig.primer(runner=runner, auto_verify=False)
         primer.run_due(rig.snap())
         pv.record_verified(rig.switcher.backup_dir, "2.1.4", by=pv.VERIFIED_BY_CLI)
         primer.run_due(rig.snap())
