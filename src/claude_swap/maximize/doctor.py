@@ -696,13 +696,14 @@ def check_codesign_kills(ctx: Context) -> list[Finding]:
         else:
             before = "no cc-swap claude launch recorded before it"
         n = e["count"]
+        launched = f"; launched by {', '.join(e['parents'])}" if e.get("parents") else ""
         out.append(Finding(
             "codesign-kills", "warn",
             f"macOS killed claude {e['version']} {n} time{'s' if n != 1 else ''} at launch "
             f"(SIGKILL, Code Signature Invalid; ~/Library/Logs/DiagnosticReports): first "
-            f"{_when(e['first'])}, last {_when(e['last'])}; {before}",
+            f"{_when(e['first'])}, last {_when(e['last'])}{launched}; {before}",
             f"if claude {e['version']} still dies at launch: "
-            f"{claude_exec.fix_command(_tilde(e['procPath'], p.home))}",
+            f"{claude_exec.fix_command(_tilde(e['path'], p.home))}",
         ))
     return out
 

@@ -9,7 +9,7 @@ import json
 import os
 import sys
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -113,8 +113,14 @@ def test_another_files_refusal_is_recorded_but_marks_nothing(home, root, sent):
     link, _ = _install(home, "2.1.290")
     w = cw.Watcher(root, lambda: str(link), home=home)
     w.handle_line(json.dumps(KERNEL) + "\n")  # names 2.1.289
-    w.handle_line(json.dumps({**KERNEL, "eventMessage": "AMFI: code signature validated"}) + "\n")
-    assert len(_events(root)) == 2
+    # another app's AMFI chatter is not kept at all; a line naming claude is
+    amfid = {**KERNEL, "processImagePath": "/usr/libexec/amfid", "processID": 312}
+    w.handle_line(json.dumps({**amfid, "eventMessage": "Some.app: code signature validated"}) + "\n")
+    w.handle_line(json.dumps({
+        **amfid,
+        "eventMessage": "/Users/x/.local/share/claude/versions/2.1.290: code signature ok",
+    }) + "\n")
+    assert [e["pid"] for e in _events(root)] == [0, 312]
     assert cx.any_killed(root) is None and sent == []
 
 
@@ -299,3 +305,100 @@ def test_a_dry_run_engine_watches_nothing(temp_home, monkeypatch):
     harness.engine.dry_run = True
     monkeypatch.setattr(cw, "_is_macos", lambda: True)
     assert cw.for_engine(harness.engine) is None
+
+
+# -- the real report shape (macOS anonymizes procPath) ---------------------------------------
+
+
+def _real_shape(home: Path, name: str, version: str, stamp: str, *,
+                parent: str = "T3 Code (Alpha)") -> Path:
+    """An .ips built from the incident's reports (no personal data): procPath
+    anonymized to /Users/USER/*/<file>, procName the file, a CODESIGNING
+    termination, slashes escaped as the real files have them."""
+    directory = cw.reports_dir(home)
+    directory.mkdir(parents=True, exist_ok=True)
+    header = {
+        "app_name": version, "timestamp": f"{stamp}.00 +0900", "app_version": "",
+        "bug_type": "309", "os_version": "macOS 26.6.2 (25G83)", "name": version,
+    }
+    body = {
+        "uptime": 470000, "procRole": "Unspecified", "version": 2, "userID": 501,
+        "captureTime": f"{stamp}.8550 +0900", "pid": 56959,
+        "procLaunch": f"{stamp}.8545 +0900", "procName": version,
+        "procPath": f"/Users/USER/*/{version}",
+        "parentProc": parent, "parentPid": 26737,
+        "responsiblePid": 26691, "responsibleProc": parent,
+        "codeSigningID": "", "codeSigningTeamID": "", "codeSigningFlags": 16777728,
+        "exception": {
+            "codes": "0x0, 0x0", "type": "EXC_CRASH",
+            "signal": "SIGKILL (Code Signature Invalid)",
+        },
+        "termination": {
+            "flags": 0, "code": 2, "namespace": "CODESIGNING",
+            "indicator": "Taskgated Invalid Signature",
+        },
+    }
+    path = directory / name
+    escaped = json.dumps(body, indent=2).replace("/", "\\/")
+    path.write_text(json.dumps(header) + "\n" + escaped)
+    return path
+
+
+def _local_stamp(epoch: float) -> str:
+    """``YYYY-MM-DD HH:MM:SS`` in +0900, the reports' zone."""
+    return datetime.fromtimestamp(epoch, tz=timezone(timedelta(hours=9))).strftime(
+        "%Y-%m-%d %H:%M:%S"
+    )
+
+
+def test_the_anonymized_real_shape_is_recognised(home):
+    _install(home, "2.1.288")
+    _install(home, "2.1.289")
+    _real_shape(home, "2.1.288-2026-10-04-012924.ips", "2.1.288", "2026-10-04 01:29:24")
+    _real_shape(home, "2.1.288-2026-10-04-015501.ips", "2.1.288", "2026-10-04 01:55:01")
+    _real_shape(home, "2.1.289-2026-10-04-205246.ips", "2.1.289", "2026-10-04 20:52:46")
+    # anonymized and no longer installed: indistinguishable from another file
+    _real_shape(home, "2.1.100-2026-10-04-100000.ips", "2.1.100", "2026-10-04 10:00:00")
+    _real_shape(home, "tool-2026-10-04-100000.ips", "tool", "2026-10-04 10:00:00")
+    now = datetime(2026, 10, 4, 21, 0, tzinfo=timezone(timedelta(hours=9))).timestamp()
+    for p in cw.reports_dir(home).iterdir():
+        os.utime(p, (now - 3600, now - 3600))
+    kills = cw.scan_crash_reports(home, now)
+    assert [k.file for k in kills] == [
+        "2.1.288-2026-10-04-012924.ips", "2.1.288-2026-10-04-015501.ips",
+        "2.1.289-2026-10-04-205246.ips",
+    ]
+    k = kills[0]
+    assert k.proc_path == "/Users/USER/*/2.1.288" and k.version == "2.1.288"
+    assert k.path == str(home / ".local" / "share" / "claude" / "versions" / "2.1.288")
+    assert (k.parent, k.responsible, k.pid) == ("T3 Code (Alpha)", "T3 Code (Alpha)", 56959)
+    assert k.at == datetime(2026, 10, 4, 1, 29, 24, tzinfo=timezone(timedelta(hours=9))).timestamp()
+    # the current binary's name counts even when its file is gone
+    named = cw.scan_crash_reports(home, now, names={"2.1.100"})
+    assert [k.version for k in named].count("2.1.100") == 1
+    [e288, e289] = cw.episodes(kills)
+    assert e288["count"] == 2 and e288["parents"] == ["T3 Code (Alpha)"]
+    assert e289["path"].endswith("versions/2.1.289")
+
+
+def test_doctor_names_the_launching_app(home, root):
+    _install(home, "2.1.289")
+    _real_shape(home, "2.1.289-x.ips", "2.1.289", _local_stamp(time.time() - 120))
+    ctx = SimpleNamespace(probes=SimpleNamespace(
+        backup_root=root, home=home, platform="darwin", now=time.time(),
+    ))
+    [f] = dr.check_codesign_kills(ctx)
+    assert "launched by T3 Code (Alpha)" in f.detail
+    assert "/Users/USER" not in f.fix and "versions/2.1.289" in f.fix
+
+
+def test_the_engine_marks_the_current_file_from_an_anonymized_report(home, root, sent):
+    link, _real = _install(home, "2.1.289")
+    later = time.time() + 120
+    _real_shape(home, "2.1.289-y.ips", "2.1.289", _local_stamp(later))
+    w = cw.Watcher(root, lambda: str(link), home=home)
+    w.scan(later + 1)
+    killed = cx.current_killed(root)
+    assert killed is not None and killed["caller"] == "crash report" and len(sent) == 1
+    [event] = _events(root)
+    assert event["parentProc"] == "T3 Code (Alpha)" and event["path"].endswith("2.1.289")

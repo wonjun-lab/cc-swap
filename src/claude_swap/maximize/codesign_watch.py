@@ -10,8 +10,9 @@ cc-swap's launches may be the trigger or a coincidence. This module
 collects the evidence for next time:
 
 * **Live** (:class:`Watcher`, while an engine runs): a ``log stream --style
-  ndjson`` child filtered to code-signature messages; every matching line
-  (time, pid, process, message) goes to ``<backup root>/codesign-events.jsonl``
+  ndjson`` child filtered to code-signature messages; every kernel line and
+  every line naming claude (:func:`relevant`; time, pid, process, message)
+  goes to ``<backup root>/codesign-events.jsonl``
   (rotated like ``claude-exec.jsonl``). A kernel message naming the current
   ``claude`` file marks it killed by the OS (``claude_exec.mark_killed_by_os``:
   priming pauses, one notification per binary) — even when the process it
@@ -19,10 +20,13 @@ collects the evidence for next time:
   restarted with a backoff when it dies; the tick only polls it.
 * **Afterwards** (:func:`scan_crash_reports`, on engine start, hourly, and
   in ``cc-swap doctor``): ``~/Library/Logs/DiagnosticReports/*.ips`` of the
-  last week whose process lives under ``~/.local/share/claude/versions`` and
-  was terminated for an invalid code signature. Doctor groups them per
-  version with the latest ``claude`` cc-swap launched before the first kill
-  (from ``claude-exec.jsonl``), so the correlation is on the screen.
+  last week whose process lives under ``~/.local/share/claude/versions``
+  (macOS anonymizes it to ``/Users/USER/*/<file>``; the file name then has
+  to be one there) and was terminated for an invalid code signature. Doctor
+  groups them per version with the app that launched them
+  (``parentProc``/``responsibleProc``) and the latest ``claude`` cc-swap
+  launched before the first kill (from ``claude-exec.jsonl``), so the
+  correlation is on the screen.
 """
 
 from __future__ import annotations
@@ -36,7 +40,7 @@ import sys
 import threading
 import time
 from collections.abc import Callable, Iterable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -131,6 +135,18 @@ def killed_file(message: str) -> str | None:
     return None
 
 
+def relevant(event: dict[str, Any]) -> bool:
+    """Whether a code-signature line is worth keeping: the kernel's (its
+    refusals name the file), or one that names a file or a path that could
+    be claude. The rest — every app's AMFI chatter, hundreds a day — is
+    dropped."""
+    message = str(event.get("message") or "")
+    if event.get("process") == "kernel" or killed_file(message):
+        return True
+    lowered = message.lower() + " " + str(event.get("processImagePath") or "").lower()
+    return "claude" in lowered or "/.local/share/claude/" in lowered
+
+
 def names_binary(token: str, binary: claude_exec.Binary) -> bool:
     """Whether a message's file names ``binary`` (the kernel gives only the
     file name, ``2.1.289``)."""
@@ -145,10 +161,17 @@ def names_binary(token: str, binary: claude_exec.Binary) -> bool:
 @dataclass(frozen=True)
 class CrashKill:
     file: str
-    proc_path: str
-    version: str
+    proc_path: str        # as the report has it (macOS anonymizes: /Users/USER/*/2.1.289)
+    version: str          # procName, else the path's file name
     pid: int | None
     at: float
+    path: str = ""        # the file it was: the real path, or versions/<version>
+    parent: str | None = None       # parentProc: who started the killed process
+    responsible: str | None = None  # responsibleProc: the app macOS charges it to
+
+
+#: macOS writes a report's ``procPath`` under the home directory anonymized.
+_ANONYMIZED_RE = re.compile(r"/Users/USER/\*/(?P<name>[^/]+)")
 
 
 def reports_dir(home: Path) -> Path:
@@ -201,19 +224,47 @@ def parse_report(path: Path) -> CrashKill | None:
         or mtime
     )
     pid = body.get("pid")
+    name = str(body.get("procName") or "") or os.path.basename(proc_path)
+
+    def text(key: str) -> str | None:
+        value = body.get(key)
+        return value if isinstance(value, str) and value else None
+
     return CrashKill(
-        path.name, proc_path, os.path.basename(proc_path),
+        path.name, proc_path, name,
         pid if isinstance(pid, int) and not isinstance(pid, bool) else None, at,
+        parent=text("parentProc"), responsible=text("responsibleProc"),
     )
 
 
+def _claude_kill(kill: CrashKill, versions: Path, names: set[str]) -> CrashKill | None:
+    """``kill`` with :attr:`CrashKill.path` set when it was a native
+    ``claude``: its ``procPath`` is under ``versions`` — or is the anonymized
+    ``/Users/USER/*/<name>`` and ``<name>`` is a file in ``versions`` (or one
+    of ``names``, the current binary's) — else None."""
+    prefix = str(versions) + os.sep
+    if kill.proc_path.startswith(prefix):
+        return replace(kill, path=kill.proc_path)
+    match = _ANONYMIZED_RE.fullmatch(kill.proc_path)
+    if match is None or match.group("name") != kill.version:
+        return None
+    candidate = versions / kill.version
+    if candidate.is_file() or kill.version in names:
+        return replace(kill, path=str(candidate))
+    return None
+
+
 def scan_crash_reports(
-    home: Path, now: float, *, max_age_s: float = REPORT_MAX_AGE_S
+    home: Path, now: float, *, max_age_s: float = REPORT_MAX_AGE_S,
+    names: Iterable[str] = (),
 ) -> list[CrashKill]:
     """Code-signing kills of a native ``claude`` (a process under
-    ``~/.local/share/claude/versions``) in the last ``max_age_s``, oldest
-    first. Never raises."""
-    prefix = str(Path(home) / VERSIONS_DIR) + os.sep
+    ``~/.local/share/claude/versions``, or macOS's anonymized form of one:
+    :func:`_claude_kill`) in the last ``max_age_s``, oldest first. ``names``:
+    file names that count as claude even when no longer in ``versions``.
+    Never raises."""
+    versions = Path(home) / VERSIONS_DIR
+    known = set(names)
     try:
         files = [
             (p, p.stat().st_mtime) for p in reports_dir(home).glob("*.ips") if p.is_file()
@@ -225,23 +276,35 @@ def scan_crash_reports(
     out = []
     for path, _m in files[:REPORT_MAX_FILES]:
         kill = parse_report(path)
-        if kill is not None and kill.proc_path.startswith(prefix):
+        kill = _claude_kill(kill, versions, known) if kill is not None else None
+        if kill is not None:
             out.append(kill)
     return sorted(out, key=lambda k: k.at)
 
 
 def episodes(kills: Iterable[CrashKill]) -> list[dict[str, Any]]:
-    """Per version: ``{"version", "procPath", "count", "first", "last"}``,
+    """Per version: ``{"version", "path", "count", "first", "last",
+    "parents"}`` (``parents``: the launching apps, most frequent first),
     oldest first."""
     by: dict[str, dict[str, Any]] = {}
+    counts: dict[str, dict[str, int]] = {}
     for k in kills:
         e = by.setdefault(k.version, {
-            "version": k.version, "procPath": k.proc_path, "count": 0,
+            "version": k.version, "path": k.path or k.proc_path, "count": 0,
             "first": k.at, "last": k.at,
         })
         e["count"] += 1
         e["first"] = min(e["first"], k.at)
         e["last"] = max(e["last"], k.at)
+        who = k.parent or k.responsible
+        if k.responsible and k.parent and k.responsible != k.parent:
+            who = f"{k.parent} (responsible: {k.responsible})"
+        if who:
+            c = counts.setdefault(k.version, {})
+            c[who] = c.get(who, 0) + 1
+    for version, e in by.items():
+        c = counts.get(version, {})
+        e["parents"] = sorted(c, key=lambda w: (-c[w], w))
     return sorted(by.values(), key=lambda e: e["first"])
 
 
@@ -353,7 +416,7 @@ class Watcher:
 
     def handle_line(self, line: str) -> None:
         event = parse_event(line)
-        if event is None:
+        if event is None or not relevant(event):
             return
         claude_exec.append_jsonl(self.root, EVENTS_FILENAME, event)
         token = killed_file(event["message"])
@@ -369,13 +432,17 @@ class Watcher:
     def scan(self, now: float) -> list[CrashKill]:
         """New crash reports into ``codesign-events.jsonl``; the latest kill
         of the current ``claude`` file marks it."""
-        kills = scan_crash_reports(self.home, now)
+        claude = self._claude()
+        binary = claude_exec.stat_binary(claude) if claude else None
+        names = {os.path.basename(binary.real)} if binary and binary.real else set()
+        kills = scan_crash_reports(self.home, now, names=names)
         new = [k for k in kills if k.file not in self._seen]
         self._seen.update(k.file for k in kills)
         for k in new:
             claude_exec.append_jsonl(self.root, EVENTS_FILENAME, {
                 "kind": "crash-report", "at": k.at, "ts": claude_exec._iso(k.at),
                 "pid": k.pid, "process": k.version, "processImagePath": k.proc_path,
+                "path": k.path, "parentProc": k.parent, "responsibleProc": k.responsible,
                 "message": f"{INVALID} ({k.file})",
             })
         if new:
@@ -383,10 +450,9 @@ class Watcher:
                 "codesign watch: %d new code-signing kill report(s) of claude (%s)",
                 len(new), ", ".join(sorted({k.version for k in new})),
             )
-        claude = self._claude()
-        if claude and kills:
-            real = claude_exec.stat_binary(claude).real
-            mine = [k for k in kills if k.proc_path == real]
+        if claude and kills and binary is not None and binary.real:
+            real = binary.real
+            mine = [k for k in kills if k.path and os.path.realpath(k.path) == real]
             if mine:
                 k = mine[-1]
                 claude_exec.mark_killed_by_os(
