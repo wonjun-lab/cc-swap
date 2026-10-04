@@ -249,13 +249,13 @@ Priming is **off by default** because it makes automated requests on your subscr
 cc-swap config set prime.enabled true
 ```
 
-**After every Claude Code update**, priming pauses itself until you confirm it is still isolated from your login. Fleet shows `! priming paused: claude 2.1.3 -> 2.1.4 (cc-swap prime verify)`. Run:
+**After every Claude Code update**, priming pauses itself until its isolation from your login is verified again. The engine does that on its own: it runs the same zero-cost check as `cc-swap prime verify`, resumes priming when it passes and sends a notification either way (`cc-swap config set prime.autoVerify false` turns this off). Meanwhile Fleet shows `! priming paused: claude 2.1.3 -> 2.1.4 (the engine re-verifies it; or cc-swap prime verify)`. To do it yourself, run:
 
 ```bash
 cc-swap prime verify
 ```
 
-It costs nothing (no real request is made) and resumes priming on the engine's next tick when every check passes. If a check fails, priming stays paused; turn it off with `cc-swap config set prime.enabled false` and open an issue with your `claude --version`.
+It costs nothing (no real request is made) and resumes priming on the engine's next tick when every check passes. If a check fails (yours or the engine's), priming stays paused until a manual `cc-swap prime verify` passes; turn it off with `cc-swap config set prime.enabled false` and open an issue with your `claude --version`.
 
 To update Claude Code and get the same reminder, use `cc-swap claude-update` (it runs Claude Code's own `claude update`).
 
@@ -362,7 +362,7 @@ cc-swap why      # the engine's last decision and its reason code, explained
 
 **`unmanaged login, run cc-swap add`.** You are logged in to Claude Code as an account cc-swap doesn't have, or as a different account than the slot expects. Check which account you are logged in as, then run `cc-swap add`.
 
-**Priming paused after an update.** Expected after every Claude Code update. Run `cc-swap prime verify`.
+**Priming paused after an update.** Expected after every Claude Code update; the engine re-verifies on its own within a tick or two. If it says the automatic verify failed, run `cc-swap prime verify`.
 
 **`cc-swap upgrade` says `cannot confirm the latest release`.** It could not reach GitHub (often the 60-requests-an-hour anonymous rate limit) and would not guess. It changed nothing. Wait and retry, or set `GITHUB_TOKEN` (or log in with the GitHub CLI, `gh auth login`) so the lookup is authenticated.
 
