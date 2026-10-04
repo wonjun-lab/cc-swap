@@ -1066,6 +1066,10 @@ class SessionManager:
             return "unreachable"
         if launch is not None:
             launch.finish(result.returncode)
+        if result.returncode in (-9, 137):
+            # cc-swap: the OS killed claude (SIGKILL; claude_exec records it):
+            # that says nothing about the profile, which must not be deleted.
+            return "unknown"
         if result.returncode != 0:
             return "invalid"
         try:

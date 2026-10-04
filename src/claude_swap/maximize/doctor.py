@@ -12,9 +12,11 @@ Strictly read-only:
 * never writes a credential, ``sequence.json``, ``autoswitch_state.json`` or
   ``settings.json`` (the settings are parsed with the non-logging primitives,
   and the engine lease is only probed when its file already exists);
-* runs no ``claude`` other than ``claude --version`` (through
-  ``claude_exec``, whose audit line is the one thing it appends; skipped
-  while the binary is still settling after an update, or the OS kills it).
+* runs no ``claude`` other than ``claude --version``, and that one
+  record-only (``claude_exec``: one audit line in ``claude-exec.jsonl`` is
+  the only thing doctor ever appends — no state, no notification, no
+  pause); skipped while the binary is still settling after an update, or
+  while the OS kills it.
 
 All I/O goes through :class:`Probes`, so tests replace the Keychain, the
 service manager, ``ps`` and ``claude`` with fakes. Output names accounts by
@@ -135,7 +137,7 @@ def _run_claude(argv: list[str], timeout: float) -> RunResult:
     try:
         done = claude_exec.run(
             argv, caller="claude --version (doctor)", timeout=timeout,
-            manual=claude_exec.Manual("cc-swap doctor"),
+            manual=claude_exec.Manual("cc-swap doctor"), record_only=True,
         )
     except subprocess.TimeoutExpired:
         return RunResult(RC_TIMEOUT)
@@ -593,7 +595,9 @@ def check_claude(ctx: Context) -> list[Finding]:
     from claude_swap.maximize import claude_exec
 
     binary = claude_exec.stat_binary(path)
-    if claude_exec.killed_entry(p.backup_root, binary) is not None:
+    if claude_exec.current_killed(p.backup_root) is not None and (
+        claude_exec.killed_entry(p.backup_root, binary) is not None
+    ):
         return out  # check_claude_exec says it: running it would be killed again
     left = claude_exec.settle_left(binary, claude_exec.settle_seconds(p.backup_root), p.now)
     if left > 0:
@@ -627,43 +631,40 @@ def check_claude_exec(ctx: Context) -> list[Finding]:
     p = ctx.probes
     state = claude_exec.load_state(p.backup_root)
     out: list[Finding] = []
-    killed = state.get("killed")
-    if isinstance(killed, dict):
+    # Only while its launcher path still resolves to the killed file: a new
+    # version (a new real path) or the fix retires it.
+    killed = claude_exec.current_killed(p.backup_root)
+    if killed is not None:
         real = str(killed.get("real") or killed.get("path") or "claude")
-        current = claude_exec.stat_binary(real).identity
         diag = killed.get("diagnostics")
         more = f"; diagnostics: {_tilde(diag, p.home)}" if diag else ""
         times = int(killed.get("count") or 1)
         when = _clock(float(killed.get("lastAt") or killed.get("at") or p.now))
-        if current is not None and current == killed.get("identity"):
-            who = "macOS" if p.platform == "darwin" else "the OS"
-            why = " (code-signing cache)" if p.platform == "darwin" else ""
-            out.append(Finding(
-                "claude-exec", "error",
-                f"{who} is killing {real} at launch{why}. Fix: "
-                f"{claude_exec.fix_command(real)} — SIGKILL {times}x, last at {when}; "
-                f"priming is paused{more}",
-                f"{claude_exec.fix_command(real)} (cc-swap never runs it for you)",
-            ))
-        else:
-            out.append(Finding(
-                "claude-exec", "info",
-                f"{real} was killed by the OS at launch (last at {when}) and has changed "
-                f"since; the next run decides{more}",
-            ))
+        who = "macOS" if p.platform == "darwin" else "the OS"
+        why = " (code-signing cache)" if p.platform == "darwin" else ""
+        out.append(Finding(
+            "claude-exec", "error",
+            f"{who} is killing {real} at launch{why}. Fix: "
+            f"{claude_exec.fix_command(real)} — SIGKILL {times}x, last at {when}; "
+            f"priming is paused{more}",
+            f"{claude_exec.fix_command(real)} (cc-swap never runs it for you)",
+        ))
     rewritten = state.get("rewritten")
     at = rewritten.get("at") if isinstance(rewritten, dict) else None
-    if isinstance(at, (int, float)) and 0 <= p.now - at < claude_exec.REWRITE_RECENT_S:
+    if (
+        isinstance(at, (int, float)) and rewritten.get("sameInode") is True
+        and 0 <= p.now - at < claude_exec.REWRITE_RECENT_S
+    ):
         ran = rewritten.get("execAt")
         ran_text = _clock(float(ran)) if isinstance(ran, (int, float)) else "?"
-        how = "in place (same inode)" if rewritten.get("sameInode") else "with a new inode"
+        how = "in place (same inode)"
         out.append(Finding(
             "claude-exec", "warn",
             f"claude binary at {rewritten.get('real')} was rewritten {how} at {_clock(float(at))} "
             f"after cc-swap had executed it (at {ran_text}); macOS may kill it at launch",
             "if claude dies with SIGKILL (exit 137): cc-swap doctor names the fix",
         ))
-    if not isinstance(killed, dict):
+    if killed is None:
         note = claude_exec.display_note(p.backup_root, p.now)
         if note is not None:
             out.append(Finding("claude-exec", "info", f"the engine is {note}"))

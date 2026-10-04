@@ -179,7 +179,8 @@ settle_seconds_real = settle_seconds
 
 def settle_left(binary: Binary, settle_s: float, now: float) -> float:
     """Seconds until ``binary`` is ``settle_s`` old (0: settled). A stamp in
-    the future (clock skew) waits ``settle_s`` at most."""
+    the future (clock skew) counts as now: each check answers ``settle_s``
+    until the clock passes the stamp, then the wait runs down from there."""
     young = binary.youngest_ns()
     if young is None or settle_s <= 0:
         return 0.0
@@ -258,27 +259,79 @@ def _default_root() -> Path | None:
 
 
 def append_record(root: Path | None, record: Mapping[str, Any]) -> None:
-    """One JSON line in ``claude-exec.jsonl``; the file moves to ``.1``
-    first when this line would take it past :data:`EXEC_LOG_MAX_BYTES`.
-    Never raises."""
+    """One JSON line in ``claude-exec.jsonl`` (:func:`append_jsonl`)."""
+    append_jsonl(root, EXEC_LOG_FILENAME, record)
+
+
+def append_jsonl(root: Path | None, filename: str, record: Mapping[str, Any]) -> None:
+    """One JSON line in ``<root>/<filename>`` (0600); the file moves to
+    ``.1`` first when this line would take it past
+    :data:`EXEC_LOG_MAX_BYTES`. Never raises."""
     if root is None:
         return
+    from claude_swap.locking import FileLock
+
     line = (json.dumps(record, sort_keys=True, default=str) + "\n").encode("utf-8")
-    path = Path(root) / EXEC_LOG_FILENAME
+    path = Path(root) / filename
     try:
         Path(root).mkdir(parents=True, exist_ok=True)
+        # Rotation and the append under one lock: two writers rotating at
+        # once would otherwise drop a generation. Unlocked (busy for 2 s),
+        # the line is still appended — O_APPEND keeps it whole — but the
+        # file is not rotated this time.
+        lock = FileLock(Path(root) / f".{filename}.lock", timeout=2.0)
+        held = lock.acquire()
         try:
-            if path.stat().st_size + len(line) > EXEC_LOG_MAX_BYTES:
-                os.replace(path, path.with_name(path.name + ".1"))
-        except FileNotFoundError:
-            pass
-        fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
-        try:
-            os.write(fd, line)
+            if held:
+                try:
+                    if path.stat().st_size + len(line) > EXEC_LOG_MAX_BYTES:
+                        os.replace(path, path.with_name(path.name + ".1"))
+                except FileNotFoundError:
+                    pass
+            fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+            try:
+                os.write(fd, line)
+            finally:
+                os.close(fd)
         finally:
-            os.close(fd)
-    except OSError as e:
+            if held:
+                lock.release()
+    except Exception as e:  # an audit line never breaks a launch
         _logger.debug("claude exec: could not append to %s: %s", path, type(e).__name__)
+
+
+def read_jsonl(root: Path | None, filename: str = EXEC_LOG_FILENAME) -> list[dict]:
+    """The records of ``filename`` and its ``.1``, oldest first; unreadable
+    lines are skipped."""
+    if root is None:
+        return []
+    out: list[dict] = []
+    base = Path(root) / filename
+    for path in (base.with_name(base.name + ".1"), base):
+        try:
+            lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+        except OSError:
+            continue
+        for line in lines:
+            try:
+                rec = json.loads(line)
+            except ValueError:
+                continue
+            if isinstance(rec, dict):
+                out.append(rec)
+    return out
+
+
+def last_launch_before(root: Path | None, at: float) -> dict | None:
+    """The latest ``claude`` run cc-swap started before ``at`` (epoch s)."""
+    best = None
+    for rec in read_jsonl(root):
+        t = rec.get("at")
+        if rec.get("kind") != "exec" or not isinstance(t, (int, float)) or t >= at:
+            continue
+        if best is None or t > best["at"]:
+            best = rec
+    return best
 
 
 def load_state(root: Path | None) -> dict[str, Any]:
@@ -293,7 +346,8 @@ def load_state(root: Path | None) -> dict[str, Any]:
 
 def _mutate(root: Path | None, fn: Callable[[dict], bool]) -> None:
     """Read-modify-write the state under its lock; written only when ``fn``
-    returns True. Best effort: a lock that cannot be had is skipped."""
+    returns True. Best effort: when the lock cannot be had within 5 s the
+    update is skipped (never written unlocked)."""
     if root is None:
         return
     from claude_swap.locking import FileLock
@@ -302,17 +356,19 @@ def _mutate(root: Path | None, fn: Callable[[dict], bool]) -> None:
     lock = FileLock(Path(root) / LOCK_FILENAME, timeout=5.0)
     try:
         held = lock.acquire()
-    except OSError:
+    except Exception:
         held = False
+    if not held:
+        _logger.debug("claude exec: state lock busy; this update is skipped")
+        return
     try:
         state = load_state(root)
         if fn(state):
             atomic_write_json(Path(root) / STATE_FILENAME, state)
-    except OSError as e:
+    except Exception as e:
         _logger.debug("claude exec: state not written: %s", type(e).__name__)
     finally:
-        if held:
-            lock.release()
+        lock.release()
 
 
 def _section(state: dict, key: str) -> dict:
@@ -349,6 +405,54 @@ def _is_macos() -> bool:
     return sys.platform == "darwin"
 
 
+_libc: Any = None
+
+
+def _darwin_listxattr(path: str) -> list[str] | None:
+    """``listxattr(2)`` through ctypes (Python's ``os.listxattr`` is Linux only)."""
+    global _libc
+    import ctypes
+    import ctypes.util
+
+    try:
+        if _libc is None:
+            lib = ctypes.CDLL(ctypes.util.find_library("c"), use_errno=True)
+            lib.listxattr.argtypes = [
+                ctypes.c_char_p, ctypes.c_char_p, ctypes.c_size_t, ctypes.c_int,
+            ]
+            lib.listxattr.restype = ctypes.c_ssize_t
+            _libc = lib
+        raw = os.fsencode(path)
+        size = _libc.listxattr(raw, None, 0, 0)
+        if size <= 0:
+            return [] if size == 0 else None
+        buf = ctypes.create_string_buffer(size)
+        size = _libc.listxattr(raw, buf, size, 0)
+        if size < 0:
+            return None
+        names = buf.raw[:size].split(bytes(1))
+        return sorted(n.decode("utf-8", "replace") for n in names if n)
+    except Exception:
+        return None
+
+
+def xattr_names(path: str | None) -> list[str] | None:
+    """The file's extended attribute NAMES (never values), sorted; None when
+    they cannot be read. A ``listxattr`` call, no subprocess: cheap enough
+    for every launch."""
+    if path is None:
+        return None
+    lister = getattr(os, "listxattr", None)
+    if lister is not None:
+        try:
+            return sorted(lister(path))
+        except OSError:
+            return None
+    if sys.platform == "darwin":
+        return _darwin_listxattr(path)
+    return None
+
+
 _CODESIGN_KEYS = ("Identifier=", "CDHash=", "TeamIdentifier=", "Timestamp=")
 
 
@@ -375,9 +479,12 @@ def signing_facts(real: str | None) -> dict[str, Any]:
 
 def observe(root: Path | None, binary: Binary, *, now: float | None = None) -> None:
     """Note ``binary``'s identity: a new one is logged ("claude binary
-    changed", with :func:`signing_facts`); the same real path changed after
-    cc-swap executed it is a loud warning; a killed mark for an older
-    identity of the path is cleared. Never raises."""
+    changed", with :func:`signing_facts`); the same file (same inode)
+    rewritten after cc-swap executed it is a loud warning — a new inode at
+    the path (an update's rename, the ``cp -p && mv`` fix, an npm install)
+    is not; a killed mark for an older identity of the launcher path or the
+    real file is cleared (a new version gets a new real path). Never
+    raises."""
     if root is None or binary.identity is None:
         return
     now = time.time() if now is None else now
@@ -395,18 +502,18 @@ def observe(root: Path | None, binary: Binary, *, now: float | None = None) -> N
             changed = True
         ran = _section(state, "executed").get(binary.real)
         if isinstance(ran, dict) and ran.get("identity") != binary.identity:
-            found["rewritten"] = dict(ran)
             state["executed"].pop(binary.real, None)
-            state["rewritten"] = {
-                "real": binary.real, "at": now, "execAt": ran.get("at"),
-                "caller": ran.get("caller"),
-                "sameInode": (ran.get("identity") or [None, None])[1] == binary.ino,
-            }
+            if (ran.get("identity") or [None, None])[1] == binary.ino:
+                found["rewritten"] = dict(ran)
+                state["rewritten"] = {
+                    "real": binary.real, "at": now, "execAt": ran.get("at"),
+                    "caller": ran.get("caller"), "sameInode": True,
+                }
             changed = True
         killed = state.get("killed")
         if (
             isinstance(killed, dict)
-            and killed.get("real") == binary.real
+            and _same_binary(killed, binary)
             and killed.get("identity") != binary.identity
         ):
             found["unkilled"] = killed
@@ -426,16 +533,15 @@ def observe(root: Path | None, binary: Binary, *, now: float | None = None) -> N
             append_record(root, record)
         if "rewritten" in found:
             ran = found["rewritten"]
-            same = (ran.get("identity") or [None, None])[1] == binary.ino
-            how = "in place (same inode)" if same else "under the same path (new inode)"
             _logger.warning(
                 "claude binary at %s was rewritten in place after it had been executed "
-                "(by cc-swap at %s, %s): %s; macOS may kill it at launch (code-signing cache)",
-                binary.real, _iso(ran.get("at")), ran.get("caller"), how,
+                "(by cc-swap at %s, %s): same inode, new content; macOS may kill it at "
+                "launch (code-signing cache)",
+                binary.real, _iso(ran.get("at")), ran.get("caller"),
             )
             append_record(root, {
                 "kind": "rewritten-after-exec", "ts": _iso(now), "at": now, "real": binary.real,
-                "sameInode": same, "executed": ran, "now": binary.to_json(),
+                "sameInode": True, "executed": ran, "now": binary.to_json(),
             })
         if "unkilled" in found:
             _logger.info(
@@ -447,6 +553,27 @@ def observe(root: Path | None, binary: Binary, *, now: float | None = None) -> N
 
 
 # -- killed by the OS ----------------------------------------------------------------------------
+
+
+def _same_binary(killed: Mapping[str, Any], binary: Binary) -> bool:
+    """Whether a killed mark is about ``binary``'s launcher path or real file."""
+    return (killed.get("path") == binary.path) or (
+        binary.real is not None and killed.get("real") == binary.real
+    )
+
+
+def current_killed(root: Path | None) -> dict | None:
+    """The killed mark, only while its launcher path still resolves to the
+    killed identity (a new version, or the fix, retires it). Read-only."""
+    killed = any_killed(root)
+    if killed is None:
+        return None
+    for path in (killed.get("path"), killed.get("real")):
+        if isinstance(path, str) and path:
+            if stat_binary(path).identity == killed.get("identity"):
+                return killed
+            return None
+    return None
 
 
 def killed_entry(root: Path | None, binary: Binary) -> dict | None:
@@ -600,12 +727,46 @@ def _on_killed(root: Path, record: dict, binary: Binary, now: float) -> None:
     _notify_killed(root, binary, now)
 
 
+def mark_killed_by_os(
+    root: Path,
+    claude_path: str,
+    *,
+    source: str,
+    at: float,
+    detail: str,
+    pid: int | None = None,
+) -> bool:
+    """A kill seen outside cc-swap's own runs (``log stream``, a crash
+    report) — maybe of the user's ``claude`` — for the binary at
+    ``claude_path``: the same "killed by the OS" state as a SIGKILL of a
+    cc-swap run (priming paused, one notification per identity,
+    diagnostics). A kill older than the file's current ctime is about an
+    earlier file at that path and is ignored; one already counted is too.
+    Returns whether it was recorded."""
+    binary = stat_binary(claude_path)
+    if binary.identity is None or binary.ctime_ns is None or at < binary.ctime_ns / 1e9:
+        return False
+    killed = killed_entry(root, binary)
+    last = killed.get("lastAt") if killed else None
+    if isinstance(last, (int, float)) and at <= last:
+        return False
+    record = {
+        "kind": "external-kill", "ts": _iso(at), "at": at, "caller": source,
+        "pid": pid, "exit": None, "signal": SIGKILL_NUM, "detail": detail[:500],
+        **binary.to_json(),
+    }
+    _logger.error("claude killed by the OS (%s): %s", source, json.dumps(record, default=str))
+    append_record(root, record)
+    _on_killed(root, record, binary, at)
+    return True
+
+
 def _clear_killed(root: Path, binary: Binary) -> None:
     cleared: list[dict] = []
 
     def mutate(state: dict) -> bool:
         killed = state.get("killed")
-        if isinstance(killed, dict) and killed.get("real") == binary.real:
+        if isinstance(killed, dict) and _same_binary(killed, binary):
             cleared.append(state.pop("killed"))
             return True
         return False
@@ -652,8 +813,8 @@ def display_note(root: Path | None, now: float | None = None) -> str | None:
     """For displays (no subprocess): the killed mark, else a settle wait
     the engine recorded that is still running, else None."""
     state = load_state(root)
-    killed = state.get("killed")
-    if isinstance(killed, dict):
+    killed = current_killed(root)
+    if killed is not None:
         return killed_text(killed)
     settling = state.get("settling")
     now = time.time() if now is None else now
@@ -684,21 +845,29 @@ class Launch:
         root: Path | None = None,
         manual: Manual | None = _UNSET,
         clock: Callable[[], float] = time.time,
+        record_only: bool = False,
     ):
+        # record_only (cc-swap doctor): the audit line and nothing else — no
+        # watcher, no guard, no state, no kill handling, no notification.
+        self.record_only = record_only
         self.argv = [str(a) for a in argv]
         self.caller = caller
         self.root = Path(root) if root is not None else _default_root()
         self.manual = current_manual() if manual is _UNSET else manual
         self.clock = clock
         self.binary = stat_binary(self.argv[0])
+        # Before and after the run (:meth:`finish`): does running it change
+        # the file's xattrs or ctime (com.apple.provenance …)?
+        self.xattrs_before = xattr_names(self.binary.real)
         self.pid: int | None = None
         self.record: dict[str, Any] | None = None
         self.settle_override: float | None = None
         self._start: float | None = None
         self._start_at: float | None = None
         now = clock()
-        observe(self.root, self.binary, now=now)
-        self._guard(now)
+        if not record_only:
+            observe(self.root, self.binary, now=now)
+            self._guard(now)
 
     def _guard(self, now: float) -> None:
         if self.root is None:
@@ -794,6 +963,8 @@ class Launch:
             record["signalViaShell"] = True
         if self.settle_override is not None:
             record["settleOverrideS"] = self.settle_override
+        if self._start is not None:
+            self._note_after(record)
         if note:
             record["note"] = note
         self.record = record
@@ -804,12 +975,35 @@ class Launch:
         else:
             _logger.info("claude exec: %s", line)
         append_record(self.root, record)
-        if self.root is not None:
+        if self.root is not None and not self.record_only:
             try:
                 self._after(record, killed, now)
             except Exception as e:
                 _logger.debug("claude exec: bookkeeping failed: %s", type(e).__name__)
         return record
+
+    def _note_after(self, record: dict) -> None:
+        """The binary's xattr names and ctime after the run, next to the ones
+        read before it; a change is a warning with both values."""
+        b = self.binary
+        after = stat_binary(b.path)
+        xattrs = xattr_names(after.real)
+        record["xattrsBefore"] = self.xattrs_before
+        record["xattrsAfter"] = xattrs
+        record["ctimeAfterNs"] = after.ctime_ns
+        if after.real != b.real or b.real is None:
+            return
+        changed = []
+        if xattrs != self.xattrs_before:
+            changed.append(f"xattrs {self.xattrs_before} -> {xattrs}")
+        if after.ctime_ns != b.ctime_ns:
+            changed.append(f"ctime {b.ctime_ns} -> {after.ctime_ns}")
+        if changed:
+            record["binaryChangedByRun"] = True
+            _logger.warning(
+                "claude binary at %s changed during a cc-swap run (%s): %s",
+                b.real, self.caller, "; ".join(changed),
+            )
 
     def _after(self, record: dict, killed: bool, now: float) -> None:
         b = self.binary
@@ -856,13 +1050,14 @@ def run(
     cwd: Path | str | None = None,
     root: Path | None = None,
     manual: Manual | None = _UNSET,
+    record_only: bool = False,
 ) -> subprocess.CompletedProcess:
     """``subprocess.run(argv, capture_output=True, text=True, timeout=...)``
     through a :class:`Launch`: stdin closed, ``DISABLE_AUTOUPDATER=1``, its
     own process group (a timeout kills the whole tree). Raises what
     ``subprocess.run`` would (``TimeoutExpired``, ``OSError``) and
     :class:`ExecRefused`."""
-    launch = Launch(argv, caller=caller, root=root, manual=manual)
+    launch = Launch(argv, caller=caller, root=root, manual=manual, record_only=record_only)
     proc = launch.popen(
         env=child_env(env), cwd=None if cwd is None else str(cwd),
         stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,

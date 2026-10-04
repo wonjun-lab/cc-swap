@@ -230,12 +230,81 @@ def test_cc_swap_never_runs_claude_update():
 
     assert importlib.util.find_spec("claude_swap.maximize.claude_update") is None
     assert "claude-update" not in cli._FORK_COMMANDS
-    src = Path(cx.__file__).parents[1]
-    offenders = [
-        p.name for p in src.rglob("*.py")
-        if '"update"]' in p.read_text() or "'update']" in p.read_text()
-    ]
+    assert "update" not in {e.action for e in __import__("claude_swap.tui.menus").tui.menus.MAIN_MENU}
+    # Structurally: no argv list anywhere in the package puts "update" right
+    # after a claude executable (`[claude, "update"]` and its spellings).
+    import ast
+
+    offenders = []
+    for path in Path(cx.__file__).parents[1].rglob("*.py"):
+        for node in ast.walk(ast.parse(path.read_text(), str(path))):
+            if not isinstance(node, (ast.List, ast.Tuple)) or len(node.elts) < 2:
+                continue
+            first, second = node.elts[0], node.elts[1]
+            name = getattr(first, "id", None) or getattr(first, "attr", None) or ""
+            if (
+                "claude" in name.lower()
+                and isinstance(second, ast.Constant) and second.value == "update"
+            ):
+                offenders.append(f"{path.name}:{node.lineno}")
     assert offenders == []
+
+
+def test_the_cswap_run_session_keeps_claudes_own_updater(tmp_path, monkeypatch):
+    """`cswap run` hands the terminal to the user's own claude: its updater
+    stays as the user has it (only cc-swap's own children turn it off)."""
+    from claude_swap.session import SessionManager
+
+    monkeypatch.delenv("DISABLE_AUTOUPDATER", raising=False)
+    seen = {}
+
+    def fake_exec(path, argv, env):
+        seen["env"] = env
+        raise SystemExit(0)
+
+    monkeypatch.setattr(os, "execvpe", fake_exec)
+    manager = SessionManager.__new__(SessionManager)
+    with pytest.raises(SystemExit):
+        manager._exec(str(_script(tmp_path / "claude", ENV_DUMP)), [], dict(os.environ))
+    assert "DISABLE_AUTOUPDATER" not in seen["env"]
+    [rec] = _execs(paths.get_backup_root())
+    assert rec["caller"] == "cswap run" and rec["note"].startswith("exec:")
+
+
+def test_an_interrupted_run_is_not_marked_killed(tmp_path, root, monkeypatch):
+    import subprocess
+
+    claude = _script(tmp_path / "claude", "sleep 30\n")
+    real_communicate = subprocess.Popen.communicate
+
+    def interrupted(self, *a, **k):
+        if k.get("timeout") is not None and k["timeout"] > 1:
+            raise KeyboardInterrupt
+        return real_communicate(self, *a, **k)
+
+    monkeypatch.setattr(subprocess.Popen, "communicate", interrupted)
+    with cx.manual("t"), pytest.raises(KeyboardInterrupt):
+        cx.run([str(claude)], caller="test", timeout=10, root=root)
+    [rec] = _execs(root)
+    assert rec["error"] == "KeyboardInterrupt"
+    assert "killed" not in cx.load_state(root)
+
+
+def test_auth_status_probe_killed_by_the_os_is_unknown_not_invalid(tmp_path, monkeypatch):
+    """A SIGKILLed `claude auth status` says nothing about the session
+    profile, which must not be deleted for it."""
+    import subprocess
+
+    from claude_swap import session as session_mod
+
+    profile = tmp_path / "profile"
+    profile.mkdir()
+    monkeypatch.setattr(
+        session_mod.subprocess, "run",
+        lambda *a, **k: subprocess.CompletedProcess(a[0], -9, "", ""),
+    )
+    manager = session_mod.SessionManager.__new__(session_mod.SessionManager)
+    assert manager._session_validity(profile, "a@example.com", "") == "unknown"
 
 
 # -- the watcher --------------------------------------------------------------------------------
@@ -486,3 +555,140 @@ def test_settle_s_is_a_setting_with_a_600s_default(tmp_path):
     assert cx.settle_seconds_real(tmp_path) == 120.0
     with pytest.raises(Exception):
         st.set_setting(tmp_path, "claude.settleS", "-1")
+
+
+# -- review fixes: a mark follows the launcher path -------------------------------------------
+
+
+def _versioned(tmp_path: Path, version: str, body: str) -> tuple[Path, Path]:
+    """A native-installer layout: ``bin/claude`` -> ``versions/<version>``."""
+    real = _script(tmp_path / "versions" / version, body)
+    link = tmp_path / "bin" / "claude"
+    link.parent.mkdir(exist_ok=True)
+    if link.is_symlink():
+        link.unlink()
+    link.symlink_to(real)
+    return link, real
+
+
+def test_a_new_version_at_a_new_real_path_clears_the_mark_and_the_note(tmp_path, root, sent):
+    link, _old = _versioned(tmp_path, "2.1.289", KILLED)
+    with cx.manual("t"):
+        cx.run([str(link), "--version"], caller="test", timeout=10, root=root)
+    assert cx.display_note(root) is not None
+    assert dr.check_claude_exec(_doctor_ctx(root, tmp_path))[0].severity == "error"
+    # Claude Code updates: the launcher now points at another file.
+    _versioned(tmp_path, "2.1.290", ENV_DUMP)
+    # Before anything runs it, nothing reports the stale mark ...
+    assert cx.display_note(root) is None and pv.paused_note(root) is None
+    assert dr.check_claude_exec(_doctor_ctx(root, tmp_path)) == []
+    # ... and the next look at the binary clears it.
+    cx.observe(root, cx.stat_binary(str(link)))
+    assert cx.any_killed(root) is None
+
+
+def test_the_fix_and_a_new_inode_are_no_rewrite(tmp_path, root, caplog):
+    claude = _script(tmp_path / "claude", ENV_DUMP)
+    cx.run([str(claude), "--version"], caller="test", timeout=10, root=root)
+    tmp = claude.with_name("claude.tmp")
+    tmp.write_bytes(claude.read_bytes())
+    tmp.chmod(0o755)
+    os.replace(tmp, claude)  # cp -p claude claude.tmp && mv claude.tmp claude
+    with caplog.at_level("WARNING", logger="claude-swap"):
+        cx.observe(root, cx.stat_binary(str(claude)))
+    assert not [r for r in caplog.records if "rewritten" in r.getMessage()]
+    assert "rewritten" not in cx.load_state(root)
+    assert dr.check_claude_exec(_doctor_ctx(root, tmp_path)) == []
+
+
+def test_doctors_run_is_record_only(tmp_path, root, sent, monkeypatch):
+    claude = _script(tmp_path / "claude", KILLED)
+    monkeypatch.setattr(cx, "_default_root", lambda: root)
+    done = dr._run_claude([str(claude), "--version"], 10.0)
+    assert done.rc == -9
+    [rec] = _execs(root)
+    assert rec["caller"] == "claude --version (doctor)" and rec["signal"] == 9
+    assert cx.load_state(root) == {}  # no mark, no binaries, no executed
+    assert sent == [] and not list(root.glob(f"{cx.KILL_PREFIX}*"))
+
+
+def test_a_busy_state_lock_skips_the_write(root):
+    from claude_swap.locking import FileLock
+
+    lock = FileLock(root / cx.LOCK_FILENAME, timeout=0)
+    assert lock.acquire()
+    try:
+        started = time.monotonic()
+        cx._mutate(root, lambda state: state.update(x=1) or True)
+        assert time.monotonic() - started >= 4.5
+    finally:
+        lock.release()
+    assert cx.load_state(root) == {}
+
+
+# -- B: xattrs and ctime before and after each run -----------------------------------------
+
+
+def test_each_run_records_xattrs_and_ctime_before_and_after(tmp_path, root):
+    claude = _script(tmp_path / "claude", ENV_DUMP)
+    cx.run([str(claude), "--version"], caller="test", timeout=10, root=root)
+    [rec] = _execs(root)
+    assert rec["xattrsBefore"] == rec["xattrsAfter"]
+    assert isinstance(rec["ctimeAfterNs"], int) and rec["ctimeAfterNs"] == rec["ctimeNs"]
+    assert "binaryChangedByRun" not in rec
+
+
+def test_a_run_that_changes_the_binarys_xattrs_is_a_warning(tmp_path, root, monkeypatch, caplog):
+    claude = _script(tmp_path / "claude", ENV_DUMP)
+    answers = iter([[], ["com.apple.provenance"]])
+    monkeypatch.setattr(cx, "xattr_names", lambda path: next(answers))
+    with caplog.at_level("WARNING", logger="claude-swap"):
+        cx.run([str(claude), "--version"], caller="test", timeout=10, root=root)
+    [rec] = _execs(root)
+    assert rec["xattrsBefore"] == [] and rec["xattrsAfter"] == ["com.apple.provenance"]
+    assert rec["binaryChangedByRun"] is True
+    [msg] = [r.getMessage() for r in caplog.records if "changed during a cc-swap run" in r.getMessage()]
+    assert "xattrs [] -> ['com.apple.provenance']" in msg
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="listxattr through ctypes is macOS")
+def test_xattr_names_reads_names_without_a_subprocess(tmp_path, monkeypatch):
+    import subprocess
+
+    path = tmp_path / "f"
+    path.write_text("x")
+    monkeypatch.setattr(subprocess, "run", lambda *a, **k: pytest.fail("no subprocess"))
+    assert isinstance(cx.xattr_names(str(path)), list)
+    assert cx.xattr_names(str(tmp_path / "missing")) is None
+
+
+# -- kills seen outside cc-swap's runs -------------------------------------------------------
+
+
+def test_a_kill_seen_elsewhere_marks_the_current_file_once(tmp_path, root, sent):
+    link, real = _versioned(tmp_path, "2.1.289", ENV_DUMP)
+    now = time.time()
+    assert cx.mark_killed_by_os(root, str(link), source="crash report", at=now, detail="x.ips")
+    assert not cx.mark_killed_by_os(root, str(link), source="crash report", at=now, detail="x.ips")
+    killed = cx.current_killed(root)
+    assert killed is not None and killed["real"] == os.path.realpath(real)
+    assert killed["caller"] == "crash report" and len(sent) == 1
+    # a kill older than the file at that path is about an earlier file
+    assert not cx.mark_killed_by_os(root, str(link), source="x", at=now - 86400, detail="")
+
+
+def test_the_login_help_probe_runs_in_a_scrubbed_throwaway_profile(tmp_path, monkeypatch):
+    claude = _script(tmp_path / "claude", (
+        'd=$(dirname "$0")\n'
+        'printf "%s|%s|%s" "${CLAUDE_CONFIG_DIR-}" "${CLAUDE_CODE_OAUTH_TOKEN-none}" '
+        '"${ANTHROPIC_API_KEY-none}" > "$d/env.txt"\n'
+        'echo "  --email <email>"\n'
+    ))
+    monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", SECRET)
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-api03-should-not-pass")
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "live-profile"))
+    assert rl.login_supported(str(claude))
+    config_dir, token, key = (tmp_path / "env.txt").read_text().split("|")
+    assert token == "none" and key == "none"
+    assert config_dir and "cc-swap-login-probe-" in config_dir
+    assert not Path(config_dir).exists()  # removed afterwards

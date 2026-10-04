@@ -120,16 +120,27 @@ def _manual():
 
 
 def login_supported(claude: str, *, timeout: float = PROBE_TIMEOUT_S) -> bool:
-    """Whether ``claude`` has ``auth login --email`` (older builds do not)."""
-    from claude_swap.maximize import claude_exec
+    """Whether ``claude`` has ``auth login --email`` (older builds do not).
 
+    Run like the login itself: every auth/endpoint override stripped and
+    ``CLAUDE_CONFIG_DIR`` pointing at a throwaway directory (removed
+    afterwards), so even ``--help`` never sees the live profile or a token."""
+    from claude_swap.maximize import claude_exec
+    from claude_swap.maximize.primer import isolated_env
+
+    try:
+        probe = Path(tempfile.mkdtemp(prefix="cc-swap-login-probe-"))
+    except OSError:
+        return False
     try:
         result = claude_exec.run(
             [claude, "auth", "login", "--help"], caller="claude auth login --help",
-            timeout=timeout, manual=_manual(),
+            timeout=timeout, manual=_manual(), env=isolated_env(os.environ, probe), cwd=probe,
         )
     except (OSError, subprocess.SubprocessError):
         return False
+    finally:
+        shutil.rmtree(probe, ignore_errors=True)
     return result.returncode == 0 and "--email" in (result.stdout or "")
 
 
