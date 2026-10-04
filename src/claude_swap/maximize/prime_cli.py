@@ -137,7 +137,18 @@ def manual_prime(
     receives the engine's own events (a quarantine); the primer's events come
     back in the report. ``on_plan`` sees the plan before anything launches,
     so a caller can show the skips while the launches run. ``check_version``
-    False skips the Claude Code version guard (``prime verify --live`` only)."""
+    False skips the Claude Code version guard (``prime verify --live`` only).
+
+    Every ``claude`` it runs is a manual one (``claude_exec.manual``): a
+    freshly changed binary runs with a warning instead of waiting."""
+    from claude_swap.maximize import claude_exec
+
+    if claude_exec.current_manual() is None:
+        with claude_exec.manual("Fleet: prime now"):
+            return manual_prime(
+                switcher, numbers, dry_run=dry_run, emit=emit, sleep=sleep, clock=clock,
+                on_plan=on_plan, check_version=check_version,
+            )
     engine = AutoSwitchEngine(
         switcher,
         load_settings(switcher.backup_dir),
@@ -174,6 +185,13 @@ def manual_prime(
         if would_prime and not disabled and num not in reported and num not in not_primed:
             not_primed[num] = "no longer a priming target"
     return PrimeReport(False, plan, list(events), pending, not_primed)
+
+
+def _warn(message: str) -> None:
+    """A ``claude_exec`` warning (a freshly changed claude run anyway), on stderr."""
+    from claude_swap.printer import warning
+
+    warning(message, file=sys.stderr)
 
 
 def prime_command(argv: list[str]) -> None:
@@ -221,15 +239,18 @@ def prime_command(argv: list[str]) -> None:
             if args.accounts
             else None
         )
-        report = manual_prime(
-            switcher,
-            numbers,
-            dry_run=args.dry_run,
-            emit=_print_event,
-            sleep=_sleep,
-            clock=_clock,
-            on_plan=_print_skips,
-        )
+        from claude_swap.maximize import claude_exec
+
+        with claude_exec.manual("cc-swap prime", warn=_warn):
+            report = manual_prime(
+                switcher,
+                numbers,
+                dry_run=args.dry_run,
+                emit=_print_event,
+                sleep=_sleep,
+                clock=_clock,
+                on_plan=_print_skips,
+            )
         if args.dry_run:
             for line in report.lines():
                 print(line)

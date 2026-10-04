@@ -890,6 +890,7 @@ class AutoSwitchEngine:
         self._exit_code: int | None = None
         # One "unmanaged login" warning per episode.
         self._unmanaged_warned = False
+        self._mixed_seen = False  # cc-swap: the unmanaged login is a mixed one
         # One-shot typo guard for ``autoswitch.model``: resolved (and possibly
         # warned) on the first tick where every relevant account has readable
         # usage — adaptive polling legitimately leaves gaps before that.
@@ -1177,6 +1178,21 @@ class AutoSwitchEngine:
             if self.switcher.has_live_login():
                 # Live login exists but cswap doesn't manage it: never act —
                 # a switch would overwrite it without a backup.
+                mixed = self._mixed_live_login()
+                if mixed is not None:
+                    # cc-swap: the config names one account while the Keychain
+                    # holds a managed slot's token (a /login while the
+                    # Keychain was locked); `add` would refuse.
+                    if not self._unmanaged_warned:
+                        self._unmanaged_warned = True
+                        self._emit(ConfigWarningEvent(message=f"{mixed}; holding"))
+                    self._emit(
+                        NoSwitchEvent(
+                            reason="unmanaged-active-account",
+                            detail="run 'cc-swap repair-live' (mixed live login)",
+                        )
+                    )
+                    return TickOutcome.NO_ACTION
                 self._warn_unmanaged_login("the live login is not a managed account")
                 self._emit(
                     NoSwitchEvent(
@@ -2564,6 +2580,21 @@ class AutoSwitchEngine:
             self._exit_code = READ_HOLD_EXIT_CODE
             self.stop()
 
+    def _mixed_live_login(self) -> str | None:
+        """cc-swap: the mixed live login (maximize/live_repair.py) explained,
+        or None. Looked for once per unmanaged spell (it reads the Keychain);
+        never raises."""
+        if self._unmanaged_warned and not self._mixed_seen:
+            return None
+        try:
+            from claude_swap.maximize.live_repair import detect, explain
+
+            found = detect(self.switcher)
+        except Exception:
+            found = None
+        self._mixed_seen = found is not None
+        return explain(found) if found is not None else None
+
     def _warn_unmanaged_login(self, why: str) -> None:
         if not self._unmanaged_warned:
             self._unmanaged_warned = True
@@ -2808,6 +2839,27 @@ class AutoSwitchEngine:
 
     def run_loop(self) -> int:
         """Tick forever (until :meth:`stop`); a failing tick never kills it."""
+        watch = self._start_codesign_watch()
+        try:
+            return self._run_loop(watch)
+        finally:
+            if watch is not None:
+                try:
+                    watch.stop()
+                except Exception:
+                    pass
+
+    def _start_codesign_watch(self):
+        """cc-swap: the code-signing kill watcher of a live engine on macOS
+        (maximize/codesign_watch.py), or None. Never raises."""
+        try:
+            from claude_swap.maximize.codesign_watch import for_engine
+
+            return for_engine(self)
+        except Exception:
+            return None
+
+    def _run_loop(self, watch) -> int:
         try:  # re-login profiles a killed `cc-swap login` left (they may hold a login)
             from claude_swap.maximize.relogin import sweep_stale_profiles
 
@@ -2826,6 +2878,8 @@ class AutoSwitchEngine:
                     self.housekeeping()
                 except Exception:
                     pass
+            if watch is not None:
+                watch.tick()  # polls its child, scans crash reports hourly; never raises
             try:
                 outcome = self.tick()
             except Exception as e:  # pragma: no cover - tick() already guards

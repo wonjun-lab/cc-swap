@@ -756,6 +756,25 @@ def _no_real_prime_verify(monkeypatch):
         pytest.fail("a test reached prime_verify.default_deps; inject VerifyDeps")
 
 
+@pytest.fixture(autouse=True)
+def _claude_exec_guard_for_tests(monkeypatch):
+    """``maximize/claude_exec.py`` around every ``claude`` run: tests write
+    their fake ``claude`` moments before running it, so the settle delay is
+    off (``claude.settleS`` 0; settle tests restore the real reader from
+    ``claude_exec.settle_seconds_real``), and no test runs the real
+    ``codesign`` / ``xattr`` / ``log show`` / ``log stream`` (tests that need
+    their output patch ``claude_exec._tool`` / ``codesign_watch._spawn``)."""
+    from claude_swap.maximize import claude_exec
+
+    monkeypatch.setattr(claude_exec, "settle_seconds", lambda root: 0.0)
+    monkeypatch.setattr(claude_exec, "_tool", lambda argv, timeout: (None, "", "stubbed in tests"))
+    # An engine's code-signing watcher (maximize/codesign_watch.py) never
+    # starts the real `log stream`; watcher tests hand in a fake spawn.
+    from claude_swap.maximize import codesign_watch
+
+    monkeypatch.setattr(codesign_watch, "_spawn", lambda argv: None)
+
+
 # No test ever pops a real desktop notification (``osascript`` /
 # ``notify-send``): delivery is off for this whole process — threads that
 # outlive their test's monkeypatch included — and the backend lookup is

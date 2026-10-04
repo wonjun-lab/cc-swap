@@ -2246,6 +2246,8 @@ class ClaudeAccountSwitcher:
         *,
         activate: bool = True,
         on_commit=None,
+        precheck=None,
+        live_shared_from: str | None = None,
     ) -> dict:
         """Store a fresh login for slot ``account_num`` that was made OUTSIDE
         the live store (``cc-swap login`` runs ``claude auth login`` in a
@@ -2272,6 +2274,12 @@ class ClaudeAccountSwitcher:
         Any failure restores both sides from snapshots and re-raises.
         ``on_commit(result)`` is called once both sides are written, before
         anything else can raise.
+
+        cc-swap: ``precheck()`` runs inside the locks before anything is
+        read or written, and aborts the store by raising (``repair-live``
+        re-checks there that the live login is still what it detected).
+        ``live_shared_from`` is the credential whose machine-shared fields
+        (``mcpOAuth`` …) the live login gets, instead of the live one's.
 
         ``ConfigError`` for an identity that is not the slot's,
         ``AccountNotFoundError`` for a missing slot, ``CredentialReadError``
@@ -2321,6 +2329,8 @@ class ClaudeAccountSwitcher:
                     f"the new login is {email or 'unknown'}, not Account-{num}'s "
                     f"account; nothing stored"
                 )
+            if precheck is not None:
+                precheck()
             live_now = activate and self._live_identity_matches(rec_email, rec_org)
             # Snapshots, all taken before the first write.
             backup_before, unreadable = self._read_account_credentials_ex(num, rec_email)
@@ -2358,7 +2368,10 @@ class ClaudeAccountSwitcher:
                 if live_now:
                     live_written = True
                     self._write_credentials(
-                        self._prepare_credentials_for_activation(credentials, live_before)
+                        self._prepare_credentials_for_activation(
+                            credentials,
+                            live_before if live_shared_from is None else live_shared_from,
+                        )
                     )
                     spliced = dict(live_config)
                     spliced["oauthAccount"] = dict(oauth_account)
@@ -3869,13 +3882,15 @@ class ClaudeAccountSwitcher:
             # is a one-time write, not a per-switch check.
             if seen_uuid != account_uuid:
                 raise ConfigError(
-                    f"The stored credential does not belong to {email}: the "
-                    f"token resolves to account {seen_uuid}, not {account_uuid}. "
-                    f"Nothing was changed. This happens when the config names "
-                    f"one account while the credential store still holds "
-                    f"another's token (e.g. a renamed .claude.json over a live "
-                    f"keychain item). Log in as {email} in THIS environment, "
-                    f"then re-run."
+                    self._mixed_login_hint() or (
+                        f"The stored credential does not belong to {email}: the "
+                        f"token resolves to account {seen_uuid}, not {account_uuid}. "
+                        f"Nothing was changed. This happens when the config names "
+                        f"one account while the credential store still holds "
+                        f"another's token (e.g. a renamed .claude.json over a live "
+                        f"keychain item). Log in as {email} in THIS environment, "
+                        f"then re-run."
+                    )
                 )
         else:
             seen = (profile.get("email") or "").strip()
@@ -3883,12 +3898,14 @@ class ClaudeAccountSwitcher:
                 return unverified("the resolved identity carries no address")
             if seen.lower() != email.lower():
                 raise ConfigError(
-                    f"The stored credential does not belong to {email}: the "
-                    f"token resolves to {seen}. Nothing was changed. This "
-                    f"happens when the config names one account while the "
-                    f"credential store still holds another's token (e.g. a "
-                    f"renamed .claude.json over a live keychain item). Log in "
-                    f"as {email} in THIS environment, then re-run."
+                    self._mixed_login_hint() or (
+                        f"The stored credential does not belong to {email}: the "
+                        f"token resolves to {seen}. Nothing was changed. This "
+                        f"happens when the config names one account while the "
+                        f"credential store still holds another's token (e.g. a "
+                        f"renamed .claude.json over a live keychain item). Log in "
+                        f"as {email} in THIS environment, then re-run."
+                    )
                 )
         resolved_org = profile.get("organizationUuid")
         if resolved_org is None:
@@ -3907,6 +3924,20 @@ class ClaudeAccountSwitcher:
             f"{org_uuid or 'personal'} organization in THIS environment, "
             f"then re-run."
         )
+
+    def _mixed_login_hint(self) -> str | None:
+        """cc-swap: when the refusal above is a mixed live login (a /login
+        while the Keychain was locked; maximize/live_repair.py), the message
+        that names it and ``cc-swap repair-live``; else None."""
+        try:
+            from claude_swap.maximize.live_repair import detect, explain
+
+            found = detect(self)
+        except Exception:
+            return None
+        if found is None:
+            return None
+        return f"Not added: {explain(found)} (nothing was changed)."
 
     def _reject_live_api_key_capture(self, creds: str) -> None:
         """Guard for ``add_account``: never capture a live managed key as OAuth.
@@ -4930,7 +4961,19 @@ class ClaudeAccountSwitcher:
                 FileLock(self.lock_file),
                 claude_credentials_lock(),
             ):
+                # cc-swap: the verdict of THIS read, not the pre-lock one —
+                # the Keychain may have stopped answering since, and then
+                # these bytes are the plaintext fallback (possibly the
+                # consumed predecessor). Forgotten first, so a stale
+                # verdict from an earlier read never speaks for this one.
+                self._store.forget_last_active_read()
                 live = self._read_credentials()
+                under_lock = self._store.last_active_read()
+                if under_lock is not None and under_lock.degraded:
+                    return _defer(
+                        force_refresh
+                        or FetchRecord(sentinel=USAGE_KEYCHAIN_UNAVAILABLE)
+                    )
                 if live is None:
                     # Read ERROR (locked keychain, unreadable store) — not
                     # absence. The store may hold a newer credential we

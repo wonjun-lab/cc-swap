@@ -787,7 +787,7 @@ class TestKeys:
                 ("toggle_auto", "auto"), ("open_mode", "mode"), ("open_strategy", "strategy"),
                 ("open_prime", "prime"), ("action_fetch", "fetch"),
                 ("action_exclude", "exclude"), ("open_accounts", "accounts"),
-                ("open_history", "history"), ("open_update", "update"),
+                ("open_history", "history"),
                 ("action_classic", "classic"), ("action_quit", "quit"),
             ):
                 setattr(screen, name, lambda action=action: seen.append(action))

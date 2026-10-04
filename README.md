@@ -117,7 +117,7 @@ Fleet keys:
 | `h` | Hold: stay on the active account for a while |
 | `n` | Name the selected account (set its alias) |
 | `↑`/`↓` or `j`/`k` | Move the selection |
-| `m` | Menu: auto on/off, mode, swap strategy, prime now, fetch usage, exclude, account settings, engine log, switch history, update Claude Code, classic dashboard |
+| `m` | Menu: auto on/off, mode, swap strategy, prime now, fetch usage, exclude, account settings, engine log, switch history, classic dashboard |
 | `?` | Explain everything on the screen |
 | `q` | Quit |
 
@@ -257,7 +257,7 @@ cc-swap prime verify
 
 It costs nothing (no real request is made) and resumes priming on the engine's next tick when every check passes. If a check fails (yours or the engine's), priming stays paused until a manual `cc-swap prime verify` passes; turn it off with `cc-swap config set prime.enabled false` and open an issue with your `claude --version`.
 
-To update Claude Code and get the same reminder, use `cc-swap claude-update` (it runs Claude Code's own `claude update`).
+cc-swap never updates Claude Code itself: Claude Code's own updater does, and the guard notices the new `claude` file. It also waits 10 minutes after Claude Code changed before the engine runs it (`claude.settleS`), logs every `claude` it runs to `claude-exec.jsonl`, and if macOS starts killing `claude` at launch (SIGKILL, exit 137), `cc-swap doctor` says so and prints the fix ([reference](docs/reference.md#every-claude-cc-swap-runs)).
 
 ## Common tasks
 
@@ -361,6 +361,8 @@ cc-swap why      # the engine's last decision and its reason code, explained
 **`re-login needed — login expired` or `invalid_grant`.** The login passed its fixed deadline, or its refresh token was revoked. Log in again: `cc-swap login N`, or Fleet → select the account → `r`.
 
 **`unmanaged login, run cc-swap add`.** You are logged in to Claude Code as an account cc-swap doesn't have, or as a different account than the slot expects. Check which account you are logged in as, then run `cc-swap add`.
+
+**`mixed live login` (macOS).** A `/login` ran while the login Keychain was locked (for example over SSH): Claude Code saved the new login in plaintext (`~/.claude/.credentials.json`) and `~/.claude.json` names it, but the Keychain still holds the previous account's token, so the engine holds and `cc-swap add` refuses. Run `cc-swap repair-live` in a GUI terminal: it checks whose the plaintext login is, asks, then writes it into the Keychain and its slot and removes the plaintext file.
 
 **Priming paused after an update.** Expected after every Claude Code update; the engine re-verifies on its own within a tick or two. If it says the automatic verify failed, run `cc-swap prime verify`.
 

@@ -228,35 +228,6 @@ class TestPrimerGate:
         assert runner.calls == []
         assert any("changed" in why for why in primer.not_primed.values())
 
-    def test_no_prime_launches_while_claude_update_holds_its_lock(self, rig):
-        from claude_swap.locking import FileLock
-
-        runner = StubRunner(rig)
-        primer = rig.primer(runner=runner)
-        lock = FileLock(rig.switcher.backup_dir / ".claude_update.lock", timeout=0)
-        assert lock.acquire()
-        try:
-            primer.run_due(rig.snap())
-            assert runner.calls == []
-            assert rig.primes() == {}
-        finally:
-            lock.release()
-        primer.run_due(rig.snap())
-        assert len(runner.calls) == 1
-
-    def test_a_claude_update_that_starts_after_the_gate_blocks_the_launch(self, rig):
-        from claude_swap.locking import FileLock
-
-        runner = StubRunner(rig)
-        primer = rig.primer(runner=runner)
-        lock = FileLock(rig.switcher.backup_dir / ".claude_update.lock", timeout=0)
-        self._during_precheck(rig, primer, lambda: lock.acquire())
-        try:
-            primer.run_due(rig.snap())
-            assert runner.calls == []
-        finally:
-            lock.release()
-
     def test_verify_lifts_the_pause_without_a_restart(self, rig, monkeypatch):
         self._changed(rig, monkeypatch)
         runner = StubRunner(rig)

@@ -27,4 +27,4 @@ It then creates an annotated tag at `HEAD`, pushes it to the remote that points 
 
 ## Documentation tests
 
-`README.md` and `docs/reference.md` are checked against the code by `tests/maximize/test_readme.py`, `tests/maximize/test_why.py`, `tests/maximize/test_ride_surfaces.py` and `tests/maximize/test_claude_update.py`: every setting and its default, every `why` reason code, every fork command and flag, every bound Fleet key, every `CC_SWAP_*` environment variable, and the sentences Fleet prints. When you add a setting, a command, a reason code or a key, document it in `docs/reference.md` or those tests fail.
+`README.md` and `docs/reference.md` are checked against the code by `tests/maximize/test_readme.py`, `tests/maximize/test_why.py` and `tests/maximize/test_ride_surfaces.py`: every setting and its default, every `why` reason code, every fork command and flag, every bound Fleet key, every `CC_SWAP_*` environment variable, and the sentences Fleet prints. When you add a setting, a command, a reason code or a key, document it in `docs/reference.md` or those tests fail.

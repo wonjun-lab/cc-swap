@@ -6,6 +6,7 @@ import hashlib
 import json
 import logging
 import sys
+import threading
 import urllib.error
 import urllib.request
 from collections.abc import Callable, Sequence
@@ -451,6 +452,12 @@ def refresh_oauth_credentials(credentials: str) -> str | None:
     return try_refresh_oauth_credentials(credentials).credentials
 
 
+#: cc-swap: the HTTP status of this thread's last failed
+#: :func:`fetch_oauth_profile` (``.code``; None when it did not get one),
+#: so a caller can tell "token rejected" (401) from "unreachable".
+PROFILE_STATUS = threading.local()
+
+
 def fetch_oauth_profile(access_token: str) -> dict | None:
     """Resolve an OAuth access token to its account identity, or None.
 
@@ -475,10 +482,12 @@ def fetch_oauth_profile(access_token: str) -> dict | None:
         "User-Agent": "claude-swap/1.0",
     }
     req = urllib.request.Request(url, headers=headers)
+    PROFILE_STATUS.code = None
     try:
         with urllib.request.urlopen(req, timeout=5) as resp:
             data = json.loads(resp.read().decode())
     except urllib.error.HTTPError as e:
+        PROFILE_STATUS.code = e.code
         if e.code == 401:
             # Evidence, not proof: the live access token can't authenticate.
             # A freshly rotated own-credential would carry a fresh token, but

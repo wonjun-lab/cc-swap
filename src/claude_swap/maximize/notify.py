@@ -12,7 +12,10 @@ What matters while you are not looking at the TUI:
 * ``prime-verified`` — the engine re-verified priming after an update
   (``prime.autoVerify``); both follow ``notify.primePaused``;
 * ``keychain`` — the live login has been unreadable (the Keychain hold) for
-  over 15 minutes, so nothing switches.
+  over 15 minutes, so nothing switches;
+* ``claude-killed`` — the OS killed a ``claude`` cc-swap ran at launch
+  (SIGKILL), once per binary identity (sent by ``claude_exec``; any process,
+  follows ``notify.enabled`` only).
 
 **Who sends them.** The engine: the service, a terminal ``cc-swap auto``, a
 TUI or menu bar engine — never a dry run. ``AutoSwitchEngine._emit`` hands
@@ -77,7 +80,7 @@ RATE_MAX = 6
 RATE_WINDOW_S = 600.0
 #: Rate-limit rooms: a switch or a stuck Keychain is never crowded out by a
 #: burst of reminders (re-logins, expiring logins, paused priming).
-ALERTS = frozenset({"switch", "keychain"})
+ALERTS = frozenset({"switch", "keychain", "claude-killed"})
 
 
 def room(event: str) -> str:
@@ -98,6 +101,7 @@ EVERY_S: dict[str, float] = {
     "prime-paused": DAY_S,
     "prime-verified": DAY_S,
     "keychain": 2 * 3600.0,
+    "claude-killed": KEEP_S,  # once per binary identity (its key)
 }
 #: Event → its ``NotifySettings`` switch.
 TOGGLES: dict[str, str] = {

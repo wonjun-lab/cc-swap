@@ -48,7 +48,6 @@ FLEET_ROUTES: dict[str, str] = {
     "last-resort": "l",  # home key: toggle last resort on the selected account
     "prime": "m p",  # menu → Prime now…
     "history": "m v",  # menu → View switch history (the ledger, newest first)
-    "claude-update": "m u",  # menu → Update Claude Code (check, confirm, run)
     "doctor": "m a i",  # menu → Account settings → Inspect all logins (doctor)
     "auto off": "m o",  # menu → o: automatic switching off (persistent)
     "auto on": "m o",  # menu → o: automatic switching back on
@@ -68,7 +67,7 @@ KNOWN_ASYMMETRY: dict[str, str] = {
     ),
     "upgrade": (
         "reinstalls cc-swap itself under the running TUI and restarts the service; "
-        "run it from a shell (Fleet's u updates Claude Code, not cc-swap)"
+        "run it from a shell"
     ),
     "init": (
         "a one-time onboarding checklist for a machine that is not set up yet; "
@@ -85,6 +84,11 @@ KNOWN_ASYMMETRY: dict[str, str] = {
         "desktop notifications are for when you are not looking at Fleet, and the "
         "engine sends them; testing the system notifier and its settings is a shell job "
         "(cc-swap config set notify.* turns them off)"
+    ),
+    "repair-live": (
+        "repairs the live login after a /login while the Keychain was locked; it "
+        "asks to confirm and must run where the Keychain can be written (a GUI "
+        "terminal) — the engine log and cc-swap add name it"
     ),
     "prime verify": (
         "spawns claude in a throwaway profile (and with --live spends a real prime) "
@@ -181,7 +185,7 @@ def test_a_routed_fleet_key_path_is_bound_at_every_step(action, route):
 def test_menu_routes_name_the_menu_item_that_does_it():
     assert menus.BY_ACTION["prime"].key == "p"
     assert menus.BY_ACTION["history"].key == "v"
-    assert menus.BY_ACTION["update"].key == "u"
+    assert "update" not in menus.BY_ACTION
     assert menus.BY_ACTION["accounts"].key == "a"
     assert menus.BY_ACTION["auto"].key == "o"
     assert menus.BY_ACTION["mode"].key == "m"

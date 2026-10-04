@@ -13,9 +13,8 @@ Keys are unique per level: the menu, the row keys and the reserved keys
 never share a letter except ``x`` (exclude), which is both a menu item and
 a row key because it acts on the selected account either way. A
 sub-screen's items (Account settings) never share one with each other or
-with its ``b``/``q``. ``v`` is only *View switch history* and ``u`` only
-*Update Claude Code* (menu), ``i`` only *Inspect all logins* (Account
-settings).
+with its ``b``/``q``. ``v`` is only *View switch history* (menu), ``i`` only *Inspect all
+logins* (Account settings).
 """
 
 from __future__ import annotations
@@ -42,7 +41,6 @@ MAIN_MENU: tuple[MenuEntry, ...] = (
               "add · re-login · rename · delete · inspect logins"),
     MenuEntry("e", "Engine log", "engine", "what the engine did and why"),
     MenuEntry("v", "View switch history", "history", "every switch, newest first"),
-    MenuEntry("u", "Update Claude Code", "update", "check, then run claude update"),
     MenuEntry("c", "Classic dashboard", "classic", "the upstream claude-swap screen"),
     MenuEntry("q", "Quit", "quit"),
 )
@@ -402,7 +400,7 @@ def help_entries(idle_pattern: str | None = None) -> list[tuple[str, str]]:
               "time (u, or just type it: 12:00), or lift the hold (o)"),
         ("m", "menu: o automatic switching on/off · m mode · s strategy · p prime · "
               "f fetch · x exclude · a accounts · e engine log · v history · "
-              "u update · c classic · q quit"),
+              "c classic · q quit"),
         (" ".join(SHORTCUT_KEYS), "those menu letters also work straight from here"),
         ("w / g", "watch every account / engine log"),
         ("?", "this help"),
