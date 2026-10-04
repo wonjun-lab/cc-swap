@@ -25,6 +25,12 @@ from claude_swap.settings import (
 from tests.maximize.test_fleet import MX, NOW, PRIME, acc, accounts, usage
 
 README = Path(__file__).resolve().parents[2] / "README.md"
+REFERENCE = README.parent / "docs" / "reference.md"
+
+
+def _docs_text() -> str:
+    """README.md and docs/reference.md together."""
+    return README.read_text(encoding="utf-8") + "\n" + REFERENCE.read_text(encoding="utf-8")
 LIVE_MX = replace(MX, hard_5h=95.0, hard_7d=99.0, force_eta_min=3)
 SERVICE = fx.EngineStatus("service", 4121, {"running": True, "pid": 4121})
 
@@ -162,7 +168,7 @@ def test_fleet_words_a_ride_and_counts_it_down():
     # A minute later, from the same published decision: ~1m, then now.
     assert "switching in ~1m (learned)" in _says(dv, rows, NOW + 60)[0]
     assert "riding to the limit, switching now (learned)" in _says(dv, rows, NOW + 130)[0]
-    assert f"`{said[0]}`" in README.read_text(encoding="utf-8")
+    assert f"`{said[0]}`" in _docs_text()
 
 
 def test_a_ride_is_never_worded_as_an_account_hold():

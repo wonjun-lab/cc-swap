@@ -32,7 +32,7 @@ pauses priming by itself (:func:`pending_update`) — also on an install
 with no verified version yet, which would otherwise keep priming and adopt
 the new build as its baseline.
 
-``prime verify`` automates the README's isolation checklist with zero-cost
+``prime verify`` automates the old README isolation checklist with zero-cost
 checks — an invalid-token run in a throwaway profile must fail with a clean
 401, leave no Keychain item and no ``.credentials.json`` behind, and leave
 the active login's Keychain item *attributes* (never its secret), its

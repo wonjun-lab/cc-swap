@@ -20,6 +20,12 @@ from claude_swap.maximize.fleet import fresh_s
 NOW = 1_790_000_000.0
 SRC = Path(__file__).resolve().parents[2] / "src" / "claude_swap"
 README = Path(__file__).resolve().parents[2] / "README.md"
+REFERENCE = README.parent / "docs" / "reference.md"
+
+
+def _docs_text() -> str:
+    """README.md and docs/reference.md together."""
+    return README.read_text(encoding="utf-8") + "\n" + REFERENCE.read_text(encoding="utf-8")
 
 
 @pytest.fixture
@@ -218,7 +224,7 @@ def _source_reason_codes() -> set[str]:
 
 
 def _readme_codes() -> dict[str, list[str]]:
-    text = README.read_text(encoding="utf-8")
+    text = _docs_text()
     section = text.split("### Why didn't it switch?", 1)[1].split("\n#", 1)[0]
     rows: dict[str, list[str]] = {}
     for line in section.splitlines():
@@ -260,4 +266,4 @@ def test_readme_table_matches_reasons_and_lists_no_dead_codes():
     "Account settings → `i`",
 ])
 def test_readme_documents_doctor_init_and_why(snippet):
-    assert snippet in README.read_text(encoding="utf-8")
+    assert snippet in _docs_text()
