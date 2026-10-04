@@ -25,7 +25,7 @@ def test_menu_keys_are_unique_and_every_title_names_its_item():
 def test_the_menu_holds_every_former_fleet_menu_action():
     actions = {e.action for e in menus.MAIN_MENU}
     assert actions >= {
-        "strategy", "mode", "prime", "fetch", "accounts", "engine", "history", "update",
+        "strategy", "mode", "prime", "fetch", "accounts", "engine", "history",
         "classic", "quit",
     }
     assert {"auto", "exclude"} <= actions
@@ -100,7 +100,7 @@ def test_the_0_3_0_keys_mean_one_thing_across_fleet():
     account = {key: action for key, _title, action in menus.ACCOUNT_ITEMS}
     main = {e.key: e.action for e in menus.MAIN_MENU}
     assert main["v"] == "history" and "v" not in account
-    assert main["u"] == "update" and "u" not in account
+    assert "u" not in main  # Update Claude Code is gone: cc-swap never updates it
     assert account["i"] == "verify" and "i" not in main
     assert "i" not in (*menus.ROW_KEYS, *menus.RESERVED_KEYS)
 

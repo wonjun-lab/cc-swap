@@ -227,8 +227,8 @@ def test_readme_names_every_fleet_footer_key():
 #
 # These read the registries (``_FORK_COMMANDS``, the parsers, the Fleet
 # bindings), so a command or key added later is held to the README as soon as
-# it is registered. Since 0.3.0 this covers doctor, init, why, history and
-# claude-update; `auto on|off|status`, `prime verify` and `upgrade --check`
+# it is registered. Since 0.3.0 this covers doctor, init, why and history;
+# `auto on|off|status`, `prime verify` and `upgrade --check`
 # are not in ``_FORK_COMMANDS`` and are listed explicitly below.
 
 
@@ -307,11 +307,12 @@ def test_every_fleet_key_the_readme_names_is_bound():
 
     bound = {"?" if k == "question_mark" else k for b in FleetScreen.BINDINGS for k in b.key.split(",")}
     bound |= {k for b in CswapApp.BINDINGS for k in b.key.split(",")}
-    # Sub-screens the section documents: the menu, Account settings and the
-    # Mode modal.
+    # Sub-screens the section documents: the menu, the hold picker, Account
+    # settings and the Mode modal.
     from claude_swap.tui import menus
 
     bound |= set(menus.MAIN_KEYS)
+    bound |= {row.key for row in menus.hold_rows(1.0, 0.0)}  # the `h` picker
     bound |= {k for b in AccountsScreen.BINDINGS for k in b.key.split(",")}
     bound |= {
         a.key
@@ -359,7 +360,7 @@ def test_readme_says_the_service_rotates_its_macos_logs():
 @pytest.mark.parametrize("command", [
     "cc-swap auto off", "cc-swap auto on", "cc-swap auto status",
     "cc-swap prime verify", "cc-swap prime verify --live",
-    "cc-swap history -n 0", "cc-swap upgrade --check", "cc-swap claude-update --check",
+    "cc-swap history -n 0", "cc-swap upgrade --check",
 ])
 def test_readme_documents_the_subcommands_outside_fork_commands(command):
     assert command in _readme_text()

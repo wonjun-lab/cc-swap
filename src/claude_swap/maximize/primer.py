@@ -883,8 +883,7 @@ class Primer:
         launching or recording anything (``cc-swap prime --dry-run``):
         ``(reason, whole_run)``. ``whole_run`` is True when the run itself is
         refused (no ``claude``, the version guard) and False when each
-        target would be held back (a ``claude update`` running, a re-login
-        pause). ``(None, False)`` when nothing stands in the way."""
+        target would be held back (a re-login pause). ``(None, False)`` when nothing stands in the way."""
         from claude_swap.maximize import prime_verify
 
         claude = resolve_claude_path(self.settings.claude_path)
@@ -904,8 +903,6 @@ class Primer:
                 )
             if not verdict.ok:
                 return verdict.reason, True
-        if prime_verify.update_in_progress(self.engine.switcher.backup_dir):
-            return "a `claude update` is in progress", False
         paused = active_pause(self.engine._read_state(), self._clock())
         if paused is not None:
             return f"switching paused ({paused[1]})", False
@@ -988,8 +985,8 @@ class Primer:
         verify`` would. A transient failure is retried later
         (``prime_verify.AUTO_RETRY_S``, at most ``AUTO_MAX_TRIES`` per
         version); any other failure, or the last try, records a failed
-        verify, which waits for a manual one. Skipped while a ``claude
-        update`` runs or another verify holds the lock. Never raises."""
+        verify, which waits for a manual one. Skipped while another verify
+        holds the lock. Never raises."""
         from claude_swap.maximize import prime_verify as pv
 
         verdict = self._gate_verdict
@@ -1001,7 +998,7 @@ class Primer:
             backoff = self._auto_backoff
             if backoff is not None and backoff[0] == verdict.current and now < backoff[1]:
                 return []
-            if pv.auto_verify_due(root, verdict, now) is None or pv.update_in_progress(root):
+            if pv.auto_verify_due(root, verdict, now) is None:
                 return []
             lock = pv.verify_lock(root)
             if not lock.acquire():
@@ -1011,7 +1008,7 @@ class Primer:
                 # recorded this version, or failed it.
                 verdict = pv.gate(root, claude, reader=self._version_reader, clock=self._clock)
                 version = pv.auto_verify_due(root, verdict, now)
-                if version is None or pv.update_in_progress(root):
+                if version is None:
                     return []
                 _logger.info("prime: claude %s changed; verifying priming isolation", version)
                 self._auto_backoff = (version, now + pv.AUTO_RETRY_S)
@@ -1188,7 +1185,7 @@ class Primer:
                 return self._skip_active(target, entry, self._clock()), False, None
             launch_at = self._clock()
         # The version gate ran at the start of the tick; the checks above can
-        # take a while, and `claude update` may have run since.
+        # take a while, and Claude Code may have updated itself since.
         stale = self._launch_blocked(claude)
         if stale is not None:
             return self._held_back(num, stale)
@@ -1200,12 +1197,9 @@ class Primer:
 
     def _launch_blocked(self, claude: str) -> str | None:
         """Why a launch must wait, from a re-check just before it: the
-        ``claude`` binary is no longer the one the version gate passed, or a
-        ``cc-swap claude-update`` is replacing it right now."""
+        ``claude`` binary is no longer the one the version gate passed."""
         from claude_swap.maximize import prime_verify
 
-        if prime_verify.update_in_progress(self.engine.switcher.backup_dir):
-            return "a `claude update` is in progress"
         if self._version_gate and self._gate_identity is not None:
             if prime_verify.identity(claude) != self._gate_identity[0]:
                 return "claude changed since the version check; re-checked next tick"

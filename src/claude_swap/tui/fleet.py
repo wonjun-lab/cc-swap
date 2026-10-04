@@ -445,7 +445,6 @@ class FleetScreen(Screen):
         Binding("a", "menu('accounts')", "Account settings", show=False),
         Binding("e,g", "menu('engine')", "Engine log", show=False),
         Binding("v", "menu('history')", "Switch history", show=False),
-        Binding("u", "menu('update')", "Update Claude Code", show=False),
         Binding("c", "menu('classic')", "Classic dashboard", show=False),
         Binding("w", "app.open_watch", "Watch", show=False),
         # The home screen: Esc never leaves it (the menu's c does).
@@ -892,7 +891,6 @@ class FleetScreen(Screen):
             "accounts": self.open_accounts,
             "engine": self.app.action_open_auto,
             "history": self.open_history,
-            "update": self.open_update,
             "classic": self.action_classic,
             "quit": self.action_quit,
         }.get(action)
@@ -997,19 +995,6 @@ class FleetScreen(Screen):
             if off else "Automatic switching ON"
         )
         self.app.call_from_thread(self._after_setting, message)
-
-    def open_update(self) -> None:
-        """Update Claude Code (``cc-swap claude-update``): check, then run on
-        a confirmation, with the output in the modal."""
-        from claude_swap.tui.fleet_update import ClaudeUpdateModal
-
-        self.app.push_screen(ClaudeUpdateModal(self._root), lambda _r: self._reload_soon())
-
-    def _reload_soon(self) -> None:
-        """After the update modal: re-read the prime guard (a changed claude
-        pauses priming) and redraw."""
-        self._prime_guard = prime_guard(self._root)
-        self._render_all()
 
     def open_history(self) -> None:
         """The switch ledger, newest first (``cc-swap history``)."""

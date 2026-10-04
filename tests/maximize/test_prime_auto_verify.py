@@ -71,19 +71,6 @@ class TestAutoVerify:
         primer.run_due(rig.snap())
         assert len(runner.calls) == 1 and len(system.calls) == 1
 
-    def test_a_claude_update_recorded_change_is_verified_too(self, rig, system, monkeypatch):
-        # Nothing verified yet; cc-swap claude-update recorded 2.1.3 -> 2.1.4.
-        monkeypatch.setattr(pv, "read_claude_version", lambda _p: "2.1.4")
-        rig.harness.engine._mutate_state(lambda st: st.update({
-            "claudeVersion": "2.1.4", "claudeVersionPrevious": "2.1.3",
-            "claudeVersionChangedAt": rig.clock() - 60,
-        }))
-        verdict = pv.gate(_root(rig), str(rig.fake.path))
-        assert not verdict.ok and verdict.cause == "update"
-        events = _primer(rig, system).run_due(rig.snap())
-        assert _outcomes(events) == ["auto-verified"]
-        assert pv.gate(_root(rig), str(rig.fake.path)).ok
-
     def test_an_isolation_failure_is_recorded_and_not_retried(self, rig, system, monkeypatch):
         _changed(rig, monkeypatch)
         system.during_run = lambda env, cwd: (cwd / ".credentials.json").write_text("{}")
@@ -155,18 +142,6 @@ class TestAutoVerify:
         assert primer.run_due(rig.snap()) == []
         assert system.calls == [] and runner.calls == []
         assert pv.verified_version(_root(rig)) == "2.1.3"
-
-    def test_not_while_claude_update_runs(self, rig, system, monkeypatch):
-        _changed(rig, monkeypatch)
-        primer = _primer(rig, system)
-        lock = FileLock(_root(rig) / ".claude_update.lock", timeout=0)
-        assert lock.acquire()
-        try:
-            assert _outcomes(primer.run_due(rig.snap())) == []
-            assert system.calls == []
-        finally:
-            lock.release()
-        assert _outcomes(primer.run_due(rig.snap())) == ["auto-verified"]
 
     def test_not_while_another_verify_holds_the_lock(self, rig, system, monkeypatch):
         _changed(rig, monkeypatch)

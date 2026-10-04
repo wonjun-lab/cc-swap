@@ -222,7 +222,7 @@ def _dry_run(argv: list[str]) -> int:
 
 @needs_posix
 def test_dry_run_reports_the_version_guard_pause_like_a_real_run(cli_rig, capsys):
-    """After `claude-update` (or a failed `prime verify`) the real run is
+    """After a Claude Code update (or a failed `prime verify`) the real run is
     refused; the dry run used to say "#2 would prime now"."""
     from claude_swap.maximize import prime_verify as pv
 

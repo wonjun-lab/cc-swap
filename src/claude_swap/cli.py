@@ -76,7 +76,6 @@ _SUBCOMMAND_FLAGS = {
 # attribute (``patch("claude_swap.cli._last_resort_command")``). New fork
 # commands (prime, service) register here; main() has a single hook for all.
 _FORK_COMMANDS: dict[str, str] = {
-    "claude-update": "_claude_update_command",
     "last-resort": "_last_resort_command",
     "prime": "_prime_command",
     "service": "_service_command",
@@ -1205,13 +1204,6 @@ def _prime_command(argv: list[str]) -> None:
     prime_command(argv)
 
 
-def _claude_update_command(argv: list[str]) -> None:
-    """Handle `cc-swap claude-update` (maximize/claude_update.py)."""
-    from claude_swap.maximize.claude_update import claude_update_command
-
-    claude_update_command(argv)
-
-
 def _doctor_command(argv: list[str]) -> None:
     """Handle `cc-swap doctor` (maximize/doctor_cli.py), imported lazily."""
     from claude_swap.maximize.doctor_cli import doctor_command
@@ -1663,7 +1655,7 @@ cc-swap:
   %(prog)s last-resort add|remove <a> use an account only as a last resort
   %(prog)s last-resort list           list last-resort accounts
   %(prog)s prime [N ...] [--dry-run]  open idle accounts' 5h windows now
-  %(prog)s prime verify [--live]      re-check priming isolation after a claude update
+  %(prog)s prime verify [--live]      re-check priming isolation after Claude Code changed
   %(prog)s login <num|email>          re-login an account (launches claude's login)
   %(prog)s service install            run auto-switch as a background service
   %(prog)s doctor [--json]            check logins, Keychain, service; say what to fix
@@ -1673,7 +1665,6 @@ cc-swap:
   %(prog)s hold [2h|until 23:00|off]  stay on the active account (soft moves wait)
   %(prog)s notify test|status         desktop notifications from the engine
   %(prog)s history [-n N] [--json]    recent account switches (who, why)
-  %(prog)s claude-update [--check]    update Claude Code via `claude update` (exit 10 = available)
 
 Aliases: ls=list  rm=remove  update=upgrade""",
         formatter_class=argparse.RawDescriptionHelpFormatter,

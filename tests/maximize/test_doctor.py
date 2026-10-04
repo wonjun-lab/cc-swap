@@ -463,7 +463,6 @@ def test_priming_on_reminds_about_isolation(world):
 
 
 def test_priming_paused_by_a_claude_update_is_a_warning_naming_prime_verify(world):
-    from claude_swap.maximize import claude_update as cu
     from claude_swap.maximize import prime_verify as pv
 
     world.healthy()
@@ -471,8 +470,8 @@ def test_priming_paused_by_a_claude_update_is_a_warning_naming_prime_verify(worl
     pv.record_verified(world.root, "2.1.280", by=pv.VERIFIED_BY_CLI, now=1.0)
     [ok] = find(run(world), "priming", "info")
     assert "verified for claude 2.1.280" in ok.detail
-    cu.record_version(world.root, "2.1.280")
-    cu.record_version(world.root, "2.1.287", "2.1.280")
+    # Claude Code updated itself; the engine's gate read the new version.
+    pv.note_seen(world.root, str(world.home / "claude"), "2.1.287", key=None)
     before = files(world.home, world.root)
     [f] = find(run(world), "priming", "warn")
     assert "2.1.280 -> 2.1.287" in f.detail and f.fix == "cc-swap prime verify"

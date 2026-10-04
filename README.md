@@ -117,7 +117,7 @@ Fleet keys:
 | `h` | Hold: stay on the active account for a while |
 | `n` | Name the selected account (set its alias) |
 | `↑`/`↓` or `j`/`k` | Move the selection |
-| `m` | Menu: auto on/off, mode, swap strategy, prime now, fetch usage, exclude, account settings, engine log, switch history, update Claude Code, classic dashboard |
+| `m` | Menu: auto on/off, mode, swap strategy, prime now, fetch usage, exclude, account settings, engine log, switch history, classic dashboard |
 | `?` | Explain everything on the screen |
 | `q` | Quit |
 
@@ -257,7 +257,7 @@ cc-swap prime verify
 
 It costs nothing (no real request is made) and resumes priming on the engine's next tick when every check passes. If a check fails (yours or the engine's), priming stays paused until a manual `cc-swap prime verify` passes; turn it off with `cc-swap config set prime.enabled false` and open an issue with your `claude --version`.
 
-To update Claude Code and get the same reminder, use `cc-swap claude-update` (it runs Claude Code's own `claude update`).
+cc-swap never updates Claude Code itself: Claude Code's own updater does, and the guard notices the new `claude` file.
 
 ## Common tasks
 

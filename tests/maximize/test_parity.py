@@ -48,7 +48,6 @@ FLEET_ROUTES: dict[str, str] = {
     "last-resort": "l",  # home key: toggle last resort on the selected account
     "prime": "m p",  # menu → Prime now…
     "history": "m v",  # menu → View switch history (the ledger, newest first)
-    "claude-update": "m u",  # menu → Update Claude Code (check, confirm, run)
     "doctor": "m a i",  # menu → Account settings → Inspect all logins (doctor)
     "auto off": "m o",  # menu → o: automatic switching off (persistent)
     "auto on": "m o",  # menu → o: automatic switching back on
@@ -181,7 +180,7 @@ def test_a_routed_fleet_key_path_is_bound_at_every_step(action, route):
 def test_menu_routes_name_the_menu_item_that_does_it():
     assert menus.BY_ACTION["prime"].key == "p"
     assert menus.BY_ACTION["history"].key == "v"
-    assert menus.BY_ACTION["update"].key == "u"
+    assert "update" not in menus.BY_ACTION
     assert menus.BY_ACTION["accounts"].key == "a"
     assert menus.BY_ACTION["auto"].key == "o"
     assert menus.BY_ACTION["mode"].key == "m"
