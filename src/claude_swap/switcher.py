@@ -2451,6 +2451,7 @@ class ClaudeAccountSwitcher:
                 "configSlot": str(account_num),
                 "fingerprint": oauth.credential_fingerprint(credentials),
             },
+            dedupe=True,
         )
 
     #: How far apart two login deadlines must be to count as different
@@ -5006,13 +5007,15 @@ class ClaudeAccountSwitcher:
                         # replaced (an old session wrote it back): keep them
                         # as an unclaimed entry and put the new login back
                         # live — never adopt them into the backup.
-                        self._stash_live_credential(
-                            live, "replaced-login", account_num, None
-                        )
                         working = self._prepare_credentials_for_activation(
                             pinned, live
                         )
                         with claude_config_lock():
+                            # Stashed once the last lock is held: a lock
+                            # timeout does not leave a stash behind each pass.
+                            self._stash_live_credential(
+                                live, "replaced-login", account_num, None
+                            )
                             self._write_credentials(working)
                         self._logger.info(
                             "refresh: account %s's live login was the one a "
@@ -7463,6 +7466,9 @@ class ClaudeAccountSwitcher:
                 "resolvedIdentity": resolved,
                 "credentialsMtime": creds_mtime,
             },
+            # The re-login guards stash the same replaced login on every pass
+            # a recovery keeps failing (offline, a lock held): one entry.
+            dedupe=reason in ("behind", "replaced-login"),
         )
         self._logger.warning(
             "Live credential does not belong to Account-%s (%s): stashed as %s "

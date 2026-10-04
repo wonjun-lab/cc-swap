@@ -547,6 +547,78 @@ def test_adopt_branch_puts_the_new_login_back_live(temp_home, monkeypatch):
     assert _stashed_rts(s) == ["rt-four-old2"]
 
 
+def test_an_offline_recovery_failing_every_pass_stashes_the_old_login_once(
+    temp_home, monkeypatch
+):
+    s = _switcher(temp_home, active="4")
+    old_prime = _blob("rt-four-old2", D - 10 * DAY_MS, expires=6000)
+    _old_session_wrote_back(s, old_prime, backup=_blob("rt-four-new", D, expires=5000))
+    posted = []
+
+    def offline(refresh_input, **kw):
+        posted.append(oauth.extract_oauth_data(refresh_input)["refreshToken"])
+        return oauth.RefreshOutcome(None, "transient")
+
+    monkeypatch.setattr(s, "_audited_refresh", offline)
+    for _ in range(3):
+        s._fetch_active_usage("4", FOUR, old_prime, ORG4)
+    assert posted == ["rt-four-new"] * 3  # never the replaced login's token
+    assert _stashed_rts(s) == ["rt-four-old2"]
+
+
+def test_an_adopt_write_failing_every_pass_stashes_the_old_login_once(temp_home, monkeypatch):
+    from claude_swap.exceptions import CredentialWriteError
+
+    s = _switcher(temp_home, active="4")
+    old_prime = _blob("rt-four-old2", D - 10 * DAY_MS)
+    _old_session_wrote_back(s, old_prime)
+    _no_refresh_of(s, monkeypatch, "rt-four-old2")
+
+    def locked(creds):
+        raise CredentialWriteError("Keychain locked")
+
+    monkeypatch.setattr(s, "_write_credentials", locked)
+    for _ in range(3):
+        s._fetch_active_usage("4", FOUR, _blob("rt-four-new", D, expires=1), ORG4)
+    assert _stashed_rts(s) == ["rt-four-old2"]
+    assert _slot_rt(s) == "rt-four-new"
+
+
+def test_an_adopt_lock_timeout_stashes_nothing(temp_home, monkeypatch):
+    import contextlib
+
+    from claude_swap import switcher as switcher_mod
+    from claude_swap.exceptions import ClaudeCodeLockTimeout
+
+    s = _switcher(temp_home, active="4")
+    old_prime = _blob("rt-four-old2", D - 10 * DAY_MS)
+    _old_session_wrote_back(s, old_prime)
+    _no_refresh_of(s, monkeypatch, "rt-four-old2")
+
+    @contextlib.contextmanager
+    def busy(**kw):
+        raise ClaudeCodeLockTimeout("config lock held")
+        yield
+
+    monkeypatch.setattr(switcher_mod, "claude_config_lock", busy)
+    for _ in range(3):
+        s._fetch_active_usage("4", FOUR, _blob("rt-four-new", D, expires=1), ORG4)
+    assert _stashed_rts(s) == []
+
+
+def test_relogin_stashes_dedupe_but_other_stashes_do_not(temp_home):
+    s = _switcher(temp_home)
+    old = _blob("rt-four-old", D - DAY_MS)
+    first = s._stash_live_credential(old, "behind", "4", None)
+    assert s._stash_live_credential(old, "replaced-login", "4", None) == first
+    assert s.stash_relogin_credential("4", _creds("rt-new"), "relogin-unstored") == \
+        s.stash_relogin_credential("4", _creds("rt-new"), "relogin-unstored")
+    assert len(s.list_unclaimed_credentials()) == 2
+    # Every other stash still gets its own entry (per-entry state elsewhere).
+    s._stash_live_credential(old, "foreign", "4", None)
+    assert len(s.list_unclaimed_credentials()) == 3
+
+
 def test_an_interrupt_after_the_store_committed_stashes_nothing(temp_home, monkeypatch):
     s = _switcher(temp_home)
 
