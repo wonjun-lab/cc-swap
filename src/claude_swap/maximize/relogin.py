@@ -57,7 +57,8 @@ _logger = logging.getLogger("claude-swap")
 PROFILE_PREFIX = "relogin-"
 PROBE_TIMEOUT_S = 20.0
 INTERRUPT_GRACE_S = 5.0
-STALE_PROFILE_S = 3600.0  # a profile this old belongs to no running attempt
+STALE_PROFILE_S = 3600.0  # older than this, a profile whose process is gone is swept
+OWNED_PROFILE_MAX_S = 86400.0  # a live owner protects it this long (pid reuse)
 
 #: ``Outcome.status`` values.
 STORED = "stored"
@@ -189,16 +190,55 @@ def terminate_as_interrupt() -> Iterator[None]:
                 pass
 
 
-def _remove_profile(profile: Path) -> None:
+PID_FILE = "cc-swap-login.pid"
+
+
+def _remove_profile(profile: Path) -> bool:
     """The profile's Keychain item (macOS), then the directory, then the
-    item again: a child that exited just now may still have written it."""
+    item again (a child that exited just now may still have written it).
+    When the Keychain delete fails the directory is KEPT — its path is the
+    only way to name the item — so a later sweep can retry. Returns whether
+    everything is gone."""
     from claude_swap.session import delete_macos_keychain_entry
 
+    if not delete_macos_keychain_entry(profile):
+        _drop_pid_file(profile)  # nobody owns it any more: the sweep may take it
+        return False
+    shutil.rmtree(profile, ignore_errors=True)
+    if not delete_macos_keychain_entry(profile):
+        _logger.warning("A Keychain item of the removed re-login profile %s may remain",
+                        profile)
+        return False
+    return True
+
+
+def _drop_pid_file(profile: Path) -> None:
     try:
-        delete_macos_keychain_entry(profile)
-    finally:
-        shutil.rmtree(profile, ignore_errors=True)
-        delete_macos_keychain_entry(profile)
+        (profile / PID_FILE).unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
+def _owner_alive(profile: Path) -> bool:
+    """Whether the process that made ``profile`` is still running (a login
+    can wait in the browser for longer than the sweep's age limit)."""
+    try:
+        pid = int((profile / PID_FILE).read_text(encoding="utf-8").strip())
+    except (OSError, ValueError):
+        return False
+    if pid <= 0:
+        return False
+    if pid == os.getpid():
+        return True
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True  # exists, another user's
+    except OSError:
+        return False
+    return True
 
 
 def sweep_stale_profiles(root: Path, *, max_age_s: float = STALE_PROFILE_S,
@@ -217,10 +257,11 @@ def sweep_stale_profiles(root: Path, *, max_age_s: float = STALE_PROFILE_S,
         try:
             if not path.is_dir() or path.is_symlink():
                 continue
-            if now - path.stat().st_mtime < max_age_s:
+            age = now - path.stat().st_mtime
+            if age < max_age_s or (age < OWNED_PROFILE_MAX_S and _owner_alive(path)):
                 continue
-            _remove_profile(path)
-            removed.append(path)
+            if _remove_profile(path):
+                removed.append(path)
         except Exception:
             _logger.warning("Could not remove the leftover re-login profile %s", path,
                             exc_info=True)
@@ -283,6 +324,7 @@ class LoginAttempt:
         self.profile = Path(tempfile.mkdtemp(prefix=PROFILE_PREFIX, dir=root))
         if os.name == "posix":
             os.chmod(self.profile, 0o700)
+        (self.profile / PID_FILE).write_text(str(os.getpid()), encoding="utf-8")
         self._clean = False
 
     def env(self, base_env: Mapping[str, str] | None = None) -> dict[str, str]:
@@ -369,6 +411,9 @@ class LoginAttempt:
             result = switcher.store_relogin(t.number, creds, account, activate=True) or {}
         except Exception as e:
             return Outcome(FAILED, t.number, _not_stored(switcher, t, creds, e))
+        except BaseException as e:  # Ctrl-C / SIGTERM mid-store: keep it, then unwind
+            _not_stored(switcher, t, creds, e)
+            raise
         stored = f"#{t.number} login stored ({t.email})"
         if result.get("activated"):
             return Outcome(STORED, t.number, f"{stored}; the live login now uses it",
@@ -442,6 +487,9 @@ def relogin(
     """The whole re-login of slot ``number`` (the CLI's; the TUI runs the
     same steps around ``App.suspend``)."""
     target = target_for(switcher, number)
+    refuse = getattr(switcher, "_refuse_session_shell", None)
+    if refuse is not None:
+        refuse()  # before the browser, not after: store_relogin would refuse anyway
     with terminate_as_interrupt(), LoginAttempt(switcher.backup_dir, target, claude) as attempt:
         if announce is not None:
             announce(attempt.banner())

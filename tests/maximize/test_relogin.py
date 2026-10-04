@@ -420,46 +420,115 @@ def test_live_account_changed_during_the_login_is_not_overwritten(temp_home):
 # -- old logins never come back over a new one -----------------------------------------
 
 
-def _old_live_valid(s, home):
-    """#4 is live on its OLD, still valid login (an early renewal); the slot
-    backup gets the NEW login without the live store (the state B1 left)."""
-    old = json.dumps({"claudeAiOauth": {
-        "accessToken": "sk-ant-oat01-old", "refreshToken": "rt-four-old",
-        "expiresAt": 99999999990000, "refreshTokenExpiresAt": 99999999990000}})
-    s._write_credentials(old)
-    s.store_relogin("4", _creds("rt-four-new"), _account(FOUR, ORG4, "uuid-4"),
-                    activate=False)
-    assert _slot_rt(s) == "rt-four-new"
-    return old
+D = 99999999999000  # the new login's deadline (_creds stamps it)
+DAY_MS = 86_400_000
 
 
-def test_collect_pass_resync_does_not_put_the_old_login_back(temp_home, monkeypatch):
-    s = _switcher(temp_home, active="4")
-    old = _old_live_valid(s, temp_home)
+def _blob(rt: str, deadline: int | None, expires: int = 99999999999500) -> str:
+    fields = {"accessToken": f"sk-ant-oat01-{rt}", "refreshToken": rt, "expiresAt": expires}
+    if deadline is not None:
+        fields["refreshTokenExpiresAt"] = deadline
+    return json.dumps({"claudeAiOauth": fields})
+
+
+OLD = _blob("rt-four-old", D - 10 * DAY_MS, 99999999990000)  # the login renewed early
+
+
+def _engine_sees_it_as_ours(monkeypatch):
     monkeypatch.setattr(oauth, "fetch_oauth_profile", lambda token: {
         "uuid": "uuid-4", "email": FOUR, "organizationUuid": ORG4})
     monkeypatch.setattr(oauth, "try_fetch_usage_for_account",
                         lambda *a, **k: oauth.UsageOutcome(usage={"five_hour": {}}))
-    s._fetch_active_usage("4", FOUR, old, ORG4)  # the engine's collect pass
+
+
+def _old_live_valid(s):
+    """#4 is live on its OLD, still valid login (an early renewal); the slot
+    backup gets the NEW login without the live store (the state B1 left)."""
+    s._write_credentials(OLD)
+    s._write_account_credentials("4", FOUR, OLD)
+    s.store_relogin("4", _creds("rt-four-new"), _account(FOUR, ORG4, "uuid-4"),
+                    activate=False)
     assert _slot_rt(s) == "rt-four-new"
+
+
+def _pin(s):
+    return s._get_sequence_data()["accounts"]["4"].get("reloginPin")
+
+
+@pytest.mark.parametrize("live", [
+    OLD,  # the replaced login itself
+    _blob("rt-four-old2", D - 10 * DAY_MS + 1500),  # a rotation of it (an old session)
+], ids=["replaced", "replaced-rotated"])
+def test_collect_pass_resync_does_not_put_the_old_login_back(temp_home, monkeypatch, live):
+    s = _switcher(temp_home, active="4")
+    _old_live_valid(s)
+    s._write_credentials(live)
+    _engine_sees_it_as_ours(monkeypatch)
+    s._fetch_active_usage("4", FOUR, live, ORG4)  # the engine's collect pass
+    assert _slot_rt(s) == "rt-four-new"
+    assert _pin(s)["newFp"] == oauth.credential_fingerprint(_creds("rt-four-new"))
 
 
 def test_active_slot_relogin_then_a_collect_pass_keeps_the_new_login(temp_home, monkeypatch):
     s = _switcher(temp_home, active="4")
-    old = json.dumps({"claudeAiOauth": {
-        "accessToken": "sk-ant-oat01-old", "refreshToken": "rt-four-old",
-        "expiresAt": 99999999990000, "refreshTokenExpiresAt": 99999999990000}})
-    s._write_credentials(old)  # the old login is still valid (early renewal)
-    s._write_account_credentials("4", FOUR, old)
+    s._write_credentials(OLD)  # the old login is still valid (early renewal)
+    s._write_account_credentials("4", FOUR, OLD)
     assert _run(s, FakeLogin()).activated
-    monkeypatch.setattr(oauth, "fetch_oauth_profile", lambda token: {
-        "uuid": "uuid-4", "email": FOUR, "organizationUuid": ORG4})
-    monkeypatch.setattr(oauth, "try_fetch_usage_for_account",
-                        lambda *a, **k: oauth.UsageOutcome(usage={"five_hour": {}}))
+    _engine_sees_it_as_ours(monkeypatch)
     s._fetch_active_usage("4", FOUR, s._read_credentials(), ORG4)
-    s._fetch_active_usage("4", FOUR, old, ORG4)  # a pass that read before the store
+    s._fetch_active_usage("4", FOUR, OLD, ORG4)  # a pass that read before the store
     assert _slot_rt(s) == "rt-four-new"
     assert oauth.extract_oauth_data(s._read_credentials())["refreshToken"] == "rt-four-new"
+
+
+# Claude Code re-stamps refreshTokenExpiresAt on every refresh as now + the
+# remaining lifetime in whole seconds: one login's value jitters both ways;
+# cc-swap's own refresh keeps min(known, stated), so its stamps move earlier.
+JITTER_MS = [200, -200, 2000, -2000, -65_000]
+
+
+@pytest.mark.parametrize("delta", JITTER_MS)
+def test_a_jittered_rotation_after_a_relogin_is_still_resynced(temp_home, monkeypatch, delta):
+    s = _switcher(temp_home, active="4")
+    assert _run(s, FakeLogin()).activated
+    rotated = _blob("rt-four-gen2", D + delta)
+    s._write_credentials(rotated)
+    _engine_sees_it_as_ours(monkeypatch)
+    s._fetch_active_usage("4", FOUR, rotated, ORG4)
+    assert _slot_rt(s) == "rt-four-gen2"
+    # The new login moved on: the next check finds the pin stale and drops it.
+    assert not s._relogin_pin_refuses("4", _blob("rt-four-gen2", D), OLD)
+    assert _pin(s) is None
+
+
+@pytest.mark.parametrize("delta", JITTER_MS)
+def test_a_jittered_rotation_after_a_relogin_is_still_adopted(temp_home, monkeypatch, delta):
+    s = _switcher(temp_home, active="4")
+    assert _run(s, FakeLogin()).activated
+    rotated = _blob("rt-four-gen2", D + delta)
+    s._write_credentials(rotated)
+    _engine_sees_it_as_ours(monkeypatch)
+    s._probe_verdicts[s._lineage_key("4", FOUR, oauth.credential_fingerprint(rotated))] = True
+    expired_read = _blob("rt-four-new", D, expires=1)  # what the pass read: expired
+    s._fetch_active_usage("4", FOUR, expired_read, ORG4)  # -> the locked adopt branch
+    assert _slot_rt(s) == "rt-four-gen2"
+
+
+@pytest.mark.parametrize("delta", JITTER_MS)
+@pytest.mark.parametrize("after_relogin", [True, False])
+def test_a_jittered_rotation_is_backed_up_on_switch_and_nothing_stashed(
+    temp_home, delta, after_relogin
+):
+    s = _switcher(temp_home, active="4")
+    if after_relogin:
+        assert _run(s, FakeLogin()).activated
+    else:
+        s._write_account_credentials("4", FOUR, _blob("rt-four-gen1", D + 300, 1000))
+    s._write_credentials(_blob("rt-four-gen2", D + delta - (0 if after_relogin else 500)))
+    s.switch_to("1", json_output=True)
+    assert s.current_account_number() == "1"
+    assert _slot_rt(s) == "rt-four-gen2"
+    assert _stashed_rts(s) == []
 
 
 def test_store_relogin_takes_the_consume_lock(temp_home, monkeypatch):
@@ -484,40 +553,46 @@ def test_store_relogin_takes_the_consume_lock(temp_home, monkeypatch):
     assert _stashed_rts(s) == ["rt-four-new"]
 
 
-def test_switch_time_backup_does_not_put_the_old_login_back(temp_home):
+def test_switch_time_backup_keeps_the_new_login_and_stashes_the_old(temp_home):
     s = _switcher(temp_home, active="4")
-    _old_live_valid(s, temp_home)
+    _old_live_valid(s)
     s.switch_to("1", json_output=True)
     assert s.current_account_number() == "1"
     assert _slot_rt(s) == "rt-four-new"
+    assert _stashed_rts(s) == ["rt-four-old"]  # "behind" never drops the only copy
 
 
-def test_a_routine_rotation_is_still_backed_up(temp_home):
+def test_store_relogin_pins_the_event(temp_home):
     s = _switcher(temp_home, active="4")
-    s._write_account_credentials("4", FOUR, json.dumps({"claudeAiOauth": {
-        "accessToken": "a1", "refreshToken": "rt-gen1", "expiresAt": 1000,
-        "refreshTokenExpiresAt": 99999999999000}}))
-    rotated = json.dumps({"claudeAiOauth": {
-        "accessToken": "a2", "refreshToken": "rt-gen2", "expiresAt": 2000,
-        "refreshTokenExpiresAt": 99999999999000}})
-    s._write_credentials(rotated)
-    s.switch_to("1", json_output=True)
-    assert _slot_rt(s) == "rt-gen2"
+    live_old = s._read_credentials()
+    assert _run(s, FakeLogin()).activated
+    pin = _pin(s)
+    assert pin["newFp"] == oauth.credential_fingerprint(_creds("rt-four-new"))
+    assert oauth.credential_fingerprint(live_old) in pin["oldFps"]
+    assert pin["deadline"] == D
 
 
-@pytest.mark.parametrize("backup,live,newer", [
-    ({"expiresAt": 2, "refreshTokenExpiresAt": 20}, {"expiresAt": 9, "refreshTokenExpiresAt": 10}, True),
-    ({"expiresAt": 9, "refreshTokenExpiresAt": 10}, {"expiresAt": 2, "refreshTokenExpiresAt": 20}, False),
-    ({"expiresAt": 1, "refreshTokenExpiresAt": 10}, {"expiresAt": 2, "refreshTokenExpiresAt": 10}, False),
-    ({"expiresAt": 3, "refreshTokenExpiresAt": 10}, {"expiresAt": 2, "refreshTokenExpiresAt": 10}, True),
-    ({"expiresAt": 3}, {"expiresAt": 2}, True),
-    ({}, {"expiresAt": 2}, False),
+@pytest.mark.parametrize("backup,live,refuses", [
+    ("new", "old", True),                       # the replaced login
+    ("new", "old-rotated-days-earlier", True),  # a rotation of it
+    ("new", "new", False),
+    ("new", "jitter-earlier", False),           # a rotation of the new login
+    ("new", "no-deadline", False),              # unknowable: pre-guard behaviour
+    ("moved-on", "old", False),                 # pin stale: backup rotated past it
 ])
-def test_backup_newer_than_orders_by_login_deadline_then_access_expiry(backup, live, newer):
-    def blob(fields):
-        return json.dumps({"claudeAiOauth": {"accessToken": "a", "refreshToken": "r", **fields}})
-
-    assert ClaudeAccountSwitcher._backup_newer_than(blob(backup), blob(live)) is newer
+def test_relogin_pin_refuses_only_the_replaced_login(temp_home, backup, live, refuses):
+    s = _switcher(temp_home)
+    s._write_account_credentials("4", FOUR, OLD)
+    s.store_relogin("4", _creds("rt-four-new"), _account(FOUR, ORG4, "uuid-4"),
+                    activate=False)
+    blobs = {
+        "new": _creds("rt-four-new"), "old": OLD,
+        "old-rotated-days-earlier": _blob("rt-x", D - 2 * DAY_MS),
+        "jitter-earlier": _blob("rt-y", D - 2000),
+        "no-deadline": _blob("rt-z", None),
+        "moved-on": _blob("rt-four-gen2", D),
+    }
+    assert s._relogin_pin_refuses("4", blobs[backup], blobs[live]) is refuses
 
 
 # -- leftovers -------------------------------------------------------------------------
@@ -695,3 +770,113 @@ def test_login_is_a_registered_command():
 
 def test_relogin_fix_points_at_the_login_command():
     assert oauth.relogin_fix(4) == "re-login #4: cc-swap login 4, or Fleet → select → r"
+
+
+# -- session shells, interrupts, leftovers (review round 3) ----------------------------
+
+
+def _inside_session_shell(s, monkeypatch):
+    inside = Path(s.backup_dir) / "sessions" / f"4-{FOUR}"
+    inside.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(inside))
+
+
+def test_store_relogin_refuses_inside_a_session_shell(temp_home, monkeypatch):
+    from claude_swap.exceptions import SwitchError
+
+    s = _switcher(temp_home, active="4")
+    _inside_session_shell(s, monkeypatch)
+    with pytest.raises(SwitchError):
+        s.store_relogin("4", _creds("rt-four-new"), _account(FOUR, ORG4, "uuid-4"))
+    with pytest.raises(SwitchError):
+        s.store_relogin("4", _creds("rt-four-new"), _account(FOUR, ORG4, "uuid-4"),
+                        activate=False)
+    assert _slot_rt(s) == "rt-four-dead"
+    assert s._get_sequence_data()["activeAccountNumber"] == 4
+    assert "reloginPin" not in s._get_sequence_data()["accounts"]["4"]
+
+
+def test_login_refuses_inside_a_session_shell_before_the_browser(temp_home, monkeypatch):
+    from claude_swap.exceptions import SwitchError
+
+    s = _switcher(temp_home)
+    _inside_session_shell(s, monkeypatch)
+    login = FakeLogin()
+    with pytest.raises(SwitchError):
+        _run(s, login)
+    assert not login.calls and not _leftover_profiles(s)
+
+
+def test_an_interrupt_during_the_store_keeps_the_login_then_unwinds(temp_home, monkeypatch):
+    s = _switcher(temp_home)
+
+    def interrupted(*a, **k):
+        raise KeyboardInterrupt  # SIGTERM via terminate_as_interrupt, or Ctrl-C
+
+    monkeypatch.setattr(s, "store_relogin", interrupted)
+    login = FakeLogin()
+    with pytest.raises(KeyboardInterrupt):
+        _run(s, login)
+    assert _stashed_rts(s) == ["rt-four-new"]
+    assert not login.profile.exists()
+
+
+def test_rollback_runs_every_step_through_an_interrupt(temp_home, monkeypatch):
+    s = _switcher(temp_home, active="4")
+    live_before = s._read_credentials()
+    real_write_json = s._write_json
+    real_write_creds = s._write_credentials
+    state = {"stage": "store"}
+
+    def failing_seq(path, data):
+        if path == s.sequence_file and state["stage"] == "store":
+            state["stage"] = "rollback"
+            raise OSError(28, "full")
+        return real_write_json(path, data)
+
+    def interrupt_first_restore(creds):
+        if state["stage"] == "rollback" and creds == live_before:
+            state["stage"] = "done"
+            real_write_creds(creds)
+            raise KeyboardInterrupt  # mid-rollback; later steps must still run
+        return real_write_creds(creds)
+
+    monkeypatch.setattr(s, "_write_json", failing_seq)
+    monkeypatch.setattr(s, "_write_credentials", interrupt_first_restore)
+    with pytest.raises(KeyboardInterrupt):
+        s.store_relogin("4", _creds("rt-four-new"), _account(FOUR, ORG4, "uuid-4"))
+    assert _slot_rt(s) == "rt-four-dead"
+    assert s._read_credentials() == live_before
+    # the live-config restore (the step after the interrupted one) still ran
+    assert json.loads((temp_home / ".claude.json").read_text())["oauthAccount"]["accountUuid"] == "uuid-4"
+
+
+def test_sweep_skips_a_profile_whose_login_is_still_running(tmp_path):
+    import os
+    import time
+
+    waiting = tmp_path / f"{rl.PROFILE_PREFIX}waiting"
+    waiting.mkdir()
+    (waiting / rl.PID_FILE).write_text(str(os.getpid()))
+    two_hours_ago = time.time() - 7200  # past the age limit, owner still alive
+    os.utime(waiting, (two_hours_ago, two_hours_ago))
+    assert rl.sweep_stale_profiles(tmp_path) == []
+    assert waiting.exists()
+
+
+def test_sweep_keeps_a_profile_whose_keychain_item_could_not_be_deleted(
+    tmp_path, monkeypatch
+):
+    import os
+
+    from claude_swap import session
+
+    left = tmp_path / f"{rl.PROFILE_PREFIX}stuck"
+    left.mkdir()
+    os.utime(left, (1, 1))
+    monkeypatch.setattr(session, "delete_macos_keychain_entry", lambda p: False)
+    assert rl.sweep_stale_profiles(tmp_path) == []
+    assert left.exists()  # its path is the only name of the item: retry later
+    monkeypatch.setattr(session, "delete_macos_keychain_entry", lambda p: True)
+    assert rl.sweep_stale_profiles(tmp_path) == [left]
+    assert not left.exists()

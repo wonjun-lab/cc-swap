@@ -261,6 +261,9 @@ def _launch_relogin(app: "CswapApp", number: str, claude: str, supported: bool) 
         return
     try:
         target = rl.target_for(app.switcher, number)
+        refuse = getattr(app.switcher, "_refuse_session_shell", None)
+        if refuse is not None:
+            refuse()  # inside a `cswap run` shell: refuse before the browser
         attempt = rl.LoginAttempt(app.switcher.backup_dir, target, claude)
     except Exception as e:
         app.notify(f"{e}", title=f"Re-login #{number}", severity="error", timeout=10)
