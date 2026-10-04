@@ -16,38 +16,48 @@ read ``cswap run`` already uses); the account from the profile's
 ``.claude.json`` ``oauthAccount``. It is stored only when it is the slot's
 account (email + organization, and the account uuid when both sides have
 one; the token-owner oracle refuses a definite mismatch), through
-``switcher.store_relogin`` (the slot lock and the ``add`` writes).
+``switcher.store_relogin``.
 
-The live login is not touched, so nothing is switched away or back and the
-engine needs no pause — except when the slot IS the live account: its old
-refresh token is the one that is dead (or about to be), so the live login
-is rewritten from the slot just stored with ``switch_to(N, force=True)``,
-the documented "rewrite the live login from the stored backup" path (all
-three locks, the displaced live credential stashed, rolled back on failure).
+``store_relogin`` takes the consume, account and Claude Code locks and, when
+the slot IS the live account, writes the live login in the same critical
+section (rolling both back on any failure): backup and live never disagree
+where another process could copy the old login back over the new one.
+Otherwise the live login is not touched — nothing switches and no engine
+pause is involved. A login that could not be stored is kept as an unclaimed
+entry (``cc-swap unclaimed``), so a finished browser login is never lost.
 
 The profile — directory and Keychain item — is removed whatever happens:
-success, mismatch, Ctrl-C, a crash.
+success, mismatch, Ctrl-C, SIGTERM/SIGHUP, a crash. A profile a killed
+process left behind is swept (with its Keychain item) by the next attempt
+and when an engine starts.
 """
 
 from __future__ import annotations
 
+import contextlib
 import json
+import logging
 import os
 import shutil
+import signal
 import subprocess
 import tempfile
+import threading
 import time
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
 from claude_swap import oauth
 from claude_swap.credentials import looks_like_api_key
-from claude_swap.exceptions import AccountNotFoundError, ClaudeSwitchError, ValidationError
+from claude_swap.exceptions import AccountNotFoundError, ValidationError
+
+_logger = logging.getLogger("claude-swap")
 
 PROFILE_PREFIX = "relogin-"
 PROBE_TIMEOUT_S = 20.0
 INTERRUPT_GRACE_S = 5.0
+STALE_PROFILE_S = 3600.0  # a profile this old belongs to no running attempt
 
 #: ``Outcome.status`` values.
 STORED = "stored"
@@ -72,7 +82,7 @@ class Outcome:
     status: str
     number: str
     message: str
-    activated: bool = False  # the live login was rewritten too (active slot)
+    activated: bool = False  # the live login got the new login too (active slot)
 
     @property
     def ok(self) -> bool:
@@ -113,20 +123,110 @@ def login_supported(claude: str, *, timeout: float = PROBE_TIMEOUT_S) -> bool:
     return result.returncode == 0 and "--email" in (result.stdout or "")
 
 
+def _reap(proc: subprocess.Popen) -> None:
+    """Wait out the child after a Ctrl-C; kill it when it lingers or when
+    the user presses Ctrl-C again. Returns only once it has exited, so it
+    cannot write its Keychain item after the profile is cleaned up."""
+    try:
+        proc.wait(timeout=INTERRUPT_GRACE_S)
+        return
+    except subprocess.TimeoutExpired:
+        pass
+    except KeyboardInterrupt:
+        pass
+    proc.kill()
+    while True:
+        try:
+            proc.wait()
+            return
+        except KeyboardInterrupt:
+            continue
+
+
 def run_interactive(argv: Sequence[str], env: Mapping[str, str], cwd: Path) -> int | None:
     """Run ``argv`` on this terminal; its exit code, or None when the user
-    pressed Ctrl-C (the child got the SIGINT too; it is killed if it lingers).
-    ``OSError`` when it cannot be started at all."""
+    pressed Ctrl-C (the child got the SIGINT too and has exited, or was
+    killed, before this returns). ``OSError`` when it cannot be started."""
     proc = subprocess.Popen(list(argv), env=dict(env), cwd=str(cwd))
     try:
         return proc.wait()
     except KeyboardInterrupt:
-        try:
-            proc.wait(timeout=INTERRUPT_GRACE_S)
-        except subprocess.TimeoutExpired:
-            proc.kill()
-            proc.wait()
+        _reap(proc)
         return None
+    except BaseException:  # SIGTERM/SIGHUP (raised as KeyboardInterrupt) or worse
+        _reap(proc)
+        raise
+
+
+@contextlib.contextmanager
+def terminate_as_interrupt() -> Iterator[None]:
+    """SIGTERM / SIGHUP raise ``KeyboardInterrupt`` meanwhile, so a closed
+    terminal or a kill still unwinds through the profile cleanup. Main
+    thread only (elsewhere a no-op)."""
+    if threading.current_thread() is not threading.main_thread():
+        yield
+        return
+
+    def interrupt(signum, frame):
+        raise KeyboardInterrupt
+
+    saved: dict = {}
+    for name in ("SIGTERM", "SIGHUP"):
+        sig = getattr(signal, name, None)
+        if sig is None:
+            continue
+        try:
+            saved[sig] = signal.signal(sig, interrupt)
+        except (ValueError, OSError):
+            pass
+    try:
+        yield
+    finally:
+        for sig, handler in saved.items():
+            try:
+                signal.signal(sig, handler)
+            except (ValueError, OSError):
+                pass
+
+
+def _remove_profile(profile: Path) -> None:
+    """The profile's Keychain item (macOS), then the directory, then the
+    item again: a child that exited just now may still have written it."""
+    from claude_swap.session import delete_macos_keychain_entry
+
+    try:
+        delete_macos_keychain_entry(profile)
+    finally:
+        shutil.rmtree(profile, ignore_errors=True)
+        delete_macos_keychain_entry(profile)
+
+
+def sweep_stale_profiles(root: Path, *, max_age_s: float = STALE_PROFILE_S,
+                         now: float | None = None) -> list[Path]:
+    """Remove ``relogin-*`` profiles older than ``max_age_s`` that a killed
+    attempt left in ``root`` (they may hold a login: the Linux
+    ``.credentials.json``, the macOS Keychain item). Returns what was
+    removed. Never raises."""
+    removed: list[Path] = []
+    now = time.time() if now is None else now
+    try:
+        candidates = list(Path(root).glob(f"{PROFILE_PREFIX}*"))
+    except OSError:
+        return removed
+    for path in candidates:
+        try:
+            if not path.is_dir() or path.is_symlink():
+                continue
+            if now - path.stat().st_mtime < max_age_s:
+                continue
+            _remove_profile(path)
+            removed.append(path)
+        except Exception:
+            _logger.warning("Could not remove the leftover re-login profile %s", path,
+                            exc_info=True)
+    if removed:
+        _logger.info("Removed %d leftover re-login profile(s)", len(removed))
+    return removed
 
 
 def _profile_account(profile: Path) -> dict | None:
@@ -164,6 +264,13 @@ def identity_problem(target: Target, account: Mapping) -> str | None:
     return None
 
 
+def _full_pair(creds: str | None) -> dict | None:
+    pair = None if looks_like_api_key(creds) else oauth.extract_oauth_data(creds or "")
+    if pair and pair.get("accessToken") and pair.get("refreshToken"):
+        return pair
+    return None
+
+
 class LoginAttempt:
     """One ``claude auth login`` in a throwaway profile; ``cleanup`` always."""
 
@@ -172,6 +279,7 @@ class LoginAttempt:
         self.claude = claude
         root = Path(root)
         root.mkdir(mode=0o700, parents=True, exist_ok=True)
+        sweep_stale_profiles(root)
         self.profile = Path(tempfile.mkdtemp(prefix=PROFILE_PREFIX, dir=root))
         if os.name == "posix":
             os.chmod(self.profile, 0o700)
@@ -200,21 +308,32 @@ class LoginAttempt:
         *,
         base_env: Mapping[str, str] | None = None,
     ) -> Outcome | None:
-        """Run the login. None when it exited 0 (go on with :meth:`finish`),
-        else the outcome that ends the attempt."""
+        """Run the login. None when there is a login to check (the child
+        exited 0, or it was interrupted / failed AFTER saving a complete
+        login: that one is not thrown away); else the outcome that ends the
+        attempt."""
         num = self.target.number
         try:
             code = run(self.argv(), self.env(base_env), self.profile)
         except OSError as e:
             return Outcome(UNAVAILABLE, num, f"could not start {self.claude}: {e}")
+        if code == 0:
+            return None
+        if self._saved_a_login():
+            return None
         if code is None:
             return Outcome(CANCELLED, num, f"re-login #{num} cancelled; nothing stored")
-        if code != 0:
-            return Outcome(
-                FAILED, num,
-                f"claude auth login exited {code} (cancelled or failed); nothing stored",
-            )
-        return None
+        return Outcome(
+            FAILED, num,
+            f"claude auth login exited {code} (cancelled or failed); nothing stored",
+        )
+
+    def _saved_a_login(self) -> bool:
+        try:
+            creds, account = self.read_login()
+        except Exception:
+            return False
+        return account is not None and _full_pair(creds) is not None
 
     def read_login(self) -> tuple[str | None, dict | None]:
         """The new credential and ``oauthAccount`` from the profile (macOS:
@@ -226,14 +345,14 @@ class LoginAttempt:
 
     def finish(self, switcher) -> Outcome:
         """Verify the profile's login is the slot's account and store it
-        (and, for the live account, rewrite the live login from it)."""
+        (for the live account, the live login too, atomically)."""
         t = self.target
         try:
             creds, account = self.read_login()
-        except ClaudeSwitchError as e:
+        except Exception as e:
             return Outcome(FAILED, t.number, f"could not read the new login: {e}")
-        pair = None if looks_like_api_key(creds) else oauth.extract_oauth_data(creds or "")
-        if not (pair and pair.get("accessToken") and pair.get("refreshToken")):
+        pair = _full_pair(creds)
+        if pair is None:
             return Outcome(FAILED, t.number, "claude saved no login; nothing stored")
         if account is None:
             return Outcome(
@@ -246,32 +365,45 @@ class LoginAttempt:
             return Outcome(
                 MISMATCH, t.number, f"not #{t.number}'s account: {problem}; nothing stored"
             )
-        active = switcher.current_account_number() == t.number
         try:
-            if active:
-                return _store_and_activate(switcher, t, creds, account)
-            switcher.store_relogin(t.number, creds, account)
-        except ClaudeSwitchError as e:
-            return Outcome(FAILED, t.number, f"not stored: {e}")
-        return Outcome(STORED, t.number, f"#{t.number} login stored ({t.email})")
+            result = switcher.store_relogin(t.number, creds, account, activate=True) or {}
+        except Exception as e:
+            return Outcome(FAILED, t.number, _not_stored(switcher, t, creds, e))
+        stored = f"#{t.number} login stored ({t.email})"
+        if result.get("activated"):
+            return Outcome(STORED, t.number, f"{stored}; the live login now uses it",
+                           activated=True)
+        return Outcome(STORED, t.number, stored)
 
     def cleanup(self) -> None:
         """Delete the profile's Keychain item and the directory. Idempotent."""
         if self._clean:
             return
         self._clean = True
-        from claude_swap.session import delete_macos_keychain_entry
-
-        try:
-            delete_macos_keychain_entry(self.profile)
-        finally:
-            shutil.rmtree(self.profile, ignore_errors=True)
+        _remove_profile(self.profile)
 
     def __enter__(self) -> LoginAttempt:
         return self
 
     def __exit__(self, *exc) -> None:
         self.cleanup()
+
+
+def _not_stored(switcher, target: Target, creds: str, error: Exception) -> str:
+    """The failure message; the new login is kept as an unclaimed entry."""
+    from claude_swap.exceptions import ClaudeSwitchError
+
+    why = str(error) if isinstance(error, ClaudeSwitchError) and str(error) else (
+        f"{type(error).__name__}: {error}"
+    )
+    message = f"not stored ({why}); the slot and the live login are unchanged"
+    try:
+        entry = switcher.stash_relogin_credential(target.number, creds, "relogin-unstored")
+    except Exception:
+        _logger.warning("Could not keep the unstored login of #%s", target.number,
+                        exc_info=True)
+        return message
+    return f"{message}. The new login was kept as {entry} (cc-swap unclaimed); retry cc-swap login {target.number}"
 
 
 def _oracle_problem(switcher, target: Target, pair: Mapping) -> str | None:
@@ -286,49 +418,6 @@ def _oracle_problem(switcher, target: Target, pair: Mapping) -> str | None:
         return None
     seen = resolved.get("email") or resolved.get("uuid") or "another account"
     return f"the new token belongs to {seen}, expected {target.email}"
-
-
-def _store_and_activate(switcher, target: Target, creds: str, account: Mapping) -> Outcome:
-    """The live account's re-login: store it, then rewrite the live login
-    from the slot (``switch_to(force=True)``). Switching is paused around
-    the two so the engine cannot switch the live login meanwhile."""
-    from claude_swap.maximize import pause
-
-    root = switcher.backup_dir
-    num = target.number
-    try:
-        pause.pause(root, "relogin", now=time.time(), seconds=120.0)
-    except Exception:
-        pass  # the window is a few milliseconds of local writes
-    try:
-        switcher.store_relogin(num, creds, account)
-        stored = f"#{num} login stored ({target.email})"
-        if switcher.current_account_number() != num:
-            return Outcome(STORED, num, f"{stored}; it is no longer the live account")
-        try:
-            switcher.switch_to(num, json_output=True, force=True)
-        except ClaudeSwitchError as e:
-            return Outcome(
-                STORED, num,
-                f"{stored}, but the live login was not updated ({e}); run "
-                f"cc-swap switch {num} --force",
-            )
-        try:
-            live = switcher._read_credentials()
-        except Exception:
-            live = None
-        if oauth.credential_fingerprint(live or "") != oauth.credential_fingerprint(creds):
-            return Outcome(
-                STORED, num,
-                f"{stored}, but the live login does not hold it yet; run "
-                f"cc-swap switch {num} --force",
-            )
-        return Outcome(STORED, num, f"{stored}; the live login now uses it", activated=True)
-    finally:
-        try:
-            pause.resume(root)
-        except Exception:
-            pass  # the marker expires by itself
 
 
 def guided_steps(number: str, email: str, claude: str | None) -> list[str]:
@@ -353,7 +442,7 @@ def relogin(
     """The whole re-login of slot ``number`` (the CLI's; the TUI runs the
     same steps around ``App.suspend``)."""
     target = target_for(switcher, number)
-    with LoginAttempt(switcher.backup_dir, target, claude) as attempt:
+    with terminate_as_interrupt(), LoginAttempt(switcher.backup_dir, target, claude) as attempt:
         if announce is not None:
             announce(attempt.banner())
         early = attempt.launch(run, base_env=base_env)

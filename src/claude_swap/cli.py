@@ -1533,6 +1533,9 @@ new deadline. Other machines keep their own logins: run this there too.
     except KeyboardInterrupt:
         print(f"\n{dimmed('Operation cancelled')}")
         sys.exit(130)
+    except Exception as e:  # e.g. OSError: say so, never a traceback
+        error(f"Error: re-login failed ({type(e).__name__}: {e}); nothing was changed")
+        sys.exit(1)
     if outcome.ok:
         print(f"{accent('Stored')} {outcome.message}")
         sys.exit(0)

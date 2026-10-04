@@ -647,12 +647,13 @@ class StoringSwitcher(IdentitySwitcher):
         super().__init__(*a, **kw)
         self.stored: list[tuple[str, str, str]] = []
 
-    def store_relogin(self, number, credentials, oauth_account):
+    def store_relogin(self, number, credentials, oauth_account, *, activate=True):
         rt = json.loads(credentials)["claudeAiOauth"]["refreshToken"]
         self.stored.append((str(number), oauth_account["emailAddress"], rt))
+        return {"activated": False}
 
 
-def _fake_claude_login(email: str, *, code=0, seen: list | None = None):
+def _fake_claude_login(email: str, *, code=0, seen: list | None = None, write=True):
     """What ``claude auth login`` leaves in its CLAUDE_CONFIG_DIR."""
     from pathlib import Path
 
@@ -660,6 +661,8 @@ def _fake_claude_login(email: str, *, code=0, seen: list | None = None):
         profile = Path(env["CLAUDE_CONFIG_DIR"])
         if seen is not None:
             seen.append((list(argv), profile))
+        if not write:
+            return code
         (profile / ".claude.json").write_text(json.dumps({"oauthAccount": {
             "emailAddress": email, "organizationUuid": "", "accountUuid": "uuid-4"}}))
         (profile / ".credentials.json").write_text(json.dumps({"claudeAiOauth": {
@@ -745,7 +748,10 @@ class TestLaunchedRelogin:
         fake = StoringSwitcher(_accounts(), tmp_path)
         app = make_app(fake)
         async with app.run_test(size=(140, 40)) as pilot:
-            _launchable(monkeypatch, app, _fake_claude_login("user4@example.com", code=None))
+            _launchable(
+                monkeypatch, app,
+                _fake_claude_login("user4@example.com", code=None, write=False),
+            )
             toasts = _toasts(app)
             await _press_r_on(pilot, "4")
             assert fake.stored == []

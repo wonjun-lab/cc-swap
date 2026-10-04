@@ -266,7 +266,7 @@ def _launch_relogin(app: "CswapApp", number: str, claude: str, supported: bool) 
         app.notify(f"{e}", title=f"Re-login #{number}", severity="error", timeout=10)
         return
     try:
-        with app.suspend():
+        with rl.terminate_as_interrupt(), app.suspend():
             print(attempt.banner(), flush=True)
             early = attempt.launch(_run_login)
     except SuspendNotSupported:

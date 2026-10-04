@@ -2239,15 +2239,20 @@ class ClaudeAccountSwitcher:
             return "error"
 
     def store_relogin(
-        self, account_num: str, credentials: str, oauth_account: dict
-    ) -> None:
+        self,
+        account_num: str,
+        credentials: str,
+        oauth_account: dict,
+        *,
+        activate: bool = True,
+    ) -> dict:
         """Store a fresh login for slot ``account_num`` that was made OUTSIDE
-        the live store: ``cc-swap login`` runs ``claude auth login`` in a
-        throwaway profile, so the live login is never touched here.
+        the live store (``cc-swap login`` runs ``claude auth login`` in a
+        throwaway profile). Returns ``{"activated": bool}``.
 
         ``oauth_account`` is that profile's ``oauthAccount``. It must be the
         slot's account — (email, org) and, when both sides carry one, the
-        account uuid — re-checked here under the lock, so a remove / move /
+        account uuid — re-checked here under the locks, so a remove / move /
         re-add landing since the caller's check cannot receive another
         account's login. Writes the slot's credential and config backup the
         way ``add``'s in-place refresh does (the config keeps the slot's
@@ -2255,9 +2260,19 @@ class ClaudeAccountSwitcher:
         nothing else) and lifts the slot's dead-token strike. A quarantine is
         keyed by the old refresh token's fingerprint, so it no longer matches.
 
+        With ``activate``, when the live login (re-checked under the locks)
+        IS this account, the live login gets the new credential IN THE SAME
+        critical section, so backup and live never disagree where another
+        process can see them. Otherwise the old live refresh token would sit
+        next to the new backup and the live→backup resyncs (collect pass,
+        switch-time backup) would copy it back over the new login. Locks in
+        the consume gate's and the switch's order: ``.consume-N.lock`` →
+        account FileLock → Claude Code's credential lock → its config lock.
+        Any failure restores both sides from snapshots and re-raises.
+
         ``ConfigError`` for an identity that is not the slot's,
         ``AccountNotFoundError`` for a missing slot, ``CredentialReadError``
-        for anything but a full OAuth token pair.
+        for anything but a full OAuth token pair or an unreadable store.
         """
         num = str(account_num)
         email = str(oauth_account.get("emailAddress") or "").strip()
@@ -2267,7 +2282,12 @@ class ClaudeAccountSwitcher:
         if not (pair and pair.get("accessToken") and pair.get("refreshToken")):
             raise CredentialReadError("the new login carries no OAuth token pair")
         self._setup_directories()
-        with FileLock(self.lock_file):
+        with (
+            FileLock(self.credentials_dir / f".consume-{num}.lock"),
+            FileLock(self.lock_file),
+            claude_credentials_lock(),
+            claude_config_lock(),
+        ):
             data = self._get_sequence_data() or {}
             record = data.get("accounts", {}).get(num)
             if not isinstance(record, dict):
@@ -2284,23 +2304,145 @@ class ClaudeAccountSwitcher:
                     f"the new login is {email or 'unknown'}, not Account-{num}'s "
                     f"account; nothing stored"
                 )
+            live_now = activate and self._live_identity_matches(rec_email, rec_org)
+            # Snapshots, all taken before the first write.
+            backup_before, unreadable = self._read_account_credentials_ex(num, rec_email)
+            if unreadable:
+                raise CredentialReadError(
+                    f"Account-{num}'s stored login is unreadable (Keychain locked?)"
+                )
+            config_file = self.configs_dir / f".claude-config-{num}-{rec_email}.json"
+            config_before = (
+                config_file.read_text(encoding="utf-8") if config_file.exists() else None
+            )
+            config_path = self._get_claude_config_path()
+            live_before: str | None = None
+            live_config: dict | None = None
+            if live_now:
+                live_before = self._read_credentials()
+                if live_before is None:
+                    raise CredentialReadError(
+                        "the live login is unreadable (Keychain locked?)"
+                    )
+                live_config = self._read_json(config_path)
+                if not isinstance(live_config, dict):
+                    raise ConfigError("the live Claude config is unreadable")
             try:
-                config = json.loads(self._read_account_config(num, rec_email) or "{}")
+                config = json.loads(config_before or "{}")
             except ValueError:
                 config = {}
             if not isinstance(config, dict):
                 config = {}
             config["oauthAccount"] = dict(oauth_account)
-            self._write_account_credentials(num, rec_email, credentials)
-            self._write_account_config(num, rec_email, json.dumps(config, indent=2))
-            if not rec_uuid and uuid:
-                record["uuid"] = uuid
-                data["lastUpdated"] = get_timestamp()
-                self._write_json(self.sequence_file, data)
+            live_written = False
+            try:
+                self._write_account_credentials(num, rec_email, credentials)
+                self._write_account_config(num, rec_email, json.dumps(config, indent=2))
+                if live_now:
+                    live_written = True
+                    self._write_credentials(
+                        self._prepare_credentials_for_activation(credentials, live_before)
+                    )
+                    spliced = dict(live_config)
+                    spliced["oauthAccount"] = dict(oauth_account)
+                    self._write_json(config_path, spliced)
+                if live_now or (not rec_uuid and uuid):
+                    if not rec_uuid and uuid:
+                        record["uuid"] = uuid
+                    if live_now:
+                        data["activeAccountNumber"] = int(num)
+                    data["lastUpdated"] = get_timestamp()
+                    self._write_json(self.sequence_file, data)
+            except BaseException:
+                self._rollback_relogin(
+                    num, rec_email, backup_before, config_file, config_before,
+                    live_before if live_written else None,
+                    live_config if live_written else None,
+                )
+                raise
         self._usage_store.clear_dead_token([num], {num: (rec_email, rec_org)})
         self._logger.info(
-            "stored a new login for #%s (rt %s)", num, oauth.fingerprint8(credentials)
+            "stored a new login for #%s (rt %s%s)", num, oauth.fingerprint8(credentials),
+            "; live login rewritten" if live_now else "",
         )
+        return {"activated": bool(live_now)}
+
+    def _rollback_relogin(
+        self,
+        num: str,
+        email: str,
+        backup_before: str,
+        config_file: Path,
+        config_before: str | None,
+        live_before: str | None,
+        live_config: dict | None,
+    ) -> None:
+        """Undo a failed :meth:`store_relogin` (the caller holds its locks).
+        Each step runs on its own; a failing one is logged, never raised over
+        the original error."""
+        steps = []
+        if backup_before:
+            steps.append(lambda: self._write_account_credentials(num, email, backup_before))
+        else:
+            steps.append(lambda: self._delete_account_credentials(num, email))
+        if config_before is not None:
+            steps.append(lambda: self._write_account_config(num, email, config_before))
+        else:
+            steps.append(lambda: config_file.unlink(missing_ok=True))
+        if live_before:
+            steps.append(lambda: self._write_credentials(live_before))
+        if live_config is not None:
+            steps.append(lambda: self._write_json(self._get_claude_config_path(), live_config))
+        for step in steps:
+            try:
+                step()
+            except Exception:
+                self._logger.error(
+                    "Rolling back the failed re-login of account %s: a restore "
+                    "step failed.", num, exc_info=True,
+                )
+
+    def stash_relogin_credential(self, account_num: str, credentials: str, reason: str) -> str:
+        """Keep a new login that could not be stored (``cc-swap unclaimed``
+        lists it), so a finished browser login is never simply lost."""
+        return self._store._write_unclaimed_credential(
+            credentials,
+            {
+                "reason": reason,
+                "configSlot": str(account_num),
+                "fingerprint": oauth.credential_fingerprint(credentials),
+            },
+        )
+
+    @staticmethod
+    def _backup_newer_than(backup: str | None, live: str | None) -> bool:
+        """Whether a slot backup is a NEWER login than the live credential
+        about to be written over it — the write would put an older login
+        back (e.g. ``cc-swap login`` stored the backup while the live store
+        still had the login it replaced).
+
+        Ordered by the login deadline (``refreshTokenExpiresAt``) when both
+        carry one and they differ: it is fixed at login and no refresh moves
+        it, so a later one is a later LOGIN and a routine rotation (same
+        login, same deadline) never trips this. Otherwise by the access
+        token's ``expiresAt``, the generation order ``_session_profile_ahead``
+        uses: every refresh and every login issues a token that expires
+        later, so a live rotation the backup has not followed yet is always
+        the later one and still gets written. Missing or unparsable fields
+        answer False (the behaviour before this guard).
+        """
+        if not backup or not live:
+            return False
+        b_deadline = oauth.login_expires_at_ms(backup)
+        l_deadline = oauth.login_expires_at_ms(live)
+        if b_deadline is not None and l_deadline is not None and b_deadline != l_deadline:
+            return b_deadline > l_deadline
+        b = oauth.extract_oauth_data(backup) or {}
+        l_ = oauth.extract_oauth_data(live) or {}
+        try:
+            return float(b.get("expiresAt") or 0) > float(l_.get("expiresAt") or 0)
+        except (TypeError, ValueError):
+            return False
 
     def backfill_account_uuid(
         self,
@@ -3421,13 +3563,13 @@ class ClaudeAccountSwitcher:
         # org is indistinguishable from a personal account, so it is
         # unverifiable — never affirmative, never condemning. On a match,
         # record the resolved uuid so future verdicts are uuid-positive.
-        if r_email and r_email == own["email"]:
+        if r_email and r_email.strip().lower() == (own["email"] or "").strip().lower():
             if r_org is None:
                 return None
             if (r_org or "") == own["organizationUuid"]:
                 self.backfill_account_uuid(
                     account_num, r_uuid,
-                    expected_email=r_email, expected_org=r_org or "",
+                    expected_email=own["email"], expected_org=r_org or "",
                 )
                 return True
             return False
@@ -4770,8 +4912,12 @@ class ClaudeAccountSwitcher:
                             sentinel=USAGE_FOREIGN_CREDENTIAL
                         )
                     working = live
-                    if live_verdict or (
+                    if (live_verdict or (
                         oauth.credential_fingerprint(live) == backup_fp
+                    )) and not self._backup_newer_than(
+                        # Re-read under the lock: never write an older login
+                        # over a newer one stored meanwhile (`cc-swap login`).
+                        self._read_account_credentials(account_num, email), live
                     ):
                         try:
                             self._write_account_credentials(
@@ -5200,6 +5346,13 @@ class ClaudeAccountSwitcher:
                     and live_oauth.get("refreshToken")
                     and oauth.credential_fingerprint(live)
                     == oauth.credential_fingerprint(creds)
+                ):
+                    return
+                # The backup may have moved since the pre-lock read: a newer
+                # LOGIN there (`cc-swap login`) must not get the older live
+                # one written back over it.
+                if self._backup_newer_than(
+                    self._read_account_credentials(account_num, email), live
                 ):
                     return
                 self._write_account_credentials(account_num, email, live)
@@ -7620,7 +7773,20 @@ class ClaudeAccountSwitcher:
                     current_account, current_email, original_creds,
                     provenance, data,
                 )
-                if kind in ("foreign", "alien", "known-foreign"):
+                if kind in ("own-rotated", "unresolved") and self._backup_newer_than(
+                    self._read_account_credentials(current_account, current_email),
+                    original_creds,
+                ):
+                    # The slot already holds a NEWER login than the live one
+                    # (`cc-swap login` stored it): backing the live bytes up
+                    # would put the older login back. Keep the slot as is.
+                    kind = "behind"
+                if kind == "behind":
+                    self._logger.info(
+                        f"Kept account {current_account}'s stored login: it is "
+                        "newer than the live one"
+                    )
+                elif kind in ("foreign", "alien", "known-foreign"):
                     # Positively not this slot's bytes: never into a slot;
                     # never silently destroyed. The safety copy (which raises
                     # on failure, aborting before the live store is

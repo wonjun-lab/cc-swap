@@ -77,3 +77,20 @@ def test_resume_without_a_marker_does_not_rewrite_the_file(tmp_path):
     pause.resume(tmp_path)
     assert path.read_text() == '{"schemaVersion": 1, "x": 1}'
     assert path.stat().st_mtime_ns == before
+
+
+def test_a_pause_never_shortens_another_owners_longer_one(tmp_path):
+    long_until = pause.pause(tmp_path, "relogin", now=NOW, owner="modal")
+    assert pause.pause(tmp_path, "relogin", now=NOW, seconds=60, owner="cli") == long_until
+    raw = json.loads((tmp_path / "autoswitch_state.json").read_text())
+    assert raw["pausedUntil"] == long_until and raw["pausedBy"] == "modal"
+
+
+def test_resume_with_an_owner_lifts_only_its_own_pause(tmp_path):
+    until = pause.pause(tmp_path, "relogin", now=NOW, owner="modal")
+    pause.resume(tmp_path, owner="cli")  # not ours: kept
+    raw = json.loads((tmp_path / "autoswitch_state.json").read_text())
+    assert raw["pausedUntil"] == until
+    pause.resume(tmp_path, owner="modal")
+    raw = json.loads((tmp_path / "autoswitch_state.json").read_text())
+    assert "pausedUntil" not in raw and "pausedBy" not in raw

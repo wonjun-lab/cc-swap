@@ -125,6 +125,14 @@ def _slot_rt(s, num="4", email=FOUR) -> str | None:
     return data.get("refreshToken") if data else None
 
 
+def _stashed_rts(s) -> list[str]:
+    out = []
+    for entry_id in s.list_unclaimed_credentials():
+        creds, _ = s._store._read_unclaimed_credential(entry_id)
+        out.append(oauth.extract_oauth_data(creds)["refreshToken"])
+    return out
+
+
 def _run(s, login, number="4", **kw):
     return rl.relogin(s, number, claude=CLAUDE, run=login, announce=None, **kw)
 
@@ -258,7 +266,7 @@ def test_token_owner_oracle_agreeing_stores(temp_home, monkeypatch):
 @pytest.mark.parametrize("code,status", [(1, rl.FAILED), (130, rl.FAILED), (None, rl.CANCELLED)])
 def test_cancel_or_nonzero_exit_stores_nothing_and_cleans_up(temp_home, code, status):
     s = _switcher(temp_home)
-    login = FakeLogin(code=code)
+    login = FakeLogin(code=code, write=False)  # stopped before a login was saved
     outcome = _run(s, login)
     assert outcome.status == status
     assert "nothing stored" in outcome.message
@@ -284,7 +292,7 @@ def test_claude_that_cannot_start_is_unavailable(temp_home):
     assert not _leftover_profiles(s)
 
 
-def test_cleanup_happens_when_the_store_raises(temp_home, monkeypatch):
+def test_a_store_that_raises_is_failed_kept_unclaimed_and_cleaned_up(temp_home, monkeypatch):
     s = _switcher(temp_home)
 
     def boom(*a, **k):
@@ -292,9 +300,17 @@ def test_cleanup_happens_when_the_store_raises(temp_home, monkeypatch):
 
     monkeypatch.setattr(s, "store_relogin", boom)
     login = FakeLogin()
-    with pytest.raises(RuntimeError):
-        _run(s, login)
+    outcome = _run(s, login)
+    assert outcome.status == rl.FAILED and "RuntimeError: disk on fire" in outcome.message
+    assert "cc-swap unclaimed" in outcome.message
+    assert _stashed_rts(s) == ["rt-four-new"]
     assert not login.profile.exists() and not _leftover_profiles(s)
+
+
+def test_ctrl_c_after_claude_saved_the_login_still_stores_it(temp_home):
+    s = _switcher(temp_home)
+    outcome = _run(s, FakeLogin(code=None))  # saved, then interrupted
+    assert outcome.ok and _slot_rt(s) == "rt-four-new"
 
 
 def test_cleanup_happens_on_ctrl_c_outside_the_child(temp_home):
@@ -335,19 +351,230 @@ def test_active_slot_rewrites_the_live_login_too(temp_home):
     assert not _leftover_profiles(s)
 
 
-def test_active_slot_reports_when_the_live_rewrite_fails(temp_home, monkeypatch):
-    from claude_swap.exceptions import SwitchError
+def test_active_slot_live_rewrite_failure_rolls_both_back_and_keeps_the_login(
+    temp_home, monkeypatch
+):
+    from claude_swap.exceptions import CredentialWriteError
 
     s = _switcher(temp_home, active="4")
+    live_before = s._read_credentials()
+    config_before = (temp_home / ".claude.json").read_text()
 
-    def refuse(*a, **k):
-        raise SwitchError("locked")
+    real = s._write_credentials
+    refused = []
 
-    monkeypatch.setattr(s, "switch_to", refuse)
+    def refuse_once(creds):
+        if not refused:
+            refused.append(creds)
+            raise CredentialWriteError("Keychain locked")
+        return real(creds)  # the rollback's restore
+
+    monkeypatch.setattr(s, "_write_credentials", refuse_once)
     outcome = _run(s, FakeLogin())
+    assert outcome.status == rl.FAILED and not outcome.ok and not outcome.activated
+    assert "Keychain locked" in outcome.message and "unchanged" in outcome.message
+    assert _slot_rt(s) == "rt-four-dead"  # the slot was rolled back
+    assert s._read_credentials() == live_before
+    assert json.loads((temp_home / ".claude.json").read_text()) == json.loads(config_before)
+    assert _stashed_rts(s) == ["rt-four-new"]  # the browser login is not lost
+    assert not _leftover_profiles(s)
+
+
+def test_a_non_claude_error_mid_write_rolls_back(temp_home, monkeypatch):
+    s = _switcher(temp_home, active="4")
+    live_before = s._read_credentials()
+    real = s._write_json
+
+    def flaky(path, data):
+        if path == s.sequence_file:  # the last write of the critical section
+            raise OSError(28, "No space left on device")
+        return real(path, data)
+
+    monkeypatch.setattr(s, "_write_json", flaky)
+    outcome = _run(s, FakeLogin())
+    assert outcome.status == rl.FAILED and "OSError" in outcome.message
+    assert _slot_rt(s) == "rt-four-dead"
+    assert s._read_credentials() == live_before
+    config = json.loads(s._read_account_config("4", FOUR))
+    assert config["keep"] == "me" and config["oauthAccount"]["accountUuid"] == "uuid-4"
+    assert json.loads((temp_home / ".claude.json").read_text())["oauthAccount"]["emailAddress"] == FOUR
+
+
+def test_live_account_changed_during_the_login_is_not_overwritten(temp_home):
+    s = _switcher(temp_home, active="4")
+    login = FakeLogin()
+    real = login.__call__
+
+    def switch_meanwhile(argv, env, cwd):
+        _live(temp_home, "one@example.com", "", "uuid-1")  # the engine moved to #1
+        s._write_credentials(_creds("rt-one"))
+        return real(argv, env, cwd)
+
+    outcome = _run(s, switch_meanwhile)
     assert outcome.ok and not outcome.activated
-    assert "cc-swap switch 4 --force" in outcome.message
     assert _slot_rt(s) == "rt-four-new"
+    assert oauth.extract_oauth_data(s._read_credentials())["refreshToken"] == "rt-one"
+    assert s.current_account_number() == "1"
+
+
+# -- old logins never come back over a new one -----------------------------------------
+
+
+def _old_live_valid(s, home):
+    """#4 is live on its OLD, still valid login (an early renewal); the slot
+    backup gets the NEW login without the live store (the state B1 left)."""
+    old = json.dumps({"claudeAiOauth": {
+        "accessToken": "sk-ant-oat01-old", "refreshToken": "rt-four-old",
+        "expiresAt": 99999999990000, "refreshTokenExpiresAt": 99999999990000}})
+    s._write_credentials(old)
+    s.store_relogin("4", _creds("rt-four-new"), _account(FOUR, ORG4, "uuid-4"),
+                    activate=False)
+    assert _slot_rt(s) == "rt-four-new"
+    return old
+
+
+def test_collect_pass_resync_does_not_put_the_old_login_back(temp_home, monkeypatch):
+    s = _switcher(temp_home, active="4")
+    old = _old_live_valid(s, temp_home)
+    monkeypatch.setattr(oauth, "fetch_oauth_profile", lambda token: {
+        "uuid": "uuid-4", "email": FOUR, "organizationUuid": ORG4})
+    monkeypatch.setattr(oauth, "try_fetch_usage_for_account",
+                        lambda *a, **k: oauth.UsageOutcome(usage={"five_hour": {}}))
+    s._fetch_active_usage("4", FOUR, old, ORG4)  # the engine's collect pass
+    assert _slot_rt(s) == "rt-four-new"
+
+
+def test_active_slot_relogin_then_a_collect_pass_keeps_the_new_login(temp_home, monkeypatch):
+    s = _switcher(temp_home, active="4")
+    old = json.dumps({"claudeAiOauth": {
+        "accessToken": "sk-ant-oat01-old", "refreshToken": "rt-four-old",
+        "expiresAt": 99999999990000, "refreshTokenExpiresAt": 99999999990000}})
+    s._write_credentials(old)  # the old login is still valid (early renewal)
+    s._write_account_credentials("4", FOUR, old)
+    assert _run(s, FakeLogin()).activated
+    monkeypatch.setattr(oauth, "fetch_oauth_profile", lambda token: {
+        "uuid": "uuid-4", "email": FOUR, "organizationUuid": ORG4})
+    monkeypatch.setattr(oauth, "try_fetch_usage_for_account",
+                        lambda *a, **k: oauth.UsageOutcome(usage={"five_hour": {}}))
+    s._fetch_active_usage("4", FOUR, s._read_credentials(), ORG4)
+    s._fetch_active_usage("4", FOUR, old, ORG4)  # a pass that read before the store
+    assert _slot_rt(s) == "rt-four-new"
+    assert oauth.extract_oauth_data(s._read_credentials())["refreshToken"] == "rt-four-new"
+
+
+def test_store_relogin_takes_the_consume_lock(temp_home, monkeypatch):
+    from claude_swap import switcher as switcher_mod
+    from claude_swap.exceptions import LockError
+
+    s = _switcher(temp_home, active="4")
+    taken = []
+    real = switcher_mod.FileLock
+
+    class Spy(real):
+        def __enter__(self):
+            taken.append(Path(self.lock_path).name)
+            if taken[-1] == ".consume-4.lock":
+                raise LockError("held by a refresh")
+            return super().__enter__()
+
+    monkeypatch.setattr(switcher_mod, "FileLock", Spy)
+    outcome = _run(s, FakeLogin())
+    assert outcome.status == rl.FAILED and "held by a refresh" in outcome.message
+    assert _slot_rt(s) == "rt-four-dead"
+    assert _stashed_rts(s) == ["rt-four-new"]
+
+
+def test_switch_time_backup_does_not_put_the_old_login_back(temp_home):
+    s = _switcher(temp_home, active="4")
+    _old_live_valid(s, temp_home)
+    s.switch_to("1", json_output=True)
+    assert s.current_account_number() == "1"
+    assert _slot_rt(s) == "rt-four-new"
+
+
+def test_a_routine_rotation_is_still_backed_up(temp_home):
+    s = _switcher(temp_home, active="4")
+    s._write_account_credentials("4", FOUR, json.dumps({"claudeAiOauth": {
+        "accessToken": "a1", "refreshToken": "rt-gen1", "expiresAt": 1000,
+        "refreshTokenExpiresAt": 99999999999000}}))
+    rotated = json.dumps({"claudeAiOauth": {
+        "accessToken": "a2", "refreshToken": "rt-gen2", "expiresAt": 2000,
+        "refreshTokenExpiresAt": 99999999999000}})
+    s._write_credentials(rotated)
+    s.switch_to("1", json_output=True)
+    assert _slot_rt(s) == "rt-gen2"
+
+
+@pytest.mark.parametrize("backup,live,newer", [
+    ({"expiresAt": 2, "refreshTokenExpiresAt": 20}, {"expiresAt": 9, "refreshTokenExpiresAt": 10}, True),
+    ({"expiresAt": 9, "refreshTokenExpiresAt": 10}, {"expiresAt": 2, "refreshTokenExpiresAt": 20}, False),
+    ({"expiresAt": 1, "refreshTokenExpiresAt": 10}, {"expiresAt": 2, "refreshTokenExpiresAt": 10}, False),
+    ({"expiresAt": 3, "refreshTokenExpiresAt": 10}, {"expiresAt": 2, "refreshTokenExpiresAt": 10}, True),
+    ({"expiresAt": 3}, {"expiresAt": 2}, True),
+    ({}, {"expiresAt": 2}, False),
+])
+def test_backup_newer_than_orders_by_login_deadline_then_access_expiry(backup, live, newer):
+    def blob(fields):
+        return json.dumps({"claudeAiOauth": {"accessToken": "a", "refreshToken": "r", **fields}})
+
+    assert ClaudeAccountSwitcher._backup_newer_than(blob(backup), blob(live)) is newer
+
+
+# -- leftovers -------------------------------------------------------------------------
+
+
+def test_sweep_removes_old_profiles_and_their_keychain_items(tmp_path, monkeypatch, block_real_keychain):
+    import os
+
+    from claude_swap import macos_keychain
+    from claude_swap.session import keychain_service_name
+
+    monkeypatch.setattr(Platform, "detect", classmethod(lambda cls: Platform.MACOS))
+    old = tmp_path / f"{rl.PROFILE_PREFIX}old"
+    fresh = tmp_path / f"{rl.PROFILE_PREFIX}fresh"
+    for d in (old, fresh):
+        d.mkdir()
+        (d / ".credentials.json").write_text(_creds("rt-left"))
+        block_real_keychain.set_password(
+            keychain_service_name(d), macos_keychain.keychain_account_name(), _creds("rt-left"))
+    os.utime(old, (1, 1))
+    assert rl.sweep_stale_profiles(tmp_path) == [old]
+    assert not old.exists() and fresh.exists()
+    services = {k[0] for k in block_real_keychain.data}
+    assert keychain_service_name(old) not in services
+    assert keychain_service_name(fresh) in services
+
+
+def test_a_new_attempt_sweeps_leftovers(temp_home):
+    import os
+
+    s = _switcher(temp_home)
+    left = Path(s.backup_dir) / f"{rl.PROFILE_PREFIX}crashed"
+    left.mkdir()
+    (left / ".credentials.json").write_text(_creds("rt-left"))
+    os.utime(left, (1, 1))
+    assert _run(s, FakeLogin()).ok
+    assert not left.exists()
+
+
+def test_sigterm_during_the_login_still_cleans_up(temp_home):
+    import signal as _signal
+
+    if not hasattr(_signal, "SIGTERM") or sys.platform == "win32":
+        pytest.skip("POSIX signals")
+    s = _switcher(temp_home)
+    seen = []
+
+    def killed(argv, env, cwd):
+        seen.append(Path(cwd))
+        _signal.raise_signal(_signal.SIGTERM)
+        return 0
+
+    before = _signal.getsignal(_signal.SIGTERM)
+    with pytest.raises(KeyboardInterrupt):
+        _run(s, killed)
+    assert not seen[0].exists()
+    assert _signal.getsignal(_signal.SIGTERM) == before  # handler restored
 
 
 # -- the switcher's store ------------------------------------------------------------
