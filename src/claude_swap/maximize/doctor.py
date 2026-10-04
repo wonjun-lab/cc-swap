@@ -671,6 +671,42 @@ def check_claude_exec(ctx: Context) -> list[Finding]:
     return out
 
 
+def _when(epoch: float) -> str:
+    return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(epoch))
+
+
+def check_codesign_kills(ctx: Context) -> list[Finding]:
+    """macOS: crash reports of the last week in which the OS killed a native
+    ``claude`` for an invalid code signature, per version — count, first and
+    last kill, and the latest ``claude`` cc-swap launched before the first
+    (``claude-exec.jsonl``), so a correlation shows. Read-only."""
+    from claude_swap.maximize import claude_exec, codesign_watch
+
+    p = ctx.probes
+    if p.platform != "darwin":
+        return []
+    out: list[Finding] = []
+    for e in codesign_watch.episodes(codesign_watch.scan_crash_reports(p.home, p.now)):
+        launch = claude_exec.last_launch_before(p.backup_root, e["first"])
+        if launch is not None:
+            before = (
+                f"latest cc-swap claude launch before the first: {launch.get('caller')} "
+                f"at {_when(float(launch['at']))} ({e['first'] - float(launch['at']):.0f}s before)"
+            )
+        else:
+            before = "no cc-swap claude launch recorded before it"
+        n = e["count"]
+        out.append(Finding(
+            "codesign-kills", "warn",
+            f"macOS killed claude {e['version']} {n} time{'s' if n != 1 else ''} at launch "
+            f"(SIGKILL, Code Signature Invalid; ~/Library/Logs/DiagnosticReports): first "
+            f"{_when(e['first'])}, last {_when(e['last'])}; {before}",
+            f"if claude {e['version']} still dies at launch: "
+            f"{claude_exec.fix_command(_tilde(e['procPath'], p.home))}",
+        ))
+    return out
+
+
 _KEYCHAIN_MEANINGS = {
     RC_INTERACTION_NOT_ALLOWED: (
         "rc=36 errSecInteractionNotAllowed: the login keychain is locked, this "
@@ -1429,6 +1465,7 @@ def _duplicates(ctx: Context) -> list[Finding]:
 ENV_CHECKS: tuple[Callable[[Context], list[Finding]], ...] = (
     check_claude,
     check_claude_exec,
+    check_codesign_kills,
     check_keychain,
     check_plaintext,
     check_live_login,

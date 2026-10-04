@@ -2839,6 +2839,27 @@ class AutoSwitchEngine:
 
     def run_loop(self) -> int:
         """Tick forever (until :meth:`stop`); a failing tick never kills it."""
+        watch = self._start_codesign_watch()
+        try:
+            return self._run_loop(watch)
+        finally:
+            if watch is not None:
+                try:
+                    watch.stop()
+                except Exception:
+                    pass
+
+    def _start_codesign_watch(self):
+        """cc-swap: the code-signing kill watcher of a live engine on macOS
+        (maximize/codesign_watch.py), or None. Never raises."""
+        try:
+            from claude_swap.maximize.codesign_watch import for_engine
+
+            return for_engine(self)
+        except Exception:
+            return None
+
+    def _run_loop(self, watch) -> int:
         try:  # re-login profiles a killed `cc-swap login` left (they may hold a login)
             from claude_swap.maximize.relogin import sweep_stale_profiles
 
@@ -2857,6 +2878,8 @@ class AutoSwitchEngine:
                     self.housekeeping()
                 except Exception:
                     pass
+            if watch is not None:
+                watch.tick()  # polls its child, scans crash reports hourly; never raises
             try:
                 outcome = self.tick()
             except Exception as e:  # pragma: no cover - tick() already guards
