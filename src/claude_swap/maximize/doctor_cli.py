@@ -9,7 +9,7 @@ Three presentations of the same read-only checks (``maximize/doctor.py``):
   ``--apply`` writes, and only the two idempotent steps (set the strategy to
   ``maximize``, install the service).
 * ``why [--json] [--no-fallback]`` — the engine's last published decision
-  with its reason code explained (:data:`REASONS`, mirrored by the README
+  with its reason code explained (:data:`REASONS`, mirrored by docs/reference.md
   table "Why didn't it switch?"); without a fresh one, a dry-run tick. An
   account hold on the active account (``cc-swap hold``) is named too.
 """
@@ -387,7 +387,7 @@ def init_command(argv: list[str]) -> None:
 # -- why ------------------------------------------------------------------------------
 
 #: Reason code → (what it means, what to do). Every ``NoSwitchEvent`` reason the
-#: engine can emit is here and in the README table "Why didn't it switch?"
+#: engine can emit is here and in the docs/reference.md table "Why didn't it switch?"
 #: (``tests/maximize/test_why.py`` checks both against the source).
 REASONS: dict[str, tuple[str, str]] = {
     "below-threshold": (
@@ -500,7 +500,7 @@ REASONS: dict[str, tuple[str, str]] = {
     ),
 }
 
-#: Switch triggers (the README's "When it switches" table plus upstream's).
+#: Switch triggers (docs/reference.md's "When it switches" table plus upstream's).
 TRIGGERS: dict[str, str] = {
     "at-limit": "the active 5h or 7d window is at 100%",
     "hard": "a hard ceiling is reached (or the recent pace reaches one within forceEtaMin)",
@@ -775,7 +775,7 @@ def why_command(argv: list[str], *, clock: Callable[[], float] = time.time) -> N
         description=(
             "Why did (or didn't) the engine switch? Prints the decision the "
             "running engine last published, with its reason code explained "
-            "(README: Why didn't it switch?). Without a fresh one it runs "
+            "(docs/reference.md: Why didn't it switch?). Without a fresh one it runs "
             "`cc-swap auto --once --dry-run` instead."
         ),
     )

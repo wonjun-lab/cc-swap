@@ -1,4 +1,5 @@
-"""The README's fork section must track SETTING_SPECS and the install story."""
+"""The user docs (README.md and docs/reference.md) must track SETTING_SPECS
+and the install story."""
 
 from __future__ import annotations
 
@@ -14,12 +15,13 @@ from claude_swap.tui.app import CswapApp
 from claude_swap.tui.fleet import FleetScreen
 
 README = Path(__file__).resolve().parents[2] / "README.md"
+REFERENCE = README.parent / "docs" / "reference.md"
 FORK_KEYS = sorted(k for k, s in SETTING_SPECS.items() if s.section in ("maximize", "prime"))
 
 
 def _table_rows() -> dict[str, list[str]]:
     rows: dict[str, list[str]] = {}
-    for line in README.read_text(encoding="utf-8").splitlines():
+    for line in _readme_text().splitlines():
         cells = [c.strip().strip("`") for c in line.split("|")]
         if len(cells) >= 6 and (
             cells[1].startswith(("maximize.", "prime.")) or cells[1] == "autoswitch.strategy"
@@ -63,11 +65,11 @@ def test_readme_strategy_row_mentions_maximize():
     "maximize.loginExpiryGuardMin",
 ])
 def test_readme_covers_install_migration_priming_and_the_service(snippet):
-    assert snippet in README.read_text(encoding="utf-8")
+    assert snippet in _readme_text()
 
 
 def test_readme_describes_the_service_takeover_as_a_retry_not_a_wait_for_terminals():
-    text = README.read_text(encoding="utf-8")
+    text = _readme_text()
     # The service holds the lease while it runs, so a terminal engine is refused
     # (exit 4); it never "waits and takes over after you stop it".
     assert "the service waits and takes over" not in text
@@ -87,7 +89,7 @@ def test_readme_describes_the_service_takeover_as_a_retry_not_a_wait_for_termina
     "nothing below is live",
 ])
 def test_readme_documents_the_fleet_screen_and_relogin(snippet):
-    assert snippet in README.read_text(encoding="utf-8")
+    assert snippet in _readme_text()
 
 
 def test_readme_fleet_screenshots_exist():
@@ -231,7 +233,9 @@ def test_readme_names_every_fleet_footer_key():
 
 
 def _readme_text() -> str:
-    return README.read_text(encoding="utf-8")
+    """README.md and docs/reference.md together: the guide simplifies, the
+    reference states every rule, and these checks hold for the pair."""
+    return README.read_text(encoding="utf-8") + "\n" + REFERENCE.read_text(encoding="utf-8")
 
 
 def _snippets() -> list[str]:
@@ -345,7 +349,7 @@ def test_readme_documents_upgrade_check_and_its_exit_codes():
 
 
 def test_readme_says_the_service_rotates_its_macos_logs():
-    text = README.read_text(encoding="utf-8")
+    text = _readme_text()
     assert "auto.err.log" in text
     assert "is not rotated" not in text
     assert "370 KiB" in text

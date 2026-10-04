@@ -619,7 +619,10 @@ def test_unknown_flag_is_a_usage_error(fake):
 
 
 def test_readme_documents_the_command_and_its_version_source():
-    readme = (Path(__file__).resolve().parents[2] / "README.md").read_text(encoding="utf-8")
+    docs = Path(__file__).resolve().parents[2]
+    readme = (docs / "README.md").read_text(encoding="utf-8") + (
+        docs / "docs" / "reference.md"
+    ).read_text(encoding="utf-8")
     assert "cc-swap claude-update --check" in readme
     assert cu.DIST_TAGS_URL in readme
     for key in (cu.KEY_VERSION, cu.KEY_CHANGED_AT):
