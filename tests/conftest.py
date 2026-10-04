@@ -736,6 +736,20 @@ def _no_claude_version_probe(monkeypatch):
     )
 
 
+@pytest.fixture(autouse=True)
+def _no_real_prime_verify(monkeypatch):
+    """The engine's automatic ``prime verify`` (``prime.autoVerify``) runs
+    ``claude`` and reads Keychain item attributes through
+    ``prime_verify.default_deps``; no test reaches the real ones. Tests that
+    exercise it inject a fake ``VerifyDeps`` (the engine skips the verify
+    when building its deps raises)."""
+
+    def refuse():
+        raise AssertionError("a test reached prime_verify.default_deps; inject VerifyDeps")
+
+    monkeypatch.setattr("claude_swap.maximize.prime_verify.default_deps", refuse)
+
+
 # No test ever pops a real desktop notification (``osascript`` /
 # ``notify-send``): delivery is off for this whole process — threads that
 # outlive their test's monkeypatch included — and the backend lookup is

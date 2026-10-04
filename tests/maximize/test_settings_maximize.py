@@ -61,7 +61,7 @@ class TestRegistry:
             "maximize.preemptHorizonMaxH", "maximize.busyRebalanceGap",
             "maximize.learnedRide", "maximize.rideWindows", "maximize.rideMaxMin",
             "prime.enabled", "prime.model", "prime.jitterS", "prime.maxAttempts",
-            "prime.claudePath",
+            "prime.claudePath", "prime.autoVerify",
         } <= keys
 
     def test_ranges_match_the_spec(self):

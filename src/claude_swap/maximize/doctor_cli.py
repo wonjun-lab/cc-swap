@@ -244,7 +244,9 @@ def init_steps(probes: dr.Probes) -> list[Step]:
             "priming is on but its claude is missing",
             "cc-swap config set prime.claudePath <path>, or cc-swap config set prime.enabled false",
         ))
-    elif (note := dr.priming_guard(ctx.probes.backup_root)[0]) is not None:
+    elif (note := dr.priming_guard(
+        ctx.probes.backup_root, auto_verify=ctx.prime_auto_verify
+    )[0]) is not None:
         steps.append(Step(
             "priming", "FIX", "Priming off unless verified",
             f"priming is {note}", "cc-swap prime verify",
@@ -252,7 +254,7 @@ def init_steps(probes: dr.Probes) -> list[Step]:
     else:
         steps.append(Step(
             "priming", "ok", "Priming off unless verified",
-            "priming on: it pauses after a Claude Code update until cc-swap prime verify passes",
+            f"priming on: {dr.update_pause_text(ctx.prime_auto_verify)}",
         ))
     return steps
 

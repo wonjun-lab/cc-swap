@@ -285,6 +285,9 @@ STRATEGY_FIELDS: tuple[StrategyField, ...] = (
                   "priming idle accounts"),
     StrategyField("prime.model", "model", "", "model for the priming call", 0,
                   "priming idle accounts"),
+    StrategyField("prime.autoVerify", "auto-verify", "",
+                  "after a Claude Code update, re-run the zero-cost prime verify", 1,
+                  "priming idle accounts"),
 )
 STRATEGY_KEYS = "↑↓ move · ←→ adjust · e edit · s save · b back · q quit"
 

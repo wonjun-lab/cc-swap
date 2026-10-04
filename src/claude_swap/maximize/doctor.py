@@ -369,6 +369,15 @@ class Context:
         return self.prime_section.get("enabled") is True
 
     @property
+    def prime_auto_verify(self) -> bool:
+        from claude_swap import settings as st
+
+        try:
+            return st.prime_from_raw(self.prime_section, []).auto_verify
+        except Exception:
+            return True
+
+    @property
     def claude_path_setting(self) -> str | None:
         value = self.prime_section.get("claudePath")
         return value if isinstance(value, str) and value else None
@@ -1104,7 +1113,8 @@ def check_priming(ctx: Context) -> list[Finding]:
     path, _ = resolve_claude(ctx)
     if path is None:
         return []  # check_claude already reported it as an error
-    note, verified = priming_guard(ctx.probes.backup_root)
+    auto = ctx.prime_auto_verify
+    note, verified = priming_guard(ctx.probes.backup_root, auto_verify=auto)
     if note is not None:
         return [Finding(
             "priming", "warn", f"priming is {note}", "cc-swap prime verify",
@@ -1113,14 +1123,24 @@ def check_priming(ctx: Context) -> list[Finding]:
         return [Finding(
             "priming", "info",
             "priming is on; its isolation was never verified with this claude "
-            "(it pauses after a Claude Code update until cc-swap prime verify passes)",
+            f"({update_pause_text(auto)})",
             "cc-swap prime verify",
         )]
     return [Finding(
         "priming", "info",
         f"priming is on; isolation verified for claude {verified} "
-        "(it pauses after a Claude Code update until cc-swap prime verify passes)",
+        f"({update_pause_text(auto)})",
     )]
+
+
+def update_pause_text(auto_verify: bool) -> str:
+    """What happens to priming after a Claude Code update."""
+    if auto_verify:
+        return (
+            "it pauses after a Claude Code update until the engine re-verifies it "
+            "(prime.autoVerify) or cc-swap prime verify passes"
+        )
+    return "it pauses after a Claude Code update until cc-swap prime verify passes"
 
 
 def check_idle_pattern(ctx: Context) -> list[Finding]:
@@ -1164,13 +1184,18 @@ def check_learned_ride(ctx: Context) -> list[Finding]:
     return [Finding("learned-ride", "info", text)]
 
 
-def priming_guard(backup_root: Path) -> tuple[str | None, str | None]:
+def priming_guard(
+    backup_root: Path, *, auto_verify: bool | None = None
+) -> tuple[str | None, str | None]:
     """``(paused note, verified version)`` from the priming version guard's
     records — read-only, no ``claude --version``."""
     from claude_swap.maximize import prime_verify
 
     try:
-        return prime_verify.paused_note(backup_root), prime_verify.verified_version(backup_root)
+        return (
+            prime_verify.paused_note(backup_root, auto_verify=auto_verify),
+            prime_verify.verified_version(backup_root),
+        )
     except Exception:
         return None, None
 

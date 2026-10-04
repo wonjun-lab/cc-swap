@@ -80,7 +80,12 @@ class TestGate:
         verdict = pv.gate(tmp_path, claude, reader=Reader("2.1.4"))
         assert not verdict.ok
         assert "2.1.3 -> 2.1.4" in verdict.reason and "cc-swap prime verify" in verdict.reason
-        assert pv.paused_note(tmp_path) == "paused: claude 2.1.3 -> 2.1.4 (cc-swap prime verify)"
+        assert pv.paused_note(tmp_path, auto_verify=False) == (
+            "paused: claude 2.1.3 -> 2.1.4 (cc-swap prime verify)"
+        )
+        assert pv.paused_note(tmp_path) == (
+            "paused: claude 2.1.3 -> 2.1.4 (the engine re-verifies it; or cc-swap prime verify)"
+        )
 
     def test_fleet_attention_line_names_the_pause(self, tmp_path):
         from claude_swap.maximize import home
@@ -91,7 +96,9 @@ class TestGate:
         pv.current_version(tmp_path, _claude(tmp_path), reader=Reader("2.1.4"))
         note = prime_guard(tmp_path)
         parts, tone = home.attention_parts([], now=0.0, prime_guard=note, priming=True)
-        assert parts == ["! priming paused: claude 2.1.3 -> 2.1.4 (cc-swap prime verify)"]
+        assert parts == [
+            "! priming paused: claude 2.1.3 -> 2.1.4 (the engine re-verifies it; or cc-swap prime verify)"
+        ]
         assert tone == "warn"
 
     def test_an_unreadable_version_pauses_once_a_version_was_verified(self, tmp_path):
@@ -125,7 +132,7 @@ class TestPrimerGate:
     def test_engine_priming_pauses_with_one_warning(self, rig, monkeypatch):
         self._changed(rig, monkeypatch)
         runner = StubRunner(rig)
-        primer = rig.primer(runner=runner)
+        primer = rig.primer(runner=runner, auto_verify=False)
         first = primer.run_due(rig.snap())
         assert [type(e) for e in first] == [ConfigWarningEvent]
         assert "2.1.3 -> 2.1.4" in first[0].message

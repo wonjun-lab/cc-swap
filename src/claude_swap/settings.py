@@ -129,6 +129,9 @@ class PrimeSettings:
     jitter_s: str = "45-300"  # "LO-HI" seconds after a reset, see parse_jitter_range
     max_attempts: int = 2
     claude_path: str | None = None
+    # After a Claude Code update, the engine runs the zero-cost
+    # `prime verify` itself (maximize/prime_verify.py) instead of waiting.
+    auto_verify: bool = True
 
 
 @dataclass(frozen=True)
@@ -344,6 +347,10 @@ SETTING_SPECS: dict[str, SettingSpec] = {
         SettingSpec(
             "prime", "claudePath", "claude_path", "string",
             help="prime: claude executable (default: auto-detect)",
+        ),
+        SettingSpec(
+            "prime", "autoVerify", "auto_verify", "bool",
+            help="prime: after a Claude Code update, the engine re-runs the zero-cost prime verify itself",
         ),
         SettingSpec(
             "notify", "enabled", "enabled", "bool",
