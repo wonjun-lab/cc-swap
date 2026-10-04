@@ -1852,13 +1852,21 @@ class CredentialStore:
             mutate(entries)
             self._write_stash_manifest(entries)
 
-    def _write_unclaimed_credential(self, credentials: str, context: dict) -> str:
+    def _write_unclaimed_credential(
+        self, credentials: str, context: dict, *, dedupe: bool = False
+    ) -> str:
         """Stash a credential of unknown provenance. Returns the entry id.
 
         Raises on any failure — callers use a successful stash as the license
         to overwrite the live store, so a failed one must be loud. The entry
         file is written before the manifest: an entry without manifest metadata
         is recoverable; a manifest row without bytes is not.
+
+        ``dedupe`` returns an existing entry holding the same credential
+        instead of writing another — for stashes a persistent failure would
+        repeat every pass (the re-login ones). Off by default: the consume
+        gate's entries carry per-entry state (retire, CAS outcome) and get
+        an entry each.
         """
         import hashlib
         import secrets
@@ -1866,6 +1874,13 @@ class CredentialStore:
 
         ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
         digest = hashlib.sha256(credentials.encode("utf-8")).hexdigest()[:12]
+        if dedupe:
+            existing = self._find_unclaimed_duplicate(context.get("fingerprint"), digest)
+            if existing is not None:
+                # Already preserved (a failure that repeats every pass would
+                # otherwise stash the same login again and again): that entry
+                # is the license, as a fresh one would be.
+                return existing
         # Nonce keeps ids unique even for identical bytes preserved in the
         # same second — append-only means no write may ever land on an
         # existing id.
@@ -1877,6 +1892,25 @@ class CredentialStore:
         }
         self._mutate_stash_manifest(lambda entries: entries.update({entry_id: row}))
         return entry_id
+
+    def _find_unclaimed_duplicate(self, fingerprint: object, digest: str) -> str | None:
+        """An existing stash entry holding the same credential — the same
+        refresh-token ``fingerprint`` (as recorded by the stashing caller),
+        else the same bytes (``digest``, part of every id) — whose entry file
+        is still there. A manifest that cannot be read finds nothing (the
+        caller then writes a new entry, as before)."""
+        try:
+            entries = self._read_stash_manifest()
+        except Exception:
+            return None
+        for entry_id, row in entries.items():
+            same = (
+                isinstance(fingerprint, str) and fingerprint
+                and isinstance(row, dict) and row.get("fingerprint") == fingerprint
+            ) or f"-{digest}-" in entry_id
+            if same and self._stash_entry_path(entry_id).exists():
+                return entry_id
+        return None
 
     def _list_unclaimed_credentials(self) -> dict[str, dict]:
         """Manifest entries by id, including orphaned entry files (no metadata)."""

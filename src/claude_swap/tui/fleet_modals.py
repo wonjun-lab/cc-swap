@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import threading
 import time
+import uuid
 from collections.abc import Callable
 from dataclasses import dataclass
 from functools import partial
@@ -180,6 +181,7 @@ class ReloginModal(ModalScreen["ActionResult | None"]):
         self._baseline_ready = threading.Event()
         self._busy = False
         self._lifted = False  # the pause was lifted (cancel, store, unmount)
+        self._owner = uuid.uuid4().hex  # resume lifts only this modal's pause
 
     def compose(self) -> ComposeResult:
         with Vertical(classes="modal-box modal-box-wide fx-modal"):
@@ -255,7 +257,8 @@ class ReloginModal(ModalScreen["ActionResult | None"]):
     def _pause_blocking(self) -> None:
         try:
             until = pause.pause(
-                self._root, "relogin", now=_now(), wanted=self._still_paused
+                self._root, "relogin", now=_now(), wanted=self._still_paused,
+                owner=self._owner,
             )
             if until is None:
                 return  # lifted meanwhile: nothing written
@@ -277,9 +280,9 @@ class ReloginModal(ModalScreen["ActionResult | None"]):
         if timer is not None:
             timer.stop()
         if wait:
-            _resume(self._root)
+            _resume(self._root, self._owner)
         else:
-            self._run_pause_op(partial(_resume, self._root), "fleet-resume")
+            self._run_pause_op(partial(_resume, self._root, self._owner), "fleet-resume")
 
     def on_unmount(self) -> None:
         # Quit (or anything else) while the modal is open: lift the pause now
@@ -332,7 +335,7 @@ class ReloginModal(ModalScreen["ActionResult | None"]):
             result = ActionResult(False, f"Error: {type(e).__name__}: {e}")
         finally:
             self._lifted = True  # no renewal from here on
-            _resume(self._root)
+            _resume(self._root, self._owner)
         self.app.call_from_thread(self._stored, result)
 
     def _not_yet(self) -> None:
@@ -355,9 +358,9 @@ class ReloginModal(ModalScreen["ActionResult | None"]):
         self.dismiss(None)
 
 
-def _resume(root: Path) -> None:
+def _resume(root: Path, owner: str | None = None) -> None:
     try:
-        pause.resume(root)
+        pause.resume(root, owner=owner)
     except Exception:
         pass  # the marker expires on its own within 10 minutes
 

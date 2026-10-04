@@ -29,6 +29,7 @@ from claude_swap.settings import atomic_write_json
 
 PAUSED_UNTIL_KEY = "pausedUntil"
 PAUSED_REASON_KEY = "pausedReason"
+PAUSED_BY_KEY = "pausedBy"  # the owner token of the pause (resume compares it)
 MAX_PAUSE_S = 600.0
 # Slack for clocks a little apart between the writer and the engine.
 _SKEW_S = 5.0
@@ -81,29 +82,42 @@ def pause(
     now: float,
     seconds: float = MAX_PAUSE_S,
     wanted: Callable[[], bool] | None = None,
+    owner: str | None = None,
 ) -> float | None:
     """Pause switching and priming until ``now + seconds`` (capped at
     :data:`MAX_PAUSE_S`); returns that time. Blocking (state-file lock).
 
     A renewal passes ``wanted``: it is asked under the state lock, and a
     False answer (the pause was lifted meanwhile) writes nothing and
-    returns None — so a renewal racing a resume never re-pauses."""
+    returns None — so a renewal racing a resume never re-pauses.
+
+    ``owner`` (a token the caller keeps) is recorded with the marker so
+    ``resume(owner=...)`` lifts only its own pause. A pause never shortens
+    another owner's longer one: that one is kept and its end returned."""
     until = now + min(max(seconds, 0.0), MAX_PAUSE_S)
     file = _StateFile(backup_root)
     with file._state_lock():
         if wanted is not None and not wanted():
             return None
         state = file._read_state()
+        held = active_pause(state, now)
+        if held is not None and held[0] > until and state.get(PAUSED_BY_KEY) != owner:
+            return held[0]
         state["schemaVersion"] = aw.STATE_SCHEMA_VERSION
         state[PAUSED_UNTIL_KEY] = until
         state[PAUSED_REASON_KEY] = reason
+        if owner is None:
+            state.pop(PAUSED_BY_KEY, None)
+        else:
+            state[PAUSED_BY_KEY] = owner
         atomic_write_json(file.state_path, state)
     return until
 
 
-def resume(backup_root: Path) -> None:
+def resume(backup_root: Path, *, owner: str | None = None) -> None:
     """Lift a pause now. A no-op (no write) when none is recorded; the
-    check and the clear happen under the same state lock."""
+    check and the clear happen under the same state lock. With ``owner``,
+    only a pause that owner wrote is lifted (compare-and-delete)."""
     file = _StateFile(backup_root)
     if not file.state_path.exists():
         return
@@ -111,8 +125,11 @@ def resume(backup_root: Path) -> None:
         state = file._read_state()
         if PAUSED_UNTIL_KEY not in state and PAUSED_REASON_KEY not in state:
             return
+        if owner is not None and state.get(PAUSED_BY_KEY) != owner:
+            return
         state.pop(PAUSED_UNTIL_KEY, None)
         state.pop(PAUSED_REASON_KEY, None)
+        state.pop(PAUSED_BY_KEY, None)
         state["schemaVersion"] = aw.STATE_SCHEMA_VERSION
         atomic_write_json(file.state_path, state)
 

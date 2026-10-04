@@ -38,6 +38,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
 import re
 import shutil
@@ -280,21 +281,28 @@ def _keychain_account_name() -> str:
     return macos_keychain.keychain_account_name()
 
 
-def delete_macos_keychain_entry(session_dir: Path) -> None:
+def delete_macos_keychain_entry(session_dir: Path) -> bool:
     """Best-effort delete of a session profile's hashed keychain entry.
 
     No-op off macOS. Needed before seeding (Claude reads the keychain before
     the plaintext file, so a stale entry would shadow a fresh seed) and on
     profile removal (once the dir is gone the hashed name is unrecoverable).
+    Returns False when the delete failed (the item may still be there).
     """
     if Platform.detect() != Platform.MACOS:
-        return
+        return True
+    service = keychain_service_name(session_dir)
     try:
-        macos_keychain.delete_password(
-            keychain_service_name(session_dir), _keychain_account_name()
+        macos_keychain.delete_password(service, _keychain_account_name())
+    except macos_keychain.KEYCHAIN_ERRORS as e:
+        # Best-effort (an absent entry is already success, rc 44), but a
+        # failure may leave a login behind: say which item.
+        logging.getLogger("claude-swap").warning(
+            "Could not delete the Keychain item %r of profile %s: %s",
+            service, session_dir, e,
         )
-    except macos_keychain.KEYCHAIN_ERRORS:
-        pass  # best-effort; absent entry is already success (rc 44)
+        return False
+    return True
 
 
 def read_session_credentials(session_dir: Path) -> str | None:

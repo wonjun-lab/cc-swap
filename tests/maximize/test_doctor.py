@@ -226,7 +226,7 @@ def test_expired_and_expiring_logins(world):
     [expired] = find(findings, "login-deadline", "error", "#2")
     assert expired.detail.startswith("login expired") and "(1h 0m ago)" in expired.detail
     assert "UTC" not in expired.detail  # local time, like list / the auto log / Fleet
-    assert expired.fix == "re-login #2: Fleet → select → r, or claude → /login → cc-swap add"
+    assert expired.fix == "re-login #2: cc-swap login 2, or Fleet → select → r"
     [soon] = find(findings, "login-deadline", "warn", "#3")
     assert soon.detail.startswith("login expires ") and "(in 2d 1h)" in soon.detail
     assert not find(findings, "login-deadline", scope="#4")
@@ -260,7 +260,7 @@ def test_missing_stored_login(world):
     world.healthy()
     world.keychain.pop(("claude-swap", f"account-3-{email(3)}"))
     [f] = find(run(world), "stored-login", "error", "#3")
-    assert "--slot 3" in f.fix
+    assert f.fix.startswith("cc-swap login 3")
 
 
 def test_duplicate_lineage_names_both_slots(world):

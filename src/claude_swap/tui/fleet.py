@@ -207,7 +207,130 @@ def fleet_rows_now(app: "CswapApp", snap: AccountsSnapshot | None = None) -> lis
     return fx.fleet_rows(snap, mx, prime, state, now=time.time())
 
 
+def _resolve_claude(app: "CswapApp") -> str | None:
+    """The real ``claude`` (``prime.claudePath``, else ``~/.local/bin/claude``)."""
+    from claude_swap.maximize.primer import resolve_claude_path
+
+    try:
+        return resolve_claude_path(load_prime_settings(app.switcher.backup_dir).claude_path)
+    except Exception:
+        return None
+
+
 def open_relogin(app: "CswapApp", number: str) -> None:
+    """Re-login slot ``number``: launch ``claude auth login`` for its email in
+    a throwaway profile and store the result (``maximize/relogin.py``). When
+    claude or its ``auth login`` is not available, the guided steps instead
+    (:func:`open_guided_relogin`)."""
+    from claude_swap.maximize import relogin as rl
+
+    if number not in {r.number for r in fleet_rows_now(app)}:
+        return
+    if app.busy:
+        app.notify("Another action is still running", severity="warning")
+        return
+    claude = _resolve_claude(app)
+    if claude is None:
+        open_guided_relogin(app, number)
+        return
+    app.busy = True
+
+    def probe() -> None:
+        try:
+            supported = rl.login_supported(claude)
+        except Exception:
+            supported = False
+        app.call_from_thread(_launch_relogin, app, number, claude, supported)
+
+    app.run_worker(
+        probe, thread=True, group="fleet-relogin-probe", exit_on_error=False,
+        name="fleet-relogin-probe",
+    )
+
+
+def _launch_relogin(app: "CswapApp", number: str, claude: str, supported: bool) -> None:
+    """On the UI thread: hand the terminal to ``claude auth login`` (the TUI
+    is suspended meanwhile), then check and store off the UI thread."""
+    from textual.app import SuspendNotSupported
+
+    from claude_swap.maximize import relogin as rl
+
+    app.busy = False
+    if not supported:
+        open_guided_relogin(app, number)
+        return
+    try:
+        target = rl.target_for(app.switcher, number)
+        refuse = getattr(app.switcher, "_refuse_session_shell", None)
+        if refuse is not None:
+            refuse()  # inside a `cswap run` shell: refuse before the browser
+        attempt = rl.LoginAttempt(app.switcher.backup_dir, target, claude)
+    except Exception as e:
+        app.notify(f"{e}", title=f"Re-login #{number}", severity="error", timeout=10)
+        return
+    try:
+        with rl.terminate_as_interrupt(), app.suspend():
+            print(attempt.banner(), flush=True)
+            early = attempt.launch(_run_login)
+    except SuspendNotSupported:
+        attempt.cleanup()
+        open_guided_relogin(app, number)
+        return
+    except BaseException:
+        attempt.cleanup()
+        raise
+    if early is not None and early.status == rl.UNAVAILABLE:
+        attempt.cleanup()
+        open_guided_relogin(app, number)
+        return
+    app.busy = True
+    if early is None:
+        app.notify(f"checking the new login for #{number}…", title="Re-login", timeout=3)
+
+    def finish() -> None:
+        try:
+            outcome = early if early is not None else ledger_tagged(attempt.finish)(app.switcher)
+        except Exception as e:  # report, never crash the UI
+            outcome = rl.Outcome(rl.FAILED, number, f"{type(e).__name__}: {e}")
+        finally:
+            attempt.cleanup()
+        app.call_from_thread(_relogin_launched, app, outcome)
+
+    app.run_worker(
+        finish, thread=True, group="fleet-relogin", exit_on_error=False,
+        name="fleet-relogin",
+    )
+
+
+def _run_login(argv, env, cwd):
+    """``relogin.run_interactive`` (a seam for tests)."""
+    from claude_swap.maximize.relogin import run_interactive
+
+    return run_interactive(argv, env, cwd)
+
+
+def ledger_tagged(fn):
+    """``fn`` with any switch it makes recorded as Fleet's re-login."""
+    from claude_swap.maximize import ledger
+
+    return ledger.tagged(fn, source="fleet", trigger="relogin")
+
+
+def _relogin_launched(app: "CswapApp", outcome) -> None:
+    from claude_swap.maximize import relogin as rl
+
+    app.busy = False
+    app.request_refresh(full=True)
+    title = f"Re-login #{outcome.number}"
+    if outcome.ok:
+        app.notify(outcome.message, title=title, timeout=8)
+    elif outcome.status == rl.CANCELLED:
+        app.notify(outcome.message, title=title, timeout=5)
+    else:
+        app.notify(outcome.message, title=title, severity="error", timeout=15)
+
+
+def open_guided_relogin(app: "CswapApp", number: str) -> None:
     """The guided re-login for slot ``number`` (cc-swap launches nothing).
 
     The steps name the real ``claude`` (``prime.claudePath``, else
@@ -220,7 +343,6 @@ def open_relogin(app: "CswapApp", number: str) -> None:
         live_login_fingerprint,
         relogin_store,
     )
-    from claude_swap.maximize.primer import resolve_claude_path
     from claude_swap.tui.data import run_action
     from claude_swap.tui.fleet_modals import ReloginModal
 
@@ -230,10 +352,7 @@ def open_relogin(app: "CswapApp", number: str) -> None:
         return
     root = app.switcher.backup_dir
     previous = app.snapshot.active_number if app.snapshot is not None else None
-    try:
-        claude = resolve_claude_path(load_prime_settings(root).claude_path)
-    except Exception:
-        claude = None
+    claude = _resolve_claude(app)
     lines = fx.relogin_steps(
         row,
         ssh=fx.over_ssh(),

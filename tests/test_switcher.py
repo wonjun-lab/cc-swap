@@ -6154,7 +6154,7 @@ class TestSwitchSkipsDeadLogins:
         assert s._get_sequence_data()["activeAccountNumber"] == 3
         out = capsys.readouterr().out
         assert "Skipping Account-2 (login expired" in out
-        assert "re-login #2: Fleet → select → r, or claude → /login → cc-swap add" in out
+        assert "re-login #2: cc-swap login 2, or Fleet → select → r" in out
 
     def test_rotation_json_names_the_skip(self, temp_home):
         s = self._three(temp_home, s2=-3600)
@@ -12914,7 +12914,7 @@ class TestLoginExpiry:
         output = capsys.readouterr().out
         assert output.count("login expires ") == 1
         assert (
-            "re-login before then: Fleet → select → r, or claude → /login → cc-swap add"
+            "re-login before then: cc-swap login <N>, or Fleet → select → r"
             in output
         )
 

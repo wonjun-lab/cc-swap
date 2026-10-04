@@ -2808,6 +2808,12 @@ class AutoSwitchEngine:
 
     def run_loop(self) -> int:
         """Tick forever (until :meth:`stop`); a failing tick never kills it."""
+        try:  # re-login profiles a killed `cc-swap login` left (they may hold a login)
+            from claude_swap.maximize.relogin import sweep_stale_profiles
+
+            sweep_stale_profiles(self.switcher.backup_dir)
+        except Exception:
+            pass
         while True:
             # Clear at the top, not after the wait: a wake() racing a wait
             # timeout is then never lost — the tick right after this clear
