@@ -7,7 +7,10 @@ What matters while you are not looking at the TUI:
   its login passed its deadline);
 * ``login-expiring`` — a login ends within 24 hours (once per account per
   day);
-* ``prime-paused`` — priming paused after a Claude Code update;
+* ``prime-paused`` — priming paused after a Claude Code update (or the
+  engine's own verify of the new version failed);
+* ``prime-verified`` — the engine re-verified priming after an update
+  (``prime.autoVerify``); both follow ``notify.primePaused``;
 * ``keychain`` — the live login has been unreadable (the Keychain hold) for
   over 15 minutes, so nothing switches.
 
@@ -93,6 +96,7 @@ EVERY_S: dict[str, float] = {
     "relogin": DAY_S,
     "login-expiring": DAY_S,
     "prime-paused": DAY_S,
+    "prime-verified": DAY_S,
     "keychain": 2 * 3600.0,
 }
 #: Event → its ``NotifySettings`` switch.
@@ -101,6 +105,7 @@ TOGGLES: dict[str, str] = {
     "relogin": "relogin",
     "login-expiring": "login_expiring",
     "prime-paused": "prime_paused",
+    "prime-verified": "prime_paused",
     "keychain": "keychain",
 }
 #: A process weighs the same key again at most this often (the state file
@@ -191,6 +196,20 @@ def prime_paused_note(note: str) -> Note:
     return Note(
         "prime-paused", f"prime-paused:{note}", "cc-swap: priming paused",
         f"priming {note} — after a Claude Code update; run cc-swap prime verify",
+    )
+
+
+def prime_verified_note(detail: str) -> Note:
+    return Note("prime-verified", f"prime-verified:{detail}", "cc-swap: priming resumed", detail)
+
+
+def prime_verify_failed_note(paused: str | None, detail: str) -> Note:
+    """Keyed as :func:`prime_paused_note` for the same pause, so the daily
+    reminder the next tick would send is this one."""
+    return Note(
+        "prime-paused", f"prime-paused:{paused or detail}",
+        "cc-swap: priming paused — automatic verify failed",
+        detail,
     )
 
 
@@ -420,6 +439,16 @@ class EngineNotifier:
             src = (event.from_ref or {}).get("number")
             dst = (event.to_ref or {}).get("number")
             return [switch_note(src, dst, event.trigger, self._switch_why(dst), self._names())]
+        if kind == "prime" and not getattr(event, "account", ""):
+            outcome = getattr(event, "outcome", "")
+            detail = getattr(event, "detail", "")
+            if outcome == "auto-verified":
+                return [prime_verified_note(detail)]
+            if outcome == "auto-verify-failed":
+                from claude_swap.maximize.prime_verify import paused_note
+
+                return [prime_verify_failed_note(paused_note(self.root), detail)]
+            return []
         if kind == "no-switch" and getattr(event, "reason", "") == "active-credential-unreadable":
             since = getattr(self.engine, "_read_hold_since", None)
             now = self.engine.clock()

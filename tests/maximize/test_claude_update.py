@@ -532,7 +532,12 @@ def test_an_update_pauses_priming_that_was_verified_for_the_old_version(
     verdict = pv.gate(root, str(fake.path))  # from the cache claude-update filled
     assert not verdict.ok and verdict.current == "2.1.287"
     assert "`cc-swap prime verify`" in verdict.reason
-    assert pv.paused_note(root) == "paused: claude 2.1.280 -> 2.1.287 (cc-swap prime verify)"
+    assert pv.paused_note(root, auto_verify=False) == (
+        "paused: claude 2.1.280 -> 2.1.287 (cc-swap prime verify)"
+    )
+    assert pv.paused_note(root) == (  # prime.autoVerify defaults on
+        "paused: claude 2.1.280 -> 2.1.287 (the engine re-verifies it; or cc-swap prime verify)"
+    )
     pv.record_verified(root, "2.1.287", by=pv.VERIFIED_BY_CLI)  # prime verify passed
     assert pv.gate(root, str(fake.path)).ok
     assert pv.paused_note(root) is None
@@ -546,7 +551,12 @@ def test_an_update_pauses_priming_even_with_nothing_verified_yet(fake, root, mon
     verdict = pv.gate(root, str(fake.path))
     assert not verdict.ok and verdict.verified is None
     assert "2.1.280 -> 2.1.287" in verdict.reason
-    assert pv.paused_note(root) == "paused: claude 2.1.280 -> 2.1.287 (cc-swap prime verify)"
+    assert pv.paused_note(root, auto_verify=False) == (
+        "paused: claude 2.1.280 -> 2.1.287 (cc-swap prime verify)"
+    )
+    assert pv.paused_note(root) == (  # prime.autoVerify defaults on
+        "paused: claude 2.1.280 -> 2.1.287 (the engine re-verifies it; or cc-swap prime verify)"
+    )
     # A confirmed prime cannot adopt the new build as the baseline: none runs.
     pv.record_verified(root, "2.1.287", by=pv.VERIFIED_BY_CLI)
     assert pv.gate(root, str(fake.path)).ok

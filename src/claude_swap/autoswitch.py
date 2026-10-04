@@ -656,7 +656,8 @@ class PrimeEvent(AutoSwitchEvent):
     kind: ClassVar[str] = "prime"
     account: str
     # primed | already-on | skipped-live | skipped-active | unverified | failed
-    # | timeout | disabled
+    # | timeout | disabled; primer-wide, the engine's own verify after a
+    # Claude Code update: auto-verified | auto-verify-retry | auto-verify-failed
     outcome: str
     resets_at: str | None
     detail: str = ""
@@ -670,6 +671,8 @@ class PrimeEvent(AutoSwitchEvent):
         }
 
     def human(self) -> str:
+        if self.outcome.startswith("auto-verif"):
+            return f"priming: {self.detail}"
         who = f"Account-{self.account}" if self.account else "priming"
         text = f"{who}: 5h window {self.outcome}"
         if self.resets_at:

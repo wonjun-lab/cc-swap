@@ -189,8 +189,8 @@ def prime_command(argv: list[str]) -> None:
             "through the official claude CLI, with only the access token, in "
             "an isolated profile. Same safety checks as automatic priming; "
             "works even when prime.enabled is false. After a Claude Code "
-            "update, run `cc-swap prime verify` first (priming pauses until "
-            "it passes)."
+            "update, priming pauses until `cc-swap prime verify` passes (the "
+            "engine runs it itself unless prime.autoVerify is false)."
         ),
     )
     parser.add_argument(

@@ -304,8 +304,8 @@ def test_priming_paused_is_notified(temp_home, fake, monkeypatch):
     h = make(temp_home)
     rt = runtime_for(h.engine)
     rt.prime_settings, rt.primer = PrimeSettings(enabled=True), None
-    monkeypatch.setattr(prime_verify, "paused_note",
-                        lambda _root: "paused: claude 2.1.0 -> 2.1.1 (cc-swap prime verify)")
+    monkeypatch.setattr(prime_verify, "paused_state",
+                        lambda _root, **_kw: ("paused: claude 2.1.0 -> 2.1.1 (cc-swap prime verify)", False))
     h.tick_with_usage({"1": win(10, 10), "2": win(0, 10), "3": win(0, 10)})
     [(title, body)] = fake.sent
     assert title == "cc-swap: priming paused"

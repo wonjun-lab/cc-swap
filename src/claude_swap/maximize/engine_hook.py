@@ -519,9 +519,15 @@ def _notify_tick(
     prime_note: str | None = None
     if rt.prime_settings.enabled:
         try:
-            from claude_swap.maximize.prime_verify import paused_note
+            from claude_swap.maximize.prime_verify import paused_state
 
-            prime_note = paused_note(engine.switcher.backup_dir)
+            prime_note, auto = paused_state(
+                engine.switcher.backup_dir, auto_verify=rt.prime_settings.auto_verify
+            )
+            if auto:
+                # The primer verifies at the end of this tick (or retries
+                # later) and notifies the outcome itself.
+                prime_note = None
         except Exception:
             prime_note = None
     tap.tick(

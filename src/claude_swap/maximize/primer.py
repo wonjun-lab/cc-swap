@@ -743,6 +743,7 @@ class Primer:
         sleep: Callable[[float], None] = time.sleep,
         version_gate: bool = True,
         version_reader: Callable[[str], str | None] | None = None,
+        verify_deps: Callable[[], object] | None = None,
     ):
         self.engine = engine
         self.settings = settings
@@ -761,6 +762,14 @@ class Primer:
         # `(binary identity,)` the version gate last passed under; None when
         # the gate has not passed (or is off). Re-checked just before a launch.
         self._gate_identity: tuple[list | None] | None = None
+        # The last closed gate (prime.autoVerify reads its cause), and what
+        # builds the zero-cost verify's VerifyDeps (prime_verify.default_deps).
+        self._gate_verdict = None
+        self._verify_deps = verify_deps
+        # `(version, not before)`: set before each automatic verify runs, so
+        # one whose outcome could not be recorded (a write error) still
+        # waits AUTO_RETRY_S instead of probing on every tick.
+        self._auto_backoff: tuple[str, float] | None = None
 
     @property
     def profile_dir(self) -> Path:
@@ -776,7 +785,9 @@ class Primer:
             return events
         blocked = self._version_blocked(claude, manual=False)
         if blocked is not None:
-            return events + blocked
+            # Priming resumes on the next tick if this verify passes: one
+            # bounded subprocess run per tick, as a launch would be.
+            return events + blocked + self._auto_verify(claude)
         events.extend(self._verify_pending(snap))
         now = self._clock()
         if guard_wait(now):
@@ -947,6 +958,7 @@ class Primer:
                 f"{prime_verify.PAUSED_UNTIL}",
             )
         self._gate_version = verdict.current
+        self._gate_verdict = verdict
         if verdict.ok:
             self._gate_warned = None
             self._gate_identity = (identity,)
@@ -959,6 +971,89 @@ class Primer:
         if manual:
             events.append(PrimeEvent("", "disabled", None, verdict.reason))
         return events
+
+    def _auto_verify(self, claude: str) -> list[AutoSwitchEvent]:
+        """``prime.autoVerify``: when the gate is closed only because the
+        installed ``claude`` changed, run the zero-cost ``prime verify``
+        checks here (never ``--live``) and record the outcome as ``prime
+        verify`` would. A transient failure is retried later
+        (``prime_verify.AUTO_RETRY_S``, at most ``AUTO_MAX_TRIES`` per
+        version); any other failure, or the last try, records a failed
+        verify, which waits for a manual one. Skipped while a ``claude
+        update`` runs or another verify holds the lock. Never raises."""
+        from claude_swap.maximize import prime_verify as pv
+
+        verdict = self._gate_verdict
+        if not self.settings.auto_verify or verdict is None:
+            return []
+        root = self.engine.switcher.backup_dir
+        try:
+            now = self._clock()
+            backoff = self._auto_backoff
+            if backoff is not None and backoff[0] == verdict.current and now < backoff[1]:
+                return []
+            if pv.auto_verify_due(root, verdict, now) is None or pv.update_in_progress(root):
+                return []
+            lock = pv.verify_lock(root)
+            if not lock.acquire():
+                return []  # a `prime verify` (or another engine) is verifying
+            try:
+                # Re-read under the lock: another verify may have just
+                # recorded this version, or failed it.
+                verdict = pv.gate(root, claude, reader=self._version_reader, clock=self._clock)
+                version = pv.auto_verify_due(root, verdict, now)
+                if version is None or pv.update_in_progress(root):
+                    return []
+                _logger.info("prime: claude %s changed; verifying priming isolation", version)
+                self._auto_backoff = (version, now + pv.AUTO_RETRY_S)
+                deps = (self._verify_deps or pv.default_deps)()
+                try:
+                    report = pv.run_verify(
+                        root, claude, deps=deps, model=self.settings.model, record=False, now=now,
+                    )
+                except Exception as e:
+                    report = pv.VerifyReport(claude, None, verdict.verified)
+                    report.add("verify ran", False, type(e).__name__, transient=True)
+                return self._settle_auto_verify(root, version, report, now)
+            finally:
+                lock.release()
+        except Exception as e:
+            _logger.warning("prime: automatic verify failed to run: %s", type(e).__name__)
+            return []
+
+    def _settle_auto_verify(
+        self, root: Path, version: str, report, now: float
+    ) -> list[AutoSwitchEvent]:
+        from claude_swap.maximize import prime_verify as pv
+
+        found = report.version or version
+        if report.ok and report.version is not None:
+            pv.record_verified(root, report.version, by=pv.VERIFIED_BY_ENGINE, now=now)
+            detail = (
+                f"claude {report.version}: priming isolation re-verified automatically "
+                "(zero-cost checks); priming resumes"
+            )
+            _logger.info("prime: %s", detail)
+            return [PrimeEvent("", "auto-verified", None, detail)]
+        failed = [c for c in report.checks if not c.ok]
+        what = "; ".join(
+            f"{c.name}: {c.detail}" if c.detail else c.name for c in failed
+        ) or "no checks ran"
+        if report.transient and pv.auto_tries(root, found) + 1 < pv.AUTO_MAX_TRIES:
+            tries = pv.note_auto_retry(root, found, what, now=now)
+            detail = (
+                f"claude {found}: automatic verify did not finish ({what}); "
+                f"retrying in {pv.AUTO_RETRY_S / 60:.0f} min (try {tries}/{pv.AUTO_MAX_TRIES})"
+            )
+            _logger.warning("prime: %s", detail)
+            return [PrimeEvent("", "auto-verify-retry", None, detail)]
+        pv.record_failed(root, found, report.failures() or [c.name for c in failed], now=now)
+        detail = (
+            f"claude {found}: automatic verify failed ({what}); priming stays paused "
+            "until `cc-swap prime verify` passes"
+        )
+        _logger.warning("prime: %s", detail)
+        return [PrimeEvent("", "auto-verify-failed", None, detail)]
 
     def _verify_pending(self, snap: Snapshot) -> list[PrimeEvent]:
         events: list[PrimeEvent] = []

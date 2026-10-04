@@ -183,11 +183,12 @@ cc-swap config path                         # where settings.json lives
 | `prime.jitterS` | string | 45-300 | Random delay after a reset before priming, in seconds, as `LO-HI` (HI at most 599) |
 | `prime.maxAttempts` | int 1–5 | 2 | Attempts per 5h window |
 | `prime.claudePath` | string | auto | `claude` executable (detected and saved by `cc-swap service install`) |
+| `prime.autoVerify` | bool | true | After a Claude Code update, the engine runs the zero-cost `cc-swap prime verify` itself (see *After every Claude Code update*) |
 | `notify.enabled` | bool | true | Desktop notifications from the engine (see [Desktop notifications](#desktop-notifications-cc-swap-notify)) |
 | `notify.switch` | bool | true | Notify an account switch, with its trigger |
 | `notify.relogin` | bool | true | Notify an account that needs a re-login |
 | `notify.loginExpiring` | bool | true | Notify a login that ends within 24 hours (once a day per account) |
-| `notify.primePaused` | bool | true | Notify priming paused after a Claude Code update |
+| `notify.primePaused` | bool | true | Notify priming paused after a Claude Code update, and the engine's automatic verify passing or failing |
 | `notify.keychain` | bool | true | Notify a live login unreadable for over 15 minutes |
 
 The plan (5x/20x) comes from each account's stored credentials; an entry in `maximize.planOverride` wins over it. It matters only for breaking ties.
@@ -288,7 +289,7 @@ With several machines, each one primes on its own schedule with its own random j
 
 ### After every Claude Code update: `cc-swap prime verify`
 
-Priming depends on how the `claude` CLI handles `CLAUDE_CODE_OAUTH_TOKEN` and its Keychain fallback, and that can change between Claude Code versions. So priming remembers the Claude Code version its isolation was last verified with (`verifiedClaudeVersion` in `<backup root>/prime_verify.json`) and **pauses itself** as soon as the installed `claude` reports a different one. Fleet's attention line then reads `! priming paused: claude 2.1.3 -> 2.1.4 (cc-swap prime verify)`, the engine log warns once, `cc-swap prime` fails with the reason, and `cc-swap doctor` warns. Run:
+Priming depends on how the `claude` CLI handles `CLAUDE_CODE_OAUTH_TOKEN` and its Keychain fallback, and that can change between Claude Code versions. So priming remembers the Claude Code version its isolation was last verified with (`verifiedClaudeVersion` in `<backup root>/prime_verify.json`) and **pauses itself** as soon as the installed `claude` reports a different one. Fleet's attention line then reads `! priming paused: claude 2.1.3 -> 2.1.4 (the engine re-verifies it; or cc-swap prime verify)` (`… (cc-swap prime verify)` with `prime.autoVerify` off), the engine log warns once, `cc-swap prime` fails with the reason, and `cc-swap doctor` warns. With `prime.autoVerify` on (the default) the engine lifts the pause itself; see below. To verify by hand, run:
 
 ```bash
 cc-swap prime verify            # zero-cost checks; records the version when they pass
@@ -297,6 +298,8 @@ cc-swap prime verify --json     # the same report for scripts
 ```
 
 It replaces the manual checklist earlier releases asked for. Without `--live` it costs nothing: it runs `claude` once in a throwaway profile with an invalid token and checks that the run fails with a clean 401, leaves no Keychain item and no `.credentials.json` behind, and leaves the active login unchanged: the Keychain item's attributes (never its secret), `~/.claude/.credentials.json` and the account in `~/.claude.json` are compared by hash before and after. `--live` then primes one idle account (one whose 5h window is off) for real and checks the same things again. When every check passes it records the version and priming resumes on the engine's next tick, with no restart; otherwise it exits 1, records the failure and removes the earlier verified version, so priming stays paused even if an older version had passed. If a check fails, keep priming off (`cc-swap config set prime.enabled false`) and open an issue that includes your `claude --version`.
+
+**Automatic verify (`prime.autoVerify`, default on).** When the pause is only a version change (the installed `claude` differs from the verified one, or `cc-swap claude-update` recorded a change), the engine runs the same zero-cost checks itself at the end of a tick, where it would otherwise prime, after any switch — never `--live`, never while a `claude update` is running, and never when `claude --version` cannot be read. It takes a lock (`.prime_verify.lock` in the backup root) that `cc-swap prime verify` also takes, so two verifies never run at once. If every check passes it records the version (`verifiedBy: "engine auto-verify"`), priming resumes on the next tick, and you get a *priming resumed* notification. A check that fails because of isolation (an accepted invalid token, a 429 instead of a 401 — an invalid token is refused before any rate limit, so `claude` used another credential — a Keychain item or `.credentials.json` left behind, a changed active login) records a failed verify exactly as `prime verify` does and notifies you: priming stays paused until a manual `cc-swap prime verify` passes, and the engine never tries that version again, not even after a later version passed and `claude` was rolled back to it (`failedVersions` in `prime_verify.json`). A failure that may be passing (no answer in time, `claude` not starting, a network error, a Keychain that cannot be read — locked, or `security` failing or timing out) is retried 30 minutes later, at most 3 tries per version; the last one records a failed verify. A Keychain that cannot be read never counts as unchanged, in `prime verify` either (there it fails the run). A newer `claude` after a failed one gets its own automatic verify. With `prime.autoVerify` false, nothing is verified automatically.
 
 The engine reads `claude --version` only when the executable changed (it caches the answer by the file's identity). An install that never ran `prime verify` takes the first prime the usage endpoint confirms as its baseline. `cc-swap claude-update` feeds the same guard: a run that changes the version pauses priming even before any baseline exists, and prints the exact command to run.
 
@@ -384,7 +387,8 @@ The engine tells you about what matters while you are not looking at the TUI:
 | switch | the engine switched accounts, with its trigger (`switched to #2 side` · `from #1 main · hard: #1 5h 96% >= hard 95%`) | `notify.switch` |
 | re-login | an account needs a re-login (its refresh token is dead, or its login passed its deadline); once a day per account | `notify.relogin` |
 | login expiring | a login ends within 24 hours; once a day per account | `notify.loginExpiring` |
-| priming paused | priming paused after a Claude Code update, until `cc-swap prime verify` passes; once a day | `notify.primePaused` |
+| priming paused | priming paused after a Claude Code update, until `cc-swap prime verify` passes (with `prime.autoVerify`, only once the engine's own verify failed); once a day | `notify.primePaused` |
+| priming resumed | the engine's own verify passed after a Claude Code update (`prime.autoVerify`) | `notify.primePaused` |
 | Keychain | the live login has been unreadable for over 15 minutes, so nothing switches; at most every 2 hours | `notify.keychain` |
 
 They come from whichever engine runs (the service, a terminal `cc-swap auto`, the TUI or the menu bar), never from a dry run. macOS shows them with `osascript` (`display notification`); Linux with `notify-send` when it is installed (Debian and Ubuntu: `libnotify-bin`); on any other system nothing is sent. A notification names accounts by slot number and short name (the alias, else the part of the address before the `@`, as in Fleet), never an email or a token. They are deduplicated and rate-limited through `notify_state.json` in the backup root: the same notification is not repeated within its interval (30 seconds for the same switch), and at most 6 go out in 10 minutes for switches and the Keychain, and another 6 for the reminders (re-login, expiring login, paused priming), so reminders never crowd out a switch. Each one is cut off after 2 seconds, and a notification that fails never affects the engine's tick.
@@ -458,7 +462,7 @@ With a strategy other than `maximize`, `cc-swap` on its own (or `cc-swap tui`) o
 | `lease` | who holds the engine lease (the service, another engine, nobody) and whether a re-login paused switching |
 | `hold` | info only: an account hold (`cc-swap hold`) on the active account and until when, or one left over on a slot that is no longer active |
 | `settings` | `settings.json` parses and every value is in range |
-| `priming` | while priming is on: paused after a Claude Code update until `cc-swap prime verify` passes (a warning), or the version its isolation was verified for |
+| `priming` | while priming is on: paused after a Claude Code update until the engine re-verifies it (`prime.autoVerify`) or `cc-swap prime verify` passes (a warning), or the version its isolation was verified for |
 | `learned-ride` | info only, strategy `maximize`: the share of the last point each window rides (*Riding the last point*), with how many rides switched before 100% and how many hit it |
 | `idle-pattern` | info only, strategy `maximize`: what has been learned of your busy and quiet times |
 | per slot | stored login present and readable, login deadline (expired, or under 7 days), quarantine, two slots holding the same login |

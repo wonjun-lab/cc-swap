@@ -392,14 +392,15 @@ class UpdateResult:
         )
 
 
-def _note_for_priming(root: Path, claude: str, version: str) -> None:
+def _note_for_priming(root: Path, claude: str, version: str, key) -> None:
     """Hand the version just read to the priming version guard's cache, so
     the pause (and Fleet's attention line) shows at once, with no second
-    ``claude --version``."""
+    ``claude --version``. ``key`` is the binary's identity read before that
+    ``--version`` (``prime_verify.note_seen``)."""
     from claude_swap.maximize import prime_verify
 
     try:
-        prime_verify.note_seen(root, claude, version)
+        prime_verify.note_seen(root, claude, version, key=key)
     except OSError:
         pass
 
@@ -416,6 +417,9 @@ def perform_update(root: Path, *, timeout: float, sink) -> UpdateResult:
     try:
         before = installed_version(claude)
         run = run_claude_update(claude, timeout=timeout, sink=sink)
+        from claude_swap.maximize.prime_verify import identity
+
+        key = identity(claude)  # before --version: a later swap must not pair with it
         after = installed_version(claude)
     except OSError as e:
         # `claude update` could not even be started (not executable, wrong
@@ -433,7 +437,7 @@ def perform_update(root: Path, *, timeout: float, sink) -> UpdateResult:
             result.recorded = record_version(root, after, before if result.changed else None)
         except (OSError, LockError):
             result.recorded = False
-        _note_for_priming(root, claude, after)
+        _note_for_priming(root, claude, after, key)
 
     if run.timed_out:
         result.error = f"`claude update` timed out after {timeout:g}s and was killed"

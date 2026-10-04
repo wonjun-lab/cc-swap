@@ -39,6 +39,15 @@ the active login's Keychain item *attributes* (never its secret), its
 ``.credentials.json`` and ``~/.claude.json`` account unchanged — and, only
 with ``--live``, one real prime. Everything that touches the system goes
 through :class:`VerifyDeps`, so tests run it with fakes.
+
+With ``prime.autoVerify`` (default on) the engine runs the same zero-cost
+checks itself when the gate is closed only because the installed version
+changed (``primer.Primer._auto_verify``). A failure that may pass on a retry
+(a timeout, a network error) is retried every :data:`AUTO_RETRY_S`, at most
+:data:`AUTO_MAX_TRIES` times per version (``autoVerify`` in the record:
+``{"version", "tries", "nextAt", "last"}``); anything else, or the last try,
+is recorded as a failed verify, exactly as ``prime verify`` records one.
+One verify runs at a time: both hold :data:`VERIFY_LOCK_FILENAME`.
 """
 
 from __future__ import annotations
@@ -67,7 +76,32 @@ PROBE_TIMEOUT_S = 60.0
 BAD_TOKEN = "sk-ant-oat01-cc-swap-prime-verify-not-a-real-token-0000000000"
 VERIFIED_BY_CLI = "prime verify"
 VERIFIED_BY_PRIME = "primed"
+VERIFIED_BY_ENGINE = "engine auto-verify"
 LIVE_CHECK = "one live prime"
+#: Held by every verify (``prime verify`` and the engine's), in the backup root.
+VERIFY_LOCK_FILENAME = ".prime_verify.lock"
+#: ``security`` calls are bounded by this (macos_keychain._TIMEOUT too).
+KEYCHAIN_TIMEOUT_S = 5.0
+#: The most ``security`` calls one zero-cost verify makes: attributes of up
+#: to two active items before and after, the probe item's check, and the
+#: probe item's deletes.
+_KEYCHAIN_CALLS_MAX = 8
+#: A ``claude`` run killed at its timeout gets this long to drain
+#: (primer.KILL_GRACE_S).
+_KILL_GRACE_S = 5.0
+#: How long ``prime verify`` waits for another verify to finish: the worst
+#: case of one zero-cost verify (the engine's gate may read ``--version``
+#: under the lock too), plus a margin.
+VERIFY_LOCK_WAIT_S = (
+    2 * VERSION_TIMEOUT_S + PROBE_TIMEOUT_S + _KILL_GRACE_S
+    + _KEYCHAIN_CALLS_MAX * KEYCHAIN_TIMEOUT_S + 30.0
+)
+#: The engine's automatic verify: a transient failure is retried this much
+#: later, at most this many tries per claude version.
+AUTO_KEY = "autoVerify"
+AUTO_RETRY_S = 1800.0
+AUTO_MAX_TRIES = 3
+AUTO_HINT = "the engine re-verifies it; or cc-swap prime verify"
 
 # -- the record ---------------------------------------------------------------------
 
@@ -112,6 +146,14 @@ def record_verified(
     data["verifiedAt"] = time.time() if now is None else now
     data["verifiedBy"] = by
     data.pop(FAILED_KEY, None)
+    data.pop(AUTO_KEY, None)
+    # Verifying a version that once failed (a manual verify: the engine
+    # never verifies those) clears it from the history.
+    history = [v for v in failed_versions(root, data) if v != version]
+    if history:
+        data[FAILED_HISTORY_KEY] = history
+    else:
+        data.pop(FAILED_HISTORY_KEY, None)
     _save(root, data)
 
 
@@ -120,20 +162,35 @@ def record_verified(
 #: record (a build that just failed isolation is not verified, whatever an
 #: earlier run said) and pauses priming until a verify passes.
 FAILED_KEY = "verifyFailed"
+#: Every version a verify failed for (most recent last, at most
+#: :data:`FAILED_HISTORY_MAX`), kept after a later version passes so a
+#: rollback to one of them is never verified automatically.
+FAILED_HISTORY_KEY = "failedVersions"
+FAILED_HISTORY_MAX = 20
 
 
 def record_failed(
     root: Path, version: str | None, checks: Sequence[str], *, now: float | None = None
 ) -> None:
     data = load(root)
-    for key in ("verifiedClaudeVersion", "verifiedAt", "verifiedBy"):
+    for key in ("verifiedClaudeVersion", "verifiedAt", "verifiedBy", AUTO_KEY):
         data.pop(key, None)
     data[FAILED_KEY] = {
         "version": version,
         "at": time.time() if now is None else now,
         "checks": list(checks),
     }
+    if version:
+        history = [v for v in failed_versions(root, data) if v != version] + [version]
+        data[FAILED_HISTORY_KEY] = history[-FAILED_HISTORY_MAX:]
     _save(root, data)
+
+
+def failed_versions(root: Path, data: Mapping[str, Any] | None = None) -> list[str]:
+    """The versions a verify failed for (:data:`FAILED_HISTORY_KEY`)."""
+    data = load(root) if data is None else data
+    raw = data.get(FAILED_HISTORY_KEY)
+    return [v for v in raw if _text(v)] if isinstance(raw, list) else []
 
 
 def failed_verify(root: Path, data: Mapping[str, Any] | None = None) -> dict | None:
@@ -258,15 +315,29 @@ def current_version(
     return version
 
 
+_UNSET: Any = object()
+
+
 def note_seen(
-    root: Path, claude_path: str, version: str, *, clock: Callable[[], float] = time.time
+    root: Path,
+    claude_path: str,
+    version: str,
+    *,
+    key: list[Any] | None = _UNSET,
+    clock: Callable[[], float] = time.time,
 ) -> None:
     """Put a version someone else just read from ``claude_path`` (``cc-swap
     claude-update``) into the ``lastSeen`` cache, keyed by the executable's
-    identity exactly as :func:`current_version` would have."""
+    identity exactly as :func:`current_version` would have. Pass ``key``
+    read (:func:`identity`) BEFORE running ``--version``: a binary replaced
+    in between then misses the cache instead of pairing the new file with
+    the old version."""
     data = load(root)
     data["lastSeen"] = {
-        "version": version, "path": claude_path, "key": identity(claude_path), "at": clock(),
+        "version": version,
+        "path": claude_path,
+        "key": identity(claude_path) if key is _UNSET else key,
+        "at": clock(),
     }
     _save(root, data)
 
@@ -307,12 +378,20 @@ def pending_update(root: Path, data: Mapping[str, Any] | None = None) -> tuple[s
 PAUSED_UNTIL = "priming paused until `cc-swap prime verify` passes"
 
 
+#: ``Gate.cause`` values the engine may lift by verifying on its own: the
+#: gate is closed only because the installed version changed.
+AUTO_CAUSES = frozenset({"changed", "update"})
+
+
 @dataclass(frozen=True)
 class Gate:
     ok: bool
     current: str | None
     verified: str | None
     reason: str
+    # verified | no-record | failed | unreadable | changed | update | error
+    cause: str = ""
+    failed_version: str | None = None  # cause "failed": the version that failed
 
 
 def gate(
@@ -336,62 +415,173 @@ def gate(
     update = pending_update(root, data)
     failed = failed_verify(root, data)
     if failed is not None:
-        return Gate(False, current, None, f"{_failed_text(failed)}; {PAUSED_UNTIL}")
+        return Gate(
+            False, current, None, f"{_failed_text(failed)}; {PAUSED_UNTIL}",
+            "failed", _text(failed.get("version")),
+        )
     if verified is None:
         if update is None:
-            return Gate(True, current, None, "no verified claude version recorded yet")
+            return Gate(True, current, None, "no verified claude version recorded yet", "no-record")
         previous, version = update
         return Gate(
             False, current, None,
             f"cc-swap claude-update changed claude {previous} -> {version} and priming "
             f"isolation was never verified; {PAUSED_UNTIL}",
+            "update",
         )
     if current is None:
         return Gate(
             False, None, verified,
             f"could not read `claude --version`; {PAUSED_UNTIL}",
+            "unreadable",
         )
     if current != verified:
         return Gate(
             False, current, verified,
             f"claude changed {verified} -> {current} since priming isolation was "
             f"last verified; {PAUSED_UNTIL}",
+            "changed",
         )
     if update is not None:
         return Gate(
             False, current, verified,
             f"cc-swap claude-update recorded claude {update[1]} after priming isolation "
             f"was verified with {verified}; {PAUSED_UNTIL}",
+            "update",
         )
-    return Gate(True, current, verified, "verified")
+    return Gate(True, current, verified, "verified", "verified")
 
 
-def paused_note(root: Path) -> str | None:
+def auto_verify_due(
+    root: Path, verdict: Gate, now: float, data: Mapping[str, Any] | None = None
+) -> str | None:
+    """The claude version the engine should verify on its own now, or None.
+
+    Only for a gate closed because the installed version changed (never an
+    unreadable version or a crashed check), and never for a version a
+    verify ever failed for (:func:`failed_versions`, so a rollback too):
+    that one waits for a manual ``prime verify``.
+    A newer build after a failed one gets its own automatic verify. Past a
+    transient failure, the next try waits until ``nextAt``; after
+    :data:`AUTO_MAX_TRIES` the last one has recorded a failed verify."""
+    current = verdict.current
+    if verdict.ok or current is None:
+        return None
+    if verdict.cause == "failed":
+        if verdict.failed_version is None or verdict.failed_version == current:
+            return None
+    elif verdict.cause not in AUTO_CAUSES:
+        return None
+    data = load(root) if data is None else data
+    if current in failed_versions(root, data):
+        return None  # failed once (a rollback to it, say): manual verify only
+    state = data.get(AUTO_KEY)
+    if isinstance(state, Mapping) and state.get("version") == current:
+        tries = state.get("tries")
+        if isinstance(tries, int) and not isinstance(tries, bool) and tries >= AUTO_MAX_TRIES:
+            return None
+        next_at = _num(state.get("nextAt"))
+        if next_at is not None and now < next_at:
+            return None
+    return current
+
+
+def auto_tries(root: Path, version: str, data: Mapping[str, Any] | None = None) -> int:
+    """Transient automatic-verify failures recorded for ``version``."""
+    data = load(root) if data is None else data
+    state = data.get(AUTO_KEY)
+    if not isinstance(state, Mapping) or state.get("version") != version:
+        return 0
+    tries = state.get("tries")
+    return tries if isinstance(tries, int) and not isinstance(tries, bool) and tries > 0 else 0
+
+
+def note_auto_retry(root: Path, version: str, last: str, *, now: float) -> int:
+    """Record a transient automatic-verify failure for ``version``; the
+    next try waits :data:`AUTO_RETRY_S`. Returns the tries so far."""
+    data = load(root)
+    tries = auto_tries(root, version, data) + 1
+    data[AUTO_KEY] = {
+        "version": version, "tries": tries, "nextAt": now + AUTO_RETRY_S, "last": last,
+    }
+    _save(root, data)
+    return tries
+
+
+def verify_lock(root: Path):
+    """The lock every verify holds (``prime verify`` waits for it, the
+    engine skips a tick when it is taken)."""
+    from claude_swap.locking import FileLock
+
+    return FileLock(Path(root) / VERIFY_LOCK_FILENAME, timeout=0)
+
+
+def _auto_verify_setting(root: Path) -> bool:
+    from claude_swap.settings import load_prime_settings
+
+    try:
+        return bool(load_prime_settings(Path(root)).auto_verify)
+    except Exception:
+        return False
+
+
+def paused_state(root: Path, *, auto_verify: bool | None = None) -> tuple[str | None, bool]:
+    """``(note, auto)``: :func:`paused_note`'s text, and whether the engine
+    will lift this pause itself (``prime.autoVerify``, read from settings
+    when not given) — a version change it has not given up on yet."""
+    data = load(root)
+    if auto_verify is None:
+        auto_verify = _auto_verify_setting(root)
+    seen = data.get("lastSeen")
+    current = _text(seen.get("version")) if isinstance(seen, dict) else None
+
+    def auto(cause: str, failed_version: str | None = None) -> bool:
+        if not auto_verify:
+            return False
+        verdict = Gate(False, current, None, "", cause, failed_version)
+        # nextAt is ignored: a retry that is merely waiting still counts.
+        return auto_verify_due(root, verdict, float("inf"), data) is not None
+
+    def note(head: str, engine: bool) -> tuple[str, bool]:
+        return f"paused: {head} ({AUTO_HINT if engine else 'cc-swap prime verify'})", engine
+
+    failed = failed_verify(root, data)
+    if failed is not None:
+        return note(_failed_text(failed), auto("failed", _text(failed.get("version"))))
+    verified = _text(data.get("verifiedClaudeVersion"))
+    if verified is not None and current is not None and current != verified:
+        return note(f"claude {verified} -> {current}", auto("changed"))
+    update = pending_update(root, data)
+    if update is not None:
+        return note(f"claude {verified or update[0]} -> {update[1]}", auto("update"))
+    return None, False
+
+
+def paused_note(root: Path, *, auto_verify: bool | None = None) -> str | None:
     """For displays (no subprocess): why priming is paused, from what the
     engine last saw and what ``cc-swap claude-update`` recorded, or None.
     The same rule as :func:`gate`, minus the unreadable-version case."""
-    data = load(root)
-    failed = failed_verify(root, data)
-    if failed is not None:
-        return f"paused: {_failed_text(failed)} (cc-swap prime verify)"
-    verified = _text(data.get("verifiedClaudeVersion"))
-    seen = data.get("lastSeen")
-    current = _text(seen.get("version")) if isinstance(seen, dict) else None
-    if verified is not None and current is not None and current != verified:
-        return f"paused: claude {verified} -> {current} (cc-swap prime verify)"
-    update = pending_update(root, data)
-    if update is not None:
-        return f"paused: claude {verified or update[0]} -> {update[1]} (cc-swap prime verify)"
-    return None
+    return paused_state(root, auto_verify=auto_verify)[0]
 
 
 # -- prime verify ------------------------------------------------------------------------
 
 
+class KeychainUnreadable(Exception):
+    """``security`` could not say whether an item exists (a locked
+    keychain, a timeout, any exit but 0 and 44): a check built on it proves
+    nothing, so it must not pass."""
+
+
+#: ``security``'s exit for "no such item" (errSecItemNotFound).
+_NOT_FOUND_RC = 44
+
+
 def keychain_attributes(service: str) -> str | None:
     """The attributes ``security`` prints for a generic-password item —
     no ``-w``/``-g``, so the secret is never read and never prompted for.
-    None when there is no such item (or it cannot be looked at)."""
+    None when there is no such item (exit 44); :class:`KeychainUnreadable`
+    when it cannot be looked at."""
     from claude_swap import macos_keychain
 
     try:
@@ -402,11 +592,17 @@ def keychain_attributes(service: str) -> str | None:
             ],
             capture_output=True,
             text=True,
-            timeout=5.0,
+            timeout=KEYCHAIN_TIMEOUT_S,
         )
-    except (OSError, subprocess.TimeoutExpired):
+    except subprocess.TimeoutExpired:
+        raise KeychainUnreadable(f"security timed out after {KEYCHAIN_TIMEOUT_S:.0f}s")
+    except OSError as e:
+        raise KeychainUnreadable(f"security could not run ({type(e).__name__})")
+    if result.returncode == 0:
+        return result.stdout
+    if result.returncode == _NOT_FOUND_RC:
         return None
-    return result.stdout if result.returncode == 0 else None
+    raise KeychainUnreadable(f"security exited {result.returncode}")
 
 
 def _keychain_delete(service: str) -> None:
@@ -459,6 +655,9 @@ class Check:
     name: str
     ok: bool
     detail: str = ""
+    # A failure that may pass on a retry (a timeout, claude not starting, a
+    # network error) rather than one that saw isolation break.
+    transient: bool = False
 
 
 @dataclass
@@ -473,9 +672,20 @@ class VerifyReport:
     def ok(self) -> bool:
         return bool(self.checks) and all(c.ok for c in self.checks)
 
-    def add(self, name: str, ok: bool, detail: str = "") -> bool:
-        self.checks.append(Check(name, ok, detail))
+    def add(self, name: str, ok: bool, detail: str = "", *, transient: bool = False) -> bool:
+        self.checks.append(Check(name, ok, detail, transient and not ok))
         return ok
+
+    def failures(self) -> list[str]:
+        """The failed checks a failed-verify record names (the live prime
+        finding nothing to prime says nothing about isolation)."""
+        return [c.name for c in self.checks if not c.ok and c.name != LIVE_CHECK]
+
+    @property
+    def transient(self) -> bool:
+        """Failed, and only on checks that may pass on a retry."""
+        failed = [c for c in self.checks if not c.ok]
+        return bool(failed) and all(c.transient for c in failed)
 
     def to_json(self) -> dict[str, Any]:
         return {
@@ -522,12 +732,57 @@ def active_fingerprint(deps: VerifyDeps) -> dict[str, str | None]:
     out: dict[str, str | None] = {}
     if deps.macos():
         for service in deps.active_services():
-            out[f"keychain:{service}"] = _sha(deps.keychain_attrs(service))
+            try:
+                out[f"keychain:{service}"] = _sha(deps.keychain_attrs(service))
+            except KeychainUnreadable:
+                out[f"keychain:{service}"] = UNREADABLE
     creds = deps.credentials_path() if deps.credentials_path else get_credentials_path()
     config = deps.config_path() if deps.config_path else get_global_config_path()
     out["credentials-file"] = _file_hash(creds)
     out["account"] = _account_hash(config)
     return out
+
+
+#: A fingerprint entry that could not be read: never compared as equal.
+UNREADABLE = "<unreadable>"
+
+
+def _unreadable(*prints: Mapping[str, str | None]) -> list[str]:
+    keys = {k for fp in prints for k, v in fp.items() if v == UNREADABLE}
+    return ["Keychain item " + k.split(":", 1)[-1] for k in sorted(keys)]
+
+
+def _add_unchanged(
+    report: VerifyReport, name: str, before: Mapping[str, str | None],
+    after: Mapping[str, str | None], ok_detail: str,
+) -> None:
+    """The "active login unchanged" check: fails on a change, and fails
+    (transient: worth a retry) when the Keychain could not be read, before
+    or after — two unreadable items compare equal and prove nothing."""
+    unreadable = _unreadable(before, after)
+    if unreadable:
+        report.add(
+            name, False, "could not read the attributes of " + ", ".join(unreadable)
+            + " (locked keychain?)", transient=True,
+        )
+        return
+    changed = _changed(before, after)
+    report.add(name, not changed, "changed: " + ", ".join(changed) if changed else ok_detail)
+
+
+def _leftover_check(
+    report: VerifyReport, name: str, service: str, deps: VerifyDeps, found: str, none: str
+) -> None:
+    """A probe's Keychain item must be gone; an unreadable Keychain fails
+    the check (transient) instead of passing it."""
+    try:
+        left = deps.keychain_attrs(service) is not None
+    except KeychainUnreadable as e:
+        report.add(name, False, f"could not read the Keychain ({e})", transient=True)
+        return
+    if left:
+        deps.keychain_delete(service)
+    report.add(name, not left, found if left else none)
 
 
 def _changed(before: Mapping[str, str | None], after: Mapping[str, str | None]) -> list[str]:
@@ -555,10 +810,11 @@ def _probe(report: VerifyReport, claude: str, root: Path, deps: VerifyDeps, mode
         result = deps.run(build_prime_argv(claude, model), env, profile, PROBE_TIMEOUT_S)
         if result.timed_out:
             report.add("invalid token is rejected", False,
-                       f"no answer in {PROBE_TIMEOUT_S:.0f}s")
+                       f"no answer in {PROBE_TIMEOUT_S:.0f}s", transient=True)
         elif result.returncode is None:
             report.add("invalid token is rejected", False,
-                       "could not start claude: " + (result.stderr_tail or "")[-200:])
+                       "could not start claude: " + (result.stderr_tail or "")[-200:],
+                       transient=True)
         elif result.returncode == 0 and result.is_error is not True:
             report.add(
                 "invalid token is rejected", False,
@@ -571,15 +827,16 @@ def _probe(report: VerifyReport, claude: str, root: Path, deps: VerifyDeps, mode
                 "invalid token is rejected", kind == "auth",
                 f"clean 401 (exit {result.returncode})" if kind == "auth"
                 else f"failed, but not with an auth error ({kind}, exit {result.returncode})",
+                # A network error says nothing about isolation yet. A 429 does:
+                # an invalid token is refused (401) before any rate limit, so
+                # claude authenticated with something else. Not retried.
+                transient=kind == "other",
             )
         if macos:
-            left = deps.keychain_attrs(service) is not None
-            if left:
-                deps.keychain_delete(service)
-            report.add(
-                "no Keychain item left behind", not left,
-                "the probe profile's item was left behind (deleted now)" if left
-                else "none for the probe profile",
+            _leftover_check(
+                report, "no Keychain item left behind", service, deps,
+                "the probe profile's item was left behind (deleted now)",
+                "none for the probe profile",
             )
         stray = (profile / ".credentials.json").exists()
         report.add(
@@ -615,55 +872,50 @@ def run_verify(
     ):
         return report
     assert claude_path is not None
+    key = identity(claude_path)  # before --version: see note_seen
     version = deps.version(claude_path)
     report.version = version
     if version is not None:
         # What was just read is what the guard's cache must say for this
         # exact binary; a stale entry would otherwise outlive the verify.
         try:
-            note_seen(root, claude_path, version)
+            note_seen(root, claude_path, version, key=key)
         except OSError:
             pass
-    if not report.add("claude --version", version is not None, version or "unreadable"):
+    if not report.add(
+        "claude --version", version is not None, version or "unreadable", transient=True
+    ):
         return report
     before = active_fingerprint(deps)
     _probe(report, claude_path, root, deps, model)
-    changed = _changed(before, active_fingerprint(deps))
-    report.add(
-        "active login unchanged", not changed,
-        "changed: " + ", ".join(changed) if changed
-        else ("Keychain item attributes, " if deps.macos() else "")
+    _add_unchanged(
+        report, "active login unchanged", before, active_fingerprint(deps),
+        ("Keychain item attributes, " if deps.macos() else "")
         + ".credentials.json and ~/.claude.json account",
     )
     if live is not None and report.ok:
         before = active_fingerprint(deps)
         ok, detail = live()
         report.add(LIVE_CHECK, ok, detail)
-        changed = _changed(before, active_fingerprint(deps))
-        report.add(
-            "active login unchanged by the live prime", not changed,
-            "changed: " + ", ".join(changed) if changed else "unchanged",
+        _add_unchanged(
+            report, "active login unchanged by the live prime", before,
+            active_fingerprint(deps), "unchanged",
         )
         if deps.macos():
             from claude_swap.maximize.primer import PROFILE_DIRNAME
             from claude_swap.session import keychain_service_name
 
-            service = keychain_service_name(root / PROFILE_DIRNAME)
-            left = deps.keychain_attrs(service) is not None
-            if left:
-                deps.keychain_delete(service)
-            report.add(
-                "no Keychain item left by the live prime", not left,
-                "prime-profile's item was left behind (deleted now)" if left else "none",
+            _leftover_check(
+                report, "no Keychain item left by the live prime",
+                keychain_service_name(root / PROFILE_DIRNAME), deps,
+                "prime-profile's item was left behind (deleted now)", "none",
             )
     if report.ok and record and version is not None:
         # The live prime has to bypass the gate it is about to lift, so it
         # runs first; the record is written only once everything passed.
         record_verified(root, version, by=VERIFIED_BY_CLI, now=now)
         report.recorded = True
-    elif record and (
-        failures := [c.name for c in report.checks if not c.ok and c.name != LIVE_CHECK]
-    ):
+    elif record and (failures := report.failures()):
         # A build that just failed is not verified, whatever an earlier run
         # recorded: drop that record so priming pauses (engine, `prime`,
         # `prime --dry-run` and doctor all read it) until a verify passes.
@@ -739,7 +991,8 @@ def verify_command(argv: list[str]) -> None:
         prog="cc-swap prime verify",
         description=(
             "Check that priming is still isolated with the installed Claude Code "
-            "(run after every claude update; priming pauses until this passes). "
+            "(priming pauses after every claude update until this passes; the "
+            "engine runs it itself unless prime.autoVerify is false). "
             "Zero-cost by default: an invalid-token run in a throwaway profile must "
             "fail with a clean 401 and leave the Keychain and the active login "
             "untouched (Keychain item attributes only — no secret is read)."
@@ -767,7 +1020,16 @@ def verify_command(argv: list[str]) -> None:
         if args.live is not None:
             target = args.live if args.live == "auto" else switcher.resolve_account(args.live)[0]
             live = _live_prime(switcher, target)
-        report = run_verify(root, claude, deps=default_deps(), model=prime.model, live=live)
+        # One verify at a time: the engine may be re-verifying on its own.
+        lock = verify_lock(root)
+        if not lock.acquire(timeout=VERIFY_LOCK_WAIT_S):
+            error("Error: another prime verify is running (the engine re-verifying "
+                  "after a Claude Code update?); try again in a minute")
+            sys.exit(1)
+        try:
+            report = run_verify(root, claude, deps=default_deps(), model=prime.model, live=live)
+        finally:
+            lock.release()
     except ClaudeSwitchError as e:
         error(f"Error: {e}")
         sys.exit(1)
