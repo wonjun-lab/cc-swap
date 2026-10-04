@@ -216,3 +216,79 @@ def test_the_refresh_defers_when_the_under_lock_read_is_degraded(temp_home, monk
         record = sw._fetch_active_usage("1", "test@example.com", expired)
     post.assert_not_called()
     assert isinstance(record, FetchRecord) and record.sentinel == USAGE_KEYCHAIN_UNAVAILABLE
+
+
+# -- re-review: under-lock re-check, shared fields, 401, the detection cache -----------------
+
+
+def test_a_keychain_rotated_between_detect_and_write_aborts_with_nothing_written(managed):
+    sw, home, store, email, uuid = managed
+    rotated = json.dumps({"claudeAiOauth": {"accessToken": "sk-2b", "refreshToken": "rt-2b",
+                                            "expiresAt": int((NOW + 3600) * 1000)}})
+
+    def confirm_while_claude_rotates(question):
+        # A running Claude session rotates #2's login meanwhile.
+        store.set_password(CLAUDE_CODE_KEYCHAIN_SERVICE, kc.keychain_account_name(), rotated)
+        return True
+
+    with _owner(email, uuid), pytest.raises(ConfigError, match="changed since it was checked"):
+        lr.repair(sw, confirm=confirm_while_claude_rotates)
+    assert _keychain(store) == rotated
+    assert sw._read_account_credentials("1", "a@example.com") == OLD1
+    assert (home / ".claude" / ".credentials.json").read_text() == FRESH
+
+
+def test_mcp_logins_from_both_sides_survive_the_repair(unmanaged):
+    sw, home, store, email, uuid = unmanaged
+    plain = json.loads(FRESH)
+    plain["mcpOAuth"] = {"made-over-ssh": {"accessToken": "mcp-new"}}
+    (home / ".claude" / ".credentials.json").write_text(json.dumps(plain))
+    keychain = json.loads(CRED2)
+    keychain["mcpOAuth"] = {"older": {"accessToken": "mcp-old"},
+                            "made-over-ssh": {"accessToken": "mcp-stale"}}
+    store.set_password(CLAUDE_CODE_KEYCHAIN_SERVICE, kc.keychain_account_name(),
+                       json.dumps(keychain))
+    sw._write_account_credentials("2", "b@example.com", json.dumps(keychain))
+    with _owner(email, uuid):
+        assert lr.repair(sw, confirm=lambda q: True).startswith("Repaired")
+    live = json.loads(_keychain(store))
+    assert live["claudeAiOauth"]["refreshToken"] == "rt-x-new"
+    assert live["mcpOAuth"] == {"older": {"accessToken": "mcp-old"},
+                                "made-over-ssh": {"accessToken": "mcp-new"}}
+
+
+def test_a_rejected_token_is_reported_as_rejected(unmanaged):
+    sw, *_ = unmanaged
+
+    def rejected(token):
+        oauth.PROFILE_STATUS.code = 401
+        return None
+
+    with patch("claude_swap.oauth.fetch_oauth_profile", side_effect=rejected):
+        with pytest.raises(ConfigError, match=r"rejected \(401\)"):
+            lr.repair(sw, confirm=lambda q: True)
+
+
+def test_repair_refuses_inside_a_session_shell(unmanaged, monkeypatch):
+    sw, home, store, email, uuid = unmanaged
+
+    def refuse():
+        raise ConfigError("inside a cswap run shell")
+
+    monkeypatch.setattr(sw, "_refuse_session_shell", refuse)
+    with _owner(email, uuid), pytest.raises(ConfigError, match="cswap run shell"):
+        lr.repair(sw, confirm=lambda q: True)
+    assert _keychain(store) == CRED2
+
+
+def test_detection_reads_the_slots_once_while_the_login_stays_mixed(unmanaged, monkeypatch):
+    sw, *_ = unmanaged
+    reads: list[str] = []
+    real = sw._read_account_credentials
+    monkeypatch.setattr(
+        sw, "_read_account_credentials", lambda n, e: reads.append(n) or real(n, e)
+    )
+    assert lr.detect(sw) is not None
+    first = len(reads)
+    assert first >= 2
+    assert lr.detect(sw) is not None and len(reads) == first

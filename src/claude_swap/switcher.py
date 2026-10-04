@@ -2246,6 +2246,8 @@ class ClaudeAccountSwitcher:
         *,
         activate: bool = True,
         on_commit=None,
+        precheck=None,
+        live_shared_from: str | None = None,
     ) -> dict:
         """Store a fresh login for slot ``account_num`` that was made OUTSIDE
         the live store (``cc-swap login`` runs ``claude auth login`` in a
@@ -2272,6 +2274,12 @@ class ClaudeAccountSwitcher:
         Any failure restores both sides from snapshots and re-raises.
         ``on_commit(result)`` is called once both sides are written, before
         anything else can raise.
+
+        cc-swap: ``precheck()`` runs inside the locks before anything is
+        read or written, and aborts the store by raising (``repair-live``
+        re-checks there that the live login is still what it detected).
+        ``live_shared_from`` is the credential whose machine-shared fields
+        (``mcpOAuth`` …) the live login gets, instead of the live one's.
 
         ``ConfigError`` for an identity that is not the slot's,
         ``AccountNotFoundError`` for a missing slot, ``CredentialReadError``
@@ -2321,6 +2329,8 @@ class ClaudeAccountSwitcher:
                     f"the new login is {email or 'unknown'}, not Account-{num}'s "
                     f"account; nothing stored"
                 )
+            if precheck is not None:
+                precheck()
             live_now = activate and self._live_identity_matches(rec_email, rec_org)
             # Snapshots, all taken before the first write.
             backup_before, unreadable = self._read_account_credentials_ex(num, rec_email)
@@ -2358,7 +2368,10 @@ class ClaudeAccountSwitcher:
                 if live_now:
                     live_written = True
                     self._write_credentials(
-                        self._prepare_credentials_for_activation(credentials, live_before)
+                        self._prepare_credentials_for_activation(
+                            credentials,
+                            live_before if live_shared_from is None else live_shared_from,
+                        )
                     )
                     spliced = dict(live_config)
                     spliced["oauthAccount"] = dict(oauth_account)

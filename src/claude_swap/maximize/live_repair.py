@@ -120,6 +120,23 @@ def _detect(switcher) -> MixedLogin | None:
     issued = _issued_at(kc_pair)
     if issued is None or mtime <= issued:
         return None  # the plaintext is not the newer login
+    # The engine asks every tick while the login stays mixed: the slot scan
+    # below (a Keychain read per slot) runs once per (identity, Keychain
+    # login, plaintext file) instead.
+    key = (identity, kc_fp, file_fp, mtime)
+    cached = getattr(switcher, "_mixed_login_cache", None)
+    if isinstance(cached, tuple) and cached[0] == key:
+        return cached[1]
+    found = _scan_slots(switcher, identity, kc_fp, file_fp, path, mtime, text, kc)
+    try:
+        switcher._mixed_login_cache = (key, found)
+    except AttributeError:
+        pass
+    return found
+
+
+def _scan_slots(switcher, identity, kc_fp, file_fp, path, mtime, text, kc) -> MixedLogin | None:
+    email, org, uuid = identity
     data = switcher._get_sequence_data() or {}
     x_slot = switcher._find_account_slot(data, email, org)
     y_slot = None
@@ -147,11 +164,18 @@ def _verify_owner(m: MixedLogin) -> None:
             "checked. Nothing was changed. Unlock the Keychain and run claude /login "
             f"as {m.email} in a GUI terminal instead."
         )
+    oauth.PROFILE_STATUS.code = None
     profile = oauth.fetch_oauth_profile(str(pair.get("accessToken") or ""))
     if not profile:
+        if getattr(oauth.PROFILE_STATUS, "code", None) == 401:
+            raise ConfigError(
+                "The plaintext login's token was rejected (401) by the token-owner "
+                "lookup: it is not a usable login. Nothing was changed. Unlock the "
+                f"Keychain and run claude /login as {m.email} in a GUI terminal."
+            )
         raise ConfigError(
-            "Could not look up whose the plaintext login is (offline?). Nothing was "
-            "changed; retry when online."
+            "Could not look up whose the plaintext login is (offline, or the lookup "
+            "failed). Nothing was changed; retry when online."
         )
     seen_uuid = str(profile.get("uuid") or "").strip()
     seen_email = str(profile.get("email") or "").strip()
@@ -167,6 +191,30 @@ def _verify_owner(m: MixedLogin) -> None:
             f"The plaintext login is not {m.email}'s (it resolves to "
             f"{seen_email or seen_uuid or 'another account'}). Nothing was changed."
         )
+
+
+def merged_login(file_creds: str, keychain_creds: str) -> str:
+    """The plaintext login with the machine-shared fields (``mcpOAuth`` …)
+    of both sides: the Keychain's, overlaid entry by entry with the
+    plaintext's (newer — MCP logins made during the SSH session live only
+    there). Account fields (``claudeAiOauth`` …) are the plaintext's."""
+    from claude_swap.credentials import SHARED_CREDENTIAL_KEYS
+
+    try:
+        plain = json.loads(file_creds)
+        kc = json.loads(keychain_creds)
+    except ValueError:
+        return file_creds
+    if not isinstance(plain, dict) or not isinstance(kc, dict):
+        return file_creds
+    out = dict(plain)
+    for key in SHARED_CREDENTIAL_KEYS:
+        mine, theirs = plain.get(key), kc.get(key)
+        if isinstance(mine, dict) and isinstance(theirs, dict):
+            out[key] = {**theirs, **mine}
+        elif key not in plain and key in kc:
+            out[key] = theirs
+    return json.dumps(out)
 
 
 def _same_login(a: str | None, b: str | None) -> bool:
@@ -204,30 +252,52 @@ def repair(switcher, *, confirm: Callable[[str], bool]) -> str:
     )
     if not confirm(question):
         return "Cancelled; nothing was changed."
+    # Inside a `cswap run` shell CLAUDE_CONFIG_DIR points at a session
+    # profile, not the live login: refuse, like add and login.
+    switcher._refuse_session_shell()
+    login = merged_login(m.file_creds, m.keychain_creds)
+
+    def unchanged() -> None:
+        """Under the locks: the live login is still exactly what was
+        detected — the same account named, the Keychain holding Y's very
+        login (a running Claude may have rotated it since: slot Y would
+        then keep a spent token), the plaintext file the same."""
+        kc_now, failed = _keychain(switcher)
+        try:
+            file_now = m.file_path.read_text(encoding="utf-8")
+        except OSError:
+            file_now = None
+        if (
+            failed
+            or kc_now != m.keychain_creds
+            or file_now != m.file_creds
+            or switcher._get_current_identity_triple() != (m.email, m.org, m.uuid)
+        ):
+            raise ConfigError(
+                f"The live login changed since it was checked; nothing was changed. "
+                f"Run {COMMAND} again."
+            )
+
     if m.x_slot:
         config = json.loads(switcher._get_claude_config_path().read_text(encoding="utf-8"))
         account = config.get("oauthAccount") if isinstance(config, dict) else None
         if not isinstance(account, dict):
             raise ConfigError("~/.claude.json names no account any more; nothing was changed")
         # The slot and the live login in one critical section, under the
-        # switch's locks; it re-checks the slot's identity there.
-        switcher.store_relogin(m.x_slot, m.file_creds, account, activate=True)
+        # switch's locks; it re-checks the slot's identity there, and
+        # `unchanged` the live login, before writing anything.
+        switcher.store_relogin(
+            m.x_slot, login, account, activate=True, precheck=unchanged,
+            live_shared_from=login,
+        )
     else:
         with (
             FileLock(switcher.lock_file),
             claude_credentials_lock(),
             claude_config_lock(),
         ):
-            kc_now, failed = _keychain(switcher)
-            try:
-                file_now = m.file_path.read_text(encoding="utf-8")
-            except OSError:
-                file_now = None
-            if failed or not _same_login(kc_now, m.keychain_creds) or not _same_login(
-                file_now, m.file_creds
-            ):
-                raise ConfigError("The live login changed meanwhile; nothing was changed")
-            switcher._write_credentials(m.file_creds)
+            unchanged()
+            switcher._write_credentials(login)
     kc_after, failed = _keychain(switcher)
     if failed or not _same_login(kc_after, m.file_creds):
         raise CredentialReadError(
