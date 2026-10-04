@@ -647,9 +647,12 @@ class StoringSwitcher(IdentitySwitcher):
         super().__init__(*a, **kw)
         self.stored: list[tuple[str, str, str]] = []
 
-    def store_relogin(self, number, credentials, oauth_account, *, activate=True):
+    def store_relogin(self, number, credentials, oauth_account, *, activate=True,
+                      on_commit=None):
         rt = json.loads(credentials)["claudeAiOauth"]["refreshToken"]
         self.stored.append((str(number), oauth_account["emailAddress"], rt))
+        if on_commit is not None:
+            on_commit({"activated": False})
         return {"activated": False}
 
 

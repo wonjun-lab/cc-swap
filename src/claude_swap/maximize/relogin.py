@@ -407,12 +407,20 @@ class LoginAttempt:
             return Outcome(
                 MISMATCH, t.number, f"not #{t.number}'s account: {problem}; nothing stored"
             )
+        committed: list[dict] = []
         try:
-            result = switcher.store_relogin(t.number, creds, account, activate=True) or {}
+            result = switcher.store_relogin(
+                t.number, creds, account, activate=True, on_commit=committed.append,
+            ) or {}
         except Exception as e:
-            return Outcome(FAILED, t.number, _not_stored(switcher, t, creds, e))
+            if not committed:
+                return Outcome(FAILED, t.number, _not_stored(switcher, t, creds, e))
+            _logger.warning("re-login #%s: stored, then %s: %s", t.number,
+                            type(e).__name__, e)
+            result = committed[0]  # stored; only the after-work failed
         except BaseException as e:  # Ctrl-C / SIGTERM mid-store: keep it, then unwind
-            _not_stored(switcher, t, creds, e)
+            if not committed:  # once stored, a stash would only duplicate it
+                _not_stored(switcher, t, creds, e)
             raise
         stored = f"#{t.number} login stored ({t.email})"
         if result.get("activated"):

@@ -481,6 +481,97 @@ def test_active_slot_relogin_then_a_collect_pass_keeps_the_new_login(temp_home, 
     assert oauth.extract_oauth_data(s._read_credentials())["refreshToken"] == "rt-four-new"
 
 
+def _old_session_wrote_back(s, live: str, *, backup: str | None = None):
+    """After an activated re-login an old Claude Code session writes a
+    rotation of the replaced login (OLD') to the live store."""
+    assert _run(s, FakeLogin()).activated
+    if backup is not None:  # same refresh token: the pin still matches
+        s._write_account_credentials("4", FOUR, backup)
+    s._write_credentials(live)
+    # A verdict cached earlier in this process says OLD' is ours (it is the
+    # same account; only a different, older login).
+    s._probe_verdicts[s._lineage_key("4", FOUR, oauth.credential_fingerprint(live))] = True
+
+
+def _no_refresh_of(s, monkeypatch, forbidden_rt: str) -> list[str]:
+    posted: list[str] = []
+
+    def refresh(refresh_input, **kw):
+        rt = oauth.extract_oauth_data(refresh_input)["refreshToken"]
+        posted.append(rt)
+        assert rt != forbidden_rt, "POSTed the replaced login's refresh token"
+        return oauth.RefreshOutcome(_blob(rt + "-next", D, 99999999999900), None)
+
+    monkeypatch.setattr(s, "_audited_refresh", refresh)
+    monkeypatch.setattr(oauth, "try_fetch_usage_for_account",
+                        lambda *a, **k: oauth.UsageOutcome(usage={"five_hour": {}}))
+    return posted
+
+
+def test_expiry_recovery_refreshes_the_new_login_not_the_replaced_one(temp_home, monkeypatch):
+    s = _switcher(temp_home, active="4")
+    # Both access tokens expired; OLD' expires later than the new login's
+    # login-time token, which used to select it for the POST.
+    old_prime = _blob("rt-four-old2", D - 10 * DAY_MS, expires=6000)
+    _old_session_wrote_back(s, old_prime, backup=_blob("rt-four-new", D, expires=5000))
+    posted = _no_refresh_of(s, monkeypatch, "rt-four-old2")
+    s._fetch_active_usage("4", FOUR, old_prime, ORG4)
+    assert posted == ["rt-four-new"]
+    assert _slot_rt(s) == "rt-four-new-next"
+    assert oauth.extract_oauth_data(s._read_credentials())["refreshToken"] == "rt-four-new-next"
+    assert _stashed_rts(s) == ["rt-four-old2"]
+
+
+def test_expiry_recovery_restores_a_valid_new_login_without_a_post(temp_home, monkeypatch):
+    s = _switcher(temp_home, active="4")
+    old_prime = _blob("rt-four-old2", D - 10 * DAY_MS, expires=6000)  # expired
+    _old_session_wrote_back(s, old_prime)  # backup: the new login, still valid
+    posted = _no_refresh_of(s, monkeypatch, "rt-four-old2")
+    s._fetch_active_usage("4", FOUR, old_prime, ORG4)
+    assert posted == []
+    assert _slot_rt(s) == "rt-four-new"
+    assert oauth.extract_oauth_data(s._read_credentials())["refreshToken"] == "rt-four-new"
+    assert _stashed_rts(s) == ["rt-four-old2"]
+
+
+def test_adopt_branch_puts_the_new_login_back_live(temp_home, monkeypatch):
+    s = _switcher(temp_home, active="4")
+    old_prime = _blob("rt-four-old2", D - 10 * DAY_MS)  # valid access token
+    _old_session_wrote_back(s, old_prime)
+    posted = _no_refresh_of(s, monkeypatch, "rt-four-old2")
+    expired_read = _blob("rt-four-new", D, expires=1)  # what the pass read
+    s._fetch_active_usage("4", FOUR, expired_read, ORG4)  # -> the locked adopt branch
+    assert posted == []
+    assert _slot_rt(s) == "rt-four-new"
+    assert oauth.extract_oauth_data(s._read_credentials())["refreshToken"] == "rt-four-new"
+    assert _stashed_rts(s) == ["rt-four-old2"]
+
+
+def test_an_interrupt_after_the_store_committed_stashes_nothing(temp_home, monkeypatch):
+    s = _switcher(temp_home)
+
+    def interrupted(*a, **k):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(s._usage_store, "clear_dead_token", interrupted)  # after commit
+    with pytest.raises(KeyboardInterrupt):
+        _run(s, FakeLogin())
+    assert _slot_rt(s) == "rt-four-new"
+    assert _stashed_rts(s) == []
+
+
+def test_an_error_after_the_store_committed_still_reports_stored(temp_home, monkeypatch):
+    s = _switcher(temp_home)
+
+    def broken(*a, **k):
+        raise OSError("usage store unwritable")
+
+    monkeypatch.setattr(s._usage_store, "clear_dead_token", broken)
+    outcome = _run(s, FakeLogin())
+    assert outcome.ok and _slot_rt(s) == "rt-four-new"
+    assert _stashed_rts(s) == []
+
+
 # Claude Code re-stamps refreshTokenExpiresAt on every refresh as now + the
 # remaining lifetime in whole seconds: one login's value jitters both ways;
 # cc-swap's own refresh keeps min(known, stated), so its stamps move earlier.
