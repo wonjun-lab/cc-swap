@@ -402,3 +402,115 @@ def test_the_engine_marks_the_current_file_from_an_anonymized_report(home, root,
     assert killed is not None and killed["caller"] == "crash report" and len(sent) == 1
     [event] = _events(root)
     assert event["parentProc"] == "T3 Code (Alpha)" and event["path"].endswith("2.1.289")
+
+
+# -- re-review: old evidence never re-marks; only kernel lines mark -----------------------------
+
+
+def test_a_successful_run_outlives_the_old_reports_across_a_restart(home, root, sent):
+    link, real = _install(home, "2.1.289")
+    killed_at = os.stat(real).st_ctime + 0.05  # killed just after it was written
+    _ips(home, "2.1.289-a.ips", str(real), killed_at)
+    while time.time() <= killed_at + 0.02:
+        time.sleep(0.01)
+    w = cw.Watcher(root, lambda: str(link), home=home)
+    w.scan(time.time())
+    assert cx.current_killed(root) is not None
+    with cx.manual("t"):
+        assert cx.run([str(link), "--version"], caller="test", timeout=10, root=root).returncode == 0
+    assert cx.current_killed(root) is None
+    w.scan(time.time())  # the hourly scan: same old reports
+    assert cx.current_killed(root) is None
+    restarted = cw.Watcher(root, lambda: str(link), home=home)  # engine restart
+    restarted.scan(time.time())
+    assert cx.current_killed(root) is None and len(sent) == 1
+    # new evidence still marks
+    restarted.handle_line(json.dumps(KERNEL) + "\n")
+    assert cx.current_killed(root) is not None
+
+
+def test_evidence_before_a_successful_run_never_marks(home, root):
+    link, _real = _install(home, "2.1.289")
+    with cx.manual("t"):
+        cx.run([str(link), "--version"], caller="test", timeout=10, root=root)
+    assert not cx.mark_killed_by_os(root, str(link), source="x", at=time.time() - 1, detail="")
+    assert cx.mark_killed_by_os(root, str(link), source="x", at=time.time() + 1, detail="")
+
+
+def test_only_the_kernel_marks(home, root, sent):
+    link, real = _install(home, "2.1.289")
+    w = cw.Watcher(root, lambda: str(link), home=home)
+    w.handle_line(json.dumps({
+        **KERNEL, "processImagePath": "/usr/libexec/syspolicyd", "processID": 99,
+        "eventMessage": f"code signature error for {real}: invalid",
+    }) + "\n")
+    w.handle_line(json.dumps({
+        **KERNEL, "processImagePath": "/usr/libexec/amfid", "processID": 98,
+        "eventMessage": 'load code signature error 2 for file "2.1.289"',
+    }) + "\n")
+    assert len(_events(root)) == 2  # kept as evidence
+    assert cx.any_killed(root) is None and sent == []
+
+
+def test_a_bare_name_that_is_not_a_version_never_matches(tmp_path, root, sent):
+    brew = tmp_path / "homebrew" / "bin" / "claude"
+    brew.parent.mkdir(parents=True)
+    brew.write_text("#!/bin/sh\n")
+    brew.chmod(0o755)
+    w = cw.Watcher(root, lambda: str(brew), home=tmp_path)
+    w.handle_line(json.dumps({
+        **KERNEL, "eventMessage": 'load code signature error 2 for file "claude"',
+    }) + "\n")
+    assert cx.any_killed(root) is None
+    assert not cw.names_binary("claude", cx.stat_binary(str(brew)))
+    assert cw.names_binary(os.path.realpath(brew), cx.stat_binary(str(brew)))
+
+
+def test_the_stream_ends_itself_hourly_and_restarts_at_once(home, root):
+    clock = Clock()
+    spawned: list[FakeStream] = []
+
+    def spawn(argv):
+        assert argv[argv.index("--timeout") + 1] == cw.STREAM_TIMEOUT
+        spawned.append(FakeStream())
+        return spawned[-1]
+
+    w = cw.Watcher(root, lambda: None, home=home, clock=clock, spawn=spawn)
+    w.tick()
+    clock.t += cw.STREAM_TIMEOUT_S
+    spawned[0].rc = 0  # its own --timeout
+    w.tick()
+    assert len(spawned) == 2  # no backoff
+    w.stop()
+
+
+def test_the_scan_runs_off_the_tick(home, root, monkeypatch):
+    import threading
+
+    started = threading.Event()
+    release = threading.Event()
+
+    def slow_scan(self, now):
+        started.set()
+        release.wait(5)
+        return []
+
+    monkeypatch.setattr(cw.Watcher, "scan", slow_scan)
+    w = cw.Watcher(root, lambda: None, home=home, spawn=lambda argv: None)
+    t0 = time.monotonic()
+    w.tick()
+    assert started.wait(5) and time.monotonic() - t0 < 1.0
+    w.tick()  # still scanning: no second scan
+    release.set()
+    w._scanner.join(5)
+
+
+def test_reports_of_other_programs_are_skipped_on_their_header(home, monkeypatch):
+    _install(home, "2.1.289")
+    _real_shape(home, "Other-1.ips", "Other", _local_stamp(time.time() - 60))
+    _real_shape(home, "2.1.289-1.ips", "2.1.289", _local_stamp(time.time() - 60))
+    parsed: list[str] = []
+    real_parse = cw.parse_report
+    monkeypatch.setattr(cw, "parse_report", lambda p: parsed.append(p.name) or real_parse(p))
+    kills = cw.scan_crash_reports(home, time.time())
+    assert parsed == ["2.1.289-1.ips"] and len(kills) == 1

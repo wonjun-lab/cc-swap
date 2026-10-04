@@ -64,6 +64,11 @@ BACKOFF_MIN_S = 30.0
 BACKOFF_MAX_S = 3600.0
 HEALTHY_S = 600.0
 STOP_GRACE_S = 2.0
+#: ``log stream --timeout``: the child ends itself this often (and is
+#: restarted at once), so one orphaned by an engine killed outright never
+#: outlives it by more than this.
+STREAM_TIMEOUT = "1h"
+STREAM_TIMEOUT_S = 3600.0
 #: Crash reports are looked at on the first tick and then this often.
 SCAN_EVERY_S = 3600.0
 REPORT_MAX_AGE_S = 7 * 86400.0
@@ -82,16 +87,20 @@ def _is_macos() -> bool:
 
 
 def stream_argv() -> list[str]:
-    return [LOG, "stream", "--style", "ndjson", "--predicate", PREDICATE]
+    return [
+        LOG, "stream", "--style", "ndjson", "--timeout", STREAM_TIMEOUT,
+        "--predicate", PREDICATE,
+    ]
 
 
 def _spawn(argv: list[str]) -> subprocess.Popen | None:
-    """Start ``log stream`` (tests replace this; none ever runs the real one)."""
+    """Start ``log stream`` (tests replace this; none ever runs the real one).
+    In the engine's own process group, so a Ctrl-C or a service stop that
+    signals the group ends it too; ``--timeout`` bounds an orphan."""
     try:
         return subprocess.Popen(
             argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL, text=True, errors="replace", bufsize=1,
-            start_new_session=True,
         )
     except (OSError, ValueError):
         return None
@@ -124,14 +133,31 @@ def parse_event(line: str) -> dict[str, Any] | None:
 
 
 def killed_file(message: str) -> str | None:
-    """The file a code-signing message says was refused: the kernel's
-    ``for file "2.1.289"``, or a ``…/.local/share/claude/versions/…`` path."""
+    """The file a code-signing message names: the kernel's ``for file
+    "2.1.289"``, or a ``…/.local/share/claude/versions/…`` path. Evidence
+    for the jsonl; only :func:`kill_target` decides a kill."""
     match = _KERNEL_FILE_RE.search(message or "")
     if match:
         return match.group(1)
     match = _VERSION_PATH_RE.search(message or "")
-    if match and ("invalid" in message.lower() or "error" in message.lower()):
+    return match.group(1) if match else None
+
+
+def kill_target(event: dict[str, Any]) -> str | None:
+    """The file a line says the KERNEL refused to run, or None: only the
+    kernel's ``load code signature error … for file "…"`` and its
+    CODESIGNING terminations naming a claude path count. AMFI, taskgated
+    and syspolicyd diagnostics stay evidence only."""
+    if event.get("process") != "kernel":
+        return None
+    message = str(event.get("message") or "")
+    match = _KERNEL_FILE_RE.search(message)
+    if match:
         return match.group(1)
+    if "CODESIGNING" in message:
+        match = _VERSION_PATH_RE.search(message)
+        if match:
+            return match.group(1)
     return None
 
 
@@ -148,11 +174,21 @@ def relevant(event: dict[str, Any]) -> bool:
 
 
 def names_binary(token: str, binary: claude_exec.Binary) -> bool:
-    """Whether a message's file names ``binary`` (the kernel gives only the
-    file name, ``2.1.289``)."""
+    """Whether a message's file names ``binary``. The kernel gives only the
+    file name (``2.1.289``), so a bare name counts when it is a version
+    number (a native install's file); anything else (a Homebrew ``claude``)
+    has to be the full real path."""
+    from claude_swap.maximize.claude_version import VERSION_RE
+
     if binary.real is None or not token:
         return False
-    return token == binary.real or os.path.basename(token) == os.path.basename(binary.real)
+    if token == binary.real:
+        return True
+    base = os.path.basename(token)
+    return (
+        "/" not in token and VERSION_RE.fullmatch(base) is not None
+        and base == os.path.basename(binary.real)
+    )
 
 
 # -- crash reports ------------------------------------------------------------------------
@@ -254,6 +290,25 @@ def _claude_kill(kill: CrashKill, versions: Path, names: set[str]) -> CrashKill 
     return None
 
 
+def _header_may_be_claude(path: Path, names: set[str]) -> bool:
+    """A cheap look at the report's first line (its JSON header) before the
+    body is read: a crash report (bug type 309) of a process named like a
+    native claude file (a version number), ``claude``, or one of ``names``."""
+    from claude_swap.maximize.claude_version import VERSION_RE
+
+    try:
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            header = json.loads(fh.readline(64 * 1024))
+    except (OSError, ValueError):
+        return False
+    if not isinstance(header, dict) or str(header.get("bug_type") or "309") != "309":
+        return False
+    name = str(header.get("name") or header.get("app_name") or "")
+    return bool(name) and (
+        VERSION_RE.fullmatch(name) is not None or name == "claude" or name in names
+    )
+
+
 def scan_crash_reports(
     home: Path, now: float, *, max_age_s: float = REPORT_MAX_AGE_S,
     names: Iterable[str] = (),
@@ -275,6 +330,8 @@ def scan_crash_reports(
     files.sort(key=lambda pm: pm[1], reverse=True)
     out = []
     for path, _m in files[:REPORT_MAX_FILES]:
+        if not _header_may_be_claude(path, known):
+            continue
         kill = parse_report(path)
         kill = _claude_kill(kill, versions, known) if kill is not None else None
         if kill is not None:
@@ -336,6 +393,7 @@ class Watcher:
         self._next_start = 0.0
         self._next_scan = 0.0
         self._seen: set[str] = set()
+        self._scanner: threading.Thread | None = None
         self.starts = 0
 
     # -- the child --------------------------------------------------------------------
@@ -344,11 +402,23 @@ class Watcher:
         try:
             now = self._clock()
             self._keep_streaming(now)
-            if now >= self._next_scan:
+            scanning = self._scanner is not None and self._scanner.is_alive()
+            if now >= self._next_scan and not scanning:
                 self._next_scan = now + SCAN_EVERY_S
-                self.scan(now)
+                # Off the tick: a directory of reports takes a while to read.
+                self._scanner = threading.Thread(
+                    target=self._scan_quietly, args=(now,), name="cc-swap-codesign-scan",
+                    daemon=True,
+                )
+                self._scanner.start()
         except Exception as e:  # evidence gathering never breaks a tick
             _logger.debug("codesign watch: %s", type(e).__name__)
+
+    def _scan_quietly(self, now: float) -> None:
+        try:
+            self.scan(now)
+        except Exception as e:
+            _logger.debug("codesign watch: scan failed: %s", type(e).__name__)
 
     def _keep_streaming(self, now: float) -> None:
         proc = self._proc
@@ -358,11 +428,16 @@ class Watcher:
                 if self._started_at is not None and now - self._started_at >= HEALTHY_S:
                     self._backoff = BACKOFF_MIN_S
                 return
-            _logger.warning(
-                "codesign watch: log stream exited (%s); restarting in %.0fs", rc, self._backoff,
-            )
             self._proc = None
-            self._schedule_retry(now)
+            lived = now - self._started_at if self._started_at is not None else 0.0
+            if rc == 0 and lived >= STREAM_TIMEOUT_S * 0.9:
+                self._backoff = BACKOFF_MIN_S  # its own --timeout: restart now
+            else:
+                _logger.warning(
+                    "codesign watch: log stream exited (%s); restarting in %.0fs",
+                    rc, self._backoff,
+                )
+                self._schedule_retry(now)
         if now < self._next_start:
             return
         spawn = self._spawn or _spawn
@@ -419,7 +494,7 @@ class Watcher:
         if event is None or not relevant(event):
             return
         claude_exec.append_jsonl(self.root, EVENTS_FILENAME, event)
-        token = killed_file(event["message"])
+        token = kill_target(event)
         claude = self._claude() if token else None
         if not claude or not names_binary(token, claude_exec.stat_binary(claude)):
             return

@@ -741,7 +741,9 @@ def mark_killed_by_os(
     ``claude_path``: the same "killed by the OS" state as a SIGKILL of a
     cc-swap run (priming paused, one notification per identity,
     diagnostics). A kill older than the file's current ctime is about an
-    earlier file at that path and is ignored; one already counted is too.
+    earlier file at that path and is ignored; one already counted is too,
+    and so is one from before a successful run of this identity
+    (:func:`ran_ok_since`): only new evidence marks it again.
     Returns whether it was recorded."""
     binary = stat_binary(claude_path)
     if binary.identity is None or binary.ctime_ns is None or at < binary.ctime_ns / 1e9:
@@ -749,6 +751,10 @@ def mark_killed_by_os(
     killed = killed_entry(root, binary)
     last = killed.get("lastAt") if killed else None
     if isinstance(last, (int, float)) and at <= last:
+        return False
+    if ran_ok_since(root, binary, at):
+        # It ran fine after this kill (and the mark, if any, was cleared):
+        # only newer evidence may mark it again — across engine restarts.
         return False
     record = {
         "kind": "external-kill", "ts": _iso(at), "at": at, "caller": source,
@@ -761,13 +767,36 @@ def mark_killed_by_os(
     return True
 
 
-def _clear_killed(root: Path, binary: Binary) -> None:
+def _note_ok(state: dict, binary: Binary, now: float) -> None:
+    """``binary`` ran fine at ``now``: kill evidence from before then
+    (a crash report, a log line) can no longer mark this identity."""
+    ok = _section(state, "ok")
+    ok.pop(binary.real, None)
+    ok[binary.real] = {"identity": binary.identity, "at": now}
+    _trim(ok)
+
+
+def ran_ok_since(root: Path | None, binary: Binary, at: float) -> bool:
+    """Whether ``binary`` (this identity) ran fine at or after ``at``."""
+    ok = load_state(root).get("ok")
+    entry = ok.get(binary.real) if isinstance(ok, dict) else None
+    last = entry.get("at") if isinstance(entry, dict) else None
+    return (
+        isinstance(last, (int, float)) and entry.get("identity") == binary.identity
+        and at <= last
+    )
+
+
+def _clear_killed(root: Path, binary: Binary, now: float | None = None) -> None:
     cleared: list[dict] = []
+    now = time.time() if now is None else now
 
     def mutate(state: dict) -> bool:
         killed = state.get("killed")
         if isinstance(killed, dict) and _same_binary(killed, binary):
             cleared.append(state.pop("killed"))
+            if binary.identity is not None:
+                _note_ok(state, binary, now)
             return True
         return False
 
@@ -1010,11 +1039,15 @@ class Launch:
         if b.real is None or self._start is None:
             return
         if b.identity is not None:
+            ran_ok = record.get("exit") == 0
+
             def mutate(state: dict) -> bool:
                 executed = _section(state, "executed")
                 executed.pop(b.real, None)
                 executed[b.real] = {"identity": b.identity, "at": now, "caller": self.caller}
                 _trim(executed)
+                if ran_ok:
+                    _note_ok(state, b, now)
                 return True
 
             _mutate(self.root, mutate)
