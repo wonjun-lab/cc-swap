@@ -147,12 +147,23 @@ class NotifySettings:
     keychain: bool = True
 
 
+@dataclass(frozen=True)
+class ClaudeSettings:
+    """cc-swap's guard around the ``claude`` it runs (``claude`` section,
+    maximize/claude_exec.py)."""
+
+    # The engine never runs a claude binary changed less than this long ago
+    # (Claude Code's updater may still be writing it); 0 turns it off.
+    settle_s: int = 600
+
+
 _SECTION_DEFAULT_SOURCES = {
     "autoswitch": AutoSwitchSettings,
     "ui": UiSettings,
     "maximize": MaximizeSettings,
     "prime": PrimeSettings,
     "notify": NotifySettings,
+    "claude": ClaudeSettings,
 }
 
 
@@ -375,6 +386,10 @@ SETTING_SPECS: dict[str, SettingSpec] = {
         SettingSpec(
             "notify", "keychain", "keychain", "bool",
             help="notify: the live login has been unreadable (Keychain) for over 15 minutes",
+        ),
+        SettingSpec(
+            "claude", "settleS", "settle_s", "int", 0, 86400,
+            help="claude: the engine waits this long after Claude Code changed before running it",
         ),
     )
 }
@@ -762,6 +777,7 @@ def effective_settings(backup_root: Path) -> list[tuple[SettingSpec, object, boo
         "maximize": load_maximize_settings(backup_root),
         "prime": load_prime_settings(backup_root),
         "notify": load_notify_settings(backup_root),
+        "claude": load_claude_settings(backup_root),
     }
     rows = []
     for spec in SETTING_SPECS.values():
@@ -960,6 +976,15 @@ def load_notify_settings(
     user meant it, or the default)."""
     raw = _read_raw(settings_path(backup_root))
     return _section_for_load(raw, "notify", NotifySettings, problems)
+
+
+def load_claude_settings(
+    backup_root: Path, *, problems: list[str] | None = None
+) -> ClaudeSettings:
+    """Load the ``claude`` section; never raises. Per key as the other
+    sections (out of range is clamped, a bad type is the default)."""
+    raw = _read_raw(settings_path(backup_root))
+    return _section_for_load(raw, "claude", ClaudeSettings, problems)
 
 
 def prime_from_raw(section, repairs: list[str]) -> PrimeSettings:

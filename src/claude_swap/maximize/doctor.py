@@ -12,7 +12,9 @@ Strictly read-only:
 * never writes a credential, ``sequence.json``, ``autoswitch_state.json`` or
   ``settings.json`` (the settings are parsed with the non-logging primitives,
   and the engine lease is only probed when its file already exists);
-* runs no ``claude`` other than ``claude --version``.
+* runs no ``claude`` other than ``claude --version`` (through
+  ``claude_exec``, whose audit line is the one thing it appends; skipped
+  while the binary is still settling after an update, or the OS kills it).
 
 All I/O goes through :class:`Probes`, so tests replace the Keychain, the
 service manager, ``ps`` and ``claude`` with fakes. Output names accounts by
@@ -126,6 +128,22 @@ def _run(argv: list[str], timeout: float) -> RunResult:
     return RunResult(done.returncode, done.stdout or "", done.stderr or "")
 
 
+def _run_claude(argv: list[str], timeout: float) -> RunResult:
+    """``claude --version`` through ``claude_exec`` (audited, SIGKILL noticed)."""
+    from claude_swap.maximize import claude_exec
+
+    try:
+        done = claude_exec.run(
+            argv, caller="claude --version (doctor)", timeout=timeout,
+            manual=claude_exec.Manual("cc-swap doctor"),
+        )
+    except subprocess.TimeoutExpired:
+        return RunResult(RC_TIMEOUT)
+    except (OSError, subprocess.SubprocessError):
+        return RunResult(RC_NO_BINARY)
+    return RunResult(done.returncode, done.stdout or "", done.stderr or "")
+
+
 def _service_status() -> dict | None:
     from claude_swap.exceptions import ClaudeSwitchError
     from claude_swap.maximize import service
@@ -222,6 +240,8 @@ class Probes:
     program_install: Callable[[str], tuple[str | None, float | None]]
     current_program: Callable[[], list[str]]
     version: str = __version__
+    #: ``claude --version`` (``claude_exec``); None: :attr:`run`.
+    run_claude: Callable[[list[str], float], RunResult] | None = None
 
     @classmethod
     def system(cls) -> Probes:
@@ -239,6 +259,7 @@ class Probes:
             process_started_at=_process_started_at,
             program_install=_program_install,
             current_program=_current_program,
+            run_claude=_run_claude,
         )
 
 
@@ -569,7 +590,20 @@ def check_claude(ctx: Context) -> list[Finding]:
             "install Claude Code, or cc-swap config set prime.claudePath <path>",
         ))
         return out
-    done = p.run([path, "--version"], CLAUDE_VERSION_TIMEOUT_S)
+    from claude_swap.maximize import claude_exec
+
+    binary = claude_exec.stat_binary(path)
+    if claude_exec.killed_entry(p.backup_root, binary) is not None:
+        return out  # check_claude_exec says it: running it would be killed again
+    left = claude_exec.settle_left(binary, claude_exec.settle_seconds(p.backup_root), p.now)
+    if left > 0:
+        out.append(Finding(
+            "claude", "info",
+            f"{_tilde(path, p.home)} changed moments ago; --version not run until it "
+            f"settles ({left:.0f}s left, claude.settleS)",
+        ))
+        return out
+    done = (p.run_claude or p.run)([path, "--version"], CLAUDE_VERSION_TIMEOUT_S)
     version = done.stdout.strip().splitlines()[0] if done.rc == 0 and done.stdout.strip() else ""
     if done.rc != 0 or not version:
         out.append(Finding(
@@ -580,6 +614,59 @@ def check_claude(ctx: Context) -> list[Finding]:
         ))
     else:
         out.append(Finding("claude", "ok", f"{_tilde(path, p.home)} ({version})"))
+    return out
+
+
+def check_claude_exec(ctx: Context) -> list[Finding]:
+    """What ``claude_exec`` recorded about the ``claude`` cc-swap runs: the
+    OS killing it at launch (an error, with the fix, never applied here), a
+    binary rewritten in place after cc-swap ran it, an update still
+    settling. Reads ``claude_exec_state.json`` only."""
+    from claude_swap.maximize import claude_exec
+
+    p = ctx.probes
+    state = claude_exec.load_state(p.backup_root)
+    out: list[Finding] = []
+    killed = state.get("killed")
+    if isinstance(killed, dict):
+        real = str(killed.get("real") or killed.get("path") or "claude")
+        current = claude_exec.stat_binary(real).identity
+        diag = killed.get("diagnostics")
+        more = f"; diagnostics: {_tilde(diag, p.home)}" if diag else ""
+        times = int(killed.get("count") or 1)
+        when = _clock(float(killed.get("lastAt") or killed.get("at") or p.now))
+        if current is not None and current == killed.get("identity"):
+            who = "macOS" if p.platform == "darwin" else "the OS"
+            why = " (code-signing cache)" if p.platform == "darwin" else ""
+            out.append(Finding(
+                "claude-exec", "error",
+                f"{who} is killing {real} at launch{why}. Fix: "
+                f"{claude_exec.fix_command(real)} — SIGKILL {times}x, last at {when}; "
+                f"priming is paused{more}",
+                f"{claude_exec.fix_command(real)} (cc-swap never runs it for you)",
+            ))
+        else:
+            out.append(Finding(
+                "claude-exec", "info",
+                f"{real} was killed by the OS at launch (last at {when}) and has changed "
+                f"since; the next run decides{more}",
+            ))
+    rewritten = state.get("rewritten")
+    at = rewritten.get("at") if isinstance(rewritten, dict) else None
+    if isinstance(at, (int, float)) and 0 <= p.now - at < claude_exec.REWRITE_RECENT_S:
+        ran = rewritten.get("execAt")
+        ran_text = _clock(float(ran)) if isinstance(ran, (int, float)) else "?"
+        how = "in place (same inode)" if rewritten.get("sameInode") else "with a new inode"
+        out.append(Finding(
+            "claude-exec", "warn",
+            f"claude binary at {rewritten.get('real')} was rewritten {how} at {_clock(float(at))} "
+            f"after cc-swap had executed it (at {ran_text}); macOS may kill it at launch",
+            "if claude dies with SIGKILL (exit 137): cc-swap doctor names the fix",
+        ))
+    if not isinstance(killed, dict):
+        note = claude_exec.display_note(p.backup_root, p.now)
+        if note is not None:
+            out.append(Finding("claude-exec", "info", f"the engine is {note}"))
     return out
 
 
@@ -1080,6 +1167,7 @@ def check_settings(ctx: Context) -> list[Finding]:
         ("ui", st.UiSettings),
         ("maximize", st.MaximizeSettings),
         ("notify", st.NotifySettings),
+        ("claude", st.ClaudeSettings),
     )
     loaded = {}
     for name, cls in sections:
@@ -1339,6 +1427,7 @@ def _duplicates(ctx: Context) -> list[Finding]:
 
 ENV_CHECKS: tuple[Callable[[Context], list[Finding]], ...] = (
     check_claude,
+    check_claude_exec,
     check_keychain,
     check_plaintext,
     check_live_login,

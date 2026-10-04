@@ -190,6 +190,7 @@ cc-swap config path                         # where settings.json lives
 | `notify.loginExpiring` | bool | true | Notify a login that ends within 24 hours (once a day per account) |
 | `notify.primePaused` | bool | true | Notify priming paused after a Claude Code update, and the engine's automatic verify passing or failing |
 | `notify.keychain` | bool | true | Notify a live login unreadable for over 15 minutes |
+| `claude.settleS` | int 0–86400 | 600 | The engine never runs a `claude` binary changed less than this many seconds ago (see *Every `claude` cc-swap runs*); 0 turns the wait off |
 
 The plan (5x/20x) comes from each account's stored credentials; an entry in `maximize.planOverride` wins over it. It matters only for breaking ties.
 
@@ -305,6 +306,16 @@ The engine reads `claude --version` only when the executable changed (it caches 
 
 cc-swap never updates or replaces Claude Code: Claude Code's own updater does (in the background, or when you run `claude update`), and the guard notices the changed `claude` file on its own. A `claudeVersion` key an older cc-swap wrote into `autoswitch_state.json` is ignored.
 
+### Every `claude` cc-swap runs
+
+cc-swap starts `claude` for priming, `prime verify` (`--version` and the invalid-token probe), `cc-swap login` (`auth login` and its `--help` probe), `cc-swap doctor` (`--version`) and `cswap run` (its `auth status` probe and the session itself). Each run goes through one guard (`maximize/claude_exec.py`):
+
+- **Auto-updater off.** Every child except the `cswap run` session itself gets `DISABLE_AUTOUPDATER=1`: priming starts several `claude` right after each 5h reset, and each would otherwise run Claude Code's background updater against the shared install.
+- **Audit log.** One line per run in the cc-swap log and in `claude-exec.jsonl` in the backup root (moved to `claude-exec.jsonl.1` past 2 MB): when, which feature, the arguments (emails and tokens masked; never the environment), the `claude` path and the real file it resolves to, that file's inode, size, mtime, ctime and birthtime, the symlink's own mtime, the file's age, pid, exit code, signal and duration.
+- **Binary watch.** The first time a new `claude` file is seen (the engine looks every tick while priming is on), a *claude binary changed* line records the old and new file, and on macOS `codesign -dv` (Identifier, CDHash, TeamIdentifier, Timestamp), `codesign --verify` and the file's xattr names. If the same file changes after cc-swap ran it, the log warns `claude binary at … was rewritten in place after it had been executed (by cc-swap at …)`, and `cc-swap doctor` repeats it for a week.
+- **Settle delay.** The engine does not run a `claude` whose file (or symlink) changed less than `claude.settleS` (600 s) ago: priming, its version check and its automatic verify wait for a later tick, and Fleet, `cc-swap doctor` and `cc-swap why` say `priming paused: waiting for the claude update to settle (…s left)`. A command you type (`cc-swap prime verify`, `cc-swap prime`, `cc-swap login`, `cswap run`) runs it anyway and prints a warning — you asked for that run, and waiting ten minutes would only stall you; the audit line notes the override. `cc-swap doctor` skips its `--version` instead.
+- **Killed by the OS.** A `claude` that ends with SIGKILL (exit -9, or 137 through a wrapper) is recorded as killed by the OS — never as a failed verify. Priming pauses, you get one notification per `claude` file, `claude-kill-<time>.txt` in the backup root keeps the diagnostics (the run, `codesign`, xattr names and, on macOS, two minutes of `log show` for the pid, `claude`, AMFI and code signing), and `cc-swap doctor` shows an error with the fix: `cp -p <real> <real>.tmp && mv <real>.tmp <real>` (cc-swap never runs it for you). The engine does not run that file again; the mark clears by itself once the file changes (the fix gives it a new inode) or any run of it succeeds.
+
 ## Always-on service
 
 ```bash
@@ -376,6 +387,7 @@ The engine tells you about what matters while you are not looking at the TUI:
 | priming paused | priming paused after a Claude Code update, until `cc-swap prime verify` passes (with `prime.autoVerify`, only once the engine's own verify failed); once a day | `notify.primePaused` |
 | priming resumed | the engine's own verify passed after a Claude Code update (`prime.autoVerify`) | `notify.primePaused` |
 | Keychain | the live login has been unreadable for over 15 minutes, so nothing switches; at most every 2 hours | `notify.keychain` |
+| claude killed | the OS killed a `claude` cc-swap ran, at launch (SIGKILL); once per `claude` file, from any cc-swap process | `notify.enabled` |
 
 They come from whichever engine runs (the service, a terminal `cc-swap auto`, the TUI or the menu bar), never from a dry run. macOS shows them with `osascript` (`display notification`); Linux with `notify-send` when it is installed (Debian and Ubuntu: `libnotify-bin`); on any other system nothing is sent. A notification names accounts by slot number and short name (the alias, else the part of the address before the `@`, as in Fleet), never an email or a token. They are deduplicated and rate-limited through `notify_state.json` in the backup root: the same notification is not repeated within its interval (30 seconds for the same switch), and at most 6 go out in 10 minutes for switches and the Keychain, and another 6 for the reminders (re-login, expiring login, paused priming), so reminders never crowd out a switch. Each one is cut off after 2 seconds, and a notification that fails never affects the engine's tick.
 
@@ -766,13 +778,16 @@ Files in the backup root:
 | File | What it holds |
 |---|---|
 | `settings.json` | Settings (`cc-swap config path` prints its location) |
-| `autoswitch_state.json` | Auto-switch state: cooldown and quarantined accounts, `autoOff`, `accountHold`, `pausedUntil`, the recorded Claude Code version. Delete it to reset |
+| `autoswitch_state.json` | Auto-switch state: cooldown and quarantined accounts, `autoOff`, `accountHold`, `pausedUntil`. Delete it to reset |
 | `auto_off.json` | Authoritative copy of `cc-swap auto off` |
 | `hold.json` | The account hold |
 | `switches.jsonl` | Switch history (0600, rotates at 1 MiB, three generations) |
 | `usage_history.jsonl` | Usage history the idle-pattern learning reads |
 | `notify_state.json` | Notification deduplication and rate limits |
 | `prime_verify.json` | The Claude Code version priming was verified with |
+| `claude-exec.jsonl` | Every `claude` cc-swap ran (0600, moves to `.1` past 2 MB) |
+| `claude_exec_state.json` | The `claude` files seen and run, a killed-by-the-OS mark, a settle wait |
+| `claude-kill-<time>.txt` | Diagnostics of a `claude` the OS killed |
 | `prime-profile/` | Isolated config directory for priming runs |
 | `sessions/` | Session-mode profiles (`cc-swap run`) |
 | `.engine.lock` | The engine lease |

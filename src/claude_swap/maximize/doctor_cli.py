@@ -771,6 +771,18 @@ def _dry_run_tick() -> int:
     return 0
 
 
+def _claude_exec_note(backup_root, now: float) -> str | None:
+    """Priming held back by ``claude_exec`` (killed by the OS, an update
+    settling), for ``why``; read-only."""
+    from claude_swap.maximize import claude_exec
+
+    try:
+        note = claude_exec.display_note(backup_root, now)
+    except Exception:
+        return None
+    return None if note is None else f"paused: {note}"
+
+
 def why_command(argv: list[str], *, clock: Callable[[], float] = time.time) -> None:
     parser = argparse.ArgumentParser(
         prog="cc-swap why",
@@ -795,8 +807,11 @@ def why_command(argv: list[str], *, clock: Callable[[], float] = time.time) -> N
         why["idlePattern"] = idle_pattern(root, now=now)
         why["learnedRide"] = ride_learning(root)
     held, hold_line = account_hold_now(root, now=now)
+    claude_note = _claude_exec_note(root, now)
     if args.json:
         payload = {"schemaVersion": SCHEMA_VERSION, **(why or {"source": "none"})}
+        if claude_note is not None:
+            payload["claude"] = claude_note
         payload.pop("holdLine", None)
         if why is None:
             payload["fallback"] = "cc-swap auto --once --dry-run --json"
@@ -811,7 +826,11 @@ def why_command(argv: list[str], *, clock: Callable[[], float] = time.time) -> N
             )
         for line in _why_lines(why):
             print(line)
+        if claude_note is not None:
+            print(f"  claude   priming {claude_note}")
         sys.exit(0)
+    if claude_note is not None:
+        print(f"claude: priming {claude_note}")
     if hold_line:
         print(f"{hold_line} (cc-swap hold off lifts it)")
     print(

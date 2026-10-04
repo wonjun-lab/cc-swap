@@ -1509,16 +1509,20 @@ new deadline. Other machines keep their own logins: run this there too.
             except Exception:
                 configured = None
         claude = resolve_claude_path(configured)
-        if claude is None or not rl.login_supported(claude):
-            why = (
-                f"{claude} has no `auth login --email` (update Claude Code)"
-                if claude else "claude was not found (pass --claude-path)"
-            )
-            warning(f"Cannot launch the login here: {why}.")
-            for line in rl.guided_steps(num, email, claude):
-                print(line)
-            sys.exit(1)
-        outcome = rl.relogin(switcher, num, claude=claude)
+        from claude_swap.maximize import claude_exec
+
+        # The user's own run: a just-updated claude runs with a warning.
+        with claude_exec.manual("cc-swap login", warn=lambda m: warning(m, file=sys.stderr)):
+            if claude is None or not rl.login_supported(claude):
+                why = (
+                    f"{claude} has no `auth login --email` (update Claude Code)"
+                    if claude else "claude was not found (pass --claude-path)"
+                )
+                warning(f"Cannot launch the login here: {why}.")
+                for line in rl.guided_steps(num, email, claude):
+                    print(line)
+                sys.exit(1)
+            outcome = rl.relogin(switcher, num, claude=claude)
     except ClaudeSwitchError as e:
         error(f"Error: {e}")
         sys.exit(1)

@@ -257,7 +257,7 @@ cc-swap prime verify
 
 It costs nothing (no real request is made) and resumes priming on the engine's next tick when every check passes. If a check fails (yours or the engine's), priming stays paused until a manual `cc-swap prime verify` passes; turn it off with `cc-swap config set prime.enabled false` and open an issue with your `claude --version`.
 
-cc-swap never updates Claude Code itself: Claude Code's own updater does, and the guard notices the new `claude` file.
+cc-swap never updates Claude Code itself: Claude Code's own updater does, and the guard notices the new `claude` file. It also waits 10 minutes after Claude Code changed before the engine runs it (`claude.settleS`), logs every `claude` it runs to `claude-exec.jsonl`, and if macOS starts killing `claude` at launch (SIGKILL, exit 137), `cc-swap doctor` says so and prints the fix ([reference](docs/reference.md#every-claude-cc-swap-runs)).
 
 ## Common tasks
 

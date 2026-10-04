@@ -555,10 +555,28 @@ def _mkdir_private(path: Path) -> None:
         directory.mkdir(mode=0o700, exist_ok=True)
 
 
+def _audit_claude(argv: list[str], caller: str):
+    """A ``claude_exec.Launch`` recording this run (cc-swap fork: every
+    ``claude`` cc-swap starts is audited and a SIGKILL noticed), already
+    marked started; None when even that failed. The user's own run, so the
+    settle delay never holds it back."""
+    try:
+        from claude_swap.maximize import claude_exec
+
+        launch = claude_exec.Launch(argv, caller=caller, manual=claude_exec.Manual("cswap run"))
+        launch.mark_started(os.getpid() if caller == "cswap run" else None)
+        return launch
+    except Exception:
+        return None
+
+
 def _probe_env(session_dir: Path) -> dict[str, str]:
-    """Env for the auth-status probe: session config dir, auth overrides dropped."""
+    """Env for the auth-status probe: session config dir, auth overrides
+    dropped, Claude Code's auto-updater off (cc-swap fork: no child cc-swap
+    starts runs the updater; maximize/claude_exec.py)."""
     env = {k: v for k, v in os.environ.items() if k not in AUTH_OVERRIDE_ENV_VARS}
     env["CLAUDE_CONFIG_DIR"] = str(session_dir)
+    env["DISABLE_AUTOUPDATER"] = "1"
     return env
 
 
@@ -684,12 +702,18 @@ class SessionManager:
         resident as a thin wrapper and mirror claude's exit code.
         """
         argv = [claude_bin, *claude_args]
+        launch = _audit_claude(argv, "cswap run")
         if sys.platform == "win32":
             try:
                 rc = subprocess.run(argv, env=env).returncode
             except KeyboardInterrupt:
                 rc = 130  # Ctrl+C went to claude; just mirror the exit
+            if launch is not None:
+                launch.finish(rc)
             sys.exit(rc)
+        if launch is not None:
+            # The exec replaces this process: no exit status will be seen.
+            launch.finish(None, note="exec: claude replaces cswap (no exit status)")
         os.execvpe(claude_bin, argv, env)
         raise AssertionError("unreachable")  # pragma: no cover
 
@@ -1015,15 +1039,19 @@ class SessionManager:
         # FileNotFoundError. `shutil.which` finds the shim; when it finds
         # nothing at all the run below still raises, and that is "unknown".
         claude_bin = shutil.which("claude") or "claude"
+        argv = [claude_bin, "auth", "status", "--json"]
+        launch = _audit_claude(argv, "claude auth status (cswap run)")
         try:
             result = subprocess.run(
-                [claude_bin, "auth", "status", "--json"],
+                argv,
                 env=_probe_env(session_dir),
                 capture_output=True,
                 text=True,
                 timeout=_AUTH_STATUS_TIMEOUT,
             )
         except subprocess.TimeoutExpired:
+            if launch is not None:
+                launch.finish(None, timed_out=True)
             # The verdict layer answers what the PROBE established, and a
             # timeout established nothing. Upstream's artifact fallback is a
             # REUSE judgement, not a verdict, so it lives in
@@ -1032,8 +1060,12 @@ class SessionManager:
             # profile is bad" the same value again, which is the conflation
             # this whole tri-state exists to undo.
             return "unknown"
-        except OSError:
+        except OSError as e:
+            if launch is not None:
+                launch.finish(None, error=type(e).__name__)
             return "unreachable"
+        if launch is not None:
+            launch.finish(result.returncode)
         if result.returncode != 0:
             return "invalid"
         try:

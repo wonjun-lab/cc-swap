@@ -111,13 +111,22 @@ def login_argv(claude: str, email: str) -> list[str]:
     return [claude, "auth", "login", "--claudeai", "--email", email]
 
 
+def _manual():
+    """Re-login is always the user's own run (``claude_exec.manual``): the
+    CLI sets one with a printed warning; Fleet's threads get this one."""
+    from claude_swap.maximize import claude_exec
+
+    return claude_exec.current_manual() or claude_exec.Manual("Fleet: re-login")
+
+
 def login_supported(claude: str, *, timeout: float = PROBE_TIMEOUT_S) -> bool:
     """Whether ``claude`` has ``auth login --email`` (older builds do not)."""
+    from claude_swap.maximize import claude_exec
+
     try:
-        result = subprocess.run(
-            [claude, "auth", "login", "--help"],
-            capture_output=True, text=True, timeout=timeout,
-            stdin=subprocess.DEVNULL,
+        result = claude_exec.run(
+            [claude, "auth", "login", "--help"], caller="claude auth login --help",
+            timeout=timeout, manual=_manual(),
         )
     except (OSError, subprocess.SubprocessError):
         return False
@@ -147,16 +156,24 @@ def _reap(proc: subprocess.Popen) -> None:
 def run_interactive(argv: Sequence[str], env: Mapping[str, str], cwd: Path) -> int | None:
     """Run ``argv`` on this terminal; its exit code, or None when the user
     pressed Ctrl-C (the child got the SIGINT too and has exited, or was
-    killed, before this returns). ``OSError`` when it cannot be started."""
-    proc = subprocess.Popen(list(argv), env=dict(env), cwd=str(cwd))
+    killed, before this returns). ``OSError`` when it cannot be started.
+    Audited, with ``DISABLE_AUTOUPDATER=1`` (maximize/claude_exec.py)."""
+    from claude_swap.maximize import claude_exec
+
+    launch = claude_exec.Launch(argv, caller="claude auth login", manual=_manual())
+    proc = launch.popen(env=claude_exec.child_env(env), cwd=str(cwd))
     try:
-        return proc.wait()
+        code = proc.wait()
     except KeyboardInterrupt:
         _reap(proc)
+        launch.finish(proc.returncode, error="interrupted")
         return None
-    except BaseException:  # SIGTERM/SIGHUP (raised as KeyboardInterrupt) or worse
+    except BaseException as e:  # SIGTERM/SIGHUP (raised as KeyboardInterrupt) or worse
         _reap(proc)
+        launch.finish(proc.returncode, error=type(e).__name__)
         raise
+    launch.finish(code)
+    return code
 
 
 @contextlib.contextmanager

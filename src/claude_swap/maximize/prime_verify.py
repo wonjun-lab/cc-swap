@@ -236,17 +236,15 @@ def _child_env() -> dict[str, str]:
 
 
 def read_claude_version(claude_path: str) -> str | None:
-    """``claude --version``'s version number; None when it cannot be read.
-    No credentials in its environment; stdin closed; bounded."""
+    """``claude --version``'s version number; None when it cannot be read
+    (or ``claude_exec`` holds the run back). No credentials in its
+    environment; stdin closed; bounded; audited (maximize/claude_exec.py)."""
+    from claude_swap.maximize import claude_exec
+
     try:
-        result = subprocess.run(
-            [claude_path, "--version"],
-            env=_child_env(),
-            stdin=subprocess.DEVNULL,
-            capture_output=True,
-            text=True,
-            errors="replace",
-            timeout=VERSION_TIMEOUT_S,
+        result = claude_exec.run(
+            [claude_path, "--version"], caller="claude --version (priming guard)",
+            env=_child_env(), timeout=VERSION_TIMEOUT_S,
         )
     except (OSError, subprocess.SubprocessError):
         return None
@@ -328,6 +326,16 @@ def _num(value: object) -> float | None:
     return float(value)
 
 
+def _killed(root: Path, claude_path: str) -> dict | None:
+    """``claude_exec``'s killed-by-the-OS mark for this exact binary."""
+    from claude_swap.maximize import claude_exec
+
+    try:
+        return claude_exec.killed_entry(root, claude_exec.stat_binary(claude_path))
+    except Exception:
+        return None
+
+
 PAUSED_UNTIL = "priming paused until `cc-swap prime verify` passes"
 
 
@@ -342,7 +350,7 @@ class Gate:
     current: str | None
     verified: str | None
     reason: str
-    # verified | no-record | failed | unreadable | changed | error
+    # verified | no-record | failed | unreadable | changed | killed | error
     cause: str = ""
     failed_version: str | None = None  # cause "failed": the version that failed
 
@@ -362,6 +370,15 @@ def gate(
     prime verify`` (or the engine's own verify) records the new version."""
     data = load(root)
     verified = _text(data.get("verifiedClaudeVersion"))
+    killed = _killed(root, claude_path)
+    if killed is not None:
+        # Running it again would only be killed again: no `--version`.
+        from claude_swap.maximize.claude_exec import killed_text
+
+        return Gate(
+            False, last_seen_version(root), verified,
+            f"{killed_text(killed)}; priming paused until it runs again", "killed",
+        )
     current = current_version(root, claude_path, reader=reader, clock=clock)
     failed = failed_verify(root, data)
     if failed is not None:
@@ -464,6 +481,13 @@ def paused_state(root: Path, *, auto_verify: bool | None = None) -> tuple[str | 
     """``(note, auto)``: :func:`paused_note`'s text, and whether the engine
     will lift this pause itself (``prime.autoVerify``, read from settings
     when not given) — a version change it has not given up on yet."""
+    from claude_swap.maximize.claude_exec import display_note
+
+    held = display_note(root)
+    if held is not None:
+        # Killed by the OS (notified once on its own) or waiting for an
+        # update to settle (the engine resumes by itself): no reminder.
+        return f"paused: {held}", True
     data = load(root)
     if auto_verify is None:
         auto_verify = _auto_verify_setting(root)
@@ -561,7 +585,7 @@ def _active_services() -> list[str]:
 def _default_runner(argv, env, cwd, timeout):
     from claude_swap.maximize.primer import run_prime
 
-    return run_prime(argv, env, cwd, timeout)
+    return run_prime(argv, env, cwd, timeout, caller="prime verify probe")
 
 
 @dataclass
@@ -582,6 +606,14 @@ def default_deps() -> VerifyDeps:
     return VerifyDeps()
 
 
+#: Exit statuses of a ``claude`` the OS killed: -9, or 137 through a wrapper.
+KILLED_RCS = (-9, 137)
+KILLED_DETAIL = (
+    "claude was killed by the OS at launch (SIGKILL), not an isolation result; "
+    "see cc-swap doctor"
+)
+
+
 @dataclass
 class Check:
     name: str
@@ -599,6 +631,9 @@ class VerifyReport:
     previous: str | None
     checks: list[Check] = field(default_factory=list)
     recorded: bool = False
+    # claude was killed by the OS (SIGKILL) during the verify: nothing about
+    # isolation was learned, so nothing is recorded (maximize/claude_exec.py).
+    killed: bool = False
 
     @property
     def ok(self) -> bool:
@@ -743,6 +778,10 @@ def _probe(report: VerifyReport, claude: str, root: Path, deps: VerifyDeps, mode
         if result.timed_out:
             report.add("invalid token is rejected", False,
                        f"no answer in {PROBE_TIMEOUT_S:.0f}s", transient=True)
+        elif result.returncode in KILLED_RCS:
+            # The OS killed claude at launch: says nothing about isolation.
+            report.killed = True
+            report.add("invalid token is rejected", False, KILLED_DETAIL, transient=True)
         elif result.returncode is None:
             report.add("invalid token is rejected", False,
                        "could not start claude: " + (result.stderr_tail or "")[-200:],
@@ -814,8 +853,11 @@ def run_verify(
             note_seen(root, claude_path, version, key=key)
         except OSError:
             pass
+    if version is None and _killed(root, claude_path) is not None:
+        report.killed = True
     if not report.add(
-        "claude --version", version is not None, version or "unreadable", transient=True
+        "claude --version", version is not None,
+        version or (KILLED_DETAIL if report.killed else "unreadable"), transient=True,
     ):
         return report
     before = active_fingerprint(deps)
@@ -847,7 +889,7 @@ def run_verify(
         # runs first; the record is written only once everything passed.
         record_verified(root, version, by=VERIFIED_BY_CLI, now=now)
         report.recorded = True
-    elif record and (failures := report.failures()):
+    elif record and not report.killed and (failures := report.failures()):
         # A build that just failed is not verified, whatever an earlier run
         # recorded: drop that record so priming pauses (engine, `prime`,
         # `prime --dry-run` and doctor all read it) until a verify passes.
@@ -959,7 +1001,16 @@ def verify_command(argv: list[str]) -> None:
                   "after a Claude Code update?); try again in a minute")
             sys.exit(1)
         try:
-            report = run_verify(root, claude, deps=default_deps(), model=prime.model, live=live)
+            from claude_swap.maximize import claude_exec
+            from claude_swap.printer import warning
+
+            # The user's own run: a just-updated claude runs with a warning.
+            with claude_exec.manual(
+                "cc-swap prime verify", warn=lambda m: warning(m, file=sys.stderr)
+            ):
+                report = run_verify(
+                    root, claude, deps=default_deps(), model=prime.model, live=live,
+                )
         finally:
             lock.release()
     except ClaudeSwitchError as e:
