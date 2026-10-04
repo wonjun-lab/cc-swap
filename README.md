@@ -362,6 +362,8 @@ cc-swap why      # the engine's last decision and its reason code, explained
 
 **`unmanaged login, run cc-swap add`.** You are logged in to Claude Code as an account cc-swap doesn't have, or as a different account than the slot expects. Check which account you are logged in as, then run `cc-swap add`.
 
+**`mixed live login` (macOS).** A `/login` ran while the login Keychain was locked (for example over SSH): Claude Code saved the new login in plaintext (`~/.claude/.credentials.json`) and `~/.claude.json` names it, but the Keychain still holds the previous account's token, so the engine holds and `cc-swap add` refuses. Run `cc-swap repair-live` in a GUI terminal: it checks whose the plaintext login is, asks, then writes it into the Keychain and its slot and removes the plaintext file.
+
 **Priming paused after an update.** Expected after every Claude Code update; the engine re-verifies on its own within a tick or two. If it says the automatic verify failed, run `cc-swap prime verify`.
 
 **`cc-swap upgrade` says `cannot confirm the latest release`.** It could not reach GitHub (often the 60-requests-an-hour anonymous rate limit) and would not guess. It changed nothing. Wait and retry, or set `GITHUB_TOKEN` (or log in with the GitHub CLI, `gh auth login`) so the lookup is authenticated.

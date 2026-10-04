@@ -86,6 +86,7 @@ _FORK_COMMANDS: dict[str, str] = {
     "hold": "_hold_command",
     "notify": "_notify_command",
     "login": "_login_command",
+    "repair-live": "_repair_live_command",
 }
 
 
@@ -1204,6 +1205,13 @@ def _prime_command(argv: list[str]) -> None:
     prime_command(argv)
 
 
+def _repair_live_command(argv: list[str]) -> None:
+    """Handle `cc-swap repair-live` (maximize/live_repair.py)."""
+    from claude_swap.maximize.live_repair import command
+
+    sys.exit(command(argv))
+
+
 def _doctor_command(argv: list[str]) -> None:
     """Handle `cc-swap doctor` (maximize/doctor_cli.py), imported lazily."""
     from claude_swap.maximize.doctor_cli import doctor_command
@@ -1661,6 +1669,7 @@ cc-swap:
   %(prog)s prime [N ...] [--dry-run]  open idle accounts' 5h windows now
   %(prog)s prime verify [--live]      re-check priming isolation after Claude Code changed
   %(prog)s login <num|email>          re-login an account (launches claude's login)
+  %(prog)s repair-live [--yes]        fix a /login saved in plaintext while the Keychain was locked
   %(prog)s service install            run auto-switch as a background service
   %(prog)s doctor [--json]            check logins, Keychain, service; say what to fix
   %(prog)s init [--apply]             onboarding/migration checklist (ok/FIX/TODO)

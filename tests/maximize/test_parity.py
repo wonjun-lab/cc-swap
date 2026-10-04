@@ -67,7 +67,7 @@ KNOWN_ASYMMETRY: dict[str, str] = {
     ),
     "upgrade": (
         "reinstalls cc-swap itself under the running TUI and restarts the service; "
-        "run it from a shell (Fleet's u updates Claude Code, not cc-swap)"
+        "run it from a shell"
     ),
     "init": (
         "a one-time onboarding checklist for a machine that is not set up yet; "
@@ -84,6 +84,11 @@ KNOWN_ASYMMETRY: dict[str, str] = {
         "desktop notifications are for when you are not looking at Fleet, and the "
         "engine sends them; testing the system notifier and its settings is a shell job "
         "(cc-swap config set notify.* turns them off)"
+    ),
+    "repair-live": (
+        "repairs the live login after a /login while the Keychain was locked; it "
+        "asks to confirm and must run where the Keychain can be written (a GUI "
+        "terminal) — the engine log and cc-swap add name it"
     ),
     "prime verify": (
         "spawns claude in a throwaway profile (and with --live spends a real prime) "
