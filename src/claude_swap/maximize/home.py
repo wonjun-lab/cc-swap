@@ -195,28 +195,28 @@ NOT_STARTED = "not started"
 
 
 def countdown(seconds: float) -> str:
-    """``47m`` / ``1h47m`` / ``3d19h``: the time left until a reset."""
+    """``0h47m`` / ``1h47m`` / ``3d19h`` / ``3d02h``: the time left until a
+    reset, fixed width so a column of them lines up."""
     s = max(int(seconds), 0)
-    if s < 3600:
-        return f"{max(s // 60, 1)}m"
     if s < 86400:
-        h, m = divmod(s // 60, 60)
+        h, m = divmod(max(s // 60, 1), 60)
         return f"{h}h{m:02d}m"
     d, h = divmod(s // 3600, 24)
-    return f"{d}d{h}h"
+    return f"{d}d{h:02d}h"
 
 
-def reset_clock(ts: float, now: float, *, date: bool = True) -> str:
+def reset_clock(ts: float, now: float, *, date: bool = True, pad: bool = False) -> str:
     """Local ``07:10`` today (or always, without ``date``), else ``Oct 7
-    02:18``."""
+    02:18`` (``Oct  7 02:18`` with ``pad``, so a column of them lines up)."""
     at = time.localtime(ts)
     if not date or at[:3] == time.localtime(now)[:3]:
         return time.strftime("%H:%M", at)
-    return time.strftime("%b ", at) + str(at.tm_mday) + time.strftime(" %H:%M", at)
+    day = f"{at.tm_mday:>2}" if pad else str(at.tm_mday)
+    return time.strftime("%b ", at) + day + time.strftime(" %H:%M", at)
 
 
 def resets_text(reset: float | None, now: float, *, clock: bool, date: bool = True) -> str:
-    """``3d19h · Oct 7 02:18`` (``clock``) or ``3d19h``; ``now`` once it
+    """``3d19h · Oct  7 02:18`` (``clock``) or ``3d19h``; ``now`` once it
     has passed, ``—`` when unknown. ``date`` False never names the day (a
     5h window is at most five hours away: ``1h47m · 07:10``)."""
     if reset is None:
@@ -224,7 +224,7 @@ def resets_text(reset: float | None, now: float, *, clock: bool, date: bool = Tr
     if reset <= now:
         return "now"
     left = countdown(reset - now)
-    return f"{left} · {reset_clock(reset, now, date=date)}" if clock else left
+    return f"{left} · {reset_clock(reset, now, date=date, pad=True)}" if clock else left
 
 
 def exact_reset(reset: float | None, now: float) -> str:

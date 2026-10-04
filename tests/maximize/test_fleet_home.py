@@ -198,12 +198,14 @@ def _local(*ymdhm: int) -> float:
 
 
 def test_countdowns_are_compact():
-    assert home.countdown(59) == "1m"
-    assert home.countdown(47 * 60 + 30) == "47m"
+    assert home.countdown(59) == "0h01m"
+    assert home.countdown(47 * 60 + 30) == "0h47m"
     assert home.countdown(H + 47 * 60) == "1h47m"
     assert home.countdown(H + 5 * 60) == "1h05m"
     assert home.countdown(3 * DAY + 19 * H + 600) == "3d19h"
-    assert home.countdown(2 * DAY) == "2d0h"
+    assert home.countdown(3 * DAY + 2 * H) == "3d02h"
+    assert len({len(home.countdown(x)) for x in (59, H, 5 * H, DAY, 6 * DAY + 23 * H)}) == 1
+    assert home.countdown(2 * DAY) == "2d00h"
 
 
 def test_resets_with_and_without_the_clock():
@@ -212,12 +214,12 @@ def test_resets_with_and_without_the_clock():
     week = _local(2026, 10, 7, 2, 18)
     assert home.resets_text(soon, now, clock=True) == "1h47m · 07:10"
     assert home.resets_text(soon, now, clock=False) == "1h47m"
-    assert home.resets_text(week, now, clock=True) == f"{home.countdown(week - now)} · Oct 7 02:18"
+    assert home.resets_text(week, now, clock=True) == f"{home.countdown(week - now)} · Oct  7 02:18"
     assert home.resets_text(week, now, clock=False) == home.countdown(week - now)
     # A 5h window is never more than five hours away: no date.
     late = _local(2026, 10, 3, 23, 0)
     assert home.resets_text(late + 2 * H, late, clock=True, date=False).endswith(" · 01:00")
-    assert home.resets_text(late + 2 * H, late, clock=True).endswith(" · Oct 4 01:00")
+    assert home.resets_text(late + 2 * H, late, clock=True).endswith(" · Oct  4 01:00")
     assert home.resets_text(None, now, clock=True) == "—"
     assert home.resets_text(now - 5, now, clock=True) == "now"
     assert home.exact_reset(soon, now) == "resets 07:10 (in 1h47m)"
@@ -261,7 +263,7 @@ def test_a_dead_login_keeps_the_resets_of_its_last_reading():
     rows = _by(fx.fleet_rows(snap, MX, PRIME, MaximizeState(), now=NOW))
     assert rows["2"].login == "relogin"
     assert home.row_resets(rows["2"], "5h", NOW, clock=False) == "2h00m"
-    assert home.row_resets(rows["2"], "7d", NOW, clock=False) == "2d0h"
+    assert home.row_resets(rows["2"], "7d", NOW, clock=False) == "2d00h"
     assert home.row_resets(rows["3"], "5h", NOW, clock=False) == "—"  # already past
 
 
@@ -868,7 +870,7 @@ def test_the_panel_shows_the_selected_account_in_full():
     labels = [line.split()[0] for line in lines[2:-1]]
     assert labels == ["5h", "7d", "Fable"]
     assert lines[2].rstrip().endswith(home.exact_reset(row1.reset5, NOW))
-    assert "resets " in lines[4] and "(in 3d0h)" in lines[4]
+    assert "resets " in lines[4] and "(in 3d00h)" in lines[4]
     assert lines[-1].strip().startswith("login ends ") and "(in 21d 0h)" in lines[-1]
     assert render.detail_height(row1, a1, ctx) == len(lines)
     statuses = {r.number: ctx.status(r) for r in rows}
