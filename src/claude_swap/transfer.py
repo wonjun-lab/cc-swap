@@ -225,6 +225,14 @@ def export_accounts(
                 raise CredentialReadError(
                     f"failed to read live credentials for active account {email}"
                 )
+            from claude_swap.credentials import holds_only_shared_fields
+
+            if holds_only_shared_fields(creds_text):
+                # cc-swap: Claude Code's MCP-only fallback file, no login.
+                raise CredentialReadError(
+                    f"the live credential for active account {email} holds only MCP "
+                    "logins, no Claude login (is the Keychain locked?)"
+                )
             config_path = switcher._get_claude_config_path()
             if not config_path.exists():
                 raise ConfigError("Claude config file not found")

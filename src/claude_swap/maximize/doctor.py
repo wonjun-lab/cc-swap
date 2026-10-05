@@ -344,15 +344,30 @@ class LiveLogin:
     identity: tuple[str, str, str] | None = None  # (email, org, accountUuid); never printed
 
     @property
+    def file_mcp_only(self) -> bool:
+        """The plaintext file holds only MCP logins (``mcpOAuth`` …), no
+        Claude login: Claude Code keeps them there while the Keychain is
+        unavailable (cc-swap fork)."""
+        from claude_swap.credentials import holds_only_shared_fields
+
+        return holds_only_shared_fields(self.file_value)
+
+    @property
+    def file_login(self) -> str | None:
+        """The plaintext file, when it holds a login (not only MCP logins)."""
+        return None if self.file_mcp_only else self.file_value
+
+    @property
     def value(self) -> str | None:
         """The login Claude Code would use: the Keychain item on macOS (the
         plaintext file only when the Keychain has none), else the file. An
-        unreadable Keychain yields None — the file may be a stale copy."""
+        unreadable Keychain yields None — the file may be a stale copy. A
+        file with only MCP logins is no login."""
         if self.keychain_rc is None:
-            return self.file_value
+            return self.file_login
         if self.keychain_value:
             return self.keychain_value
-        return self.file_value if self.keychain_rc == RC_NOT_FOUND else None
+        return self.file_login if self.keychain_rc == RC_NOT_FOUND else None
 
 
 @dataclass
@@ -665,10 +680,83 @@ def check_claude_exec(ctx: Context) -> list[Finding]:
             "if claude dies with SIGKILL (exit 137): cc-swap doctor names the fix",
         ))
     if killed is None:
+        external = _external_kills(p, claude_exec.current_external(p.backup_root))
+        if external is not None:
+            out.append(external)
         note = claude_exec.display_note(p.backup_root, p.now)
         if note is not None:
             out.append(Finding("claude-exec", "info", f"the engine is {note}"))
     return out
+
+
+def _external_kills(p: Probes, ext: dict | None) -> Finding | None:
+    """Kills of the current ``claude`` that cc-swap did not launch
+    (``claude_exec.note_external_kill``): who launched them, how often, and
+    what the engine's own ``claude --version`` said. Never a pause: a probe
+    the OS kills becomes the killed-by-the-OS error above instead."""
+    from claude_swap.maximize import claude_exec
+
+    if not isinstance(ext, dict):
+        return None
+    first, last = ext.get("firstAt"), ext.get("lastAt")
+    if not isinstance(last, (int, float)) or not isinstance(first, (int, float)):
+        return None
+    if p.now - last >= claude_exec.EXTERNAL_RECENT_S:
+        return None
+    n = claude_exec.external_count(ext)
+    launchers = ext.get("launchers") if isinstance(ext.get("launchers"), dict) else {}
+    apps = sorted(launchers, key=lambda a: (-int(launchers[a] or 0), a))
+    by = f"launched by {', '.join(apps)}" if apps else "not launched by cc-swap"
+    version = ext.get("version") or os.path.basename(str(ext.get("real") or "")) or "claude"
+    probe = ext.get("probe") if isinstance(ext.get("probe"), dict) else {}
+    result, probed = probe.get("result"), probe.get("at")
+    when = _clock(float(probed)) if isinstance(probed, (int, float)) else "?"
+    if result == "ok":
+        verdict = f"cc-swap's own launches work (claude --version ran fine at {when})"
+    elif result == "running" and claude_exec.probe_stale(ext, p.now):
+        verdict = (
+            f"the engine's claude --version check started at {when} never finished "
+            "(its engine stopped?); a running engine checks again; priming is not paused"
+        )
+    elif result == "running":
+        verdict = (
+            f"the engine is checking claude --version now (since {when}); priming is "
+            "not paused meanwhile"
+        )
+    elif isinstance(ext.get("probeDueAt"), (int, float)):
+        verdict = (
+            "the engine checks claude --version itself shortly; priming is not "
+            "paused meanwhile"
+        )
+    elif result:
+        verdict = f"the engine's claude --version check at {when}: {result}"
+    else:
+        verdict = "no check by the engine yet (it runs while an engine runs)"
+    real = _tilde(str(ext.get("real") or ext.get("path") or "claude"), p.home)
+    provenance = ext.get("provenance") if isinstance(ext.get("provenance"), dict) else None
+    app = apps[0] if apps else "the app that launched it"
+    if provenance:
+        err = provenance.get("error")
+        fix = (
+            f"macOS's AppleSystemPolicy could not apply its provenance sandbox to claude "
+            f"launched by {app} (ASP error {err if err is not None else '?'}): a problem "
+            f"between macOS and {app}, not cc-swap — quit and reopen {app}. If claude "
+            f"also dies when you run it yourself: {claude_exec.fix_command(real)}"
+        )
+    else:
+        fix = (
+            f"if it keeps happening, quit and reopen {app}; if claude also dies when you "
+            f"run it yourself: {claude_exec.fix_command(real)}"
+        )
+    severity = "warn" if p.now - last < claude_exec.EXTERNAL_WARN_S else "info"
+    times = f"{n} time{'s' if n != 1 else ''}"
+    asp = "; macOS logged 'ASP: Unable to apply provenance sandbox' with it" if provenance else ""
+    return Finding(
+        "claude-exec", severity,
+        f"macOS killed claude {version} {by} {times} (first {_clock(float(first))}, "
+        f"last {_clock(float(last))}){asp}; {verdict}",
+        fix,
+    )
 
 
 def _when(epoch: float) -> str:
@@ -745,7 +833,7 @@ def check_keychain(ctx: Context) -> list[Finding]:
             f"(rt {oauth.fingerprint8(live.keychain_value)})",
         )]
     if rc == RC_NOT_FOUND:
-        if live.file_value:
+        if live.file_login:
             return []  # check_plaintext reports the plaintext-only login
         if live.identity is None:
             return [Finding(
@@ -775,6 +863,8 @@ def check_plaintext(ctx: Context) -> list[Finding]:
             "plaintext", "error", f"{shown} exists but is unreadable ({live.file_problem})",
             f"check its owner and mode: ls -l {shown}",
         )]
+    if live.file_mcp_only:
+        return _plaintext_mcp_only(p, live, shown)
     if live.file_value is None:
         if p.platform != "darwin" and live.identity is not None:
             return [Finding(
@@ -827,6 +917,26 @@ def check_plaintext(ctx: Context) -> list[Finding]:
         "unreadable the engine treats it as possibly stale and holds",
         "fix the Keychain finding above first",
     )]
+
+
+def _plaintext_mcp_only(p: Probes, live: LiveLogin, shown: str) -> list[Finding]:
+    """The plaintext file holds only MCP logins (``mcpOAuth`` …), no Claude
+    login: nothing stale to warn about. On macOS Claude Code wrote it while
+    the Keychain was unavailable and reads the Keychain first; elsewhere the
+    file is the login store, so there is no login."""
+    what = f"{shown} holds only MCP logins (no Claude login)"
+    if p.platform == "darwin":
+        return [Finding(
+            "plaintext", "info",
+            f"{what}: Claude Code keeps them there while the Keychain is unavailable",
+        )]
+    if live.identity is not None:
+        return [Finding(
+            "plaintext", "error",
+            f"~/.claude.json names an account but {what}",
+            "run claude and /login again",
+        )]
+    return [Finding("plaintext", "warn", f"no live login: {what}", "run claude and /login")]
 
 
 def _slot_for_identity(ctx: Context) -> str | None:

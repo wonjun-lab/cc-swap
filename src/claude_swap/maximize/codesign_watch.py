@@ -10,23 +10,35 @@ cc-swap's launches may be the trigger or a coincidence. This module
 collects the evidence for next time:
 
 * **Live** (:class:`Watcher`, while an engine runs): a ``log stream --style
-  ndjson`` child filtered to code-signature messages; every kernel line and
-  every line naming claude (:func:`relevant`; time, pid, process, message)
-  goes to ``<backup root>/codesign-events.jsonl``
-  (rotated like ``claude-exec.jsonl``). A kernel message naming the current
-  ``claude`` file marks it killed by the OS (``claude_exec.mark_killed_by_os``:
-  priming pauses, one notification per binary) — even when the process it
-  killed was the user's own ``claude``, not one of cc-swap's. The child is
+  ndjson`` child filtered to code-signature messages and AppleSystemPolicy's
+  ``provenance sandbox`` lines; every kernel line and every line naming
+  claude (:func:`relevant`; time, pid, process, message — a provenance line
+  only when it names the claude versions directory) goes to ``<backup
+  root>/codesign-events.jsonl`` (rotated like ``claude-exec.jsonl``). A
+  kernel message naming the current ``claude`` file is a kill cc-swap did
+  not launch (its own launches see their SIGKILL themselves): evidence,
+  with the provenance line that came just before it
+  (``claude_exec.note_external_kill``), and the engine probes ``claude
+  --version`` itself a little later (``claude_exec.probe_external``, run off
+  the tick). Only a probe the OS kills pauses priming. The child is
   restarted with a backoff when it dies; the tick only polls it.
 * **Afterwards** (:func:`scan_crash_reports`, on engine start, hourly, and
   in ``cc-swap doctor``): ``~/Library/Logs/DiagnosticReports/*.ips`` of the
   last week whose process lives under ``~/.local/share/claude/versions``
   (macOS anonymizes it to ``/Users/USER/*/<file>``; the file name then has
-  to be one there) and was terminated for an invalid code signature. Doctor
-  groups them per version with the app that launched them
+  to be one there) and was terminated for an invalid code signature. A
+  report of the current file is evidence with its launching app, or — when
+  its pid is a ``claude`` cc-swap ran — that run's kill. Doctor groups them
+  per version with the app that launched them
   (``parentProc``/``responsibleProc``) and the latest ``claude`` cc-swap
   launched before the first kill (from ``claude-exec.jsonl``), so the
   correlation is on the screen.
+
+2026-10-04 22:24–22:26: 37 kills of ``claude`` launched by T3 Code (a GUI
+app), each after ``ASP: Unable to apply provenance sandbox``, while cc-swap
+had launched nothing for 20 minutes and ``claude --version`` ran fine from a
+shell. 0.5.3 paused priming on them; now they are evidence until a probe of
+cc-swap's own says otherwise.
 """
 
 from __future__ import annotations
@@ -41,7 +53,7 @@ import threading
 import time
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, replace
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -52,12 +64,18 @@ _logger = logging.getLogger("claude-swap")
 EVENTS_FILENAME = "codesign-events.jsonl"
 LOG = "/usr/bin/log"
 #: Catches the kernel's ``load code signature error N for file "…"``, AMFI's
-#: and taskgated's code-signature lines, and CODESIGNING terminations.
+#: and taskgated's code-signature lines, CODESIGNING terminations, and
+#: AppleSystemPolicy's ``ASP: Unable to apply provenance sandbox: <err>,
+#: <pid>, <path>`` (:func:`relevant` keeps only those naming claude).
 PREDICATE = (
     'eventMessage CONTAINS[c] "code signature" '
     'OR (process == "kernel" AND eventMessage CONTAINS "CODESIGNING") '
-    'OR eventMessage CONTAINS "Code Signature Invalid"'
+    'OR eventMessage CONTAINS "Code Signature Invalid" '
+    'OR eventMessage CONTAINS "provenance sandbox"'
 )
+PROVENANCE = "provenance sandbox"
+#: A provenance line this recent goes with the kill line after it.
+PROVENANCE_WINDOW_S = 10.0
 #: A dead ``log stream`` is restarted after this long, doubling up to the
 #: maximum; one that stayed up :data:`HEALTHY_S` resets it.
 BACKOFF_MIN_S = 30.0
@@ -80,6 +98,8 @@ INVALID = "Code Signature Invalid"
 
 _KERNEL_FILE_RE = re.compile(r'load code signature error \d+ for file "([^"]+)"')
 _VERSION_PATH_RE = re.compile(r"(/[^\s\"']*/\.local/share/claude/versions/[^\s\"'),]+)")
+_PROVENANCE_RE = re.compile(r"provenance sandbox:\s*(-?\d+),\s*(\d+),")
+CLAUDE_VERSIONS = "/.local/share/claude/versions/"
 
 
 def _is_macos() -> bool:
@@ -109,9 +129,60 @@ def _spawn(argv: list[str]) -> subprocess.Popen | None:
 # -- live events --------------------------------------------------------------------------
 
 
+_LOG_TIME_RE = re.compile(
+    r"^(\d{4})-(\d{2})-(\d{2})[ T](\d{2}):(\d{2}):(\d{2})(?:[.,](\d{1,9}))?"
+    r"\s*(Z|[+-]\d{2}:?\d{2})?$"
+)
+
+
+def parse_log_time(value: object) -> float | None:
+    """Epoch seconds of a unified-log timestamp, or None. ``log stream
+    --style ndjson`` and ``log show`` write ``2026-10-04 22:24:19.003000+0900``
+    (a space, microseconds, an offset without a colon); ISO forms (``T``,
+    ``+09:00``, ``Z``, no fraction) are accepted too. No offset: local time."""
+    if not isinstance(value, str):
+        return None
+    match = _LOG_TIME_RE.match(value.strip())
+    if match is None:
+        return None
+    year, month, day, hour, minute, second, frac, zone = match.groups()
+    micro = int((frac or "0")[:6].ljust(6, "0"))
+    tz = None
+    if zone:
+        if zone == "Z":
+            tz = timezone.utc
+        else:
+            digits = zone[1:].replace(":", "")
+            delta = timedelta(hours=int(digits[:2]), minutes=int(digits[2:]))
+            tz = timezone(-delta if zone[0] == "-" else delta)
+    try:
+        when = datetime(
+            int(year), int(month), int(day), int(hour), int(minute), int(second), micro,
+            tzinfo=tz,
+        )
+    except ValueError:
+        return None
+    return when.timestamp()
+
+
+def event_time(record: dict[str, Any]) -> float | None:
+    """When a ``codesign-events.jsonl`` record happened: its ``ts`` re-parsed
+    first — 0.5.3 and the first 0.5.4 build stored the time a line was READ
+    as ``at`` — else ``at``."""
+    parsed = parse_log_time(record.get("ts"))
+    if parsed is not None:
+        return parsed
+    at = record.get("at")
+    return float(at) if isinstance(at, (int, float)) and not isinstance(at, bool) else None
+
+
 def parse_event(line: str) -> dict[str, Any] | None:
     """One ``log stream --style ndjson`` line as an event record, or None
-    (the ``Filtering the log data …`` banner, anything that is not one)."""
+    (the ``Filtering the log data …`` banner, anything that is not one).
+    ``at`` is the event's own time (:func:`parse_log_time`), the time the
+    line was read only when its timestamp cannot be parsed: a line that
+    arrives late must still compare with the file's ctime, a successful run
+    and the provenance line before it by when it HAPPENED."""
     try:
         data = json.loads(line)
     except ValueError:
@@ -119,10 +190,11 @@ def parse_event(line: str) -> dict[str, Any] | None:
     if not isinstance(data, dict) or "eventMessage" not in data:
         return None
     image = str(data.get("processImagePath") or "")
+    at = parse_log_time(data.get("timestamp"))
     return {
         "kind": "log-event",
         "ts": data.get("timestamp"),
-        "at": time.time(),
+        "at": time.time() if at is None else at,
         "pid": data.get("processID"),
         "process": os.path.basename(image) or data.get("process"),
         "processImagePath": image or None,
@@ -165,12 +237,34 @@ def relevant(event: dict[str, Any]) -> bool:
     """Whether a code-signature line is worth keeping: the kernel's (its
     refusals name the file), or one that names a file or a path that could
     be claude. The rest — every app's AMFI chatter, hundreds a day — is
-    dropped."""
+    dropped. AppleSystemPolicy's provenance lines (the kernel's too) are
+    kept only when they name the claude versions directory: other CLIs
+    (codex …) get them as well."""
     message = str(event.get("message") or "")
+    if PROVENANCE in message:
+        return CLAUDE_VERSIONS in message
     if event.get("process") == "kernel" or killed_file(message):
         return True
     lowered = message.lower() + " " + str(event.get("processImagePath") or "").lower()
     return "claude" in lowered or "/.local/share/claude/" in lowered
+
+
+def provenance_of(event: dict[str, Any]) -> dict[str, Any] | None:
+    """AppleSystemPolicy's ``ASP: Unable to apply provenance sandbox: <err>,
+    <pid>, <path>`` as ``{"at", "ts", "error", "pid", "path", "message"}``,
+    or None for any other line."""
+    message = str(event.get("message") or "")
+    if PROVENANCE not in message:
+        return None
+    match = _PROVENANCE_RE.search(message)
+    path = _VERSION_PATH_RE.search(message)
+    return {
+        "at": event.get("at"), "ts": event.get("ts"),
+        "error": int(match.group(1)) if match else None,
+        "pid": int(match.group(2)) if match else None,
+        "path": path.group(1) if path else None,
+        "message": message[:MESSAGE_MAX],
+    }
 
 
 def names_binary(token: str, binary: claude_exec.Binary) -> bool:
@@ -339,6 +433,15 @@ def scan_crash_reports(
     return sorted(out, key=lambda k: k.at)
 
 
+def launcher_of(kill: CrashKill) -> str | None:
+    """The app that launched the killed process: ``parentProc``, with
+    ``responsibleProc`` when that is another one."""
+    who = kill.parent or kill.responsible
+    if kill.responsible and kill.parent and kill.responsible != kill.parent:
+        who = f"{kill.parent} (responsible: {kill.responsible})"
+    return who
+
+
 def episodes(kills: Iterable[CrashKill]) -> list[dict[str, Any]]:
     """Per version: ``{"version", "path", "count", "first", "last",
     "parents"}`` (``parents``: the launching apps, most frequent first),
@@ -353,9 +456,7 @@ def episodes(kills: Iterable[CrashKill]) -> list[dict[str, Any]]:
         e["count"] += 1
         e["first"] = min(e["first"], k.at)
         e["last"] = max(e["last"], k.at)
-        who = k.parent or k.responsible
-        if k.responsible and k.parent and k.responsible != k.parent:
-            who = f"{k.parent} (responsible: {k.responsible})"
+        who = launcher_of(k)
         if who:
             c = counts.setdefault(k.version, {})
             c[who] = c.get(who, 0) + 1
@@ -394,6 +495,8 @@ class Watcher:
         self._next_scan = 0.0
         self._seen: set[str] = set()
         self._scanner: threading.Thread | None = None
+        self._prober: threading.Thread | None = None
+        self._provenance: dict[str, Any] | None = None
         self.starts = 0
 
     # -- the child --------------------------------------------------------------------
@@ -411,6 +514,7 @@ class Watcher:
                     daemon=True,
                 )
                 self._scanner.start()
+            self._maybe_probe(now)
         except Exception as e:  # evidence gathering never breaks a tick
             _logger.debug("codesign watch: %s", type(e).__name__)
 
@@ -419,6 +523,31 @@ class Watcher:
             self.scan(now)
         except Exception as e:
             _logger.debug("codesign watch: scan failed: %s", type(e).__name__)
+
+    def _maybe_probe(self, now: float) -> None:
+        """A probe due after kills cc-swap did not launch
+        (``claude_exec.probe_external``), on its own thread: ``claude
+        --version`` may take seconds."""
+        if self._prober is not None and self._prober.is_alive():
+            return
+        if not claude_exec.probe_pending(self.root, now):
+            return
+        claude = self._claude()
+        if not claude or not claude_exec.external_probe_due(
+            self.root, claude_exec.stat_binary(claude), now,
+        ):
+            return
+        self._prober = threading.Thread(
+            target=self._probe_quietly, args=(claude, now), name="cc-swap-claude-probe",
+            daemon=True,
+        )
+        self._prober.start()
+
+    def _probe_quietly(self, claude: str, now: float) -> None:
+        try:
+            claude_exec.probe_external(self.root, claude, now=now)
+        except Exception as e:
+            _logger.debug("codesign watch: probe failed: %s", type(e).__name__)
 
     def _keep_streaming(self, now: float) -> None:
         proc = self._proc
@@ -494,19 +623,71 @@ class Watcher:
         if event is None or not relevant(event):
             return
         claude_exec.append_jsonl(self.root, EVENTS_FILENAME, event)
+        provenance = provenance_of(event)
+        if provenance is not None:
+            # Comes just before the kernel's kill line, with the killed pid.
+            claude = self._claude() if provenance.get("path") else None
+            if claude and names_binary(provenance["path"], claude_exec.stat_binary(claude)):
+                self._provenance = provenance
+            return
         token = kill_target(event)
         claude = self._claude() if token else None
         if not claude or not names_binary(token, claude_exec.stat_binary(claude)):
             return
-        pid = event.get("pid")
-        claude_exec.mark_killed_by_os(
-            self.root, claude, source="log stream", at=event["at"], detail=event["message"],
-            pid=pid if isinstance(pid, int) else None,
+        provenance, self._provenance = self._provenance, None
+        at = event["at"]
+        if provenance is not None and not (
+            isinstance(provenance.get("at"), (int, float))
+            and 0 <= at - provenance["at"] <= PROVENANCE_WINDOW_S
+        ):
+            provenance = None
+        pid = provenance.get("pid") if provenance else None
+        self._attribute(
+            claude, source="log stream", at=at, detail=event["message"], pid=pid,
+            provenance=provenance,
+        )
+
+    def _attribute(self, claude: str, *, source: str, at: float, detail: str,
+                   pid: int | None, records: list[dict] | None = None,
+                   **evidence: Any) -> None:
+        """A kill of the current ``claude`` file: whose launch was it?
+
+        * a ``claude`` cc-swap started with that pid and still running (its
+          end not recorded yet): its own SIGKILL takes the killed path —
+          nothing here; one that runs ``claude`` in place (``cswap run``)
+          records no end, so this marks it;
+        * a finished one: :func:`claude_exec.mark_killed_by_os` (a no-op
+          when its end already marked it);
+        * a kernel line with no pid while cc-swap's own run of this file
+          started moments before: left to that run (its end, or its crash
+          report with the pid, decides);
+        * anything else: evidence (:func:`claude_exec.note_external_kill`).
+        """
+        launch = (
+            claude_exec.cc_swap_launch(self.root, pid, at, records=records)
+            if pid is not None else None
+        )
+        if launch is None and pid is None:
+            real = claude_exec.stat_binary(claude).real
+            if claude_exec.inflight_near(self.root, real, at, PROVENANCE_WINDOW_S):
+                return
+        if launch is not None:
+            if launch.get("kind") == "inflight" and launch.get("finishes"):
+                return
+            claude_exec.mark_killed_by_os(
+                self.root, claude, source=source, at=at, detail=detail, pid=pid,
+            )
+            return
+        claude_exec.note_external_kill(
+            self.root, claude, source=source, at=at, detail=detail, pid=pid, **evidence,
         )
 
     def scan(self, now: float) -> list[CrashKill]:
-        """New crash reports into ``codesign-events.jsonl``; the latest kill
-        of the current ``claude`` file marks it."""
+        """New crash reports into ``codesign-events.jsonl``. Each new kill
+        of the current ``claude`` file is evidence with its launching app
+        (``claude_exec.note_external_kill``) — or, when its pid is a
+        ``claude`` cc-swap ran, that run's kill
+        (``claude_exec.mark_killed_by_os``)."""
         claude = self._claude()
         binary = claude_exec.stat_binary(claude) if claude else None
         names = {os.path.basename(binary.real)} if binary and binary.real else set()
@@ -525,13 +706,14 @@ class Watcher:
                 "codesign watch: %d new code-signing kill report(s) of claude (%s)",
                 len(new), ", ".join(sorted({k.version for k in new})),
             )
-        if claude and kills and binary is not None and binary.real:
+        if claude and new and binary is not None and binary.real:
             real = binary.real
-            mine = [k for k in kills if k.path and os.path.realpath(k.path) == real]
-            if mine:
-                k = mine[-1]
-                claude_exec.mark_killed_by_os(
-                    self.root, claude, source="crash report", at=k.at, detail=k.file, pid=k.pid,
+            mine = [k for k in new if k.path and os.path.realpath(k.path) == real]
+            launches = claude_exec.read_jsonl(self.root) if mine else []
+            for k in mine:
+                self._attribute(
+                    claude, source="crash report", at=k.at, detail=k.file, pid=k.pid,
+                    records=launches, launcher=launcher_of(k), report=k.file,
                 )
         return new
 
