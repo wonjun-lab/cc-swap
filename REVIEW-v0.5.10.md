@@ -306,3 +306,73 @@ A ride after a long gap now gives up part of the point instead of riding into 10
 ### Verdict update
 
 R1 and R2 are fixed and covered by simulation, and R3–R5 and R10 are in. **`feat/ride-to-99-9` @ `04e222e` is mergeable** from this review's side. R6 (a parked return reads the phase as a lower bound), R7 (the reset-wait label and learning), R8 (freezing the measure kind at arm time), R9 (an effective cap for time-rule rides) and R11 (documenting the history writes) remain open as follow-ups.
+
+---
+
+## Verification of 04e222e
+
+This is an independent check of `feat/ride-to-99-9` @ `04e222e` against R1–R5 and R10. It does not rely on the "Fix round" summary above. No code was changed. Line numbers are at `04e222e`.
+
+**Tests, re-run as root.** `tests/maximize`: 28 failed, 2866 passed. The 28 failures are the same root-refusal set as on main (`test_login_new` 5, `test_login_upsert` 8, `test_names` 1, `test_prime_auto_verify` 1, `test_prime_cli` 7, `test_prime_verify` 2, `test_relogin` 4). The four ride test files pass (152 passed). `ruff check src/claude_swap/maximize` shows only the 2 findings already on the base.
+
+### Status per finding
+
+| # | Status | Evidence |
+|---|---|---|
+| R1 | **Fixed** | `engine_hook.py:1010`: the half-gap is credited only when `read_at - at <= ride.MIDPOINT_MAX_GAP_S` (240 s, `ride.py:170`). Otherwise the phase is `phase_5h(samples, at, …)`, which counts from the arm time, the conservative end. The 120 s ±10% cadence stays inside the gate. A single missed poll (≈ 240–264 s) can fall just outside it and lose the credit. That is a small cost in the safe direction. |
+| R2 | **Fixed** (residuals below) | Per-account learning: `ride.py:200` (`_item`, field-by-field fallback), `ride.py:278` (`learned_for`), `ride.py:320-360` (`learn(..., account=)`, which steps the account record and the window record). The engine reads the active account's values (`engine_hook.py:1187-1188`) and teaches the slot that rode (`engine_hook.py:1235`, where `record["account"]` is the pre-switch account). Fleet does the same (`view.py:463,467`). Stricter k: `drain.py:158` (`ride_k`: ≥ 5 windows, IQR/median ≤ 0.10), `policy.py:604-620` (±35% band). It is fed only while the 7d rides (`engine_hook.py:812`). |
+| R3 | **Fixed** | `policy.py:764` (`ok` = due and not capped), carried in `Switch.ride_ok` (`policy.py:775`). The engine teaches only `ride_ok`, and the 5h subset of it (`engine_hook.py:1883-1884`). When every due window is capped, `ride_ok` is empty, so the old `not ride_capped` guard is kept. |
+| R4 | **Fixed** | `ride.py:208`: a record with no `"v"` gets `Q_START` whatever its q. The slow start stays ahead (`settled` requires `current`). The test covers legacy q 0.85, 0.9 and 0.95. |
+| R5 | **Fixed** | `engine_hook.py:1033`: a reset is a drop in value, or a reading at or after the stored `r5`. The carry is taken at `r5` when it falls inside the gap. `r5` is cleared on consumption (`:1041`) and refreshed from the current reading (`:1047`). A false positive (a `resets_at` reported early) adds the whole new reading. That over-reads `used` and switches early, which is the safe direction. |
+| R10 | **Fixed** | The README, the `docs/reference.md` "Riding the last point" paragraph, and the `ride` row in reference and `doctor_cli.REASONS` now say that a hit stops the running turn. They say the ride aims for ~1 hit in 10, and they name `learnedRide false` / `rideWindows ""`. `TARGET_SHARE` is removed. `describe` says "aims for ~1 hit in 10". |
+
+### Regression checks
+
+- **State file and upgrade from v0.5.9.**
+  - The new data sits under `rideLearning["accounts"]`. `learned()` iterates only `WINDOWS`, so code that does not know the key ignores it.
+  - A v0.5.9 halving-era record migrates on read, and nothing is written until the next learn.
+  - An armed v0.5.9 entry has no `fiveH`, so the ride in flight rides by the time rule. A `fiveH` from `710f4b8` without `r5` falls back to detection by value.
+  - Downgrading drops the per-account part harmlessly.
+- **Size.** Per slot it holds at most 2 windows × 7 small fields. It is bounded by the number of slots. Records of removed slots are never pruned (nit).
+- **Fallback when k is rejected.** `ride_used_5h` returns None, and the ride uses the time rule with the account's own q. When T1 is also unknown, the switch is immediate ("pace unknown"), as before. Rides do not stop starting.
+  - I simulated `drain.ride_k` on quantized history: Δ5h 40–100 per window, whole-percent readings, and real-k variation σ of 0, 3% or 6% per window.
+  - Acceptance was 97% / 93–95% / 70–77% respectively, for 5–10 windows.
+  - The accepted k had an error sd of 1–3%, with a tail of 5–13%.
+  - So the stricter rule rarely disables the 5h path, and it bounds the iid part of the k error as intended.
+- **Riding into 100% more than intended.** I found no new path. The midpoint gate, k rejection and the R3 attribution all move in the conservative direction. Two residual paths are left. Both are rare and both were already present in some form:
+  - **The plan band sits on the wrong side for the dangerous direction.**
+    - The band is ±35% around 0.165, so its lower bound is 0.107. A 5x account's real k of about 0.11–0.12 therefore *passes* for a 20x account.
+    - In simulation, a slot whose history is still 7–8 windows of the 5x k (or of a different login with k 0.15 on a slot now holding k 0.18) was accepted in 62–95% of draws. Those k values under-read `used` by 15–33%, so a ride there would very likely hit.
+    - The IQR check catches the mix only once 2–3 new windows exist.
+    - After a real upgrade the 7d needs many new windows before it reaches 99%, so this is mostly the case of a slot re-used for a login already near its weekly limit.
+    - The per-account t of the old login also carries over to the new login.
+  - **The measure can flip mid-ride.** `ride_k7` is recomputed every tick, including the ongoing 5h window, so the k check can flip mid-ride. This extends R8: it mixes q and t evidence, and the direction is safe.
+- **`describe` nit (verified).** For an account that has learned only q (timed rides), the "per account" list shows the window's t as if it were the account's own. Its own q is never shown. Example: `learn(None, "7d", "ok", 1, account="2")` → `per account: 2 0.85`.
+
+### Are the new simulations honest?
+
+- **Persistent per-account k bias (`simulate_accounts`).** The test is honest about what it tests: a fixed bias per account, ±3% iid noise per ride on top, and the real `ride.learn` / `t_values` with `account=`.
+  - It measures only the steady state: 200 burn-in rides per account, which is years at about one ride per week.
+  - I ran the transient. A −8% account joins after the window t has settled on an unbiased account. It hits on 46% of its first ride and 24% over its first 5 rides, then 9.9% from ride 6 on: about 2.7 hits in its first 20 rides, against 2.0 at a flat 10%. That is a one-time cost of under one extra interrupted turn. It is acceptable, but the docs' "each account ~6–10%" is the long-run figure.
+  - The learned k is still injected, not derived from simulated history. The test does not show that `drain.ride_k` produces a bias of that size or persistence; my `ride_k` simulation above covers part of that gap.
+- **20-minute pre-arm gap (`test_a_long_gap_before_the_arm_does_not_ride_into_100`).** This test is honest and worst-case.
+  - The crossing is uniform within the gap.
+  - Use continues at full pace through the gap (another machine), and the 5h rise across the gap is folded in.
+  - With the gate patched out (`MIDPOINT_MAX_GAP_S = inf`) the same seed reproduces the ≥ 20% hits.
+  - It runs at a fixed t of 0.88 with a pace of 30–45 min per point. A faster pace makes the gap matter less, because the gap-length credit becomes a smaller share of the point.
+- **R3, R4 and R5 tests.** They exercise the real `policy.decide`, `simulate(q0=legacy)` and `_fold_five_h` with a reset near 0% and no drop. They are adequate.
+
+### Verdict
+
+**Mergeable: yes.** I found no blockers. R1, R3, R4, R5 and R10 are fixed. R2 is fixed for the cases the review raised: quantization bias, and a shared t that settles on the mix.
+
+Should-fix, in this PR or as an immediate follow-up:
+
+1. **Make the k plan band asymmetric** in `policy.py:618`, so it rejects a k below the plan default by more than about 20%. Alternatively, drop history points and the slot's `rideLearning["accounts"]` entry when a slot's login or plan changes. As it stands, a 5x-era k passes for a 20x account and under-reads the last point by about a third.
+
+Nits and follow-ups:
+
+- the `describe` per-account list (show t only for accounts with an own t, and q for those with an own q);
+- prune per-account records of removed slots;
+- the docs' per-account hit rates are steady-state;
+- R6–R9 and R11 are still open, as listed above.
