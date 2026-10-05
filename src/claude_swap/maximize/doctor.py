@@ -1202,6 +1202,24 @@ def service_file(p: Probes) -> tuple[list[str] | None, dict[str, str]] | None:
     return service.read_installed(platform=p.platform, home=p.home)
 
 
+# How far a process start may precede the install timestamp and still count as
+# "started after the install". The two clocks differ in precision: the install
+# time is a nanosecond file mtime, while a process start is a whole second (ps
+# lstart, systemd's ExecMainStartTimestamp) that on Linux is also derived from
+# boot time plus clock ticks and can be a second or two off. `service install`
+# restarts the service right after the files are written, so a fresh restart
+# lands inside this window; a service that really missed an upgrade is older by
+# minutes to days.
+_INSTALL_START_TOLERANCE_S = 5.0
+
+
+def _started_before_install(started: float | None, installed_at: float | None) -> bool:
+    """True when the service process predates the install by more than clock noise."""
+    if started is None or installed_at is None:
+        return False
+    return started < installed_at - _INSTALL_START_TOLERANCE_S
+
+
 def check_service(ctx: Context) -> list[Finding]:
     p = ctx.probes
     if p.platform not in ("darwin", "linux"):
@@ -1270,7 +1288,7 @@ def check_service(ctx: Context) -> list[Finding]:
                     stale_fix,
                 ))
             started = p.process_started_at(pid) if (pid and running) else None
-            if started is not None and installed_at is not None and started < installed_at - 1:
+            if _started_before_install(started, installed_at):
                 out.append(Finding(
                     "service", "warn",
                     f"service process (pid {pid}) started before cc-swap was last "

@@ -466,6 +466,34 @@ def test_service_process_older_than_the_install_runs_old_code(world):
     assert "still runs the old code" in f.detail
 
 
+def test_service_restarted_in_the_same_second_as_the_install_is_not_stale(world):
+    # uv tool install --force then service install: the install mtime carries
+    # nanoseconds (04:58:11.384) while the process start is whole seconds (:11).
+    world.healthy()
+    installed = 1_700_000_011.384
+    world.installs[world.program[0]] = (world.version, installed)
+    world.started_at[4121] = 1_700_000_011
+    assert not [f for f in find(run(world), "service", "warn") if "old code" in f.detail]
+
+
+@pytest.mark.parametrize("lag", [0.0, 0.5, 1.9, 3.9])
+def test_service_start_within_clock_noise_of_the_install_is_not_stale(lag):
+    installed = 1_700_000_011.384
+    assert not dr._started_before_install(installed - lag, installed)
+    assert not dr._started_before_install(float(int(installed - lag)), installed)
+
+
+@pytest.mark.parametrize("lag", [6.0, 60.0, 3600.0])
+def test_service_start_well_before_the_install_is_stale(lag):
+    installed = 1_700_000_011.384
+    assert dr._started_before_install(installed - lag, installed)
+
+
+def test_service_start_or_install_time_unknown_is_not_stale():
+    assert not dr._started_before_install(None, 1_700_000_011.384)
+    assert not dr._started_before_install(1_700_000_011.0, None)
+
+
 def test_service_program_missing_is_an_error(world):
     world.healthy()
     world.service_installed(program=[str(world.home / "gone" / "cc-swap")])
