@@ -28,7 +28,7 @@ import logging
 import time
 import urllib.error
 import urllib.request
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Mapping
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from functools import partial
@@ -363,8 +363,12 @@ def refresh(
     force: bool = False,
     fetcher: Callable[[str, str], CreditsOutcome] | None = None,
     timeout: float = 5.0,
+    names: Mapping[str, str] | None = None,
 ) -> dict[str, dict]:
     """Fetch the due slots, record the outcomes, return every slot's reading.
+
+    Log lines call a slot by its display name (``names``, maximize/names.py;
+    never an email).
 
     Slots without an organization are never fetched (nor their credentials
     read). ``read_credentials(num)`` is called only for due slots, at fetch
@@ -373,7 +377,10 @@ def refresh(
     deferred (``CreditsStore.defer``) — no failure is recorded for it.
     ``timeout`` bounds each request (``cswap list`` passes a short one).
     """
+    from claude_swap.maximize.names import name_of
+
     fetcher = fetcher or partial(fetch_credits, timeout=timeout)
+    names = names or {}
     with_org = {num: ident for num, ident in identities.items() if ident[1]}
     due = store.reserve(with_org, force=force) if with_org else []
     jobs: dict[str, tuple[str, str]] = {}
@@ -382,7 +389,7 @@ def refresh(
         try:
             creds = read_credentials(num)
         except Exception as e:
-            _logger.debug("Credits: credential read failed for account %s: %r", num, e)
+            _logger.debug("Credits: credential read failed for %s: %r", name_of(names, num), e)
             creds = ""
         data = oauth.extract_oauth_data(creds) if creds else None
         token = data.get("accessToken") if data else None
@@ -402,11 +409,11 @@ def refresh(
                     outcomes[num] = CreditsOutcome(error=type(e).__name__)
         failed = store.record(identities, outcomes)
         for num, failures in failed.items():
-            # First failure of a streak at WARNING, the repeats at DEBUG. No
-            # email: the line is paste-safe for public issues.
+            # First failure of a streak at WARNING, the repeats at DEBUG. The
+            # display name, never the email: the line is paste-safe.
             level = logging.WARNING if failures == 1 else logging.DEBUG
-            _logger.log(level, "Credits fetch failed for account %s: %s (%d in a row)",
-                        num, outcomes[num].error, failures)
+            _logger.log(level, "Credits fetch failed for %s: %s (%d in a row)",
+                        name_of(names, num), outcomes[num].error, failures)
     store.defer(identities, skipped)
     return store.readings(identities)
 

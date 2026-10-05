@@ -450,12 +450,17 @@ def test_repeat_failures_log_at_debug(tmp_path: Path, caplog):
         return credits.CreditsOutcome(error="http-500")
 
     ids = {"1": IDS["1"]}
+    creds = {"1": _token()}
     with caplog.at_level(logging.DEBUG, logger="claude-swap"):
-        _refresh(store, fail, ids=ids)
-        clock.t += credits.BACKOFF_CAP_S
-        _refresh(store, fail, ids=ids)
-    levels = [r.levelno for r in caplog.records if "Credits fetch failed" in r.getMessage()]
-    assert levels == [logging.WARNING, logging.DEBUG]
+        for _ in range(2):
+            credits.refresh(store, ids, creds.__getitem__, fetcher=fail,
+                            names={"1": "main"})
+            clock.t += credits.BACKOFF_CAP_S
+    records = [r for r in caplog.records if "Credits fetch failed" in r.getMessage()]
+    assert [r.levelno for r in records] == [logging.WARNING, logging.DEBUG]
+    # Named, never by slot number or email.
+    assert records[0].getMessage() == "Credits fetch failed for main: http-500 (1 in a row)"
+    assert all("@" not in r.getMessage() for r in records)
 
 
 def test_a_slot_without_an_org_is_never_read(tmp_path: Path):

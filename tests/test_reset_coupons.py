@@ -223,14 +223,15 @@ def test_doctor_line(tmp_path: Path):
         (cache / "usage.json").write_text(json.dumps({"schemaVersion": 2, "accounts": rows}))
         slots = {num: SimpleNamespace(email=f"{num}@example.com", org=f"org-{num}")
                  for num in blocks}
-        ctx = SimpleNamespace(probes=SimpleNamespace(backup_root=tmp_path, now=NOW), slots=slots)
+        ctx = SimpleNamespace(probes=SimpleNamespace(backup_root=tmp_path, now=NOW),
+                              slots=slots, name=lambda n: f"acct{n}")
         return [(f.scope, f.severity, f.detail) for f in dr.check_reset_coupons(ctx)]
 
     assert seed({"1": INELIGIBLE, "2": INELIGIBLE}) == [
         ("accounts", "info", "not offered to this client (surface)")]
     assert seed({"1": INELIGIBLE, "2": eligible(grant())}) == [
         ("#2", "info", f"2 left (5h/7d) · expires {_day(NOW + 14 * DAY)}"),
-        ("accounts", "info", "not offered to this client (surface) on #1"),
+        ("accounts", "info", "not offered to this client (surface) on acct1"),
     ]
     assert seed({"1": ..., "2": None}) == []
     assert dr.check_reset_coupons in dr.ENV_CHECKS

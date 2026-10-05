@@ -1989,7 +1989,8 @@ class ClaudeAccountSwitcher:
             if not fetch:
                 return self._credits_store.readings(identities)
             return credits_mod.refresh(
-                self._credits_store, identities, read, force=force, timeout=timeout
+                self._credits_store, identities, read, force=force, timeout=timeout,
+                names=self.account_names(),
             )
         except Exception as e:
             self._logger.debug(f"Credits pass failed: {e!r}")

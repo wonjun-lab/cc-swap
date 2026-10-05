@@ -1527,7 +1527,7 @@ def check_reset_coupons(ctx: Context) -> list[Finding]:
         else:
             out.append(Finding(
                 "reset-coupons", "info",
-                f"{detail} on {', '.join('#' + n for n in nums)}", scope="accounts",
+                f"{detail} on {', '.join(ctx.name(n) for n in nums)}", scope="accounts",
             ))
     return out
 
