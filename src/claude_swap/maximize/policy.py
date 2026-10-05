@@ -155,9 +155,10 @@ NO_PATTERN_HORIZON_H = 4.0
 DEFER_WITHIN_S = 6 * 3600.0
 # The learned ride only rides a hard mark in the last whole point.
 RIDE_FLOOR_PCT = LIMIT_PCT - 1.0
-# A ride switches this long before its learned end: one urgent poll
-# interval (the reading that would show 100% can be that old) plus 30 s.
-RIDE_MARGIN_S = poll_policy.URGENT_INTERVAL_S + 30.0
+# A ride switches this long before its learned end. A fixed margin, not
+# derived from the poll cadence: q is learned from how rides end, so it
+# absorbs the active account's 120 s polling at >= 80%.
+RIDE_MARGIN_S = 90.0
 # A non-active account read longer ago than this is no landing target
 # unless nothing else can take you (its usage may have moved elsewhere, on
 # another machine). Just past the slowest cadence a candidate is ever

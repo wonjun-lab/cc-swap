@@ -1027,28 +1027,43 @@ class TestAdaptiveScheduler:
         self._tick(h, counts, usage)
         assert counts["1"] == 3
 
-    def test_urgent_cadence_when_burning_near_the_band(self, temp_home, monkeypatch):
-        # Active moving inside the escalation band → 60s urgent cadence, so
-        # a threshold crossing is seen within a minute of the previous poll.
+    def test_active_at_80_is_polled_every_120_s(self, temp_home, monkeypatch):
+        # The active account at or above 80% is read every 2 minutes, so a
+        # threshold crossing is seen within two minutes of the previous poll.
         h = self._harness(temp_home, monkeypatch, accounts=2)
         usage = {"1": _usage(70), "2": _usage(10)}
         counts: dict[str, int] = {}
         self._tick(h, counts, usage)
-        usage["1"] = _usage(80)  # burning: +10 pts, now inside the band
+        usage["1"] = _usage(80)
         h.clock.advance(180)
-        self._tick(h, counts, usage)  # movement + in band → urgent plan
+        self._tick(h, counts, usage)  # reads 80% → 120 s plan
         assert counts["1"] == 2
-        usage["1"] = _usage(84)
         h.clock.advance(60)
-        self._tick(h, counts, usage)  # urgent plan due after only 60s
+        self._tick(h, counts, usage)  # inside the 120 s plan
+        assert counts["1"] == 2
+        h.clock.advance(60)
+        self._tick(h, counts, usage)  # 120 s plan due
         assert counts["1"] == 3
 
-    def test_in_band_without_movement_keeps_the_floor(self, temp_home, monkeypatch):
-        # In the escalation band but not burning: no urgency — the normal
-        # 180s floor applies (escalation keeps candidates fresh; it must not
-        # re-fetch a fresh, unmoving active every tick).
+    def test_active_at_80_without_movement_still_polls_every_120_s(
+        self, temp_home, monkeypatch
+    ):
         h = self._harness(temp_home, monkeypatch, accounts=2)
         usage = {"1": _usage(80), "2": _usage(10)}
+        counts: dict[str, int] = {}
+        self._tick(h, counts, usage)
+        for expected in (2, 3):
+            h.clock.advance(60)
+            self._tick(h, counts, usage)  # not due inside 120 s
+            assert counts["1"] == expected - 1
+            h.clock.advance(60)
+            self._tick(h, counts, usage)
+            assert counts["1"] == expected
+
+    def test_active_at_79_keeps_the_normal_floor(self, temp_home, monkeypatch):
+        # Just under 80% and not burning: the normal 180 s floor applies.
+        h = self._harness(temp_home, monkeypatch, accounts=2)
+        usage = {"1": _usage(79), "2": _usage(10)}
         counts: dict[str, int] = {}
         self._tick(h, counts, usage)
         for _ in range(2):
@@ -1059,22 +1074,20 @@ class TestAdaptiveScheduler:
         self._tick(h, counts, usage)
         assert counts["1"] == 2
 
-    def test_urgent_band_follows_the_threshold(self, temp_home, monkeypatch):
-        # The urgent band is distance-to-threshold, not absolute pct: with
-        # threshold 50 (band edge 35), movement at 40% engages the urgent
-        # cadence that the default threshold would ignore.
+    def test_the_80_is_fixed_not_tied_to_the_threshold(self, temp_home, monkeypatch):
+        # A low threshold (50) does not pull the 120 s cadence below 80%.
         h = self._harness(temp_home, monkeypatch, accounts=2, threshold=50)
         usage = {"1": _usage(30), "2": _usage(10)}
         counts: dict[str, int] = {}
         self._tick(h, counts, usage)
         usage["1"] = _usage(40)
         h.clock.advance(180)
-        self._tick(h, counts, usage)  # movement inside the 35..50 band
+        self._tick(h, counts, usage)  # movement, but 40% < 80%
         assert counts["1"] == 2
         usage["1"] = _usage(44)
         h.clock.advance(60)
-        self._tick(h, counts, usage)  # urgent plan due after only 60s
-        assert counts["1"] == 3
+        self._tick(h, counts, usage)  # normal 180 s plan: not due
+        assert counts["1"] == 2
 
     def test_stale_candidate_plan_never_gates_the_active(
         self, temp_home, monkeypatch
@@ -1150,7 +1163,7 @@ class TestAdaptiveScheduler:
     ):
         # Active at 40% jumps into the band between polls: the jump is picked
         # up on the next planned poll, escalates the same tick, and the
-        # movement flips the active onto the urgent cadence.
+        # reading at 80% puts the active onto the 120 s cadence.
         h = self._harness(temp_home, monkeypatch, accounts=2)
         usage = {"1": _usage(40), "2": _usage(20)}
         counts: dict[str, int] = {}
@@ -1164,9 +1177,12 @@ class TestAdaptiveScheduler:
         assert counts["1"] == 2
         assert counts["2"] == 1  # at the TTL edge: still served, not refetched
         h.clock.advance(60)
-        self._tick(h, counts, usage)  # movement in band → urgent cadence
-        assert counts["1"] == 3
+        self._tick(h, counts, usage)  # inside the 120 s plan
+        assert counts["1"] == 2
         assert counts["2"] == 2  # now stale → the escalation refreshes it
+        h.clock.advance(60)
+        self._tick(h, counts, usage)  # 120 s plan due
+        assert counts["1"] == 3
 
     def test_active_in_backoff_keeps_trusted_headroom(self, temp_home, monkeypatch):
         # The active account's fetches are being refused (429 with a long
@@ -2528,8 +2544,8 @@ class TestRunLoop:
 class TestLoopObeysThePollPlan:
     """The loop must not oversleep the plan the planner wrote.
 
-    When the active account burns near the threshold the planner tightens its
-    row to URGENT_INTERVAL_S so the crossing is caught quickly. The loop used
+    When the active account is at or above 80% the planner tightens its
+    row to ACTIVE_HIGH_USAGE_INTERVAL_S so the crossing is caught quickly. The loop used
     to sleep ``interval_seconds`` regardless, so on any machine configured
     slower than the plan (360s here, the default) that plan could not be
     honoured: measured on the linux box mid-episode, the active row asked to
@@ -2554,9 +2570,9 @@ class TestLoopObeysThePollPlan:
         harness.engine.settings = replace(
             harness.engine.settings, interval_seconds=360.0
         )
-        self._plan(harness, due_in=60.0)
-        # Pre-fix this returned ~360s and the 60s plan silently ran late.
-        assert harness.engine._next_delay(TickOutcome.NO_ACTION) == 60.0
+        self._plan(harness, due_in=150.0)
+        # Pre-fix this returned ~360s and the 150s plan silently ran late.
+        assert harness.engine._next_delay(TickOutcome.NO_ACTION) == 150.0
 
     def test_never_sleeps_below_the_planners_own_floor(self, harness):
         """A row already overdue must not spin: the floor is the rate budget."""
@@ -2566,7 +2582,7 @@ class TestLoopObeysThePollPlan:
         self._plan(harness, due_in=-500.0)
         assert (
             harness.engine._next_delay(TickOutcome.NO_ACTION)
-            == poll_policy.URGENT_INTERVAL_S
+            == poll_policy.ACTIVE_HIGH_USAGE_INTERVAL_S
         )
 
     def test_a_relaxed_plan_never_lengthens_the_sleep(self, harness):
@@ -3082,9 +3098,9 @@ class TestModelAwareSwitch:
         assert exhausted.earliest_reset_at == fable_reset
 
     def test_scoped_binding_window_keeps_active_cadence_tight(self, temp_home):
-        # Fable moving at 88% is inside the escalation band: with the model
-        # configured the urgent cadence engages, while the 5%-used 5h window
-        # alone would just decay the interval.
+        # Fable at 88% is at or above 80%: with the model configured the
+        # 120 s cadence engages, while the 5%-used 5h window alone would just
+        # decay the interval.
         kwargs = dict(
             prev_interval_s=poll_policy.MIN_INTERVAL_S,
             prev_usage=_model_usage(5, 84),
@@ -3096,7 +3112,7 @@ class TestModelAwareSwitch:
             rng=lambda: 0.5,
         )
         _, scoped = poll_policy.plan_after_fetch(models=("Fable",), **kwargs)
-        assert scoped == poll_policy.URGENT_INTERVAL_S
+        assert scoped == poll_policy.ACTIVE_HIGH_USAGE_INTERVAL_S
         _, unscoped = poll_policy.plan_after_fetch(models=(), **kwargs)
         assert unscoped > poll_policy.MIN_INTERVAL_S  # plain decay
 

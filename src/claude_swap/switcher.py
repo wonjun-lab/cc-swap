@@ -1933,19 +1933,12 @@ class ClaudeAccountSwitcher:
         instead of the settings file)."""
         self._poll_inputs_override = (threshold, models)
 
-    def set_poll_window_caps(self, caps: dict | None) -> None:
-        """cc-swap: each window's own cap for the active account's urgency
-        (``poll_policy.plan_after_fetch``'s ``window_caps``; the maximize
-        hard caps). None: the threshold, as upstream."""
-        self._poll_window_caps = dict(caps) if caps else None
-
     def clear_poll_policy_inputs(self) -> None:
         """Drop the hosted engine's pin so poll planning falls back to the
         settings file — called when the engine's screen closes, or a TUI
         session threshold override would keep steering cadence after the
         engine it belonged to is gone."""
         self._poll_inputs_override = None
-        self._poll_window_caps = None
 
     def _poll_policy_inputs(self) -> tuple[float, tuple[str, ...]]:
         """Threshold + configured model names for poll planning: the hosting
@@ -6071,8 +6064,8 @@ class ClaudeAccountSwitcher:
         ``fetch=None`` (on-demand callers: ``--list``/``--status``/switch
         strategies, dashboards) makes every account a candidate but respects
         the persisted poll plans; the auto engine passes an explicit set whose
-        members may beat the serve TTL when their plan says so (urgent
-        cadence) or, unless ``scheduled`` is set, when escalation needs them
+        members may beat the serve TTL when their plan says so (the 120 s
+        high-usage cadence) or, unless ``scheduled`` is set, when escalation needs them
         fresh. Final eligibility —
         freshness, backoff, claims, plans — is decided atomically by
         ``UsageStore.reserve``, so concurrent collectors can never
@@ -6329,8 +6322,6 @@ class ClaudeAccountSwitcher:
                 models=models,
                 recent_429=recent_429,
                 now=now,
-                window_caps=getattr(self, "_poll_window_caps", None),
-                prev_fetched_at=before.fetched_at if before else None,
             )
         return plans
 
