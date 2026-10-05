@@ -87,6 +87,7 @@ class TestRegistry:
             "maximize.preemptHorizonMaxH": (1, 48),
             "maximize.busyRebalanceGap": (0.0, 5.0),
             "maximize.rideMaxMin": (0, 120),
+            "maximize.drainHours": (0, 168),
             "prime.maxAttempts": (1, 5),
         }
 

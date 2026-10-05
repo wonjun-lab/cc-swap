@@ -47,6 +47,23 @@ def plan_weight(
     return DEFAULT_WEIGHT
 
 
+def plan_name(
+    rate_limit_tier: str | None, email: str, override: str | None
+) -> str | None:
+    """``20x`` / ``5x`` as :func:`plan_weight` reads it (override first, then
+    the stored ``rateLimitTier``), or None when neither says: unlike the
+    weight, an unknown plan is not a 5x one."""
+    forced = parse_plan_override(override).get((email or "").strip().lower())
+    weight = forced
+    if weight is None and isinstance(rate_limit_tier, str):
+        weight = _weight_for_label(rate_limit_tier)
+    if weight == WEIGHT_20X:
+        return "20x"
+    if weight == WEIGHT_5X:
+        return "5x"
+    return None
+
+
 def plan_label(rate_limit_tier: str | None) -> str | None:
     """A stored ``rateLimitTier`` as the TUI's plan label: ``20x``, ``5x``,
     ``team``, or None when it says none of those. Never the raw string."""

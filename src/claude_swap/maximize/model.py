@@ -47,6 +47,9 @@ class AccountView:
     # When the stored login lapses (epoch s, ``refreshTokenExpiresAt``);
     # None = the login records no deadline (never treated as expiring).
     login_deadline: float | None = None
+    # ``20x`` / ``5x`` when the plan is known (``plan.plan_name``), else None:
+    # the near-reset drain's fallback 7d-per-5h ratio (maximize/drain.py).
+    plan: str | None = None
 
 
 @dataclass(frozen=True)
@@ -108,6 +111,10 @@ class Snapshot:
     ride_armed_at: Mapping[str, float] = field(default_factory=dict)
     ride_point_s: Mapping[str, float] = field(default_factory=dict)
     ride_q: Mapping[str, float] = field(default_factory=dict)
+    # The near-reset drain (maximize/drain.py): each account's learned
+    # 7d-per-5h ratio k (7d points one 5h point costs; ``drain.learn_k``
+    # over the usage history). Absent = not learned: the plan's default.
+    k7: Mapping[str, float] = field(default_factory=dict)
 
     def view(self, number: str | None) -> AccountView | None:
         """The account with this slot number, or None."""

@@ -134,8 +134,11 @@ def land_note(
     active: bool,
     login: LoginState,
     now: float | None = None,
+    draining: bool = False,
 ) -> str:
-    """Whether maximize could land on this account, and if not, why."""
+    """Whether maximize could land on this account, and if not, why. A
+    ``draining`` account (maximize/drain.py) has its 7d soft mark set
+    aside: its 7d limit is the hard cap less the margin."""
     if login == "relogin":
         return "re-login"
     if active:
@@ -150,8 +153,9 @@ def land_note(
         return "usage ?"
     if view.pct5 >= s.soft_5h - s.landing_margin:
         return f"5h≥{s.soft_5h - s.landing_margin:g}"
-    if view.pct7 >= s.soft_7d - s.landing_margin:
-        return f"7d≥{s.soft_7d - s.landing_margin:g}"
+    limit7 = (s.hard_7d if draining else s.soft_7d) - s.landing_margin
+    if view.pct7 >= limit7:
+        return f"7d≥{limit7:g}"
     if now is not None and policy.login_guarded(view, now, s):
         return f"login<{minutes_text(s.login_expiry_guard_min).replace('h00m', 'h')}"
     return "yes"
@@ -259,6 +263,9 @@ class FleetRow:
     # up to the window's reset). False: it counts as unknown — never a
     # landing target, not counted in the summary; the row still shows it.
     trusted: bool = True
+    # The near-reset drain (maximize/drain.py): the engine sets this
+    # account's 7d soft mark aside and uses it first until its 7d reset.
+    drain: bool = False
 
 
 def _seen_resets(acc: AccountSnapshot, now: float) -> tuple[float | None, float | None]:
@@ -315,6 +322,7 @@ def fleet_rows(
     state: mxview.MaximizeState,
     *,
     now: float,
+    history: UsageHistory | None = None,
 ) -> list[FleetRow]:
     """One row per account in slot order, carrying maximize's rank.
 
@@ -322,8 +330,10 @@ def fleet_rows(
     reading, however old) and what maximize decides on (the engine's
     decision values: a reading it no longer trusts is unknown). Rank,
     score, ``landable`` and ``land`` come from the second; ``trusted`` says
-    whether the engine still decides on the row's reading."""
-    msnap = fleet_snapshot(snap, mx, state, now=now)
+    whether the engine still decides on the row's reading. ``history``
+    (``view.read_history``) gives the near-reset drain the k it learned, so
+    ``drain`` agrees with the order the engine's decisions use."""
+    msnap = fleet_snapshot(snap, mx, state, now=now, history=history)
     shown_snap = fleet_snapshot(snap, mx, state, now=now, trusted=False)
     ranked = mxview.rows(msnap, state.primes)
     rank: dict[str, int] = {}
@@ -349,6 +359,7 @@ def fleet_rows(
         entry = raw if isinstance(raw, Mapping) else None
         active = acc.number == msnap.active
         seen5, seen7 = _seen_resets(acc, now)
+        draining = policy.draining(tv, msnap)
         out.append(
             FleetRow(
                 number=acc.number,
@@ -364,9 +375,13 @@ def fleet_rows(
                 days7=days_left(v, now) if v.pct7 is not None else None,
                 score=by_row[acc.number].score,
                 landable=(
-                    not active and landable(tv, mx) and not policy.login_guarded(tv, now, mx)
+                    not active
+                    and landable(tv, mx, draining=draining)
+                    and not policy.login_guarded(tv, now, mx)
                 ),
-                land=land_note(tv, mx, active=active, login=login, now=now),
+                land=land_note(
+                    tv, mx, active=active, login=login, now=now, draining=draining
+                ),
                 state5=r.state5,
                 reset5=(v.reset5 if r.state5 != "cold" else None) or seen5,
                 prime=prime_cell(v, entry, msnap.active, prime, now),
@@ -382,6 +397,7 @@ def fleet_rows(
                 reset7=v.reset7 if v.reset7 is not None else seen7,
                 shared=acc.usage.last_error == SHARED_LOGIN,
                 trusted=acc.usage.decision_value() is not None,
+                drain=draining,
             )
         )
     return out

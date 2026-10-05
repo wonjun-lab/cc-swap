@@ -666,7 +666,9 @@ class FleetScreen(Screen):
             self._state = mxview.MaximizeState()
         self._history = mxview.read_history(self._root, now)  # never raises
         self._prime_guard = prime_guard(self._root)
-        self._rows = fx.fleet_rows(snap, self._mx, self._prime, self._state, now=now)
+        self._rows = fx.fleet_rows(
+            snap, self._mx, self._prime, self._state, now=now, history=self._history
+        )
         self._accounts = {a.number: a for a in snap.accounts}
         self._maybe_fetch_on_open()
         self._render_all()

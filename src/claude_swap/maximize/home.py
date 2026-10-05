@@ -47,6 +47,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Literal
 
 from claude_swap import oauth
+from claude_swap.maximize import drain
 from claude_swap.maximize import fleet as fx
 from claude_swap.maximize import hold as account_hold
 from claude_swap.maximize import policy
@@ -178,7 +179,7 @@ def short_left(seconds: float) -> str:
 #: The tags in priority order: an account shows only the first that applies.
 TAG_PRIORITY: tuple[str, ...] = (
     "active", "re-login", "keychain", "excluded", "untrusted", "next", "login",
-    "reading old", "last resort", "prime",
+    "reading old", "drain", "last resort", "prime",
 )
 
 #: A reading the engine still decides on gets a dim ``reading 25m old`` tag
@@ -219,6 +220,11 @@ def tag_for(
         return (f"login {short_left(left)} left" if left > 0 else "login expired"), tone
     if row.login == "ok" and row.stale and age is not None and age >= STALE_TAG_S:
         return old, "dim"
+    if row.drain:
+        # Near its 7d reset: used first, its 7d soft mark set aside
+        # (maximize/drain.py). ``drain 18h``: the time to that reset.
+        left = (row.reset7 - now) / 3600.0 if row.reset7 is not None else None
+        return (drain.tag(left) if left is not None and left > 0 else "drain"), "ok"
     if row.tier == "last_resort":
         return "last resort", "dim"
     if row.state5 == "cold" and row.login == "ok":  # an API key has no 5h window
@@ -657,14 +663,15 @@ def capacity(
     guard = mx.login_expiry_guard_min * 60.0
 
     def week_lands(r: fx.FleetRow) -> bool:
-        return (r.pct7 or 0.0) < mx.soft_7d - margin
+        return (r.pct7 or 0.0) < (mx.hard_7d if r.drain else mx.soft_7d) - margin
 
     def guarded(r: fx.FleetRow, at: float) -> bool:
         return r.login_deadline is not None and r.login_deadline - at < guard
 
     def free_now(r: fx.FleetRow) -> bool:
         if r.active:
-            return (r.pct5 or 0.0) < mx.soft_5h and (r.pct7 or 0.0) < mx.soft_7d
+            soft7 = mx.hard_7d if r.drain else mx.soft_7d
+            return (r.pct5 or 0.0) < mx.soft_5h and (r.pct7 or 0.0) < soft7
         return week_lands(r) and (r.pct5 or 0.0) < mx.soft_5h - margin and not guarded(r, now)
 
     free = [r for r in usable if free_now(r)]
@@ -826,10 +833,11 @@ def ago_text(seconds: float) -> str:
 
 
 def _past_soft(row: fx.FleetRow, mx: MaximizeSettings) -> tuple[str, float, float] | None:
-    """The window (label, pct, soft) the account is past its soft mark in."""
+    """The window (label, pct, soft) the account is past its soft mark in
+    (never 7d on a draining account: that mark is set aside)."""
     if row.pct5 is not None and row.pct5 >= mx.soft_5h:
         return "5h", row.pct5, mx.soft_5h
-    if row.pct7 is not None and row.pct7 >= mx.soft_7d:
+    if row.pct7 is not None and row.pct7 >= mx.soft_7d and not row.drain:
         return "7d", row.pct7, mx.soft_7d
     return None
 
@@ -1256,6 +1264,17 @@ def status_variants(
                         " — nowhere better to go yet, it stays ", "plain"),
                  (f"(forced at {hard:g}%)", "dim")],
                 [head, (f" · #{act.number} {win} {pct:.0f}% past soft {soft:g} — it stays",
+                        "plain")],
+                [head],
+            ]
+        if act.drain and act.pct7 is not None:
+            left = (act.reset7 - now) / 3600.0 if act.reset7 is not None else None
+            when = f" resets in {drain.left_text(left)}" if left is not None and left > 0 else ""
+            return [
+                [head, (f" · using {name(act.number)} · 7d {act.pct7:.0f}%{when}"
+                        " — draining it first ", "plain"),
+                 (f"(forced at {mx.hard_7d:g}%)", "dim")],
+                [head, (f" · #{act.number} 7d {act.pct7:.0f}%{when} — draining it first",
                         "plain")],
                 [head],
             ]

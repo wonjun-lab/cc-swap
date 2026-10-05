@@ -118,6 +118,11 @@ class MaximizeSettings:
     ride_windows: str = "7d"
     # A ride never lasts longer than this many minutes (0 = no ride).
     ride_max_min: int = 30
+    # Near-reset 7d drain (maximize/drain.py): within this many hours of an
+    # account's 7d reset (or sooner when its 7d room needs most of the time
+    # left), its 7d soft mark is set aside and it is used first, so the
+    # quota does not expire unused. 0 = off.
+    drain_hours: int = 24
 
 
 @dataclass(frozen=True)
@@ -330,6 +335,10 @@ SETTING_SPECS: dict[str, SettingSpec] = {
         SettingSpec(
             "maximize", "rideMaxMin", "ride_max_min", "int", 0, 120,
             help="maximize: a learned ride lasts at most this many minutes (0 = no ride)",
+        ),
+        SettingSpec(
+            "maximize", "drainHours", "drain_hours", "int", 0, 168,
+            help="maximize: within this many hours of a 7d reset, set that account's 7d soft mark aside and use it first (0 = off)",
         ),
         SettingSpec(
             "maximize", "lastResort", "last_resort", "string",

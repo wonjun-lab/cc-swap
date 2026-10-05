@@ -21,6 +21,7 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Literal, get_args
 
+from claude_swap.maximize import drain
 from claude_swap.maximize import history as usage_history
 from claude_swap.maximize import hold as account_hold
 from claude_swap.maximize import ride as learned_ride
@@ -320,6 +321,21 @@ def history_inputs(
     return forecast, rates
 
 
+def drain_k7(
+    h: usage_history.History | None, settings: MaximizeSettings, now: float
+) -> dict[str, float]:
+    """Each account's learned 7d-per-5h ratio for the near-reset drain, the
+    way the engine derives it (``engine_hook._history_inputs``:
+    ``drain.learn_k`` while ``drainHours`` is on). No history, or any
+    failure, is nothing learned."""
+    if h is None or settings.drain_hours <= 0:
+        return {}
+    try:
+        return drain.learn_k(h.points, now)
+    except Exception:
+        return {}
+
+
 def idle_pattern_text(
     h: usage_history.History | None, settings: MaximizeSettings, now: float
 ) -> str:
@@ -392,6 +408,7 @@ def snapshot_from_accounts(
         ride_q=state.ride_q,
         ride_armed_at=state.ride_armed_at.get(snap.active_number or "", {}),
         ride_point_s=state.ride_point_s.get(snap.active_number or "", {}),
+        k7=drain_k7(history, settings, now),
     )
 
 
@@ -432,7 +449,9 @@ def rows(snap: Snapshot, primes: Mapping[str, Mapping]) -> list[RowView]:
                 tier=account.tier,
                 active=account.number == snap.active,
                 score=value if math.isfinite(value) else None,
-                landable=landable(account, snap.settings),
+                landable=landable(
+                    account, snap.settings, draining=drain.draining(account, snap)
+                ),
                 state5=state5(account, primes.get(account.email), snap.now),
                 reset5=account.reset5,
             )
@@ -452,7 +471,7 @@ def pending(snap: Snapshot) -> PendingView | None:
         return None  # at-limit / hard switch at once: nothing to wait for
     if active.pct5 >= s.soft_5h:
         window, pct = "5h", active.pct5
-    elif active.pct7 >= s.soft_7d:
+    elif active.pct7 >= s.soft_7d and not drain.draining(active, snap):
         window, pct = "7d", active.pct7
     else:
         return None

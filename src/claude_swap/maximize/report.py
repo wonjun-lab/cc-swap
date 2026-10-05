@@ -8,7 +8,7 @@ from __future__ import annotations
 import math
 from collections.abc import Sequence
 
-from claude_swap.maximize import idle
+from claude_swap.maximize import drain, idle
 from claude_swap.maximize.model import Snapshot
 from claude_swap.maximize.score import days_left, landable, score
 
@@ -25,7 +25,14 @@ def decision_rows(snap: Snapshot) -> list[dict]:
     rows: list[dict] = []
     for v in snap.accounts:
         value = score(v, snap.now)
-        flags = [name for name, on in (("quarantined", v.quarantined), ("api-key", v.api_key)) if on]
+        draining = drain.draining(v, snap)
+        flags = [
+            name
+            for name, on in (
+                ("quarantined", v.quarantined), ("api-key", v.api_key), ("drain", draining),
+            )
+            if on
+        ]
         rows.append({
             "number": v.number,
             "active": v.number == snap.active,
@@ -35,7 +42,9 @@ def decision_rows(snap: Snapshot) -> list[dict]:
             "pct7": v.pct7,
             "days7": round(days_left(v, snap.now), 2) if v.pct7 is not None else None,
             "score": round(value, 3) if math.isfinite(value) else None,
-            "landable": v.number != snap.active and landable(v, snap.settings),
+            "landable": v.number != snap.active and landable(
+                v, snap.settings, draining=draining
+            ),
             "idle": state if v.number == snap.active else "",
             "flags": ",".join(flags),
         })

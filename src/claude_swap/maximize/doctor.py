@@ -1483,6 +1483,26 @@ def check_learned_ride(ctx: Context) -> list[Finding]:
     return [Finding("learned-ride", "info", text)]
 
 
+def check_drain(ctx: Context) -> list[Finding]:
+    """The near-reset 7d drain (info only; ``maximize`` strategy only): its
+    setting and each account's learned 7d-per-5h ratio k
+    (``drain.learn_k`` over the usage history). Writes nothing."""
+    from claude_swap import settings as st
+    from claude_swap.maximize import drain, history
+
+    if ctx.strategy != "maximize":
+        return []
+    try:
+        mx = st._section_from_raw(
+            (ctx.raw_settings or {}).get("maximize"), "maximize", st.MaximizeSettings
+        )
+    except TypeError:
+        mx = st.MaximizeSettings()
+    p = ctx.probes
+    k7 = drain.learn_k(history.read(p.backup_root, p.now).points, p.now) if mx.drain_hours > 0 else {}
+    return [Finding("drain", "info", drain.describe(mx.drain_hours, k7))]
+
+
 def priming_guard(
     backup_root: Path, *, auto_verify: bool | None = None
 ) -> tuple[str | None, str | None]:
@@ -1710,6 +1730,7 @@ ENV_CHECKS: tuple[Callable[[Context], list[Finding]], ...] = (
     check_priming,
     check_idle_pattern,
     check_learned_ride,
+    check_drain,
 )
 
 

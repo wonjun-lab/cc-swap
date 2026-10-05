@@ -679,7 +679,8 @@ class TestPreempt:
         # inside the 5 h and before its 7d reset (6 h). A second account at
         # 60% (15 h) is the target, though #2 ranks first by score.
         crossing = acct("2", 10, 81, reset7_d=0.25)
-        s = preempt_snap(candidate=crossing)
+        # A 6 h reset is near-reset drain territory: off here (TestDrain).
+        s = preempt_snap(candidate=crossing, drain_hours=0)
         got = decide(s)
         assert not (isinstance(got, Switch) and got.trigger == "preempt")
         assert getattr(got, "code", None) != "preempt"
@@ -826,6 +827,10 @@ PING_2 = acct("2", 0, 30, reset7_d=6.0)
 def ping(active: str, *accounts, rates=None, **settings) -> Snapshot:
     from dataclasses import replace
 
+    # #1 resets in a day: the near-reset drain (drainHours, 24 by default)
+    # would set its 7d soft mark aside. These cases are about preempt and
+    # rebalance without it (TestDrain covers the drain).
+    settings.setdefault("drain_hours", 0)
     s = snap(active, *(accounts or (PING_1, PING_2)), samples="idle",
              last_switch_min=31, active_changed_min=31, **settings)
     return replace(s, rates7={"1": 3.0} if rates is None else rates)

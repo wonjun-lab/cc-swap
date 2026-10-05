@@ -79,6 +79,19 @@ recent 429 on the active token never rides (it cannot be polled every
 60 s), an ETA-forced hard trigger never rides, and an account hold sets
 none of it aside: the ride is the hard path, only later.
 
+Near-reset drain (``drainHours``, maximize/drain.py): an account whose 7d
+reset is close (within ``drainHours``, or so close that what is left under
+``hard7d`` needs most of the 5h windows to the reset) is *draining*. Its 7d
+soft mark is set aside: no ``soft`` or ``preempt`` move off it on 7d, and it
+is landable while its 7d is under ``hard7d − landingMargin``. Within a tier
+``landing_candidates`` puts draining accounts first, the earliest 7d reset
+first (:func:`drain_first`). Rebalance (b) tries the first draining
+candidate before the best other one, and never moves off a draining active
+account except to a draining one whose 7d resets sooner (so it cannot
+bounce back). Hard caps, at-limit, the login-expiry guard, last resort,
+quarantine and holds are unchanged. With no draining account every decision
+is what it was without the drain.
+
 Unknown active usage is ``Indeterminate`` (the engine's upstream failover
 path counts it).
 """
@@ -90,6 +103,7 @@ from dataclasses import dataclass, replace
 from typing import Literal
 
 from claude_swap import poll_policy
+from claude_swap.maximize import drain
 from claude_swap.maximize import hold as account_hold
 from claude_swap.maximize import idle
 from claude_swap.maximize import ride as learned_ride
@@ -147,23 +161,50 @@ def login_lapsed(v: AccountView, now: float) -> bool:
     return v.login_deadline is not None and now >= v.login_deadline
 
 
+def draining(v: AccountView, snap: Snapshot) -> bool:
+    """``v`` is near its 7d reset and its 7d soft mark is set aside
+    (maximize/drain.py)."""
+    return drain.draining(v, snap)
+
+
+def can_land(v: AccountView, snap: Snapshot) -> bool:
+    """``score.landable`` with the drain's 7d limit for a draining ``v``."""
+    return landable(v, snap.settings, draining=draining(v, snap))
+
+
+def drain_first(ranked: list[AccountView], snap: Snapshot) -> list[AccountView]:
+    """``ranked`` (``rank`` order) with the draining accounts first within
+    each tier, the earliest 7d reset first. Stable: with none draining it is
+    ``ranked`` unchanged, and the rest keep their order."""
+    def key(v: AccountView) -> tuple:
+        if draining(v, snap):
+            return (TIER_ORDER[v.tier], 0, v.reset7 if v.reset7 is not None else math.inf)
+        return (TIER_ORDER[v.tier], 1, 0.0)
+
+    return sorted(ranked, key=key)
+
+
 def landing_candidates(snap: Snapshot) -> list[AccountView]:
-    """Every non-active landable account, best first (spec §5.2 + §5.4).
+    """Every non-active landable account, best first (spec §5.2 + §5.4),
+    draining accounts first within a tier (:func:`drain_first`).
 
     An account inside its login-expiry guard is no landing target (soft,
     rebalance, and the first choice of hard/at-limit); the hard/at-limit
     fallbacks (``escape_candidates``, ``limit_candidates``) still take it."""
     s = snap.settings
-    return rank(
-        [
-            v
-            for v in snap.accounts
-            if v.number != snap.active
-            and landable(v, s)
-            and not login_guarded(v, snap.now, s)
-        ],
-        snap.now,
-        s.tie_epsilon,
+    return drain_first(
+        rank(
+            [
+                v
+                for v in snap.accounts
+                if v.number != snap.active
+                and can_land(v, snap)
+                and not login_guarded(v, snap.now, s)
+            ],
+            snap.now,
+            s.tie_epsilon,
+        ),
+        snap,
     )
 
 
@@ -272,8 +313,11 @@ def idle_note(snap: Snapshot) -> str:
     )
 
 
-def _target(v: AccountView, now: float) -> str:
-    return f"#{v.number} ({v.tier}, score {score(v, now):.2f})"
+def _target(v: AccountView, snap: Snapshot) -> str:
+    out = f"#{v.number} ({v.tier}, score {score(v, snap.now):.2f})"
+    if draining(v, snap):
+        out += f": {drain.text(v, snap)}"
+    return out
 
 
 @dataclass(frozen=True)
@@ -526,7 +570,7 @@ def _soft_reason(
     s = snap.settings
     if "5h" not in skip and a.pct5 >= s.soft_5h:
         return f"#{a.number} 5h {_pct(a.pct5)} >= soft {_pct(s.soft_5h)}"
-    if "7d" not in skip and a.pct7 >= s.soft_7d:
+    if "7d" not in skip and a.pct7 >= s.soft_7d and not draining(a, snap):
         return f"#{a.number} 7d {_pct(a.pct7)} >= soft {_pct(s.soft_7d)}"
     return None
 
@@ -590,7 +634,7 @@ def _reset_wait(
     soft = tuple(
         w
         for w, pct, mark in (("5h", a.pct5, s.soft_5h), ("7d", a.pct7, s.soft_7d))
-        if pct >= mark
+        if pct >= mark and not (w == "7d" and draining(a, snap))
     )
     rates = idle.velocity(snap.samples, s) if _fresh_samples(snap) else (None, None)
     waits: dict[Window, float] = {}
@@ -629,7 +673,7 @@ def _reset_wait(
 def _at_limit(snap: Snapshot, landing: list[AccountView], why: str) -> Decision:
     if landing:
         top = landing[0]
-        return Switch(top.number, "at-limit", f"{why}; -> {_target(top, snap.now)}")
+        return Switch(top.number, "at-limit", f"{why}; -> {_target(top, snap)}")
     fallback = escape_candidates(snap)
     if fallback:
         top = fallback[0]
@@ -656,7 +700,7 @@ def _hard(
 ) -> Decision:
     if landing:
         top = landing[0]
-        return Switch(top.number, "hard", f"{force.reason}; -> {_target(top, snap.now)}")
+        return Switch(top.number, "hard", f"{force.reason}; -> {_target(top, snap)}")
     windows = "/".join(force.windows)
     fallback = roomier_candidates(snap, a, force.windows)
     if fallback:
@@ -683,7 +727,7 @@ def _soft(snap: Snapshot, landing: list[AccountView], why: str) -> Decision:
         return Hold(f"{why}; nothing landable", pending=False)
     top = landing[0]
     if idle.is_idle(snap.samples, snap.now, snap.settings):
-        return Switch(top.number, "soft", f"{why}; idle; -> {_target(top, snap.now)}")
+        return Switch(top.number, "soft", f"{why}; idle; -> {_target(top, snap)}")
     return Hold(
         f"{why}; waiting for idle to move to #{top.number} ({idle_note(snap)})",
         pending=True,
@@ -754,7 +798,10 @@ def crosses_soft7_within(
     """Hours until ``v``'s 7d would pass soft7d once you are on it
     (:func:`landed_rate7`), when that is within ``horizon``; else None. The
     one check preempt picks a target with and rebalance skips a candidate by,
-    so neither lands where preempt would move off again."""
+    so neither lands where preempt would move off again. Never for a
+    draining ``v``: its 7d soft mark is set aside."""
+    if draining(v, snap):
+        return None
     hours = soft7_eta_h(v, landed_rate7(snap, a, v), snap)
     return hours if hours is not None and hours <= horizon else None
 
@@ -773,6 +820,8 @@ def _preempt(
     rate = snap.rates7.get(a.number)
     if not s.preempt or rate is None or rate <= 0 or not landing:
         return None
+    if draining(a, snap):
+        return None  # its 7d soft mark is set aside: nothing to pre-empt
     horizon, when = preempt_horizon(snap)
     hours = soft7_eta_h(a, rate, snap)
     if hours is None or hours > horizon:
@@ -846,6 +895,15 @@ def _deferred_to(snap: Snapshot, gain: float) -> QuietWindow | None:
     return f.next
 
 
+def _rebalance_tries(pool: list[AccountView], snap: Snapshot) -> list[AccountView]:
+    """The candidates rebalance (b) weighs, in turn: the first draining one,
+    then the first other one (``pool`` is in landing order). With none
+    draining that is ``pool[0]`` alone, as without the drain."""
+    first_draining = next((v for v in pool if draining(v, snap)), None)
+    first_other = next((v for v in pool if not draining(v, snap)), None)
+    return [v for v in (first_draining, first_other) if v is not None]
+
+
 def _rebalance(
     snap: Snapshot, a: AccountView, landing: list[AccountView]
 ) -> Decision:
@@ -865,13 +923,35 @@ def _rebalance(
     else:
         skipped = _preempt_would_leave(snap, a, landing)
         pool = [v for v in landing if v.number not in skipped]
-        top = pool[0] if pool else None
-        t_score = score(top, snap.now) if top is not None else -math.inf
-        if top is not None and top.tier == a.tier and t_score - a_score > s.tie_epsilon:
+        a_draining = draining(a, snap)
+        if a_draining:
+            # Off a draining account only onto one that resets sooner: never
+            # back to a non-draining one, and never back and forth.
+            pool = [
+                v for v in pool
+                if draining(v, snap) and (v.reset7 or math.inf) < (a.reset7 or math.inf)
+            ]
+        top = next(
+            (
+                v for v in _rebalance_tries(pool, snap)
+                if v.tier == a.tier and score(v, snap.now) - a_score > s.tie_epsilon
+            ),
+            None,
+        )
+        if top is not None:
+            t_score = score(top, snap.now)
             gain = t_score - a_score
             why = (
                 f"#{top.number} score {t_score:.2f} beats #{a.number} "
                 f"{a_score:.2f} by more than {s.tie_epsilon:g}"
+            )
+            if draining(top, snap):
+                why += f"; {drain.text(top, snap)}"
+        elif a_draining:
+            return Hold(
+                f"{drain.text(a, snap)} (7d soft {_pct(s.soft_7d)} set aside "
+                f"until the reset; hard {_pct(s.hard_7d)} still switches)",
+                pending=False,
             )
         else:
             best = landing[0]
