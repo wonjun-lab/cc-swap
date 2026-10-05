@@ -406,11 +406,9 @@ def short_name(record: Mapping | None) -> str:
 
 
 def _names(root: Path) -> dict[str, str]:
-    try:
-        data = json.loads((Path(root) / "sequence.json").read_text(encoding="utf-8"))
-    except (OSError, ValueError, RecursionError):
-        return {}
-    return record_names(data.get("accounts") if isinstance(data, dict) else None)
+    from claude_swap.maximize.names import roster_names
+
+    return roster_names(root)
 
 
 def record_names(accounts: object) -> dict[str, str]:
@@ -426,10 +424,10 @@ def display_name_hook(root: Path):
     (alias, else the part before the ``@``), read fresh from sequence.json so
     a new alias shows on the next line. An unknown slot gets the short name of
     its address."""
-    from claude_swap.maximize.names import short_name as local_part
+    from claude_swap.maximize.names import name_of
 
     def name(slot: str, email: str) -> str:
-        return _names(root).get(str(slot)) or local_part(email) or email
+        return name_of(_names(root), slot, email)
 
     return name
 

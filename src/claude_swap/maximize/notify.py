@@ -65,7 +65,6 @@ from claude_swap.json_output import (
     USAGE_NO_CREDENTIALS,
     USAGE_RELOGIN_REQUIRED,
 )
-from claude_swap.maximize.hold import record_names
 from claude_swap.maximize.names import cli_arg, name_of
 
 _logger = logging.getLogger("claude-swap")
@@ -415,11 +414,9 @@ class EngineNotifier:
         return Path(self.engine.switcher.backup_dir)
 
     def _names(self) -> dict[str, str]:
-        try:
-            data = self.engine.switcher._get_sequence_data() or {}
-        except Exception:
-            return {}
-        return record_names(data.get("accounts"))
+        from claude_swap.maximize.names import roster_names
+
+        return roster_names(self.root)
 
     def send(self, note: Note, now: float) -> bool:
         last = self._weighed.get(note.key)

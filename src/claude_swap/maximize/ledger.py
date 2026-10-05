@@ -239,13 +239,9 @@ def scrub(text: object) -> str | None:
 def _names(root: Path) -> dict[str, str]:
     """``{slot: display name}`` off ``root``'s sequence.json (``{}`` when
     unreadable)."""
-    from claude_swap.maximize.names import record_names
+    from claude_swap.maximize.names import roster_names
 
-    try:
-        data = json.loads((Path(root) / "sequence.json").read_text(encoding="utf-8"))
-    except (OSError, ValueError, RecursionError):
-        return {}
-    return record_names(data.get("accounts") if isinstance(data, dict) else None)
+    return roster_names(root)
 
 
 def _name(names: Mapping[str, str], slot: int | None) -> str | None:

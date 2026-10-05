@@ -23,13 +23,9 @@ DEFAULT_COUNT = 20
 def root_names(root: Path) -> dict[str, str]:
     """``{slot: display name}`` from ``root``'s sequence.json; {} when it
     cannot be read."""
-    from claude_swap.maximize.names import record_names
+    from claude_swap.maximize.names import roster_names
 
-    try:
-        data = json.loads((Path(root) / "sequence.json").read_text(encoding="utf-8"))
-    except (OSError, ValueError, RecursionError):
-        return {}
-    return record_names(data.get("accounts") if isinstance(data, dict) else None)
+    return roster_names(root)
 
 
 def _slot(value: object, names: Mapping[str, str] | None = None, stored: object = None) -> str:

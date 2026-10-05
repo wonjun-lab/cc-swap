@@ -23,7 +23,7 @@ def test_same_address_in_two_organizations_says_the_org():
         "4": {"email": "same@example.com", "organizationUuid": "o-1",
               "organizationName": "Acme Labs"},
     })
-    assert got == {"1": "same·personal", "4": "same·Acme Labs"}
+    assert got == {"1": "same·personal", "4": "same·Acme-Labs"}
 
 
 def test_org_named_after_an_address_shows_no_address():
@@ -32,7 +32,7 @@ def test_org_named_after_an_address_shows_no_address():
               "organizationName": "same@example.com's Organization"},
         "2": {"email": "same@example.com"},
     })
-    assert "@" not in got["1"] and got["1"].startswith("same·same's Org")
+    assert got["1"] == "same·sames-Organization"  # typeable: no quote, no space, no @
     assert got["2"] == "same·personal"
 
 
@@ -175,3 +175,57 @@ def test_cli_resolves_display_names(temp_home):
     assert sw._resolve_account_identifier("school") == "3"
     assert sw._resolve_account_identifier("2") == "2"  # numbers still work
     assert sw.account_names() == {"1": "dev.shared", "2": "jo", "3": "school"}
+
+
+def test_a_digits_only_local_part_never_reads_like_a_slot_number():
+    got = names.display_names([("1", "123456789@qq.example.com", ""),
+                               ("2", "dev@example.com", "")])
+    assert got == {"1": "123456789@qq", "2": "dev"}
+    # With no domain label to add, the slot tells (never a bare number).
+    assert not names.display_names([("1", "42@x", "")])["1"].isdigit()
+
+
+def test_an_alias_that_folds_like_a_short_name_takes_it_over():
+    # ``same.acme`` (alias) and ``same:acme`` (local part) are one name typed
+    # two ways: the short name gives way, as it does to an identical alias.
+    got = names.display_names([("1", "x@example.com", "same.acme"),
+                               ("2", "same:acme@example.com", "")])
+    assert got["1"] == "same.acme" and names.fold(got["2"]) != names.fold(got["1"])
+    assert names.match_name(got, "same·acme") == "1"
+
+
+def test_deep_domains_join_with_a_dash_so_no_name_reads_like_an_address():
+    from claude_swap.maximize import ledger, notify
+
+    got = names.display_names([("1", "jo@cs.stanford.example.edu", ""),
+                               ("2", "jo@ee.stanford.example.edu", ""),
+                               ("3", "a@example.co.uk", ""), ("4", "a@example.com", "")])
+    assert got["1"] == "jo@cs" and got["2"] == "jo@ee"
+    deep = names.display_names([("1", "jo@mail.cs.example.edu", ""),
+                                ("2", "jo@mail.ee.example.edu", "")])
+    assert deep == {"1": "jo@mail-cs", "2": "jo@mail-ee"}
+    for name in (*got.values(), *deep.values()):
+        assert "." not in name.split("@", 1)[1]
+        assert name in notify.scrub(f"switched to {name}.")
+        assert name in ledger._EMAIL_RE.sub("<email>", f"{name} 5h 96%")
+
+
+def test_roster_names_rereads_only_a_changed_file(tmp_path):
+    import json
+    import os
+
+    path = tmp_path / "sequence.json"
+    path.write_text(json.dumps({"accounts": {"1": {"email": "a@example.com"}}}))
+    assert names.roster_names(tmp_path) == {"1": "a"}
+    path.write_text(json.dumps({"accounts": {"1": {"email": "a@example.com", "alias": "work"}}}))
+    st = path.stat()
+    os.utime(path, ns=(st.st_atime_ns, st.st_mtime_ns + 1_000_000))
+    assert names.roster_names(tmp_path) == {"1": "work"}
+    assert names.roster_names(tmp_path / "missing") == {}
+
+
+def test_labeled_tells_an_alias_that_starts_like_the_address():
+    assert names.labeled("dev.shared2", "dev.shared@example.com") == (
+        "dev.shared2 (dev.shared@example.com)"
+    )
+    assert names.labeled("same·Acme-Labs", "same@example.com") == "same·Acme-Labs"

@@ -8936,6 +8936,69 @@ class TestSwitchRemoveGatesAcceptAlias:
         with pytest.raises(ValidationError):
             switcher.remove_account("not an email or alias!")
 
+    @staticmethod
+    def _named_roster(temp_home: Path) -> ClaudeAccountSwitcher:
+        """dev.shared; jo@example and jo@uni; one address in two orgs."""
+        data = {
+            "activeAccountNumber": 1, "sequence": [1, 2, 3, 4, 5],
+            "accounts": {
+                "1": {"email": "dev.shared@example.com", "uuid": "u1"},
+                "2": {"email": "jo@example.com", "uuid": "u2"},
+                "3": {"email": "jo@uni.example.com", "uuid": "u3"},
+                "4": {"email": "same@example.com", "uuid": "u4"},
+                "5": {"email": "same@example.com", "uuid": "u5", "organizationUuid": "o",
+                      "organizationName": "Acme Labs"},
+            },
+        }
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        switcher._write_json(switcher.sequence_file, data)
+        return switcher
+
+    @pytest.mark.parametrize(("typed", "slot"), [
+        ("dev.shared", "1"), ("jo@uni", "3"), ("same·Acme-Labs", "5"), ("same.acme-labs", "5"),
+        ("same:personal", "4"),
+    ])
+    def test_switch_to_by_display_name(self, temp_home: Path, typed, slot):
+        switcher = self._named_roster(temp_home)
+        with patch.object(switcher, "_perform_switch", return_value={
+            "from": None, "to": {"number": int(slot)}, "warnings": [],
+        }) as perform:
+            switcher.switch_to(typed)
+        assert perform.call_args.args[0] == slot
+
+    def test_remove_account_by_display_name(self, temp_home: Path, monkeypatch):
+        switcher = self._named_roster(temp_home)
+        monkeypatch.setattr("builtins.input", lambda *a, **k: "y")
+        with patch.object(switcher, "_delete_account_files"):
+            switcher.remove_account("jo@uni")
+        accounts = switcher._get_sequence_data()["accounts"]
+        assert "3" not in accounts and "2" in accounts
+
+    def test_a_folded_match_of_two_names_is_refused_never_guessed(self, temp_home: Path):
+        from claude_swap.exceptions import ConfigError
+        from claude_swap.maximize.names import match_names
+
+        # Two aliases that differ only in ·/./: can no longer be set (below);
+        # a hand-edited roster with both is refused, not resolved to one.
+        names = {"1": "a.b", "2": "a:b"}
+        assert match_names(names, "a·b") == ["1", "2"]
+        switcher = self._named_roster(temp_home)
+        with patch.object(switcher, "account_names", return_value={"1": "x.y", "2": "x:y"}):
+            with pytest.raises(ConfigError, match="more than one account"):
+                switcher._resolve_account_identifier("x·y")
+
+    def test_an_alias_that_reads_like_another_accounts_name_is_refused(self, temp_home: Path):
+        from claude_swap.exceptions import ConfigError
+
+        switcher = self._named_roster(temp_home)
+        for alias in ("dev.shared", "DEV.Shared", "same.acme-labs"):
+            with pytest.raises(ConfigError, match="already used by"):
+                switcher.set_alias("2", alias)
+        # Its own name is fine; so is a fresh one.
+        assert switcher.set_alias("1", "dev.shared") == ("1", "dev.shared")
+        assert switcher.set_alias("2", "jo-work")[1] == "jo-work"
+
 
 class TestAddAccountAlias:
     """Test the --alias convenience at add time, and preservation on re-add."""

@@ -1141,7 +1141,6 @@ class ClaudeAccountSwitcher:
             raise ConfigError(
                 f"Alias '{normalized}' is already used by {self._alias_owner(conflict, data)}"
             )
-
         record["alias"] = normalized
         data["lastUpdated"] = get_timestamp()
         self._write_json(self.sequence_file, data)
@@ -3887,14 +3886,13 @@ class ClaudeAccountSwitcher:
     def account_names(self, data: dict | None = None) -> dict[str, str]:
         """cc-swap: ``{slot: display name}`` for every managed account
         (maximize/names.py: alias, else short name, made unique). ``{}``
-        when the roster is missing or unreadable — never raises."""
-        from claude_swap.maximize.names import record_names
+        when the roster is missing or unreadable — never raises. Without
+        ``data`` the roster is read through ``names.roster_names``, which
+        re-reads sequence.json only when it changed."""
+        from claude_swap.maximize.names import record_names, roster_names
 
         if data is None:
-            try:
-                data = self._get_sequence_data()
-            except Exception:
-                data = None
+            return roster_names(self.sequence_file.parent)
         return record_names((data or {}).get("accounts"))
 
     def account_name(self, num: object, email: object = "", *, data: dict | None = None) -> str:
@@ -4359,11 +4357,28 @@ class ClaudeAccountSwitcher:
         return labeled(self.account_name(num, email, data=data), email)
 
     def _alias_in_use(self, alias: str, *, exclude_num: str | None = None) -> str | None:
-        """Return the account number already using ``alias`` (other than ``exclude_num``), if any."""
+        """Return the account number already using ``alias`` (other than ``exclude_num``), if any.
+
+        cc-swap: "using" includes reading like another account's name — its
+        alias or the name every surface shows for it (maximize/names.py),
+        case and ``·``/``.``/``:`` aside — or a command would mean two."""
         num = self._find_account_by_alias(alias)
-        if num is not None and num == exclude_num:
+        if num is not None and num != exclude_num:
+            return num
+        from claude_swap.maximize.names import fold
+
+        try:
+            data = self._get_sequence_data() or {}
+        except Exception:
             return None
-        return num
+        accounts = data.get("accounts") or {}
+        for other, shown in sorted(self.account_names(data).items()):
+            if other == exclude_num:
+                continue
+            own = str((accounts.get(other) or {}).get("alias") or "")
+            if fold(alias) in (fold(shown), fold(own)):
+                return other
+        return None
 
     def _resolve_account_identifier(self, identifier: str) -> str | None:
         """Resolve account identifier (number, alias, or email) to account number.
@@ -4389,26 +4404,45 @@ class ClaudeAccountSwitcher:
             if account.get("email") == identifier
         ]
 
+        names = self.account_names(data)
         if len(matches) == 0:
             # cc-swap: the display name every surface shows (alias, else the
-            # short name, made unique; maximize/names.py), case-insensitively.
-            # ``·`` in a name may be typed as ``.`` or ``:``.
-            from claude_swap.maximize.names import match_name
+            # short name, made unique; maximize/names.py), case-insensitively;
+            # ``·``, ``.`` and ``:`` count as one. Never a guess: two
+            # accounts that match only that way are refused.
+            from claude_swap.maximize.names import match_names
 
-            return match_name(self.account_names(data), identifier)
+            found = match_names(names, identifier)
+            if len(found) > 1:
+                raise ConfigError(
+                    f"'{identifier}' matches more than one account: "
+                    f"{', '.join(names[n] for n in found)}. Type the name exactly."
+                )
+            return found[0] if found else None
         if len(matches) == 1:
             return matches[0]
 
-        names = self.account_names(data)
+        from claude_swap.maximize.names import cli_arg
+
         details = ", ".join(
             f"{names.get(num, num)} [{data['accounts'][num].get('organizationName') or 'personal'}]"
             for num in matches
         )
-        example = names.get(matches[0], matches[0])
+        example = cli_arg(names.get(matches[0], matches[0]))
         raise ConfigError(
             f"Email '{identifier}' is ambiguous — matches accounts: {details}. "
             f"Use the account's name instead (e.g., cc-swap switch {example})."
         )
+
+    def _names_account(self, identifier: str) -> bool:
+        """cc-swap: ``identifier`` is some account's display name (one or,
+        ambiguously, more: the resolver then says so)."""
+        from claude_swap.maximize.names import match_names
+
+        try:
+            return bool(match_names(self.account_names(), identifier))
+        except Exception:
+            return False
 
     def _get_sequence_data_migrated(self) -> dict | None:
         """Get sequence data, ensuring org-field migration has run."""
@@ -4970,7 +5004,12 @@ class ClaudeAccountSwitcher:
 
         # Resolve identifier
         if not identifier.isdigit():
-            is_alias = self._find_account_by_alias(identifier) is not None
+            # cc-swap: a display name (maximize/names.py) is as good as an
+            # alias: unique, and what every surface calls the account.
+            is_alias = (
+                self._find_account_by_alias(identifier) is not None
+                or self._names_account(identifier)
+            )
             if not is_alias and not self._validate_email(identifier):
                 raise ValidationError(f"Invalid account identifier: {identifier}")
 
@@ -7490,7 +7529,12 @@ class ClaudeAccountSwitcher:
 
         # Resolve identifier
         if not identifier.isdigit():
-            is_alias = self._find_account_by_alias(identifier) is not None
+            # cc-swap: a display name (maximize/names.py) is as good as an
+            # alias: unique, and what every surface calls the account.
+            is_alias = (
+                self._find_account_by_alias(identifier) is not None
+                or self._names_account(identifier)
+            )
             if not is_alias and not self._validate_email(identifier):
                 raise ValidationError(f"Invalid account identifier: {identifier}")
 

@@ -17,7 +17,7 @@ from claude_swap.maximize import names
      {"3": "jordan.lee@example", "4": "jordan.lee@uni"}),
     # The first domain label is the same too: as much of the domain as it takes.
     ([("1", "a@mail.one.example", ""), ("2", "a@mail.two.example", "")],
-     {"1": "a@mail.one", "2": "a@mail.two"}),
+     {"1": "a@mail-one", "2": "a@mail-two"}),
     # A short name that would read like another account's alias gives way.
     ([("1", "side@example.com", ""), ("2", "other@example.com", "side")],
      {"1": "side@example", "2": "side"}),

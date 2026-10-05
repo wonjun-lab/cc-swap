@@ -62,7 +62,7 @@ def _plain(segs) -> str:
 #: What the screenshots' six accounts need: 26-character names (as wide as
 #: the 23-character names plus the ``#4`` slot they used to carry), a ``team`` plan, ``1h47m · 07:10`` / ``3d19h · Oct 7
 #: 02:18`` resets (``not started`` without the clock), ``login 1d left``.
-NEEDS = home.TableNeeds(rows=6, name=26, slot=0, plan=4, reset5=13, reset5_short=11,
+NEEDS = home.TableNeeds(rows=6, name=26, plan=4, reset5=13, reset5_short=11,
                         reset7=19, reset7_short=5, status=13, detail=6)
 ALWAYS = ("order", "account", "5h", "reset5", "7d", "reset7", "status")
 ORDER = tuple(k for k, _h in home.COLUMNS)
@@ -87,19 +87,18 @@ def _shape(plan: home.TablePlan) -> tuple:
     (100, (6, False, True, 1, 26)),
     # 3. the plan column goes …
     (95, (6, False, False, 1, 26)),
-    # 4. the name shortens with … (down to 13 cells) …
-    (90, (6, False, False, 1, 21)),
-    (85, (6, False, False, 1, 16)),
-    # … then the bars go, the percentages stay and the name takes the room.
-    (84, (0, False, False, 1, 26)),
-    (80, (0, False, False, 1, 25)),
-    (66, (0, False, False, 1, 11)),
+    # 4. then the bars go, the percentages stay; the name is never cut …
+    (90, (0, False, False, 1, 26)),
+    (81, (0, False, False, 1, 26)),
+    # … so past that the row's end is clipped, the name whole.
+    (80, (0, False, False, 1, 26)),
+    (66, (0, False, False, 1, 26)),
 ])
 def test_table_plan_gives_way_in_order(width, shape):
     plan = home.table_plan(width, 40, NEEDS)
     assert _shape(plan) == shape
     assert plan.room == width - home.MARGIN
-    assert plan.total <= plan.room
+    assert plan.total <= plan.room or (plan.bar == 0 and width < 81)
     assert plan.keys == tuple(k for k in ORDER if k in plan.keys)
     assert (plan.width("5h"), plan.width("7d")) == ((plan.bar + 5 if plan.bar else 4),) * 2
     assert plan.width("reset5") == max(NEEDS.reset5 if plan.clock else NEEDS.reset5_short, 9)
@@ -114,20 +113,19 @@ def test_table_plan_never_drops_order_resets_or_status(width, height):
     # The status column starts right after 7d resets: never pushed to the edge.
     assert plan.x("status") == plan.x("reset7") + plan.width("reset7") + plan.gap
     assert plan.x("status") + plan.width("status") == plan.total
-    if width >= 62:
-        assert plan.total <= plan.room
+    # The name is never cut: when nothing else gives, the row's end clips.
+    assert plan.width("account") == NEEDS.name
+    if plan.total > plan.room:
+        assert plan.bar == 0 and not plan.plan and not plan.clock
     assert plan.bar == 0 or home.MIN_BAR <= plan.bar <= home.MAX_BAR
     # The order the details give way in.
     if plan.gap == home.GAP:
-        assert plan.clock and plan.plan and plan.width("account") == NEEDS.name + NEEDS.slot
+        assert plan.clock and plan.plan
     if not plan.plan:
         assert not plan.clock
-    if plan.width("account") < NEEDS.name + NEEDS.slot:
-        assert not plan.plan and plan.gap == home.TIGHT_GAP
     # Wider never shows less.
     wider = home.table_plan(width + 1, height, NEEDS, attention=True)
     assert (wider.clock, wider.plan) >= (plan.clock, plan.plan)
-    assert wider.width("account") >= plan.width("account") or plan.bar == 0
 
 
 def test_table_is_narrower_than_a_wide_terminal():
@@ -155,15 +153,15 @@ def test_the_panel_goes_first_on_a_short_terminal(size, attention, rows, detail,
     assert not home.table_plan(*size, replace(NEEDS, rows=rows, detail=0)).detail
 
 
-def test_the_account_column_fits_the_longest_name_up_to_32():
+def test_the_account_column_fits_the_longest_name_whole():
     def account(name: int, width: int = 220) -> int:
         return home.table_plan(width, 40, replace(NEEDS, name=name)).width("account")
 
     assert account(23) == 23
     assert account(32) == 32
-    assert account(45) == 32              # capped
+    assert account(45) == 45              # never capped: a name is never cut
     assert account(2) == len("account")   # never narrower than its header
-    assert account(26, 80) < 26           # cut with … only when nothing else gives
+    assert account(26, 60) == 26          # not even when nothing else gives
 
 
 def test_table_needs_measures_the_rows():
@@ -174,7 +172,6 @@ def test_table_needs_measures_the_rows():
     needs = home.table_needs([*rows, long, wide], statuses, now=NOW, detail=5)
     assert needs.rows == 8 and needs.detail == 5
     assert needs.name == len("team.shared@example.com")
-    assert needs.slot == 0  # names only: no slot number after them
     assert home.cells("업무 계정") == 9
     assert needs.reset5_short == len("not started")
     assert needs.status == max(len(s[0]) for s in statuses.values() if s)
@@ -1020,22 +1017,20 @@ def test_every_row_shows_its_order_both_resets_and_its_status_after_them(width):
         assert all(len(line.rstrip()) < plan.room for line in lines)
 
 
-def test_the_account_cell_cuts_the_name_and_shows_no_slot():
+def test_the_account_cell_never_cuts_the_name_and_shows_no_slot():
     long = "team.shared@example.com"
     snap = accounts(acc(1, active=True), acc(12, usage(5, 5)))
     rows = [replace(r, name=long) for r in fx.fleet_rows(snap, MX, PRIME, MaximizeState(),
                                                          now=NOW)]
     ctx = render.Ctx(P, window_ticks(MX), NOW)
     statuses = {r.number: ctx.status(r) for r in rows}
-    for width, whole in ((160, True), (75, False)):
+    for width in (160, 75, 50):
         plan = home.table_plan(width, 40, home.table_needs(rows, statuses, now=NOW))
         cells = [_cell(plan, line, "account")
                  for line in render.render_table(rows, plan, ctx, selected=None,
                                                  selected_bg="").text.plain.splitlines()]
-        assert "#" not in "".join(cells)
-        assert (cells[1] == long) is whole
-        if not whole:
-            assert "…" in cells[1] and cells[1].startswith("team.shared")
+        assert "#" not in "".join(cells) and "…" not in "".join(cells)
+        assert cells[1] == long, width
 
 
 def test_a_dead_login_spans_its_bars_with_what_to_do():

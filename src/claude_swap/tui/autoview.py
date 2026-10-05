@@ -579,7 +579,7 @@ class AutoScreen(Screen):
                 f"\n{'●' if row.active else ' '}  ",
                 style=palette.accent if row.active else palette.foreground,
             )
-            line.append(f"{names.get(row.number, row.email):<24.24}  ", style=palette.foreground)
+            line.append(f"{names.get(row.number, row.email):<24}  ", style=palette.foreground)
             line.append(
                 f"{mxview.TIER_LABELS.get(row.tier, row.tier):<11}  ",
                 style=palette.foreground if row.tier == "normal" else palette.muted,

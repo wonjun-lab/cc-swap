@@ -355,13 +355,9 @@ MAX_BAR = 24
 MIN_BAR = 6
 #: The percentage after a bar: `` 62%``.
 PCT_W = 4
-#: The account column is never wider than this for the name itself, …
-NAME_CAP = 32
-#: … and gives up characters only down to this before the bars go (the
-#: percentages stay): ``team.shared@exa…`` tells accounts apart, ``team.s…``
-#: does not. (16: the cells a 13-character name and the `` #4`` slot that
-#: used to follow it took, so the table gives way where it always did.)
-MIN_NAME = 16
+#: (The account column is as wide as the longest name, always: a name is
+#: what every command takes, so it is never cut — the other columns give
+#: way, and past that the row's end is clipped.)
 #: Blank columns between two columns, and when room is tight.
 GAP, TIGHT_GAP = 2, 1
 
@@ -382,7 +378,6 @@ class TableNeeds:
 
     rows: int = 0
     name: int = 0          # the longest display name, in cells
-    slot: int = 0          # the longest suffix after a name (none: names only)
     plan: int = 0          # the longest plan label
     reset5: int = 0        # the longest 5h resets cell, with the clock …
     reset5_short: int = 0  # … and without it
@@ -401,13 +396,6 @@ def plan_text(row: fx.FleetRow) -> str:
     return NOT_KNOWN if row.plan == "?" else row.plan
 
 
-def account_slot(row: fx.FleetRow) -> str:
-    """What follows the name in the table: nothing. The name is what every
-    surface and command calls an account (maximize/names.py); the slot
-    number is an internal id that differs per machine."""
-    return ""
-
-
 def table_needs(
     rows: Sequence[fx.FleetRow],
     statuses: Mapping[str, tuple[str, Tone] | None],
@@ -422,7 +410,6 @@ def table_needs(
     return TableNeeds(
         rows=len(rows),
         name=widest(r.name for r in rows),
-        slot=widest(account_slot(r) for r in rows),
         plan=widest(plan_text(r) for r in rows),
         reset5=widest(row_resets(r, "5h", now, clock=True) for r in rows),
         reset5_short=widest(row_resets(r, "5h", now, clock=False) for r in rows),
@@ -488,7 +475,7 @@ def _columns(
         return key, max(width, cells(HEADERS[key]))
 
     usage = bar + 1 + PCT_W if bar else PCT_W
-    out = [head("order", 1), head("account", name + needs.slot)]
+    out = [head("order", 1), head("account", name)]
     if plan:
         out.append(head("plan", needs.plan))
     out += [
@@ -507,7 +494,7 @@ def _span(columns: Sequence[tuple[str, int]], gap: int) -> int:
 
 def _name_room(room: int, needs: TableNeeds, columns: Sequence[tuple[str, int]], gap: int) -> int:
     """Cells left for the name when every other column takes its width."""
-    return room - (_span(columns, gap) - dict(columns)["account"]) - needs.slot
+    return room - (_span(columns, gap) - dict(columns)["account"])
 
 
 #: The most lines the attention notes take (:func:`attention_lines`).
@@ -525,16 +512,14 @@ def table_plan(
     """The table's columns for a ``width`` x ``height`` terminal.
 
     Everything shows while it fits: bars up to :data:`MAX_BAR`, the reset
-    clocks, the plan, the whole name (up to :data:`NAME_CAP`). When it does
-    not, in this order: the bars shorten to :data:`MIN_BAR`; the columns
-    move closer (:data:`TIGHT_GAP`); the reset clocks go (the countdowns
-    stay); the plan column goes; the status column takes its shorter
-    wording (:func:`short_status`, ``login 1d`` for ``login 1d left``); the
-    name shortens with … (to :data:`MIN_NAME`); then the bars go, leaving
-    the percentages, and the name takes what is left (the status keeps its
-    full wording again once the whole name fits). ``order``, the resets and
-    the status columns never go, so a terminal too narrow even for that
-    clips the row's end.
+    clocks, the plan, the whole name. When it does not, in this order: the
+    bars shorten to :data:`MIN_BAR`; the columns move closer
+    (:data:`TIGHT_GAP`); the reset clocks go (the countdowns stay); the plan
+    column goes; the status column takes its shorter wording
+    (:func:`short_status`, ``login 1d`` for ``login 1d left``); then the
+    bars go, leaving the percentages. The name is never cut: ``order``, the
+    whole name, the resets and the status columns never go, so a terminal
+    too narrow even for that clips the row's end.
 
     Height: ``attention`` is how many lines the attention notes would like
     (:func:`attention_want`; True: one). The first always shows; the others
@@ -547,7 +532,7 @@ def table_plan(
     nothing, and never below :data:`SUMMARY_MIN_ROWS` rows. The table itself
     is used at every size."""
     room = text_width(width)
-    name = min(needs.name, NAME_CAP)
+    name = needs.name
     columns: list[tuple[str, int]] | None = None
     short = False
     for clock, plan, gap in ((True, True, GAP), (True, True, TIGHT_GAP),
@@ -558,7 +543,7 @@ def table_plan(
         if bar >= MIN_BAR:
             columns = _columns(needs, bar=bar, clock=clock, plan=plan, name=name)
             break
-    if columns is None:  # the status shortens, then the name, then the bars go
+    if columns is None:  # the status shortens, then the bars go; never the name
         clock, plan, gap = False, False, TIGHT_GAP
 
         def fit_at(bar: int) -> tuple[int, int | None]:
@@ -576,12 +561,11 @@ def table_plan(
 
         bar = MIN_BAR
         fit, status = fit_at(bar)
-        if fit < min(name, MIN_NAME):
+        if fit < name:
             bar = 0
             fit, status = fit_at(bar)
         short = status is not None
-        columns = _columns(needs, bar=bar, clock=clock, plan=plan,
-                           name=max(min(name, fit), 1), status=status)
+        columns = _columns(needs, bar=bar, clock=clock, plan=plan, name=name, status=status)
     blanks = height >= BLANKS_MIN_ROWS
     want = int(attention)
     fixed_lines = 1 + 1 + 1 + min(want, 1) + 2 * int(blanks)  # status, header, footer

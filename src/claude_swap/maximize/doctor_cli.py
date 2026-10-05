@@ -22,7 +22,6 @@ import sys
 import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
-from pathlib import Path
 
 from claude_swap import paths
 from claude_swap.maximize import doctor as dr
@@ -812,13 +811,9 @@ def _engine_why(backup_root, *, now: float, state: Mapping | None = None) -> dic
 def _names(backup_root) -> dict[str, str]:
     """``{slot: display name}`` (maximize/names.py) from sequence.json; {}
     when it cannot be read."""
-    from claude_swap.maximize.names import record_names
+    from claude_swap.maximize.names import roster_names
 
-    try:
-        data = json.loads((Path(backup_root) / "sequence.json").read_text(encoding="utf-8"))
-    except (OSError, ValueError, RecursionError):
-        return {}
-    return record_names(data.get("accounts") if isinstance(data, dict) else None)
+    return roster_names(backup_root)
 
 
 def _name(backup_root, number: object) -> str:
