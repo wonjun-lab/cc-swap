@@ -310,7 +310,7 @@ class CswapApp(App):
         if "switched" in payload:
             if payload.get("switched"):
                 to = payload.get("to") or {}
-                target = to.get("email") or f"account {to.get('number')}"
+                target = to.get("name") or self.account_name(to.get("number"), to.get("email"))
                 self.notify(f"Switched to {target}", title="Switch")
             else:
                 reason = str(payload.get("reason") or "no switch performed")
@@ -323,9 +323,19 @@ class CswapApp(App):
 
     # -- account operations ----------------------------------------------------
 
+    def account_name(self, number: object, email: object = "") -> str:
+        """Slot ``number``'s display name (maximize/names.py) for a title
+        or toast — never its slot number or whole address."""
+        from claude_swap.maximize.names import name_of
+
+        try:
+            return self.switcher.account_name(number, email)
+        except Exception:
+            return name_of({}, number, email)
+
     def do_switch(self, number: str) -> None:
         self._start_action(
-            f"Switch to account {number}",
+            f"Switch to {self.account_name(number)}",
             partial(self.switcher.switch_to, number, json_output=True),
         )
 
@@ -347,14 +357,16 @@ class CswapApp(App):
         target = not acc.disabled
         verb = "Disable" if target else "Enable"
         self._start_action(
-            f"{verb} account {number}",
+            f"{verb} {self.account_name(number)}",
             partial(self.switcher.set_account_disabled, number, target),
         )
 
     def confirm_remove(self, number: str, email: str) -> None:
+        from claude_swap.maximize.names import labeled
+
         self.push_screen(
             ConfirmModal(
-                f"Remove account {number} ({email})?\n\n"
+                f"Remove {labeled(self.account_name(number, email), email)}?\n\n"
                 "Its stored credentials and config backup are deleted.",
                 title="Remove account",
                 yes_label="Remove",
@@ -365,7 +377,7 @@ class CswapApp(App):
     def _on_remove_confirm(self, number: str, confirmed: bool | None) -> None:
         if confirmed:
             self._start_action(
-                f"Remove account {number}",
+                f"Remove {self.account_name(number)}",
                 partial(self.switcher.remove_account, number, assume_yes=True),
             )
 

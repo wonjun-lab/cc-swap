@@ -58,7 +58,7 @@ def test_stores_a_new_account_in_the_next_free_slot_and_leaves_the_live_login(te
     login = _new_login()
     outcome = _run(s, login)
     assert outcome.ok and outcome.number == "6"  # slots 1, 4, 5 → next is 6
-    assert "new account #6 stored (new@example.com [Team])" == outcome.message
+    assert "new account new@example.com stored [Team]" == outcome.message
     record = s._get_sequence_data()["accounts"]["6"]
     assert record["email"] == NEW and record["uuid"] == "uuid-new"
     assert record["organizationUuid"] == "org-new" and record["organizationName"] == "Team"
@@ -108,7 +108,7 @@ def test_the_plan_is_detected_from_the_credential(temp_home, monkeypatch):
         return code
 
     outcome = _run(s, with_tier)
-    assert outcome.ok and outcome.message.endswith("[Team · 20x])")
+    assert outcome.ok and outcome.message.endswith("[Team · 20x]")
     from claude_swap.maximize.plan import rate_limit_tier_from_credentials
 
     assert rate_limit_tier_from_credentials(
@@ -163,7 +163,7 @@ def test_an_account_already_in_a_slot_is_refused(temp_home):
     login = FakeLogin()  # signs in as #4's account
     outcome = _run(s, login)
     assert outcome.status == rl.DUPLICATE and outcome.number == "4"
-    assert "already #4" in outcome.message and "cc-swap login 4" in outcome.message
+    assert "already four" in outcome.message and "cc-swap login four" in outcome.message
     assert _slot_rt(s) == "rt-four-dead"  # #4 untouched
     assert json.dumps(s._get_sequence_data(), sort_keys=True) == before
     assert not _leftover_profiles(s)
@@ -204,7 +204,7 @@ def test_a_duplicate_can_be_kept_as_that_slots_relogin(temp_home):
     asked = []
     outcome = _run(s, FakeLogin(), adopt_existing=lambda n, e: asked.append((n, e)) or True)
     assert asked == [("4", FOUR)]
-    assert outcome.ok and outcome.number == "4" and "#4 login stored" in outcome.message
+    assert outcome.ok and outcome.number == "4" and "four login stored" in outcome.message
     assert _slot_rt(s) == "rt-four-new"
     assert "6" not in s._get_sequence_data()["accounts"]
 
@@ -293,7 +293,7 @@ def test_cli_new_stores_and_exits_zero(temp_home, monkeypatch, capsys, cli_new):
     cli_new["login"] = _new_login()
     assert _cli(monkeypatch, ["--new", "--slot", "2", "--email", NEW]) == 0
     out = capsys.readouterr().out
-    assert "new account #2 stored" in out and "new account" in out  # + the banner
+    assert "new account new@example.com stored" in out and "new account" in out  # + the banner
     assert _slot_rt(s, "2", NEW) == "rt-new"
 
 
@@ -304,7 +304,7 @@ def test_cli_new_duplicate_exits_one_without_a_terminal(temp_home, monkeypatch, 
     monkeypatch.setattr("sys.stdin.isatty", lambda: False, raising=False)
     assert _cli(monkeypatch, ["--new"]) == 1
     captured = capsys.readouterr()
-    assert "cc-swap login 4" in captured.out + captured.err
+    assert "cc-swap login four" in captured.out + captured.err
     assert _slot_rt(s) == "rt-four-dead"
 
 
@@ -317,7 +317,7 @@ def test_cli_new_duplicate_offers_the_relogin_on_a_terminal(temp_home, monkeypat
                         lambda n, e, **kw: asked.append(kw) or True)
     assert _cli(monkeypatch, ["--new"]) == 0
     assert _slot_rt(s) == "rt-four-new"
-    assert asked == [{"live": False}]  # #1 is live, not #4
+    assert asked == [{"live": False, "name": "four"}]  # #1 is live, not #4
 
 
 def test_cli_new_taken_slot_exits_one_before_the_browser(temp_home, monkeypatch, capsys,

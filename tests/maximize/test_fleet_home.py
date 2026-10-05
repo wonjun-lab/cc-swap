@@ -59,12 +59,12 @@ def _plain(segs) -> str:
 
 # -- the table plan -----------------------------------------------------------------------------
 
-#: What the screenshots' six accounts need: full 22-23 character emails and a
-#: ``#4`` after each, a ``team`` plan, ``1h47m · 07:10`` / ``3d19h · Oct 7
+#: What the screenshots' six accounts need: 26-character names (as wide as
+#: the 23-character names plus the ``#4`` slot they used to carry), a ``team`` plan, ``1h47m · 07:10`` / ``3d19h · Oct 7
 #: 02:18`` resets (``not started`` without the clock), ``login 1d left``.
-NEEDS = home.TableNeeds(rows=6, name=23, slot=3, plan=4, reset5=13, reset5_short=11,
+NEEDS = home.TableNeeds(rows=6, name=26, plan=4, reset5=13, reset5_short=11,
                         reset7=19, reset7_short=5, status=13, detail=6)
-ALWAYS = ("order", "account", "5h", "reset5", "7d", "reset7", "status")
+ALWAYS = ("order", "account", "5h", "7d", "status")
 ORDER = tuple(k for k, _h in home.COLUMNS)
 
 
@@ -87,13 +87,12 @@ def _shape(plan: home.TablePlan) -> tuple:
     (100, (6, False, True, 1, 26)),
     # 3. the plan column goes …
     (95, (6, False, False, 1, 26)),
-    # 4. the name shortens with … (down to 13 cells) …
-    (90, (6, False, False, 1, 21)),
-    (85, (6, False, False, 1, 16)),
-    # … then the bars go, the percentages stay and the name takes the room.
-    (84, (0, False, False, 1, 26)),
-    (80, (0, False, False, 1, 25)),
-    (66, (0, False, False, 1, 11)),
+    # 4. then the bars go, the percentages stay; the name is never cut …
+    (90, (0, False, False, 1, 26)),
+    (81, (0, False, False, 1, 26)),
+    # … then the 7d resets go, then the 5h ones (the status never does).
+    (80, (0, False, False, 1, 26)),
+    (66, (0, False, False, 1, 26)),
 ])
 def test_table_plan_gives_way_in_order(width, shape):
     plan = home.table_plan(width, 40, NEEDS)
@@ -102,32 +101,40 @@ def test_table_plan_gives_way_in_order(width, shape):
     assert plan.total <= plan.room
     assert plan.keys == tuple(k for k in ORDER if k in plan.keys)
     assert (plan.width("5h"), plan.width("7d")) == ((plan.bar + 5 if plan.bar else 4),) * 2
-    assert plan.width("reset5") == max(NEEDS.reset5 if plan.clock else NEEDS.reset5_short, 9)
+    assert ("reset7" in plan.keys) is (width >= 81) and ("reset5" in plan.keys) is (width >= 71)
+    if "reset5" in plan.keys:
+        assert plan.width("reset5") == max(
+            NEEDS.reset5 if plan.clock else NEEDS.reset5_short, 9)
 
 
 @pytest.mark.parametrize("width", range(60, 221, 3))
 @pytest.mark.parametrize("height", [8, 16, 24, 36, 45])
-def test_table_plan_never_drops_order_resets_or_status(width, height):
+def test_table_plan_never_drops_order_names_or_status(width, height):
     plan = home.table_plan(width, height, NEEDS, attention=True)
     assert set(ALWAYS) <= set(plan.keys)
     assert plan.keys == tuple(k for k in ORDER if k in plan.keys)
-    # The status column starts right after 7d resets: never pushed to the edge.
-    assert plan.x("status") == plan.x("reset7") + plan.width("reset7") + plan.gap
+    # The status column is the last, right after the column before it.
+    before = plan.keys[plan.keys.index("status") - 1]
+    assert plan.x("status") == plan.x(before) + plan.width(before) + plan.gap
     assert plan.x("status") + plan.width("status") == plan.total
-    if width >= 62:
-        assert plan.total <= plan.room
+    # The name is never cut, and the status is never what a clipped row
+    # loses: the resets go first (7d, then 5h).
+    assert plan.width("account") == NEEDS.name
+    assert plan.total <= plan.room
+    if "reset7" not in plan.keys:
+        assert plan.bar == 0 and not plan.plan and not plan.clock
+    if "reset5" not in plan.keys:
+        assert "reset7" not in plan.keys
     assert plan.bar == 0 or home.MIN_BAR <= plan.bar <= home.MAX_BAR
     # The order the details give way in.
     if plan.gap == home.GAP:
-        assert plan.clock and plan.plan and plan.width("account") == NEEDS.name + NEEDS.slot
+        assert plan.clock and plan.plan
     if not plan.plan:
         assert not plan.clock
-    if plan.width("account") < NEEDS.name + NEEDS.slot:
-        assert not plan.plan and plan.gap == home.TIGHT_GAP
     # Wider never shows less.
     wider = home.table_plan(width + 1, height, NEEDS, attention=True)
     assert (wider.clock, wider.plan) >= (plan.clock, plan.plan)
-    assert wider.width("account") >= plan.width("account") or plan.bar == 0
+    assert set(plan.keys) <= set(wider.keys)
 
 
 def test_table_is_narrower_than_a_wide_terminal():
@@ -155,15 +162,15 @@ def test_the_panel_goes_first_on_a_short_terminal(size, attention, rows, detail,
     assert not home.table_plan(*size, replace(NEEDS, rows=rows, detail=0)).detail
 
 
-def test_the_account_column_fits_the_longest_name_up_to_32():
+def test_the_account_column_fits_the_longest_name_whole():
     def account(name: int, width: int = 220) -> int:
         return home.table_plan(width, 40, replace(NEEDS, name=name)).width("account")
 
-    assert account(23) == 23 + 3
-    assert account(32) == 32 + 3
-    assert account(45) == 32 + 3          # capped
+    assert account(23) == 23
+    assert account(32) == 32
+    assert account(45) == 45              # never capped: a name is never cut
     assert account(2) == len("account")   # never narrower than its header
-    assert account(23, 80) < 23 + 3       # cut with … only when nothing else gives
+    assert account(26, 60) == 26          # not even when nothing else gives
 
 
 def test_table_needs_measures_the_rows():
@@ -174,7 +181,6 @@ def test_table_needs_measures_the_rows():
     needs = home.table_needs([*rows, long, wide], statuses, now=NOW, detail=5)
     assert needs.rows == 8 and needs.detail == 5
     assert needs.name == len("team.shared@example.com")
-    assert needs.slot == len(" #12")
     assert home.cells("업무 계정") == 9
     assert needs.reset5_short == len("not started")
     assert needs.status == max(len(s[0]) for s in statuses.values() if s)
@@ -400,9 +406,9 @@ def test_the_status_column_gives_way_before_a_name_is_cut():
     """80 columns, the audit's six names and a locked keychain: the status
     column takes the shorter wording of the tags that are too wide, so no
     name is cut."""
-    needs = replace(NEEDS, name=18, status=19, status_short=12)
+    needs = replace(NEEDS, name=21, status=19, status_short=12)
     plan = home.table_plan(80, 24, needs)
-    assert plan.width("account") == 18 + 3 and plan.short_status
+    assert plan.width("account") == 21 and plan.short_status
     assert plan.width("status") < 19
     assert plan.status_text("keychain locked (f)") == "keychain (f)"
     assert plan.status_text("login 1d left") == "login 1d left"   # it fits as it is
@@ -471,7 +477,7 @@ def _sentence(es, dv, sit, *, published_at=None, mx=None):
 def test_live_pending_sentence_names_both_accounts_the_mark_and_the_force():
     variants = _sentence(SERVICE, _pending(), "live")
     assert _plain(variants[0]) == (
-        "Auto ON · using #1 main · 5h 62% past soft 50 — will switch to #2 side when you "
+        "Auto ON · using main · 5h 62% past soft 50 — will switch to side when you "
         "pause (forced at 98%, ~2h)"
     )
     assert variants[0][0] == ("Auto ON", "okb")
@@ -482,7 +488,7 @@ def test_live_pending_sentence_names_both_accounts_the_mark_and_the_force():
 
 def test_dry_run_says_would():
     text = _plain(_sentence(HERE_DRY, _pending(source="here"), "live")[0])
-    assert text.startswith("Dry run · ") and "would switch to #2" in text
+    assert text.startswith("Dry run · ") and "would switch to side" in text
 
 
 @pytest.mark.parametrize(("sit", "es", "first"), [
@@ -550,7 +556,7 @@ def test_with_no_account_the_sentence_and_footer_say_how_to_add_one():
 
 def test_waiting_sentence_claims_no_decision():
     variants = _sentence(OTHER, replace(_pending(), source="computed"), "waiting")
-    assert _plain(variants[0]) == "Auto ON · using #1 main · waiting for the engine's next check"
+    assert _plain(variants[0]) == "Auto ON · using main · waiting for the engine's next check"
     assert all("switch" not in _plain(v) for v in variants)
 
 
@@ -563,7 +569,7 @@ def test_paused_sentence():
 def test_hold_sentences_tell_all_fine_from_stuck_past_soft():
     calm = fx.DecisionView("hold", "4", None, None, "under soft", at=NOW - 10, source="engine")
     assert _plain(_sentence(SERVICE, calm, "live")[0]).startswith(
-        "Auto ON · using #4 work · all fine (5h 3%, moves on past 50%)"
+        "Auto ON · using work · all fine (5h 3%, moves on past 50%)"
     )
     stuck = fx.DecisionView("hold", "1", None, None, "nothing landable", at=NOW - 10,
                             source="engine")
@@ -574,7 +580,7 @@ def test_hold_sentences_tell_all_fine_from_stuck_past_soft():
 def test_switch_exhausted_and_indeterminate_sentences():
     switch = fx.DecisionView("switch", "1", "2", "soft", "", at=NOW - 5, source="engine")
     assert _plain(_sentence(SERVICE, switch, "live")[0]) == (
-        "Auto ON · switching #1 main → #2 side now (soft)"
+        "Auto ON · switching main → side now (soft)"
     )
     spent = fx.DecisionView("exhausted", "1", None, None, "", at=NOW - 5, source="engine")
     assert "every account is at its limit" in _plain(_sentence(SERVICE, spent, "live")[0])
@@ -624,11 +630,11 @@ def test_a_reset_wait_hold_says_it_waits_the_reset_out():
     assert (dv.kind, dv.code) == ("hold", "reset-wait")
     said = _says(SERVICE, dv, rows)
     assert said[0] == (
-        "Auto ON · using #1 main · 5h 96% — resets in 8m, waiting it out "
+        "Auto ON · using main · 5h 96% — resets in 8m, waiting it out "
         "(switches at once if it hits 100%)"
     )
     assert said[1] == (
-        "Auto ON · #1 5h 96% — resets in 8m, waiting it out (switches at once if it hits 100%)"
+        "Auto ON · main 5h 96% — resets in 8m, waiting it out (switches at once if it hits 100%)"
     )
     assert all("nowhere better" not in s and "forced" not in s for s in said)
     # The minutes count down from now, not from when the engine decided.
@@ -637,7 +643,7 @@ def test_a_reset_wait_hold_says_it_waits_the_reset_out():
     # The window reset since: the engine's own words, never a negative count.
     gone = replace(dv, waits=())
     assert _says(SERVICE, gone, rows)[0] == (
-        "Auto ON · using #1 main · 5h 96% — resets in 8m, waiting it out "
+        "Auto ON · using main · 5h 96% — resets in 8m, waiting it out "
         "(switches at once if it hits 100%)"
     )
 
@@ -648,12 +654,12 @@ def test_a_preempt_hold_says_why_and_where_it_moves_at_the_next_pause():
     assert (dv.kind, dv.code, dv.target) == ("hold", "preempt", "2")
     said = _says(SERVICE, dv, rows)
     assert said[0] == (
-        "Auto ON · using #1 main · 7d 84% would pass 90% in ~4h, before your usual quiet "
-        "time (23:00) — will move to #2 side when you pause"
+        "Auto ON · using main · 7d 84% would pass 90% in ~4h, before your usual quiet "
+        "time (23:00) — will move to side when you pause"
     )
-    assert said[2] == "Auto ON · #1 7d 84% would pass 90% in ~4h — to #2 on pause"
+    assert said[2] == "Auto ON · main 7d 84% would pass 90% in ~4h — to side on pause"
     assert _says(HERE_DRY, replace(dv, source="here"), rows)[0].startswith("Dry run · ")
-    assert "would move to #2" in _says(HERE_DRY, dv, rows)[0]
+    assert "would move to side" in _says(HERE_DRY, dv, rows)[0]
     # In the rebalance cooldown it names no target and says it waits.
     cool = replace(state, last_switch_at=NOW - 600)
     dv, rows = _decided(snap, cool, forecast=QUIET_23, rates7={"1": 1.5})
@@ -669,11 +675,11 @@ def test_a_preempt_switch_says_it_moves_early_while_you_are_idle():
     assert (dv.kind, dv.trigger, dv.target) == ("switch", "preempt", "2")
     said = _says(SERVICE, dv, rows)
     assert said[0] == (
-        "Auto ON · switching #1 main → #2 side now while you're idle — 7d 84% would pass "
+        "Auto ON · switching main → side now while you're idle — 7d 84% would pass "
         "90% in ~4h, before your usual quiet time (23:00)"
     )
-    assert said[1] == "Auto ON · switching #1 main → #2 side now while you're idle (preempt)"
-    assert _says(HERE_DRY, dv, rows)[0].startswith("Dry run · would switch #1 main → #2")
+    assert said[1] == "Auto ON · switching main → side now while you're idle (preempt)"
+    assert _says(HERE_DRY, dv, rows)[0].startswith("Dry run · would switch main → side")
 
 
 def test_a_deferred_rebalance_says_it_waits_for_your_quiet_time():
@@ -683,8 +689,8 @@ def test_a_deferred_rebalance_says_it_waits_for_your_quiet_time():
     assert (dv.kind, dv.code, dv.target) == ("hold", "rebalance-deferred", "2")
     said = _says(SERVICE, dv, rows)
     assert said[0] == (
-        "Auto ON · using #1 main · all fine — rebalance deferred to your quiet time (23:00) "
-        "(#2 side scores better; this is usually a busy time)"
+        "Auto ON · using main · all fine — rebalance deferred to your quiet time (23:00) "
+        "(side scores better; this is usually a busy time)"
     )
     assert "Auto ON · rebalance deferred to your quiet time (23:00)" in said
     assert home.next_number(dv, ["2"], "live") == "2"
@@ -773,19 +779,19 @@ def test_attention_names_dead_logins_first_then_expiring_ones():
     by = _by(rows)
     rows = [replace(by["4"], login_deadline=NOW + 28 * H) if r.number == "4" else r
             for r in rows]
-    dead = "! #3 old needs re-login — select it, press r"
+    dead = "! old needs re-login — select it, press r"
     # Wide: both on one line, red (a dead login).
-    assert _attention(rows, 200) == [(f"{dead} · #4 work login ends in 1d 4h", "crit")]
+    assert _attention(rows, 200) == [(f"{dead} · work login ends in 1d 4h", "crit")]
     # Narrower: a line each, every one saying what to do, each in its own colour.
     assert _attention(rows, 60) == [
-        (dead, "crit"), ("! #4 work login ends in 1d 4h — select it, press r", "warn"),
+        (dead, "crit"), ("! work login ends in 1d 4h — select it, press r", "warn"),
     ]
     # One line only: the dead login, the other when it fits after it, else
     # how many did not (unless saying so would cut the first note).
     assert _attention(rows, 60, lines=1) == [(f"{dead} (+1 more)", "crit")]
-    assert _attention(rows, 33, lines=1) == [("! #3 old needs re-login (+1 more)", "crit")]
-    assert _attention(rows, 30, lines=1) == [("! #3 old needs re-login", "crit")]
-    assert _attention(rows, 20, lines=1) == [("! " + fx.clip("#3 old needs re-login", 18),
+    assert _attention(rows, 33, lines=1) == [("! old needs re-login (+1 more)", "crit")]
+    assert _attention(rows, 29, lines=1) == [("! old needs re-login", "crit")]
+    assert _attention(rows, 20, lines=1) == [("! " + fx.clip("old needs re-login", 18),
                                               "crit")]
 
 
@@ -793,7 +799,7 @@ def test_attention_tone_and_extra_parts():
     rows = [r for r in _fleet()[3] if r.login != "relogin"]
     assert home.attention_notices(rows, now=NOW) == []
     soon = [replace(rows[1], login_deadline=NOW + 3 * DAY)]
-    assert _attention(soon, 200) == [("! #2 side login ends in 3d 0h — select it, press r",
+    assert _attention(soon, 200) == [("! side login ends in 3d 0h — select it, press r",
                                       "warn")]
     guard = "paused: claude 2.1.3 -> 2.1.4 (cc-swap prime verify)"
     assert home.attention_notices(rows, now=NOW, prime_guard=guard, priming=False) == []
@@ -813,9 +819,9 @@ def test_a_killed_claude_comes_right_after_a_dead_login_and_keeps_its_remedy():
             for r in rows]
     lines = _attention(rows, W80, prime_guard=KILLED, priming=True)
     assert [t for t, _ in lines] == [
-        "! #3 old needs re-login — select it, press r",
+        "! old needs re-login — select it, press r",
         "! claude 2.1.4 killed by macOS — priming paused (fix: cc-swap doctor)",
-        "! #4 work login ends in 1d 4h — select it, press r",
+        "! work login ends in 1d 4h — select it, press r",
     ]
     assert _attention(rows, 117, prime_guard=KILLED, priming=True)[1][0] == (
         "! claude 2.1.4 killed by macOS at launch — priming paused (cc-swap doctor shows the fix)"
@@ -859,14 +865,14 @@ def test_priming_paused_is_worded_for_the_width(view, width, line, alarm):
 def test_a_relogin_pause_does_not_ask_for_a_relogin():
     rows = _fleet()[3]
     (line, _tone), = _attention(rows, 200, relogin_paused=True)
-    assert line == "! #3 old needs re-login"
+    assert line == "! old needs re-login"
 
 
 def test_a_locked_keychain_says_how_to_unlock_it():
     rows = [replace(r, login="keychain") if r.number == "2" else r
             for r in _fleet()[3] if r.login != "relogin"]
-    assert _attention(rows, 200) == [("! #2 side keychain locked — unlock it, press f", "warn")]
-    assert _attention(rows, 42) == [("! #2 keychain locked — unlock it, press f", "warn")]
+    assert _attention(rows, 200) == [("! side keychain locked — unlock it, press f", "warn")]
+    assert _attention(rows, 42) == [("! side keychain locked (f)", "warn")]
 
 
 def test_attention_lines_take_only_rows_the_table_leaves():
@@ -1004,7 +1010,8 @@ def test_every_row_shows_its_order_both_resets_and_its_status_after_them(width):
     marks = home.order_marks(ordered, ctx.picks, ctx.forced)
     for row, line in zip(ordered, lines):
         assert _cell(plan, line, "order") == marks[row.number]
-        assert _cell(plan, line, "account").endswith(f"#{row.number}")
+        cell = _cell(plan, line, "account")
+        assert "#" not in cell and row.name.startswith(cell.rstrip("…")), cell
         assert _cell(plan, line, "reset5") == home.row_resets(row, "5h", NOW, clock=plan.clock)
         assert _cell(plan, line, "reset7") == home.row_resets(row, "7d", NOW, clock=plan.clock)
         status = ctx.status(row)
@@ -1019,22 +1026,20 @@ def test_every_row_shows_its_order_both_resets_and_its_status_after_them(width):
         assert all(len(line.rstrip()) < plan.room for line in lines)
 
 
-def test_the_account_cell_cuts_the_name_but_keeps_the_slot():
+def test_the_account_cell_never_cuts_the_name_and_shows_no_slot():
     long = "team.shared@example.com"
     snap = accounts(acc(1, active=True), acc(12, usage(5, 5)))
     rows = [replace(r, name=long) for r in fx.fleet_rows(snap, MX, PRIME, MaximizeState(),
                                                          now=NOW)]
     ctx = render.Ctx(P, window_ticks(MX), NOW)
     statuses = {r.number: ctx.status(r) for r in rows}
-    for width, whole in ((160, True), (75, False)):
+    for width in (160, 75, 50):
         plan = home.table_plan(width, 40, home.table_needs(rows, statuses, now=NOW))
         cells = [_cell(plan, line, "account")
                  for line in render.render_table(rows, plan, ctx, selected=None,
                                                  selected_bg="").text.plain.splitlines()]
-        assert cells[1].endswith(" #12") and cells[0].endswith(" #1")
-        assert (cells[1] == f"{long} #12") is whole
-        if not whole:
-            assert "…" in cells[1] and cells[1].startswith("team.shared")
+        assert "#" not in "".join(cells) and "…" not in "".join(cells)
+        assert cells[1] == long, width
 
 
 def test_a_dead_login_spans_its_bars_with_what_to_do():
@@ -1075,7 +1080,7 @@ def test_the_panel_shows_the_selected_account_in_full():
     row1 = replace(_by(rows)["1"], login_deadline=NOW + 21 * DAY)
     lines = render.render_detail(row1, a1, 117, ctx).plain.splitlines()
     assert lines[0] == "─" * 117
-    assert lines[1].startswith("main (u1@x.com) #1  personal · 20x  ● active")
+    assert lines[1].startswith("main (u1@x.com)  personal · 20x  ● active")
     labels = [line.split()[0] for line in lines[2:-1]]
     assert labels == ["5h", "7d", "Fable"]
     assert lines[2].rstrip().endswith(home.exact_reset(row1.reset5, NOW))
@@ -1131,17 +1136,17 @@ def test_a_hold_on_the_active_account_is_the_sentence():
     clock = account_hold.clock_text(NOW + 2 * H, NOW)
     variants = _held_sentence(_pending())
     assert _plain(variants[0]) == (
-        f"Holding #1 main until {clock} (2h left) — only hard 98%/100% will move you "
+        f"Holding main until {clock} (2h left) — only hard 98%/100% will move you "
         "(h to change)"
     )
     assert variants[0][0] == ("Holding", "okb") and variants[0][-1] == ("(h to change)", "dim")
     # The wording the user asked for, at a narrower width.
     assert _plain(variants[1]) == (
-        f"Holding #1 until {clock} (2h left) — only hard 98%/100% will move you"
+        f"Holding main until {clock} (2h left) — only hard 98%/100% will move you"
     )
     lengths = [home.seg_len(v) for v in variants]
     assert lengths == sorted(lengths, reverse=True)
-    assert _plain(variants[-1]) == "Holding #1"
+    assert _plain(variants[-1]) == "Holding main"
     different = _held_sentence(_pending(), mx=MX)
     assert "only a hard mark (5h 95%, 7d 98%) or 100% will move you" in _plain(different[0])
 
@@ -1155,7 +1160,7 @@ def test_a_hold_on_the_active_account_is_the_sentence():
 ])
 def test_the_hold_is_worded_for_every_decision_it_sets_aside(dv):
     sit = "waiting" if dv.source == "computed" else "live"
-    assert _plain(_held_sentence(dv, sit=sit)[0]).startswith("Holding #1 main until ")
+    assert _plain(_held_sentence(dv, sit=sit)[0]).startswith("Holding main until ")
 
 
 @pytest.mark.parametrize("dv", [
@@ -1182,7 +1187,7 @@ def test_past_hard_with_nowhere_roomier_is_worded_and_never_a_hold():
     for hold in (HOLD, None):  # held or not: the hard mark is what it is
         variants = _held_sentence(HARD_STAY, hold=hold)
         assert _plain(variants[0]) == (
-            "Auto ON · using #1 main · 5h 99% >= hard 98% — no account has more room, "
+            "Auto ON · using main · 5h 99% >= hard 98% — no account has more room, "
             "it stays (switches at once at 100%)"
         )
         assert not any("Holding" in _plain(v) or "only hard" in _plain(v) for v in variants)
@@ -1209,13 +1214,13 @@ def test_a_lifted_hold_is_not_worded_from_a_stale_engine_word():
     assert not _plain(_held_sentence(coded, hold=None)[0]).startswith("Holding")
     # A caller that never read the marker words the engine's own code.
     said = _plain(_held_sentence(coded, hold=None, hold_read=False)[1])
-    assert said == "Holding #1 until 15:30 (2h left) — only hard 98%/100% will move you"
+    assert said == "Holding main until 15:30 (2h left) — only hard 98%/100% will move you"
 
 
 def test_a_dry_run_hold_says_dry_run():
     first = _held_sentence(_pending(source="here"), es=HERE_DRY)[0]
     assert first[0] == ("Dry run", "warnb")
-    assert _plain(first).startswith("Dry run · holding #1 main until ")
+    assert _plain(first).startswith("Dry run · holding main until ")
 
 
 @pytest.mark.parametrize("width", [157, 117, 77, 60, 40, 20])
@@ -1257,9 +1262,9 @@ def test_capacity_counts_the_accounts_switching_can_use():
     cap = home.capacity(CAP_ROWS, MX, NOW)
     assert cap.usable == 5                         # 1, 2, 3, 4, 8
     assert cap.free5 == 2                          # 2 and 3 (8's week is spent)
-    assert cap.back5 == (NOW + 1 * H, "4")         # 1 is back later, 8's week is spent
+    assert cap.back5 == (NOW + 1 * H, "acct4")         # 1 is back later, 8's week is spent
     assert cap.left7 == pytest.approx((60 + 80 + 70 + 50 + 1) / 100)
-    assert cap.next7 == (NOW + 2 * DAY, "2")       # the dead/excluded/lapsed ones skipped
+    assert cap.next7 == (NOW + 2 * DAY, "acct2")       # the dead/excluded/lapsed ones skipped
 
 
 def test_the_account_named_back_is_one_switching_could_land_on():
@@ -1273,7 +1278,7 @@ def test_the_account_named_back_is_one_switching_could_land_on():
         _cap_row(3, 48, 30, reset5=NOW + 1.5 * H, reset7=NOW + 4 * DAY),  # 5h past soft-5
     ]
     cap = home.capacity(rows, mx, NOW)
-    assert cap.back5 == (NOW + 1.5 * H, "3")
+    assert cap.back5 == (NOW + 1.5 * H, "acct3")
 
 
 def test_free_and_back_follow_one_rule():
@@ -1292,7 +1297,7 @@ def test_free_and_back_follow_one_rule():
     ]
     cap = home.capacity(rows, mx, NOW)
     assert cap.free5 == 2                       # #1 and #4
-    assert cap.back5 == (NOW + 0.5 * H, "2")    # not #1 (active), #3/#5 (login guard)
+    assert cap.back5 == (NOW + 0.5 * H, "acct2")    # not #1 (active), #3/#5 (login guard)
     active_past = [replace(rows[0], pct5=55.0), rows[3]]
     cap = home.capacity(active_past, mx, NOW)
     assert cap.free5 == 1 and cap.back5 is None  # the active one is never named back
@@ -1308,10 +1313,10 @@ def test_the_summary_line_and_how_it_gives_way():
     variants = [_plain(v) for v in home.summary_variants(cap, NOW)]
     # Countdowns, as the table's resets count; the 7d room goes first.
     assert variants == [
-        "5h free: 2 accounts · next back in 1h00m (#4) · 7d left this week ≈ 2.6 accounts"
-        " · next 7d in 2d00h (#2)",
-        "5h free: 2 accounts · next back in 1h00m (#4) · next 7d in 2d00h (#2)",
-        "5h free: 2 accounts · next back in 1h00m (#4)",
+        "5h free: 2 accounts · next back in 1h00m (acct4) · 7d left this week ≈ 2.6 accounts"
+        " · next 7d in 2d00h (acct2)",
+        "5h free: 2 accounts · next back in 1h00m (acct4) · next 7d in 2d00h (acct2)",
+        "5h free: 2 accounts · next back in 1h00m (acct4)",
         "5h free: 2 accounts",
     ]
     for width in (200, 90, 70, 40, 15):

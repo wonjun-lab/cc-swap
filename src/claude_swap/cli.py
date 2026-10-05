@@ -11,6 +11,7 @@ import sys
 from claude_swap import __version__, paths, printer
 from claude_swap.exceptions import ClaudeSwitchError, ValidationError
 from claude_swap.json_output import error_envelope
+from claude_swap.maximize.names import cli_arg, labeled, name_of
 from claude_swap.printer import (
     accent,
     bolded,
@@ -315,14 +316,15 @@ Examples:
         store.set(target, email, org_uuid)
 
         shown = normalize_path(target)
+        account = labeled(switcher.account_name(account_num, email), email)
         if previous and previous.get("email") != email:
             prev_email = previous.get("email")
             print(
-                f"{accent('Mapped')} {shown} → Account-{account_num} ({email}) "
+                f"{accent('Mapped')} {shown} → {account} "
                 f"{muted(f'(was {prev_email})')}"
             )
         else:
-            print(f"{accent('Mapped')} {shown} → Account-{account_num} ({email})")
+            print(f"{accent('Mapped')} {shown} → {account}")
     except ClaudeSwitchError as e:
         error(f"Error: {e}")
         sys.exit(1)
@@ -409,10 +411,14 @@ def _unclaimed_command(argv: list[str]) -> None:
         if not entries:
             print(dimmed("No unclaimed credential entries"))
             return
+        names = switcher.account_names()
         for entry_id, meta in sorted(entries.items()):
-            slot = meta.get("configSlot") or "?"
+            slot = meta.get("configSlot")
+            # The slot the entry was made for, by its name today (an entry
+            # outlives a move or removal: then the bare slot says it).
+            who = name_of(names, slot)
             reason = meta.get("reason") or "orphaned (no manifest row)"
-            print(f"{entry_id}  slot {slot}  {reason}")
+            print(f"{entry_id}  {who}  {reason}")
     except ClaudeSwitchError as e:
         error(f"Error: {e}")
         sys.exit(1)
@@ -452,12 +458,15 @@ Examples:
         switcher = ClaudeAccountSwitcher(debug=args.debug)
         _guard_root(switcher)
         num_a, num_b = switcher.swap_accounts(args.first, args.second)
-        print(f"{accent('Swapped')} Account {num_a} and Account {num_b}:")
         data = switcher._get_sequence_data() or {}
+        names = switcher.account_names(data)
+        print(
+            f"{accent('Swapped')} {name_of(names, num_a)} and {name_of(names, num_b)}:"
+        )
         accounts = data.get("accounts", {})
         for num in sorted((num_a, num_b), key=int):
             email = accounts.get(num, {}).get("email", "")
-            print(f"  {num}: {email}")
+            print(f"  {num}: {labeled(name_of(names, num, email), email)}")
     except ClaudeSwitchError as e:
         error(f"Error: {e}")
         sys.exit(1)
@@ -499,18 +508,24 @@ Examples:
         _guard_root(switcher)
         num_src, num_target, swapped = switcher.move_account(args.account, args.slot)
         data = switcher._get_sequence_data() or {}
+        names = switcher.account_names(data)
         accounts = data.get("accounts", {})
+
+        def shown(num: str) -> str:
+            email = accounts.get(num, {}).get("email", "")
+            return labeled(name_of(names, num, email), email)
+
         if num_src == num_target:
-            email = accounts.get(num_target, {}).get("email", "")
-            print(f"{dimmed('Already in')} slot {num_target}: {email}")
+            print(f"{dimmed('Already in')} slot {num_target}: {shown(num_target)}")
         elif swapped:
-            print(f"{accent('Swapped')} Account {num_src} and Account {num_target}:")
+            print(
+                f"{accent('Swapped')} {name_of(names, num_src)} and "
+                f"{name_of(names, num_target)}:"
+            )
             for num in sorted((num_src, num_target), key=int):
-                email = accounts.get(num, {}).get("email", "")
-                print(f"  {num}: {email}")
+                print(f"  {num}: {shown(num)}")
         else:
-            email = accounts.get(num_target, {}).get("email", "")
-            print(f"{accent('Moved')} {email} to slot {num_target}")
+            print(f"{accent('Moved')} {shown(num_target)} to slot {num_target}")
     except ClaudeSwitchError as e:
         error(f"Error: {e}")
         sys.exit(1)
@@ -577,15 +592,16 @@ Examples:
                 return
             print(bolded("Aliases:"))
             for num, alias_name, email in rows:
-                print(f"  {num}: {alias_name} {muted(f'({email})')}")
+                print(f"  {alias_name} {muted(f'({email})')}")
             return
 
         if args.unset:
             account_num = switcher.unset_alias(args.account)
-            print(f"{accent('Removed alias')} for Account {account_num}")
+            print(f"{accent('Removed alias')} for {switcher.account_name(account_num)}")
         else:
             account_num, normalized = switcher.set_alias(args.account, args.alias_name)
-            print(f"{accent('Set alias')} '{normalized}' for Account {account_num}")
+            email = switcher.account_email(account_num)
+            print(f"{accent('Set alias')} '{normalized}' for {email or normalized}")
     except ClaudeSwitchError as e:
         error(f"Error: {e}")
         sys.exit(1)
@@ -803,14 +819,10 @@ Defaults live in settings.json in the backup root; flags override them.
 
     def human_emit(event: AutoSwitchEvent) -> None:
         stamp = _time.strftime("%H:%M:%S")
-        # cc-swap: under maximize, name accounts by alias / short name, not
-        # address (auto.log gets pasted into issues). The strategy is read per
-        # line: a hot reload can change it.
-        live = running[0].settings if running else settings
-        if live.strategy == "maximize":
-            with account_names(display_name_hook(switcher.backup_dir)):
-                line = event.human()
-        else:
+        # cc-swap: name accounts by their display name (alias / short name,
+        # maximize/names.py), never slot number or address (auto.log gets
+        # pasted into issues). Read fresh per line: a rename shows at once.
+        with account_names(display_name_hook(switcher.backup_dir)):
             line = event.human()
         if event.kind == "switch":
             line = accent(line)
@@ -1122,7 +1134,9 @@ Examples:
         entries = list(parse_model_names(load_maximize_settings(root).last_resort))
 
         if action == "list":
-            accounts = (switcher._get_sequence_data() or {}).get("accounts", {})
+            data = switcher._get_sequence_data() or {}
+            accounts = data.get("accounts", {})
+            names = switcher.account_names(data)
             if not entries:
                 print(dimmed("No last-resort accounts"))
                 return
@@ -1130,13 +1144,15 @@ Examples:
             for entry in entries:
                 nums = _last_resort_matches(accounts, entry)
                 where = (
-                    ", ".join(f"Account-{n}" for n in nums)
+                    ", ".join(name_of(names, n) for n in nums)
                     if nums else muted("(no matching account)")
                 )
                 print(f"  {entry} → {where}")
             return
 
-        accounts = (switcher._get_sequence_data() or {}).get("accounts", {})
+        data = switcher._get_sequence_data() or {}
+        accounts = data.get("accounts", {})
+        names = switcher.account_names(data)
         dangling = [
             e for e in entries
             if e.lower() == args.account.strip().lower() and not _last_resort_matches(accounts, e)
@@ -1152,14 +1168,15 @@ Examples:
             print(f"{accent('Removed')} {dangling[0]} from last-resort (it named no account)")
             return
         num, email, _ = switcher.resolve_account(args.account)
+        who = name_of(names, num, email)
 
         if action == "add":
             if num in {n for e in entries for n in _last_resort_matches(accounts, e)}:
-                print(dimmed(f"Account-{num} ({email}) is already last-resort."))
+                print(dimmed(f"{who} is already last-resort."))
                 return
             entries.append(_last_resort_entry(accounts, num, email))
             set_setting(root, "maximize.lastResort", ",".join(entries))
-            print(f"{accent('Marked')} Account-{num} ({email}) last-resort")
+            print(f"{accent('Marked')} {who} last-resort")
             strategy = load_settings(root).strategy
             if strategy != "maximize":
                 print(dimmed(
@@ -1172,21 +1189,21 @@ Examples:
         # guaranteed normal afterwards.
         dropped = [e for e in entries if num in _last_resort_matches(accounts, e)]
         if not dropped:
-            print(dimmed(f"Account-{num} ({email}) is not last-resort."))
+            print(dimmed(f"{who} is not last-resort."))
             return
         kept = [e for e in entries if e not in dropped]
         if kept:
             set_setting(root, "maximize.lastResort", ",".join(kept))
         else:
             unset_setting(root, "maximize.lastResort")
-        print(f"{accent('Removed')} Account-{num} ({email}) from last-resort")
+        print(f"{accent('Removed')} {who} from last-resort")
         also = sorted(
             {n for e in dropped for n in _last_resort_matches(accounts, e)} - {num},
             key=int,
         )
         if also:
             warning(
-                f"  Also returned {', '.join(f'Account-{n}' for n in also)} "
+                f"  Also returned {', '.join(name_of(names, n) for n in also)} "
                 "(the removed entry named them too); re-add by alias if needed."
             )
     except ClaudeSwitchError as e:
@@ -1590,6 +1607,7 @@ new deadline. Other machines keep their own logins: run this there too.
                     switcher, new, claude=claude,
                     adopt_existing=lambda n, e: _ask_adopt_existing(
                         n, e, live=switcher.current_account_number() == n,
+                        name=switcher.account_name(n, e),
                     ),
                 )
             else:
@@ -1625,27 +1643,30 @@ new deadline. Other machines keep their own logins: run this there too.
     elif args.new:
         error(f"New account: {outcome.message}")
     else:
-        error(f"Re-login #{num}: {outcome.message}")
+        error(f"Re-login {switcher.account_name(num, email)}: {outcome.message}")
     sys.exit(1)
 
 
-def _ask_adopt_existing(number: str, email: str, *, live: bool = False) -> bool:
-    """``login --new`` signed in as an account already in slot ``number``:
-    offer to keep this fresh login as that slot's re-login (a terminal
-    only; otherwise refused). ``live``: that slot is the account Claude Code
-    is logged in as, so the re-login rewrites the live login too — said in
-    the prompt."""
+def _ask_adopt_existing(
+    number: str, email: str, *, live: bool = False, name: str = ""
+) -> bool:
+    """``login --new`` signed in as an account already in slot ``number``
+    (called ``name``): offer to keep this fresh login as that slot's
+    re-login (a terminal only; otherwise refused). ``live``: that slot is
+    the account Claude Code is logged in as, so the re-login rewrites the
+    live login too — said in the prompt."""
     if not sys.stdin.isatty():
         return False
-    warning(f"{email} is already #{number}.")
+    name = name or name_of({}, number, email)
+    warning(f"{email} is already added as {name}.")
     if live:
         warning(
-            f"#{number} is the account Claude Code is logged in as: storing this "
+            f"{name} is the account Claude Code is logged in as: storing this "
             "login as its re-login replaces the live login too (like "
-            f"cc-swap login {number})."
+            f"cc-swap login {cli_arg(name)})."
         )
     try:
-        answer = input(f"Store this login as #{number}'s new login instead? [y/N] ")
+        answer = input(f"Store this login as {name}'s new login instead? [y/N] ")
     except EOFError:
         return False
     return answer.strip().lower() in ("y", "yes")

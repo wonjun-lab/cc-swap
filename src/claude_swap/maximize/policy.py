@@ -130,6 +130,7 @@ from claude_swap.maximize import hold as account_hold
 from claude_swap.maximize import idle
 from claude_swap.maximize import ride as learned_ride
 from claude_swap.maximize.history import QUIET_P
+from claude_swap.maximize.names import view_name
 from claude_swap.maximize.model import (
     TIER_ORDER,
     AccountView,
@@ -382,7 +383,7 @@ def idle_note(snap: Snapshot) -> str:
 
 
 def _target(v: AccountView, snap: Snapshot) -> str:
-    out = f"#{v.number} ({v.tier}, score {score(v, snap.now):.2f})"
+    out = f"{view_name(v)} ({v.tier}, score {score(v, snap.now):.2f})"
     if draining(v, snap):
         out += f": {drain.text(v, snap)}"
     return out
@@ -490,14 +491,14 @@ def _force(
     s = snap.settings
     if reached:
         if reached[0] == "5h":
-            why = f"#{a.number} 5h {_pct(a.pct5)} >= hard {_pct(s.hard_5h)}"
+            why = f"{view_name(a)} 5h {_pct(a.pct5)} >= hard {_pct(s.hard_5h)}"
         else:
-            why = f"#{a.number} 7d {_pct(a.pct7)} >= hard {_pct(s.hard_7d)}"
+            why = f"{view_name(a)} 7d {_pct(a.pct7)} >= hard {_pct(s.hard_7d)}"
         return _Force(why, reached, reached=True)
     if forced:
         eta = min(forced.values())
         return _Force(
-            f"#{a.number} reaches a hard cap in ~{eta:.1f} min "
+            f"{view_name(a)} reaches a hard cap in ~{eta:.1f} min "
             f"(<= {s.force_eta_min} min)",
             tuple(forced),
         )
@@ -629,7 +630,7 @@ def _ride_reset_wait(
         if r is not None
     )
     return Hold(
-        f"#{a.number} {held}, waiting it out (switches at once if it hits 100%)",
+        f"{view_name(a)} {held}, waiting it out (switches at once if it hits 100%)",
         pending=False,
         reset_wait_until=max(r for r in resets if r is not None),
         code="reset-wait",
@@ -675,7 +676,7 @@ def _hard_or_ride(
         )
     label = " / ".join(f"{w} {_pct(_window_pct(a, w))}" for w in windows)
     return Hold(
-        f"#{a.number} {label} — riding to the limit, switching in "
+        f"{view_name(a)} {label} — riding to the limit, switching in "
         f"~{max(1, round((until - snap.now) / 60.0))}m "
         f"({'capped' if capped else 'learned'}) or at your next pause",
         pending=False,
@@ -690,9 +691,9 @@ def _soft_reason(
 ) -> str | None:
     s = snap.settings
     if "5h" not in skip and a.pct5 >= s.soft_5h:
-        return f"#{a.number} 5h {_pct(a.pct5)} >= soft {_pct(s.soft_5h)}"
+        return f"{view_name(a)} 5h {_pct(a.pct5)} >= soft {_pct(s.soft_5h)}"
     if "7d" not in skip and a.pct7 >= s.soft_7d and not draining(a, snap):
-        return f"#{a.number} 7d {_pct(a.pct7)} >= soft {_pct(s.soft_7d)}"
+        return f"{view_name(a)} 7d {_pct(a.pct7)} >= soft {_pct(s.soft_7d)}"
     return None
 
 
@@ -787,7 +788,7 @@ def _reset_wait(
         for w, left in waits.items()
     )
     return Hold(
-        f"#{a.number} {held}, waiting it out (switches at once if it hits 100%)",
+        f"{view_name(a)} {held}, waiting it out (switches at once if it hits 100%)",
         pending=False,
         reset_wait_until=max(
             r for r in (_window_reset(a, w) for w in waits) if r is not None
@@ -806,7 +807,7 @@ def _at_limit(snap: Snapshot, landing: list[AccountView], why: str) -> Decision:
         return Switch(
             top.number,
             "at-limit",
-            f"{why}; nothing landable, #{top.number} is under the hard caps "
+            f"{why}; nothing landable, {view_name(top)} is under the hard caps "
             f"({_usage(top)})",
         )
     last = limit_candidates(snap)
@@ -815,7 +816,7 @@ def _at_limit(snap: Snapshot, landing: list[AccountView], why: str) -> Decision:
         return Switch(
             top.number,
             "at-limit",
-            f"{why}; nothing under the hard caps, #{top.number} has "
+            f"{why}; nothing under the hard caps, {view_name(top)} has "
             f"{binding_room(top):g} pts left ({_usage(top)})",
         )
     return Exhausted(f"{why}; every account is at its limit")
@@ -834,7 +835,7 @@ def _hard(
         return Switch(
             top.number,
             "hard",
-            f"{force.reason}; nothing landable, #{top.number} has the most "
+            f"{force.reason}; nothing landable, {view_name(top)} has the most "
             f"{windows} room under the hard caps ({_usage(top)})",
         )
     # Every reachable account would hit a cap no later than the active: stay
@@ -842,7 +843,7 @@ def _hard(
     # decision of its own (``hard-stay``): an account hold never words it.
     return Hold(
         f"{force.reason}; nothing landable and no account under the hard caps "
-        f"has more {windows} room than #{a.number}; staying",
+        f"has more {windows} room than {view_name(a)}; staying",
         pending=False,
         code="hard-stay",
     )
@@ -855,7 +856,7 @@ def _soft(snap: Snapshot, landing: list[AccountView], why: str) -> Decision:
     if is_idle(snap):
         return Switch(top.number, "soft", f"{why}; idle; -> {_target(top, snap)}")
     return Hold(
-        f"{why}; waiting for idle to move to #{top.number} ({idle_note(snap)})",
+        f"{why}; waiting for idle to move to {view_name(top)} ({idle_note(snap)})",
         pending=True,
     )
 
@@ -980,7 +981,7 @@ def _preempt(
     if target is None:
         return None
     why = (
-        f"#{a.number} 7d {_pct(a.pct7)} would pass {_pct(s.soft_7d)} "
+        f"{view_name(a)} 7d {_pct(a.pct7)} would pass {_pct(s.soft_7d)} "
         f"in {_hours(hours)}, {when}"
     )
     left = _cooldown_left(snap)
@@ -992,7 +993,7 @@ def _preempt(
         )
     if not is_idle(snap):
         return Hold(
-            f"{why} — will move to #{target.number} at the next idle moment "
+            f"{why} — will move to {view_name(target)} at the next idle moment "
             f"({idle_note(snap)})",
             pending=False,
             code="preempt",
@@ -1000,7 +1001,7 @@ def _preempt(
     return Switch(
         target.number,
         "preempt",
-        f"{why} — moving to #{target.number} now while you're idle",
+        f"{why} — moving to {view_name(target)} now while you're idle",
     )
 
 
@@ -1055,7 +1056,7 @@ def _rebalance(
     s = snap.settings
     if not landing:
         return Hold(
-            f"#{a.number} under soft ({_usage(a)}); nothing else landable",
+            f"{view_name(a)} under soft ({_usage(a)}); nothing else landable",
             pending=False,
         )
     top = landing[0]
@@ -1064,7 +1065,7 @@ def _rebalance(
     if TIER_ORDER[top.tier] < TIER_ORDER[a.tier]:
         # Leaving an excluded or last-resort account is the user's rule:
         # never skipped for a 7d pace.
-        why = f"#{a.number} is {a.tier} and #{top.number} ({top.tier}) can land"
+        why = f"{view_name(a)} is {a.tier} and {view_name(top)} ({top.tier}) can land"
     else:
         skipped = _preempt_would_leave(snap, a, landing)
         pool = [v for v in landing if v.number not in skipped]
@@ -1089,7 +1090,7 @@ def _rebalance(
             t_score = score(top, snap.now)
             gain = t_score - a_score
             why = (
-                f"#{top.number} score {t_score:.2f} beats #{a.number} "
+                f"{view_name(top)} score {t_score:.2f} beats {view_name(a)} "
                 f"{a_score:.2f} by more than {s.tie_epsilon:g}"
             )
             if draining(top, snap):
@@ -1110,13 +1111,13 @@ def _rebalance(
             ):
                 _, when = preempt_horizon(snap)
                 return Hold(
-                    f"#{a.number} under soft ({_usage(a)}); #{best.number} scores better "
+                    f"{view_name(a)} under soft ({_usage(a)}); {view_name(best)} scores better "
                     f"({b_score:.2f}) but its 7d would pass {_pct(s.soft_7d)} in "
                     f"{_hours(skipped[best.number])}, {when} — staying",
                     pending=False,
                 )
             return Hold(
-                f"#{a.number} under soft ({_usage(a)}); no better account "
+                f"{view_name(a)} under soft ({_usage(a)}); no better account "
                 f"(score {a_score:.2f})",
                 pending=False,
             )
@@ -1159,7 +1160,7 @@ def _held(snap: Snapshot, a: AccountView, inner: Decision) -> Decision:
     s = snap.settings
     hold = account_hold.AccountHold(a.number, snap.now + left)
     return Hold(
-        f"#{a.number} held {account_hold.until_text(hold, snap.now)} — "
+        f"{view_name(a)} held {account_hold.until_text(hold, snap.now)} — "
         f"{account_hold.safety_text(s.hard_5h, s.hard_7d)}; otherwise: {inner.reason}",
         pending=False,
         code="hold",
@@ -1186,11 +1187,11 @@ def _decide(snap: Snapshot) -> Decision:
     if a is None:
         return Indeterminate("no active managed account")
     if a.pct5 is None or a.pct7 is None:
-        return Indeterminate(f"#{a.number} usage unknown")
+        return Indeterminate(f"{view_name(a)} usage unknown")
     landing = landing_candidates(snap)
 
     if a.pct5 >= LIMIT_PCT or a.pct7 >= LIMIT_PCT:
-        return _at_limit(snap, landing, f"#{a.number} at limit ({_usage(a)})")
+        return _at_limit(snap, landing, f"{view_name(a)} at limit ({_usage(a)})")
     force = _hard_force(snap, a)
     soft = _soft_reason(a, snap)
     if force is not None or soft is not None:

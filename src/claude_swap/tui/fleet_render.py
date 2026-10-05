@@ -89,11 +89,11 @@ class Ctx:
         )
 
 
-def pad_to(line: Text, width: int) -> Text:
-    """``line`` cut (with …) or padded to exactly ``width`` cells."""
+def pad_to(line: Text, width: int, *, overflow: str = "ellipsis") -> Text:
+    """``line`` cut (with …, or cropped) or padded to exactly ``width`` cells."""
     out = line.copy()
     if out.cell_len > width:
-        out.truncate(max(width, 0), overflow="ellipsis")
+        out.truncate(max(width, 0), overflow=overflow)
     else:
         out.append(" " * (width - out.cell_len))
     return out
@@ -110,12 +110,12 @@ def _fit(variants: Sequence[str], width: int) -> str:
 
 def table_header(plan: home.TablePlan, palette: Palette) -> Text:
     """The dim column headers, each over its column."""
-    line = Text(style=palette.muted, no_wrap=True, overflow="ellipsis")
+    line = Text(style=palette.muted, no_wrap=True, overflow="crop")
     for i, (key, width) in enumerate(plan.columns):
         if i:
             line.append(" " * plan.gap)
         line.append(pad_to(Text(home.HEADERS[key]), width))
-    return pad_to(line, plan.room)
+    return pad_to(line, plan.room, overflow="crop")  # clipped as the rows are
 
 
 def _order_cell(mark: str, width: int, ctx: Ctx) -> Text:
@@ -130,14 +130,9 @@ def _order_cell(mark: str, width: int, ctx: Ctx) -> Text:
 
 
 def _account_cell(row: fx.FleetRow, width: int, ctx: Ctx) -> Text:
-    """The name (cut with … to fit) and the dim slot number after it."""
+    """The whole name: never cut (the column is as wide as the longest)."""
     p = ctx.palette
-    slot = home.account_slot(row)
-    name = Text(row.name, style=f"bold {p.accent}" if row.active else p.foreground)
-    room = width - home.cells(slot)
-    if name.cell_len > room:
-        name.truncate(max(room, 1), overflow="ellipsis")
-    return name.append(slot, style=p.muted)
+    return Text(row.name, style=f"bold {p.accent}" if row.active else p.foreground)
 
 
 def _usage_cell(row: fx.FleetRow, window: str, plan: home.TablePlan, ctx: Ctx) -> Text:
@@ -204,7 +199,7 @@ def table_row(row: fx.FleetRow, mark: str, plan: home.TablePlan, ctx: Ctx) -> Te
             cell = (Text(plan.status_text(status[0]), style=tone_style(status[1], p))
                     if status else Text())
         line.append(pad_to(cell, width))
-    return pad_to(line, plan.room)
+    return pad_to(line, plan.room, overflow="crop")  # never a … inside a name
 
 
 @dataclass
@@ -345,7 +340,6 @@ def render_detail(
     head.append(alias or row.email, style=name_style)
     if alias:
         head.append(f" ({row.email})", style=p.foreground)
-    head.append(home.account_slot(row), style=p.muted)
     facts = [row.org] + ([home.plan_text(row)] if row.plan != "?" else [])
     head.append("  " + " · ".join(facts), style=p.muted)
     status = ctx.status(row)

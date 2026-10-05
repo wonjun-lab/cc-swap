@@ -7,7 +7,7 @@ backup was overwritten with another's), a slot and another slot's ``cswap
 run`` profile, or a slot that is not the live account and the live login.
 
 cc-swap does not refresh such a slot until one of the two is re-logged
-(``cc-swap login N``): the consume gate refuses with :data:`SHARED_LOGIN`,
+(``cc-swap login NAME``): the consume gate refuses with :data:`SHARED_LOGIN`,
 the active fetch path the same, so nothing cc-swap does decides which copy
 dies. ``cc-swap doctor`` names the places. A slot's own copies are not
 sharing: its backup and the live login while it is the live account, its
@@ -68,8 +68,15 @@ def session_profiles(backup_dir: Path) -> list[tuple[str, Path]]:
     return out
 
 
-def profile_label(number: str) -> str:
-    return f"#{number}'s cswap run profile"
+def _name(number: str, names: Mapping[str, str] | None) -> str:
+    """Slot ``number``'s display name (maximize/names.py)."""
+    from claude_swap.maximize.names import name_of
+
+    return name_of(names or {}, number)
+
+
+def profile_label(number: str, names: Mapping[str, str] | None = None) -> str:
+    return f"{_name(number, names)}'s cswap run profile"
 
 
 def shared_slots(entries: Mapping[str, object], active: str | None) -> set[str]:
@@ -88,27 +95,35 @@ def shared_slots(entries: Mapping[str, object], active: str | None) -> set[str]:
 def skip_text(
     numbers: list[str],
     partners: Mapping[str, list[tuple[str, str | None]]] | None = None,
+    names: Mapping[str, str] | None = None,
 ) -> str:
-    """``#2 shares its login with #3 — re-login one of them (cc-swap login 2
-    or cc-swap login 3)`` for ``cc-swap why``: each slot set aside, the
-    places that hold its login too (``partners``: slot -> ``(label, slot to
-    re-login or None)``, as ``switcher.shared_login_places`` and doctor name
-    them), and the fix. Without ``partners``: ``#2 shares its login —
-    re-login one of them (cc-swap login 2)``."""
+    """``side shares its login with work — re-login one of them (cc-swap
+    login side or cc-swap login work)`` for ``cc-swap why``: each slot set
+    aside, the places that hold its login too (``partners``: slot ->
+    ``(label, slot to re-login or None)``, as
+    ``switcher.shared_login_places`` and doctor name them), and the fix;
+    accounts by display name (``names``: slot -> name). Without
+    ``partners``: ``side shares its login — re-login one of them (cc-swap
+    login side)``."""
     parts = []
     for n in numbers:
         places = list((partners or {}).get(n) or [])
         with_ = f" with {', '.join(label for label, _slot in places)}" if places else ""
-        remedy = fix([n, *(slot for _label, slot in places if slot)]).split(": ", 1)[1]
-        parts.append(f"#{n} shares its login{with_} — re-login one of them ({remedy})")
+        remedy = fix([n, *(slot for _label, slot in places if slot)], names).split(": ", 1)[1]
+        parts.append(
+            f"{_name(n, names)} shares its login{with_} — re-login one of them ({remedy})"
+        )
     return "; ".join(parts)
 
 
-def fix(numbers: list[str]) -> str:
-    """The one remedy: a fresh login for one of the slots involved."""
+def fix(numbers: list[str], names: Mapping[str, str] | None = None) -> str:
+    """The one remedy: a fresh login for one of the slots involved, each
+    named by its display name (``names``: slot -> name)."""
+    from claude_swap.maximize.names import cli_arg
+
     shown = list(dict.fromkeys(n for n in numbers if n))
     if not shown:
-        return "re-login the account: cc-swap login N"
-    first = f"cc-swap login {shown[0]}"
-    rest = "".join(f" or cc-swap login {n}" for n in shown[1:])
+        return "re-login the account: cc-swap login NAME"
+    first = f"cc-swap login {cli_arg(_name(shown[0], names))}"
+    rest = "".join(f" or cc-swap login {cli_arg(_name(n, names))}" for n in shown[1:])
     return f"re-login one of them: {first}{rest}"

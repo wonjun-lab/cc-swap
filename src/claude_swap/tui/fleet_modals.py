@@ -48,6 +48,7 @@ class PrimeChoice:
     number: str
     label: str
     eligible: bool
+    name: str = ""  # the display name (maximize/names.py) the log says
 
 
 class PrimeModal(ModalScreen[None]):
@@ -76,6 +77,12 @@ class PrimeModal(ModalScreen[None]):
         self._preselect = preselect
         self._runner = runner
         self._priming = False
+
+    def _account_name(self, number: str) -> str:
+        from claude_swap.maximize.names import name_of
+
+        found = next((c.name for c in self._choices if c.number == number and c.name), "")
+        return found or name_of({}, number)
 
     def compose(self) -> ComposeResult:
         with Vertical(classes="modal-box modal-box-wide fx-modal"):
@@ -111,7 +118,7 @@ class PrimeModal(ModalScreen[None]):
         self._priming = True
         order = sorted(numbers, key=lambda n: (len(n), n))
         log.write(
-            f"priming {', '.join('#' + n for n in order)} — a launch is verified "
+            f"priming {', '.join(self._account_name(n) for n in order)} — a launch is verified "
             "about 35 s later…"
         )
         self.run_worker(

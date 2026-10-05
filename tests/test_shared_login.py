@@ -90,7 +90,7 @@ def test_the_places_name_slots_never_tokens(temp_home):
     s = _switcher(temp_home)
     s._write_account_credentials("3", _email(3), _creds("rt-2"))
     places = s.shared_login_places("2", _creds("rt-2"), is_active=False)
-    assert places == [("#3", "3")]
+    assert places == [("user3", "3")]
 
 
 def test_a_slot_of_its_own_is_refreshed(temp_home):
@@ -121,7 +121,7 @@ def test_another_slots_cswap_run_profile_is_sharing(temp_home):
     s = _switcher(temp_home)
     _profile(s, 3, _creds("rt-2"))
     assert s.shared_login_places("2", _creds("rt-2"), is_active=False) == [
-        ("#3's cswap run profile", "3")
+        ("user3's cswap run profile", "3")
     ]
     outcome, post = _consume(s, 2)
     assert outcome.error == shared_login.SHARED_LOGIN
@@ -132,7 +132,7 @@ def test_a_leftover_profile_is_named_without_its_email(temp_home):
     s = _switcher(temp_home)
     _profile(s, 3, _creds("rt-2"), email="gone@example.com")
     [(label, slot)] = s.shared_login_places("2", _creds("rt-2"), is_active=False)
-    assert label == "a leftover cswap run profile made for #3" and slot is None
+    assert label == "a leftover cswap run profile made for user3" and slot is None
 
 
 def test_live_login_held_by_a_slot_that_is_not_live_is_deferred(temp_home):
@@ -223,7 +223,11 @@ def test_freshen_reports_the_kind_and_the_tick_skips_the_candidate(temp_home):
 
 
 def test_fix_names_every_slot_once():
-    assert shared_login.fix(["3", "2", "3"]) == (
+    assert shared_login.fix(["3", "2", "3"], {"2": "side", "3": "work"}) == (
+        "re-login one of them: cc-swap login work or cc-swap login side"
+    )
+    # A slot no name is known for: the number is still a valid argument.
+    assert shared_login.fix(["3", "2"]) == (
         "re-login one of them: cc-swap login 3 or cc-swap login 2"
     )
     assert shared_login.fix([]).startswith("re-login")
@@ -347,7 +351,7 @@ def test_a_manual_switch_onto_a_shared_slot_is_refused(temp_home):
     with pytest.raises(SwitchRefusedError) as info:
         s.switch_to("2")
     assert info.value.reason == shared_login.SHARED_LOGIN
-    assert "also held by #3" in str(info.value) and "--allow-dead-login" in str(info.value)
+    assert "also held by user3" in str(info.value) and "--allow-dead-login" in str(info.value)
     payload = s.switch_to("2", json_output=True)
     assert payload["reason"] == shared_login.SHARED_LOGIN and not payload["switched"]
     assert s.current_account_number() == "1"
@@ -363,7 +367,7 @@ def test_cswap_run_refuses_to_seed_a_shared_login(temp_home):
     s._write_account_credentials("3", _email(3), _creds("rt-2"))
     with (
         patch("claude_swap.oauth.try_refresh_oauth_credentials") as post,
-        pytest.raises(SessionError, match="also held by #3"),
+        pytest.raises(SessionError, match="also held by user3"),
     ):
         SessionManager(s).setup_session("2", share=False)
     post.assert_not_called()
@@ -515,19 +519,20 @@ def test_why_names_the_partner_as_doctor_does(temp_home):
     s = _switcher(temp_home)
     s._write_account_credentials("3", _email(3), _creds("rt-2"))  # #3 got #2's login
     partners = shared_partners(["2"], switcher=s)
-    assert partners == {"2": [["#3", "3"]]}
-    assert shared_login.skip_text(["2"], {"2": [("#3", "3")]}) == (
-        "#2 shares its login with #3 — re-login one of them "
-        "(cc-swap login 2 or cc-swap login 3)"
+    assert partners == {"2": [["user3", "3"]]}
+    names = {"2": "user2", "3": "user3"}
+    assert shared_login.skip_text(["2"], {"2": [("user3", "3")]}, names) == (
+        "user2 shares its login with user3 — re-login one of them "
+        "(cc-swap login user2 or cc-swap login user3)"
     )
     why = {"source": "engine", "decision": "hold", "pending": True, "target": "1",
-           "reason": "r", "ageS": 3, "shared": ["2"], "sharedWith": partners}
-    assert "  skipped  #2 shares its login with #3 — re-login one of them " \
-        "(cc-swap login 2 or cc-swap login 3)" in _why_lines(why)
+           "reason": "r", "ageS": 3, "shared": ["2"], "sharedWith": partners, "names": names}
+    assert "  skipped  user2 shares its login with user3 — re-login one of them " \
+        "(cc-swap login user2 or cc-swap login user3)" in _why_lines(why)
     # A leftover cswap run profile is named the way doctor names it.
     s._write_account_credentials("3", _email(3), _creds("rt-3"))
     _profile(s, 3, _creds("rt-2"))
-    assert shared_partners(["2"], switcher=s) == {"2": [["#3's cswap run profile", "3"]]}
+    assert shared_partners(["2"], switcher=s) == {"2": [["user3's cswap run profile", "3"]]}
 
 
 def test_clear_error_touches_only_that_error(temp_home):

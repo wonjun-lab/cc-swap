@@ -137,13 +137,13 @@ class TestMaximizeAutoScreen:
             plain = app.screen.query_one("#candidates", Static).render().plain
             assert plain.startswith("Maximize")
             active, primed, cold, excluded = (
-                _line(plain, f"user{n}@example.com") for n in (1, 2, 3, 4)
+                _line(plain, f"user{n} ") for n in (1, 2, 3, 4)
             )
             assert active.lstrip().startswith("●") and "5h running · resets" in active
             assert "normal" in primed and " yes " in primed and "5h primed · resets" in primed
             assert "last resort" in cold and "5h cold" in cold
             assert "excluded" in excluded and " no " in excluded
-            order = [plain.index(f"user{n}@example.com") for n in (2, 1, 3, 4)]
+            order = [plain.index(f"user{n} ") for n in (2, 1, 3, 4)]
             assert order == sorted(order)
             assert "waiting for idle: 5h 72%, +3%p/10min" in plain
 

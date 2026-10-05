@@ -131,10 +131,10 @@ def history_text(root: Path, live: str | None) -> str:
     """Fleet's switch-history view: the ledger's newest entries, newest
     first, plus a note when the live login moved outside cc-swap."""
     from claude_swap.maximize import ledger
-    from claude_swap.maximize.history_cli import drift_line, history_lines
+    from claude_swap.maximize.history_cli import drift_line, history_lines, root_names
 
     entries = ledger.read(root, HISTORY_COUNT)
-    lines = history_lines(list(reversed(entries)))
+    lines = history_lines(list(reversed(entries)), root_names(root))
     note = drift_line(root, live)
     if note:
         lines = [note, ""] + lines
@@ -273,7 +273,7 @@ def _launch_relogin(app: "CswapApp", number: str, claude: str, supported: bool) 
             refuse()  # inside a `cswap run` shell: refuse before the browser
         attempt = rl.LoginAttempt(app.switcher.backup_dir, target, claude)
     except Exception as e:
-        app.notify(f"{e}", title=f"Re-login #{number}", severity="error", timeout=10)
+        app.notify(f"{e}", title=f"Re-login {_who(app, number)}", severity="error", timeout=10)
         return
     try:
         with rl.terminate_as_interrupt(), app.suspend():
@@ -292,7 +292,9 @@ def _launch_relogin(app: "CswapApp", number: str, claude: str, supported: bool) 
         return
     app.busy = True
     if early is None:
-        app.notify(f"checking the new login for #{number}…", title="Re-login", timeout=3)
+        app.notify(
+            f"checking the new login for {_who(app, number)}…", title="Re-login", timeout=3
+        )
 
     def finish() -> None:
         try:
@@ -328,7 +330,7 @@ def _relogin_launched(app: "CswapApp", outcome) -> None:
 
     app.busy = False
     app.request_refresh(full=True)
-    title = f"Re-login #{outcome.number}"
+    title = f"Re-login {_who(app, outcome.number)}"
     if outcome.ok:
         app.notify(outcome.message, title=title, timeout=8)
     elif outcome.status == rl.CANCELLED:
@@ -501,27 +503,39 @@ def _relogin_done(app: "CswapApp", number: str, result) -> None:
 
     app.request_refresh(full=True)
     if result is None:
-        app.notify(f"Re-login #{number} cancelled; switching resumed", timeout=3)
+        app.notify(f"Re-login {_who(app, number)} cancelled; switching resumed", timeout=3)
         return
     if not result.ok:
-        app.push_screen(OutputModal(f"Re-login #{number} — failed", result.output))
+        app.push_screen(OutputModal(f"Re-login {_who(app, number)} — failed", result.output))
         return
     payload = result.payload or {}
     if not payload.get("stored"):
         app.notify(
-            str(payload.get("reason") or "nothing stored"), title=f"Re-login #{number}",
+            str(payload.get("reason") or "nothing stored"),
+            title=f"Re-login {_who(app, number)}",
             severity="error", timeout=10,
         )
         return
     back = payload.get("returned_to")
     if payload.get("switch_back_error"):
         app.notify(
-            f"#{number} login stored; not switched back: {payload['switch_back_error']}",
+            f"{_who(app, number)} login stored; not switched back: "
+            f"{payload['switch_back_error']}",
             title="Re-login", severity="warning", timeout=10,
         )
         return
-    tail = f"; back on #{back}" if back else ""
-    app.notify(f"#{number} login stored{tail}", title="Re-login")
+    tail = f"; back on {_who(app, back)}" if back else ""
+    app.notify(f"{_who(app, number)} login stored{tail}", title="Re-login")
+
+
+def _who(app: "CswapApp", number: object) -> str:
+    """Slot ``number``'s display name (maximize/names.py) for a toast."""
+    from claude_swap.maximize.names import name_of
+
+    try:
+        return app.switcher.account_name(number)
+    except Exception:
+        return name_of({}, number)
 
 
 
@@ -1192,10 +1206,8 @@ class FleetScreen(Screen):
         choices = []
         for plan in plan_rows(msnap, self._state.primes, self._prime, now):
             text = mxprimer_plan_text(plan, self._prime.max_attempts)
-            choices.append(PrimeChoice(
-                plan.number, f"#{plan.number} {names.get(plan.number, '')}  {text}",
-                plan.reason is None,
-            ))
+            who = names.get(plan.number) or _who(self.app, plan.number)
+            choices.append(PrimeChoice(plan.number, f"{who}  {text}", plan.reason is None, who))
         row = self.current_row()
         preselect = {row.number} if row is not None else set()
         self.app.push_screen(
@@ -1203,6 +1215,13 @@ class FleetScreen(Screen):
         )
 
     # -- account keys ----------------------------------------------------------------------
+
+    def _account_name(self, number: object) -> str:
+        """Slot ``number``'s display name, as the table shows it."""
+        for r in self._rows:
+            if r.number == str(number):
+                return r.name
+        return _who(self.app, number)
 
     def action_switch_selected(self) -> None:
         """enter: switch to the selected account — asking first only when
@@ -1212,7 +1231,7 @@ class FleetScreen(Screen):
             return
         number = row.number
         if row.active:
-            self.notify(f"#{number} is already the active account", timeout=2)
+            self.notify(f"{row.name} is already the active account", timeout=2)
             return
         warning = fx.switch_warning(row, self._mx)
         if warning is None:
@@ -1221,7 +1240,7 @@ class FleetScreen(Screen):
         from claude_swap.tui.modals import ConfirmModal
 
         self.app.push_screen(
-            ConfirmModal(warning + "\n\nSwitch anyway?", title=f"Switch to #{number}",
+            ConfirmModal(warning + "\n\nSwitch anyway?", title=f"Switch to {row.name}",
                          yes_label="Switch"),
             lambda confirmed: self._switch(number) if confirmed else None,
         )
@@ -1231,7 +1250,7 @@ class FleetScreen(Screen):
         from claude_swap.maximize import ledger
 
         self.app._start_action(
-            f"Switch to account {number}",
+            f"Switch to {self._account_name(number)}",
             ledger.tagged(
                 partial(self.app.switcher.switch_to, number, json_output=True), source="fleet"
             ),
@@ -1260,7 +1279,8 @@ class FleetScreen(Screen):
         except ClaudeSwitchError as e:
             self.app.call_from_thread(self.notify, str(e), severity="error", timeout=8)
             return
-        message = f"#{number} is last resort" if marked else f"#{number} is back to normal"
+        who = self._account_name(number)
+        message = f"{who} is last resort" if marked else f"{who} is back to normal"
         self.app.call_from_thread(self._after_setting, message)
 
     def _after_setting(self, message: str) -> None:
@@ -1280,7 +1300,7 @@ class FleetScreen(Screen):
             return
         self.app.push_screen(
             TextInputModal(
-                f"Name #{row.number}",
+                f"Name {row.name}",
                 "Letters, digits, - _ . (no @ or comma, not taken). Empty: back to the "
                 "part of the address before the @.",
                 row.name,
@@ -1296,9 +1316,9 @@ class FleetScreen(Screen):
         switcher = self.app.switcher
         verb, name = request
         if verb == "set":
-            self.app._start_action(f"Name #{number}", partial(switcher.set_alias, number, name))
+            self.app._start_action(f"Name {shown}", partial(switcher.set_alias, number, name))
         else:
-            self.app._start_action(f"Name #{number}", partial(switcher.unset_alias, number))
+            self.app._start_action(f"Name {shown}", partial(switcher.unset_alias, number))
 
     # -- hold (h) -----------------------------------------------------------------------
 
@@ -1320,7 +1340,7 @@ class FleetScreen(Screen):
         self.app.push_screen(
             MenuModal(
                 menus.hold_rows(current.until if current is not None else None, now),
-                title=menus.HOLD_TITLE.format(number=row.number, name=row.name),
+                title=menus.HOLD_TITLE.format(name=row.name),
                 note=menus.HOLD_NOTE,
                 digits=menus.HOLD_TYPED,
             ),
@@ -1337,7 +1357,7 @@ class FleetScreen(Screen):
 
             self.app.push_screen(
                 TextInputModal(
-                    f"Hold #{slot} until", "A local time, HH:MM (the next one; at most 24h "
+                    f"Hold {self._account_name(slot)} until", "A local time, HH:MM (the next one; at most 24h "
                     "ahead). Enter holds, esc cancels.",
                     value=action.removeprefix(menus.HOLD_TYPED)
                     if action.startswith(menus.HOLD_TYPED) else "",
@@ -1375,7 +1395,9 @@ class FleetScreen(Screen):
                 hold = account_hold.set_hold(
                     self._root, slot, until, by="fleet", now=now, host=self._hostname,
                 )
-                message = account_hold.held_message(hold, now, asked=until)
+                message = account_hold.held_message(
+                    hold, now, asked=until, name=self._account_name(slot)
+                )
         except Exception as e:
             self.app.call_from_thread(
                 self.notify, f"Could not change the hold: {e}", severity="error", timeout=8,
@@ -1393,7 +1415,7 @@ class FleetScreen(Screen):
         if row is None:
             return
         if row.login != "relogin" and not row.shared and not fx.login_due(row, time.time()):
-            self.notify(f"#{row.number} login works — nothing to fix", timeout=3)
+            self.notify(f"{row.name}'s login works — nothing to fix", timeout=3)
             return
         open_relogin(self.app, row.number)
 

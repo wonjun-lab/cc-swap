@@ -284,19 +284,32 @@ def format_account_label(
     alias: str | None = None,
     disabled: bool = False,
     fetched_at: float | None = None,
+    name: str | None = None,
 ) -> str:
-    """Build one account row's menu label."""
-    label = f"{alias}  ({email})" if alias else email
+    """Build one account row's menu label. ``num`` is the slot (the row's
+    callback key, never shown); the account goes by its display name."""
     marker = "  (disabled)" if disabled else ""
-    return f"{num}  {label}{marker}  {usage_summary(usage, now, fetched_at)}"
+    return (
+        f"{account_menu_name(num, email, alias, name)}{marker}  "
+        f"{usage_summary(usage, now, fetched_at)}"
+    )
 
 
-def _local_part(email: str, limit: int = 12) -> str:
-    """Email text before '@', truncated with a trailing '*' marker."""
-    local = email.split("@", 1)[0]
-    if len(local) > limit:
-        return local[: limit - 1] + "*"
-    return local
+def account_menu_name(num, email: str, alias: str | None = None, name: str | None = None) -> str:
+    """cc-swap: how a menu row names an account (maximize/names.py): the
+    address alone when the display name is just its local part, else
+    ``name  (address)``."""
+    from claude_swap.maximize.names import name_of, short_name
+
+    shown = name or alias or name_of({}, num, email)
+    if not email or shown == short_name(email):
+        return email or shown
+    return f"{shown}  ({email})"
+
+
+def _local_part(email: str) -> str:
+    """Email text before '@' — whole: a name is never cut."""
+    return email.split("@", 1)[0]
 
 
 def format_title(
@@ -305,15 +318,18 @@ def format_title(
     settings: MenuBarSettings,
     now: float | None = None,
     alias: str | None = None,
+    name: str | None = None,
 ) -> str:
-    """Build the menu-bar title from the active account and settings."""
+    """Build the menu-bar title from the active account and settings:
+    the account by its display name (``name``, maximize/names.py), else its
+    alias, else its address's local part — never cut."""
     if active_email is None:
         return ICON
     if now is None:
         now = time.time()
     segments: list[str] = []
     if settings.show_account_name:
-        segments.append(alias if alias else _local_part(active_email))
+        segments.append(name or alias or _local_part(active_email))
     if settings.title_pct in ("5h", "both"):
         p = _window_pct(active_usage, "five_hour")
         if p is not None:
@@ -372,21 +388,62 @@ def _usage_log_key(usage: dict | str | None) -> tuple[float | None, float | None
 _SWITCH_LOG_RE = re.compile(r"Switched from account (\d+) to (\d+)")
 
 
-def parse_switch_history(log_text: str, limit: int = SWITCH_HISTORY_LIMIT) -> list[str]:
+def parse_switch_history(
+    log_text: str, limit: int = SWITCH_HISTORY_LIMIT, names: dict | None = None
+) -> list[str]:
     """Recent account switches from the log, most-recent first.
 
     Reads the ``Switched from account X to Y`` lines the switcher logs and pairs
     each with its timestamp (trimmed to the minute). Returns at most ``limit``
-    entries like ``"3 → 1   2026-06-27 02:06"``. Any unparseable line is skipped.
+    entries like ``"work → side   2026-06-27 02:06"``: each slot by its display
+    name in ``names`` ({slot: name}; maximize/names.py), ``#3`` for a slot it
+    does not name. Any unparseable line is skipped.
     """
+    from claude_swap.maximize.names import name_of
+
     out: list[str] = []
     for line in log_text.splitlines():
         m = _SWITCH_LOG_RE.search(line)
         if not m:
             continue
         stamp = line.split(" - ", 1)[0].strip()[:16]  # "YYYY-MM-DD HH:MM"
-        out.append(f"{m.group(1)} → {m.group(2)}   {stamp}")
+        out.append(
+            f"{name_of(names or {}, m.group(1))} → {name_of(names or {}, m.group(2))}   {stamp}"
+        )
     return out[-limit:][::-1]
+
+
+def ledger_switch_history(root, limit: int = SWITCH_HISTORY_LIMIT) -> list[str]:
+    """Recent switches from the switch ledger (maximize/ledger.py), most
+    recent first, each account by the name the ledger recorded with the
+    switch (``fromName``/``toName``), else its slot number then (an entry
+    from before names were recorded). [] when the ledger is empty or
+    unreadable."""
+    import time as _time
+
+    try:
+        from claude_swap.maximize import ledger
+
+        entries = ledger.read(root, limit)
+    except Exception:
+        return []
+
+    def who(entry: dict, key: str) -> str:
+        name = entry.get(f"{key}Name")
+        value = entry.get(key)
+        if isinstance(name, str) and name:
+            return name
+        return f"#{value}" if value is not None else "(none)"
+
+    out = []
+    for entry in entries:
+        ts = entry.get("ts")
+        stamp = (
+            _time.strftime("%Y-%m-%d %H:%M", _time.localtime(float(ts)))
+            if isinstance(ts, (int, float)) and not isinstance(ts, bool) else "?"
+        )
+        out.append(f"{who(entry, 'from')} → {who(entry, 'to')}   {stamp}")
+    return out[::-1]
 
 
 def _account_display_usage(entry) -> dict | str | None:
@@ -821,6 +878,7 @@ def run(switcher) -> int:
                 self.snapshot["active_usage"],
                 self.settings,
                 alias=self.snapshot.get("active_alias"),
+                name=self._active_name(),
             )
             # Stop a rumps memory leak: rumps registers each menu item's callback
             # in the process-global NSApp._ns_to_py_and_callback, but Menu.clear()
@@ -843,10 +901,12 @@ def run(switcher) -> int:
                 _purge(self.menu._menu)
             self.menu.clear()
             account_items = []
+            names = self._account_names()
             for num, email, is_active, display, _last_good, alias, disabled, fetched_at in self.snapshot["accounts"]:
                 item = rumps.MenuItem(
                     format_account_label(
-                        num, email, display, alias=alias, disabled=disabled, fetched_at=fetched_at
+                        num, email, display, alias=alias, disabled=disabled, fetched_at=fetched_at,
+                        name=names.get(str(num)),
                     ),
                     callback=self._make_switch_to(num),
                 )
@@ -885,9 +945,10 @@ def run(switcher) -> int:
             accounts = self.snapshot["accounts"]
             if not accounts:
                 menu.add(rumps.MenuItem("No managed accounts", callback=None))
+            names = self._account_names()
             for num, email, _is_active, _display, _last_good, alias, _disabled, _fetched_at in accounts:
-                label = f"{num}  {alias}  ({email})" if alias else f"{num}  {email}"
-                menu.add(rumps.MenuItem(label, callback=self._make_remove(num)))
+                label = account_menu_name(num, email, alias, names.get(str(num)))
+                menu.add(rumps.MenuItem(label, callback=self._make_remove(num, label)))
             return menu
 
         def _disable_menu(self, rumps):
@@ -895,10 +956,11 @@ def run(switcher) -> int:
             accounts = self.snapshot["accounts"]
             if not accounts:
                 menu.add(rumps.MenuItem("No managed accounts", callback=None))
+            names = self._account_names()
             for num, email, _is_active, _display, _last_good, alias, disabled, _fetched_at in accounts:
-                name = f"{alias}  ({email})" if alias else email
                 item = rumps.MenuItem(
-                    f"{num}  {name}", callback=self._make_toggle_disabled(num, disabled)
+                    account_menu_name(num, email, alias, names.get(str(num))),
+                    callback=self._make_toggle_disabled(num, disabled),
                 )
                 # A check-mark reads as "held out of rotation" — same glyph the
                 # active row uses, but here it means disabled, not selected.
@@ -908,11 +970,15 @@ def run(switcher) -> int:
 
         def _history_menu(self, rumps):
             menu = rumps.MenuItem("Switch history")
-            try:
-                text = log_path.read_text(encoding="utf-8")
-            except OSError:
-                text = ""
-            entries = parse_switch_history(text)
+            # The switch ledger records each switch's names as they were
+            # then; today's names would mislabel a slot renamed or moved since.
+            entries = ledger_switch_history(self.switcher.backup_dir)
+            if not entries:
+                try:
+                    text = log_path.read_text(encoding="utf-8")
+                except OSError:
+                    text = ""
+                entries = parse_switch_history(text)
             if entries:
                 for line in entries:
                     menu.add(rumps.MenuItem(line, callback=None))
@@ -1003,11 +1069,27 @@ def run(switcher) -> int:
                     self.refresh_async()
             return cb
 
-        def _make_remove(self, num):
+        def _active_name(self) -> str | None:
+            """cc-swap: the active account's display name, or None."""
+            email = self.snapshot.get("active_email")
+            for row in self.snapshot.get("accounts") or ():
+                if row[1] == email and row[2]:
+                    return self._account_names().get(str(row[0]))
+            return None
+
+        def _account_names(self) -> dict:
+            """cc-swap: ``{slot: display name}``; ``{}`` when unknown."""
+            try:
+                names = self.switcher.account_names()
+            except Exception:
+                return {}
+            return names if isinstance(names, dict) else {}
+
+        def _make_remove(self, num, label=None):
             def cb(_sender):
                 if rumps.alert(
                     title="Remove account",
-                    message=f"Remove account {num}?",
+                    message=f"Remove {label or account_menu_name(num, '')}?",
                     ok="Remove",
                     cancel="Cancel",
                 ) == 1:  # 1 == OK

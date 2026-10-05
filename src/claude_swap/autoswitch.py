@@ -321,9 +321,11 @@ def pct_label(value: float) -> str:
 # Events
 # ---------------------------------------------------------------------------
 
-# cc-swap: how a ``human()`` line names an account. Upstream prints the
-# address; ``auto`` installs a short-name function under the maximize
-# strategy (``account_names``). JSON output never goes through it.
+# cc-swap: how a ``human()`` line names an account: by its display name
+# (maximize/names.py), never its slot number or whole address. ``auto``
+# installs a function reading the names off sequence.json
+# (``account_names``); without one a line says the address's local part.
+# JSON output never goes through it.
 _name_hook: Callable[[str, str], str] | None = None
 
 
@@ -338,15 +340,30 @@ def account_names(hook: Callable[[str, str], str] | None) -> Iterator[None]:
         _name_hook = previous
 
 
-def _who(number: object, email: object) -> object:
-    """What a ``human()`` line prints for an account: the address, or the
-    installed hook's name for it."""
-    if _name_hook is not None:
+def _who(number: object, email: object = "") -> str:
+    """What a ``human()`` line calls an account: the installed hook's name
+    for it (without one, the names in the backup root's sequence.json, so a
+    menu-bar notification or a TUI log line names it too), else the local
+    part of its address, else ``#number``."""
+    from claude_swap.maximize.names import name_of
+
+    hook = _name_hook
+    if hook is None:
         try:
-            return _name_hook(str(number), str(email or "")) or email
+            from claude_swap.maximize.hold import display_name_hook
+            from claude_swap.paths import get_backup_root
+
+            hook = display_name_hook(get_backup_root())
+        except Exception:
+            hook = None
+    if hook is not None:
+        try:
+            found = hook(str(number), str(email or ""))
+            if found:
+                return str(found)
         except Exception:
             pass
-    return email
+    return name_of({}, number, email)
 
 
 
@@ -436,14 +453,14 @@ class PollEvent(AutoSwitchEvent):
             err = self.fetch_errors.get(str(num))
             used = f"usage unknown ({err})" if err else "usage unknown"
         others = ", ".join(
-            f"#{n}: {self._describe(n)}"
+            f"{_who(n)} {self._describe(n)}"
             for n in self.headroom
             if n != str(num)
         )
         tail = f" | others: {others}" if others else ""
         label = self.marks or f"switch at {pct_label(self.threshold)}%"
         return (
-            f"Account-{num} ({_who(num, self.active.get('email'))}): {used} "
+            f"{_who(num, self.active.get('email'))}: {used} "
             f"({label}){tail}"
         )
 
@@ -468,11 +485,11 @@ class SwitchEvent(AutoSwitchEvent):
 
     def human(self) -> str:
         src = (
-            f"Account-{self.from_ref.get('number')}" if self.from_ref else "(none)"
+            _who(self.from_ref.get("number"), self.from_ref.get("email"))
+            if self.from_ref else "(none)"
         )
         dst = (
-            f"Account-{self.to_ref.get('number')} "
-            f"({_who(self.to_ref.get('number'), self.to_ref.get('email'))})"
+            _who(self.to_ref.get("number"), self.to_ref.get("email"))
             if self.to_ref
             else "?"
         )
@@ -505,8 +522,8 @@ class QuarantineEvent(AutoSwitchEvent):
 
     def human(self) -> str:
         return (
-            f"Account-{self.number} ({_who(self.number, self.email)}) quarantined: {self.reason}. "
-            f"To recover, {oauth.relogin_fix(self.number)}"
+            f"{_who(self.number, self.email)} quarantined: {self.reason}. "
+            f"To recover, {oauth.relogin_fix(_who(self.number, self.email))}"
         )
 
 
@@ -522,7 +539,7 @@ class UnquarantineEvent(AutoSwitchEvent):
 
     def human(self) -> str:
         return (
-            f"Account-{self.number} ({_who(self.number, self.email)}) "
+            f"{_who(self.number, self.email)} "
             f"back in rotation ({self.reason})"
         )
 
@@ -541,7 +558,7 @@ class LoginAdoptedEvent(AutoSwitchEvent):
 
     def human(self) -> str:
         tail = "; back in rotation" if self.lifted else ""
-        return f"adopted new login for #{self.number}{tail}"
+        return f"adopted new login for {_who(self.number)}{tail}"
 
 
 @dataclass(frozen=True)
@@ -663,8 +680,12 @@ class MaximizeDecisionEvent(AutoSwitchEvent):
         head = f"maximize: {self.decision}"
         if self.trigger:
             head += f" ({self.trigger})"
-        who = f"Account-{self.active}" if self.active else "no active account"
-        line = f"{head} on {who}: {self.reason}"
+        who = _who(self.active) if self.active else "no active account"
+        # A reason that starts by naming the active account says "on" already.
+        if self.active and self.reason.startswith(f"{who} "):
+            line = f"{head}: {self.reason}"
+        else:
+            line = f"{head} on {who}: {self.reason}"
         if self.pending:
             line += " [waiting for idle]"
         if self.dry_run and self.rows:
@@ -702,7 +723,7 @@ class PrimeEvent(AutoSwitchEvent):
     def human(self) -> str:
         if self.outcome.startswith("auto-verif"):
             return f"priming: {self.detail}"
-        who = f"Account-{self.account}" if self.account else "priming"
+        who = _who(self.account) if self.account else "priming"
         text = f"{who}: 5h window {self.outcome}"
         if self.resets_at:
             text += f", resets {local_time_label(self.resets_at)}"
@@ -1156,7 +1177,7 @@ class AutoSwitchEngine:
             try:
                 self.switcher.backfill_account_uuid(number, ta_uuid)
             except Exception as e:  # never let bookkeeping break a freshen
-                _logger.debug("uuid backfill failed for account %s: %r", number, e)
+                _logger.debug("uuid backfill failed for %s: %r", self._name(number), e)
             return False
         return slot_identity["uuid"] != ta_uuid
 
@@ -1324,7 +1345,7 @@ class AutoSwitchEngine:
                 self._read_hold_last_warn = now
                 self._emit(ConfigWarningEvent(
                     message=(
-                        f"Keychain unreadable; holding — Account-{current}'s "
+                        f"Keychain unreadable; holding — {self._name(current)}'s "
                         "live credential could not be read cleanly, so no "
                         "switch until a read succeeds"
                     )
@@ -1723,7 +1744,7 @@ class AutoSwitchEngine:
                         NoSwitchEvent(
                             reason="stale-usage",
                             detail=(
-                                f"account {num} usage could not be refreshed "
+                                f"{self._name(num, email)} usage could not be refreshed "
                                 "this tick (backoff or a concurrent poller); "
                                 "retrying"
                             ),
@@ -2785,7 +2806,7 @@ class AutoSwitchEngine:
             return TickOutcome.NO_ACTION
         if kind == "mismatch":
             self._warn_unmanaged_login(
-                f"the live login does not match Account-{current}"
+                f"the live login does not match {self._name(current)}"
             )
             self._emit(NoSwitchEvent(
                 reason="unmanaged-active-account",
@@ -2794,7 +2815,7 @@ class AutoSwitchEngine:
             return TickOutcome.NO_ACTION
         self._emit(NoSwitchEvent(
             reason="new-login-not-backed-up",
-            detail=f"Account-{current}'s new login is not backed up yet ({kind}); holding",
+            detail=f"{self._name(current)}'s new login is not backed up yet ({kind}); holding",
         ))
         return TickOutcome.NO_ACTION
 
@@ -2898,6 +2919,20 @@ class AutoSwitchEngine:
         if earliest is None:
             return None
         return datetime.fromtimestamp(earliest, tz=timezone.utc)
+
+    def _name(self, number: object, email: object = "") -> str:
+        """cc-swap: what an engine message calls slot ``number``: the name
+        ``human()`` lines use (``account_names``' hook), else the
+        switcher's display name, else the local part of ``email``. Never
+        the slot number while the account has a name; never an address."""
+        if _name_hook is None:
+            try:
+                found = self.switcher.account_name(number, email)
+                if isinstance(found, str) and found:
+                    return found
+            except Exception:
+                pass
+        return _who(number, email)
 
     def _emit(self, event: AutoSwitchEvent) -> None:
         self.on_event(event)

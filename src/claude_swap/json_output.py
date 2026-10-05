@@ -251,9 +251,14 @@ def usage_fields(
     return "unavailable", None
 
 
-def account_ref(number: int | None, email: str) -> dict:
-    """A minimal account reference, used for switch ``from``/``to``."""
-    return {"number": number, "email": email}
+def account_ref(number: int | None, email: str, name: str = "") -> dict:
+    """A minimal account reference, used for switch ``from``/``to``.
+
+    ``name`` (additive) is the account's display name (maximize/names.py);
+    without one, the local part of ``email`` (``#number`` without either)."""
+    from claude_swap.maximize.names import name_of
+
+    return {"number": number, "email": email, "name": name or name_of({}, number, email)}
 
 
 def usage_freshness_fields(
@@ -329,12 +334,18 @@ def account_row(
     disabled: bool = False,
     login_expires_at: str | None = None,
     login_expired: bool = False,
+    name: str = "",
 ) -> dict:
     """A full account row for ``--list``. ``backoff_until`` is the live
-    backoff only; a lapsed one is the caller's to withhold."""
+    backoff only; a lapsed one is the caller's to withhold. ``name``
+    (additive) is the display name every human surface uses
+    (maximize/names.py); ``number`` stays the stable slot id."""
+    from claude_swap.maximize.names import name_of
+
     status, usage = usage_fields(usage_entry, usage_fetched_at)
     row = {
         "number": number,
+        "name": name or name_of({}, number, email),
         "email": email,
         "organizationName": org_name,
         "organizationUuid": org_uuid,

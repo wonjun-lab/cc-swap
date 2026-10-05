@@ -250,7 +250,7 @@ def test_decision_view_pending_reports_growth_and_hard_eta():
     # +3 points in 10 minutes from 62% to hard 95: 110 minutes.
     assert dv.eta_hard_min == pytest.approx(110.0)
     line = fleet.now_line(dv, now=NOW)
-    assert line.startswith("HOLD — waiting for idle → #2 · #1 5h 62% >= soft 50% · +3%p/10m")
+    assert line.startswith("HOLD — waiting for idle → side · main 5h 62% >= soft 50% · +3%p/10m")
     assert "hard in ~1h50m" in line and line.endswith("computed here")
 
 
@@ -290,7 +290,7 @@ def _reset_wait_fleet():
 
 
 RESET_WAIT_REASON = (
-    "#1 5h 96% — resets in 8m, waiting it out (switches at once if it hits 100%)"
+    "main 5h 96% — resets in 8m, waiting it out (switches at once if it hits 100%)"
 )
 
 
@@ -583,14 +583,14 @@ def test_attention_warns_of_logins_expiring_within_a_week():
     def lines(rows, width=200):
         return home.attention_lines(home.attention_notices(rows, now=NOW), width)
 
-    assert lines(rows) == [("! #2 side login ends in 1d 9h — select it, press r", "warn")]
+    assert lines(rows) == [("! side login ends in 1d 9h — select it, press r", "warn")]
     soon = fleet.fleet_rows(
         accounts(acc(1, active=True), _expiring(3, 20 * H, alias="soon"),
                  _expiring(4, 2 * DAY, alias="next")),
         MX, PRIME, MaximizeState(), now=NOW,
     )
     assert lines(soon) == [(
-        "! #3 soon login ends in 20h 0m — select it, press r · #4 next login ends in 2d 0h",
+        "! soon login ends in 20h 0m — select it, press r · next login ends in 2d 0h",
         "crit",
     )]
     assert fleet.login_due(soon[1], NOW) and not fleet.login_due(rows[2], NOW)
@@ -601,7 +601,7 @@ def test_attention_warns_of_logins_expiring_within_a_week():
         MX, PRIME, MaximizeState(), now=NOW,
     )
     assert lines(mixed) == [(
-        "! #3 old needs re-login — select it, press r · #2 side login ends in 1d 9h", "crit",
+        "! old needs re-login — select it, press r · side login ends in 1d 9h", "crit",
     )]
     steps = "\n".join(fleet.relogin_steps(rows[1], ssh=False, host="h", claude_path=None,
                                           return_to=rows[0], now=NOW))
@@ -620,9 +620,9 @@ def test_attention_names_a_login_shared_with_another_place():
     assert rows[1].shared and not rows[0].shared
     notices = home.attention_notices(rows, now=NOW)
     assert home.attention_lines(notices, 200) == [
-        ("! #2 side shares its login with another place — select it, press r", "crit"),
+        ("! side shares its login with another place — select it, press r", "crit"),
     ]
-    assert home.attention_lines(notices, 40) == [("! #2 shares its login (cc-swap doctor)", "crit")]
+    assert home.attention_lines(notices, 40) == [("! side shares its login (cc-swap doctor)", "crit")]
     # After a dead login, before an expiring one.
     mixed = fleet.fleet_rows(
         accounts(acc(1, active=True), _expiring(3, DAY + 9 * H, alias="soon"),
@@ -631,7 +631,7 @@ def test_attention_names_a_login_shared_with_another_place():
         MX, PRIME, MaximizeState(), now=NOW,
     )
     assert [n.variants[-1] for n in home.attention_notices(mixed, now=NOW)] == [
-        "#4 old needs re-login", "#2 shares its login", "#3 soon login ends in 1d 9h",
+        "old needs re-login", "side shares its login", "soon login ends in 1d 9h",
     ]
 
 
@@ -659,7 +659,7 @@ def test_relogin_steps_mention_ssh_code_flow_only_over_ssh():
     assert "/opt/bin/claude" in local and "/login" in local and "u3@x.com" in local
     assert "paste" not in local and "paste" in remote
     assert "claude" in remote
-    assert "#1 main" in local and "slot 3" in local
+    assert "main" in local and "slot 3" in local
     assert "paused" in local  # the engine pauses while this runs
 
 

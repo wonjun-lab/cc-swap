@@ -240,11 +240,27 @@ def estimate_active(
             base=projected,
         )
     result = reported or projected
-    _log_once(watch, result, current)
+    _log_once(watch, result, current, engine)
     return result
 
 
-def _log_once(watch: ActiveWatch, result: est.Estimate | None, current: str) -> None:
+def _name(engine: Any, number: str) -> str:
+    """The display name the engine's lines call slot ``number`` by."""
+    named = getattr(engine, "_name", None)
+    try:
+        found = named(number) if callable(named) else None
+    except Exception:
+        found = None
+    if isinstance(found, str) and found:
+        return found
+    from claude_swap.autoswitch import _who
+
+    return _who(number)
+
+
+def _log_once(
+    watch: ActiveWatch, result: est.Estimate | None, current: str, engine: Any = None
+) -> None:
     """One log line when the estimate starts, or changes kind."""
     if result is None:
         watch.last_note = None
@@ -254,15 +270,15 @@ def _log_once(watch: ActiveWatch, result: est.Estimate | None, current: str) -> 
         if key not in watch.logged:
             watch.logged.add(key)
             _logger.warning(
-                "Account-%s: %s; treating it as at its limit", current, result.note
+                "%s: %s; treating it as at its limit", _name(engine, current), result.note
             )
         return
     kind = f"{current}:{result.kind}"
     if watch.last_note != kind:
         watch.last_note = kind
         _logger.warning(
-            "Account-%s: deciding on projected usage (%s; rates %s)",
-            current,
+            "%s: deciding on projected usage (%s; rates %s)",
+            _name(engine, current),
             result.note,
             ", ".join(
                 f"{w} {r:.1f}%/h ({result.sources.get(w, '?')})"

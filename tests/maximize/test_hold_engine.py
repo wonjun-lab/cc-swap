@@ -35,7 +35,7 @@ def marker(h) -> hold.AccountHold | None:
 
 
 def lifted(h) -> list[str]:
-    return [e.message for e in of(h, ConfigWarningEvent) if e.message.startswith("hold on #")]
+    return [e.message for e in of(h, ConfigWarningEvent) if e.message.startswith("hold on ")]
 
 
 def test_soft_is_set_aside_while_the_hold_lasts(temp_home):
@@ -48,8 +48,8 @@ def test_soft_is_set_aside_while_the_hold_lasts(temp_home):
     assert no_switch_reasons(h) == ["hold"] * 4
     record = h.state()[DECISION_KEY]
     assert (record["decision"], record["code"], record["pending"]) == ("hold", "hold", False)
-    assert record["reason"].startswith("#1 held until ")
-    assert "otherwise: #1 5h 62% >= soft 50%" in record["reason"]
+    assert record["reason"].startswith("a held until ")
+    assert "otherwise: a 5h 62% >= soft 50%" in record["reason"]
     assert marker(h) is not None and not lifted(h)
 
 
@@ -59,7 +59,7 @@ def test_preempt_is_set_aside_while_the_hold_lasts(temp_home):
     pin(h, hours=4, now=FRIDAY_NOON)
     assert two_idle_ticks(h) is TickOutcome.NO_ACTION
     assert no_switch_reasons(h) == ["hold", "hold"]
-    assert "otherwise: #1 7d 84% would pass 90%" in h.state()[DECISION_KEY]["reason"]
+    assert "otherwise: a 7d 84% would pass 90%" in h.state()[DECISION_KEY]["reason"]
     assert h.active_number() == 1
 
 
@@ -80,7 +80,7 @@ def test_hard_still_switches_and_ends_the_hold(temp_home):
     assert marker(h) is None
     assert not (h.switcher.backup_dir / hold.HOLD_FILENAME).exists()
     assert hold.STATE_KEY not in h.state()
-    assert lifted(h) == ["hold on #1 lifted: the engine switched to #2"]
+    assert lifted(h) == ["hold on a lifted: the engine switched to b"]
 
 
 def test_at_limit_still_switches(temp_home):
@@ -99,7 +99,7 @@ def test_an_external_switch_ends_the_hold(temp_home):
     h.clock.advance(120)
     h.tick_with_usage({"1": win(62, 40), "2": win(10, 10), "3": win(0, 50)})
     assert marker(h) is None
-    assert lifted(h) == ["hold on #1 lifted: #2 is the active account now"]
+    assert lifted(h) == ["hold on a lifted: b is the active account now"]
     assert no_switch_reasons(h)[-1] != "hold"
 
 
@@ -121,7 +121,7 @@ def test_a_hold_on_another_slot_never_applies(temp_home):
     pin(h, "2")
     h.tick_with_usage(SOFT)
     assert "hold" not in no_switch_reasons(h)
-    assert marker(h) is None and lifted(h) == ["hold on #2 lifted: #1 is the active account now"]
+    assert marker(h) is None and lifted(h) == ["hold on b lifted: a is the active account now"]
 
 
 def test_a_dry_run_honours_the_hold_but_never_clears_it(temp_home):
@@ -195,7 +195,7 @@ def test_a_marker_newer_than_the_tick_is_left_for_the_next_one(temp_home):
     h.clock.advance(60)
     h.tick_with_usage(SOFT)
     assert marker(h) is None
-    assert lifted(h) == ["hold on #3 lifted: #1 is the active account now"]
+    assert lifted(h) == ["hold on c lifted: a is the active account now"]
 
 
 def test_the_lifted_note_names_the_live_account_not_the_ticks(temp_home):
@@ -203,7 +203,7 @@ def test_the_lifted_note_names_the_live_account_not_the_ticks(temp_home):
     pin(h, "3", now=h.clock.now - 120)
     tick_during(h, SOFT, lambda: h.make_live(EMAILS[2], 2))
     assert marker(h) is None
-    assert lifted(h) == ["hold on #3 lifted: #2 is the active account now"]
+    assert lifted(h) == ["hold on c lifted: b is the active account now"]
 
 
 def test_a_forced_switch_leaves_a_hold_renewed_during_its_tick_to_the_next_tick(temp_home):
@@ -219,7 +219,7 @@ def test_a_forced_switch_leaves_a_hold_renewed_during_its_tick_to_the_next_tick(
     h.clock.advance(60)
     h.tick_with_usage({"1": win(96, 40), "2": win(10, 10), "3": win(0, 50)})
     assert marker(h) is None
-    assert lifted(h) == ["hold on #1 lifted: #2 is the active account now"]
+    assert lifted(h) == ["hold on a lifted: b is the active account now"]
 
 
 def test_a_switch_away_and_back_between_ticks_ends_the_hold(temp_home):
@@ -237,7 +237,7 @@ def test_a_switch_away_and_back_between_ticks_ends_the_hold(temp_home):
     h.tick_with_usage(SOFT)
     assert no_switch_reasons(h)[-1] != "hold"
     assert marker(h) is None
-    assert lifted(h) == ["hold on #1 lifted: the active account changed since it was set"]
+    assert lifted(h) == ["hold on a lifted: the active account changed since it was set"]
 
 
 def test_a_damaged_hold_file_is_no_hold(temp_home):

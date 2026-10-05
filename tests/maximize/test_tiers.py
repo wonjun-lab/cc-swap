@@ -103,7 +103,10 @@ def test_toggle_last_resort_adds_email_or_alias_and_removes_all_matches():
 
 
 def test_toggle_last_resort_shared_email_without_alias_raises():
-    with pytest.raises(ConfigError, match="give Account-3 an alias first"):
+    with pytest.raises(
+        ConfigError,
+        match=r"shared by Team and work; give Team an alias first \(cc-swap alias Team NAME\)",
+    ):
         toggle_last_resort(ACCOUNTS, None, "3")
 
 

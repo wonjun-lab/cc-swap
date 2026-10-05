@@ -95,7 +95,7 @@ class DashboardScreen(Screen):
         snap = self.app.snapshot
         entries: MenuEntries = [
             (
-                f"{acc.number}  {f'{acc.alias} ({acc.email})' if acc.alias else acc.email}"
+                f"{f'{acc.alias} ({acc.email})' if acc.alias else acc.email}"
                 f"  [{acc.display_tag}]",
                 f"remove:{acc.number}",
             )
@@ -114,7 +114,7 @@ class DashboardScreen(Screen):
             action = "→ enable" if acc.disabled else "→ disable"
             state = "  (disabled)" if acc.disabled else ""
             entries.append(
-                (f"{acc.number}  {name}{state}   {action}", f"disable:{acc.number}")
+                (f"{name}{state}   {action}", f"disable:{acc.number}")
             )
         entries.append(_BACK)
         return entries

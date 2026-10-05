@@ -246,12 +246,22 @@ def test_fleet_says_so_when_it_caps_a_hold(new_york):
     now = time.mktime((2026, 11, 1, 0, 30, 0, 0, 0, 1))
     asked = h.parse_until("00:15", now)
     hold = h.AccountHold("1", now + 24 * H, now)
-    assert h.held_message(hold, now, asked=asked) == (
-        "Holding #1 until 23:30 (24h left) (00:15 is 24h45m away; a hold is at most 24h)"
+    assert h.held_message(hold, now, asked=asked, name="main") == (
+        "Holding main until 23:30 (24h left) (00:15 is 24h45m away; a hold is at most 24h)"
     )
-    assert h.held_message(h.AccountHold("1", now + H, now), now, asked=now + H) == (
-        "Holding #1 until 01:30 (1h left)"
+    assert h.held_message(h.AccountHold("1", now + H, now), now, asked=now + H, name="main") == (
+        "Holding main until 01:30 (1h left)"
     )
+
+
+def test_held_message_reads_the_name_off_the_root(tmp_path):
+    (tmp_path / "sequence.json").write_text(json.dumps({"accounts": {
+        "1": {"email": "dev.shared@example.com"}, "2": {"email": "x@example.com", "alias": "ops"},
+    }}))
+    hold = h.AccountHold("2", NOW + H, NOW)
+    assert h.held_message(hold, NOW, root=tmp_path).startswith("Holding ops until ")
+    assert h.held_message(h.AccountHold("1", NOW + H, NOW), NOW, root=tmp_path).startswith(
+        "Holding dev.shared until ")
 
 
 def test_a_refused_hold_is_a_clean_error(root, monkeypatch, capsys):
@@ -338,7 +348,7 @@ def _main(monkeypatch, capsys, *argv) -> tuple[int, str]:
 def test_hold_a_duration_pins_the_active_account(root, monkeypatch, capsys):
     code, out = _main(monkeypatch, capsys, "hold", "2h")
     assert code == 0
-    assert out.startswith("Holding #1 main until ")
+    assert out.startswith("Holding main until ")
     assert "(2h left) — only a hard mark (5h 95%, 7d 98%) or 100% will move you." in out
     assert "cc-swap hold off lifts it" in out
     hold = h.read_hold(root, now=NOW)
@@ -365,7 +375,7 @@ def test_hold_status_json_and_off(root, monkeypatch, capsys):
     assert payload["hold"] == {"slot": "1", "until": NOW + 5400, "leftS": 5400,
                                "since": NOW, "by": "cli"}
     code, out = _main(monkeypatch, capsys, "hold")  # no argument: status
-    assert code == 0 and out.startswith("Holding #1 main until")
+    assert code == 0 and out.startswith("Holding main until")
     code, out = _main(monkeypatch, capsys, "hold", "off")
     assert code == 0 and "Hold lifted" in out
     assert h.read_hold(root, now=NOW) is None
@@ -377,7 +387,7 @@ def test_a_hold_on_another_slot_is_reported_as_over(root, monkeypatch, capsys):
     h.set_hold(root, "2", NOW + H, by="cli", now=NOW)
     code, out = _main(monkeypatch, capsys, "hold", "status")
     assert code == 0
-    assert out.startswith("No hold: the hold on #2 side no longer applies (#1 main is the active")
+    assert out.startswith("No hold: the hold on side no longer applies (main is the active")
 
 
 @pytest.mark.parametrize("argv", [["soon"], ["until"], ["until", "25:00"], ["2h", "3h"],
@@ -409,9 +419,9 @@ def test_hold_pins_the_live_login_not_the_recorded_slot(root, temp_home, monkeyp
     # sequence.json still says #1, but a /login outside cc-swap made #2 live.
     _live(temp_home, "side@example.com")
     code, out = _main(monkeypatch, capsys, "hold", "1h")
-    assert code == 0 and out.startswith("Holding #2 side until ")
+    assert code == 0 and out.startswith("Holding side until ")
     assert h.read_hold(root, now=NOW).slot == "2"
-    assert "Holding #2 side" in _main(monkeypatch, capsys, "auto", "status")[1]
+    assert "Holding side" in _main(monkeypatch, capsys, "auto", "status")[1]
 
 
 def test_an_unmanaged_live_login_is_never_held(root, temp_home, monkeypatch, capsys):
@@ -449,7 +459,7 @@ def test_auto_status_names_the_hold(root, monkeypatch, capsys):
     h.set_hold(root, "1", NOW + 2 * H, by="fleet", now=NOW)
     code, out = _main(monkeypatch, capsys, "auto", "status")
     assert code == 0 and "Automatic switching is ON." in out
-    assert "Holding #1 main until" in out and "(cc-swap hold off lifts it)." in out
+    assert "Holding main until" in out and "(cc-swap hold off lifts it)." in out
     code, out = _main(monkeypatch, capsys, "auto", "status", "--json")
     assert json.loads(out)["hold"]["slot"] == "1"
     h.clear_hold(root)
@@ -463,8 +473,8 @@ def _publish(root, **record) -> None:
     decision = {
         "at": NOW - 30, "pid": 4121, "active": "1", "decision": "hold", "trigger": None,
         "target": None, "pending": False, "plans": {},
-        "reason": "#1 held until 02:13 (2h left) — only a hard mark (5h 95%, 7d 98%) or 100% "
-                  "will move you; otherwise: #1 5h 62% >= soft 50%; idle; -> #2",
+        "reason": "main held until 02:13 (2h left) — only a hard mark (5h 95%, 7d 98%) or 100% "
+                  "will move you; otherwise: main 5h 62% >= soft 50%; idle; -> side",
         "code": "hold",
     }
     decision.update(record)
@@ -479,7 +489,7 @@ def test_why_explains_a_hold_and_names_it(root, monkeypatch, capsys):
         doctor_cli.why_command([], clock=lambda: NOW)
     out = capsys.readouterr().out
     assert "code     hold" in out and doctor_cli.REASONS["hold"][0] in out
-    assert "  hold     #1 main until" in out and "(cc-swap hold off lifts it)" in out
+    assert "  hold     main until" in out and "(cc-swap hold off lifts it)" in out
     with pytest.raises(SystemExit):
         doctor_cli.why_command(["--json"], clock=lambda: NOW)
     payload = json.loads(capsys.readouterr().out)
@@ -494,7 +504,7 @@ def test_why_names_a_hold_without_a_fresh_decision(root, monkeypatch, capsys):
     with pytest.raises(SystemExit):
         doctor_cli.why_command(["--no-fallback"], clock=lambda: NOW)
     out = capsys.readouterr().out
-    assert out.startswith("Holding #1 main until") and "No engine published" in out
+    assert out.startswith("Holding main until") and "No engine published" in out
 
 
 # -- `cc-swap doctor` --------------------------------------------------------------------------------
@@ -514,7 +524,7 @@ def test_doctor_names_a_hold_as_info(tmp_path):
     h.set_hold(world.root, "1", DNOW + 2 * H, by="cli", now=DNOW)
     [finding] = [f for f in _doctor(world) if f.check == "hold"]
     assert finding.severity == "info" and finding.fix == ""
-    assert finding.detail.startswith("holding #1 until ")
+    assert finding.detail.startswith("holding user1 until ")
     assert "soft, preempt and rebalance moves wait" in finding.detail
     assert dr.exit_code([finding]) == 0
 
@@ -535,7 +545,7 @@ def test_doctor_reads_the_live_login_for_the_held_slot(tmp_path):
     world.login(2)                      # ... but #2 is the live login
     h.set_hold(world.root, "2", DNOW + H, by="cli", now=DNOW)
     [finding] = [f for f in _doctor(world) if f.check == "hold"]
-    assert finding.detail.startswith("holding #2 until ")
+    assert finding.detail.startswith("holding user2 until ")
 
 
 def test_doctor_says_a_hold_the_ledger_ended_no_longer_applies(tmp_path):
@@ -546,7 +556,7 @@ def test_doctor_says_a_hold_the_ledger_ended_no_longer_applies(tmp_path):
     _switch(world.root, 1, 2, DNOW - 300)
     _switch(world.root, 2, 1, DNOW - 200)
     [finding] = [f for f in _doctor(world) if f.check == "hold"]
-    assert finding.detail.startswith("a hold on #1 no longer applies: the active account "
+    assert finding.detail.startswith("a hold on user1 no longer applies: the active account "
                                      "changed since it was set")
     assert finding.fix == "cc-swap hold off"
 

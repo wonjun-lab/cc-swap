@@ -75,6 +75,7 @@ from claude_swap.maximize.model import (
     Snapshot,
     Switch,
 )
+from claude_swap.maximize.names import name_of, record_names
 from claude_swap.maximize.plan import plan_label, rate_limit_tier_from_credentials
 from claude_swap.maximize.report import decision_rows
 from claude_swap.maximize.score import score
@@ -563,7 +564,7 @@ def _rate_limit_tiers(
                     engine.switcher.read_account_credentials(number, email)
                 )
             except Exception:
-                _logger.debug("rateLimitTier unreadable for account %s", number)
+                _logger.debug("rateLimitTier unreadable for %s", engine._name(number))
         rt.tier_cache[number] = (email, tier, now)
         out[number] = tier
     return out
@@ -587,7 +588,9 @@ def read_login_deadlines(
                     number, str(record.get("email") or "")
                 )
         except Exception:
-            _logger.debug("login deadline unreadable for account %s", number)
+            _logger.debug(
+                "login deadline unreadable for %s", name_of(record_names(records), number)
+            )
             continue
         deadline_ms = oauth.login_expires_at_ms(creds or "")
         if deadline_ms is not None:
@@ -631,8 +634,9 @@ def _warn_login_expiry(
         rt.login_warned[number] = now
         note = oauth.login_expiry_note_ms(deadline * 1000.0, int(now * 1000))
         then = "" if now >= deadline else "before then, "
+        name = engine._name(number)
         engine._emit(aw.ConfigWarningEvent(
-            message=f"Account-{number} {note} — {then}{oauth.relogin_fix(number)}"
+            message=f"{name} {note} — {then}{oauth.relogin_fix(name)}"
         ))
 
 
@@ -1291,7 +1295,7 @@ def _switch(
                 systemic = status
         # "skip-live-session" and every failure: set aside, decide again.
         failed.add(number)
-        set_aside.append(f"#{number} ({status})")
+        set_aside.append(f"{engine._name(number)} ({status})")
         pick = policy.decide(_without(snap, failed))
     if isinstance(pick, Hold) and not systemic:
         held = replace(pick, reason=f"{pick.reason}; set aside {', '.join(set_aside)}")
@@ -1350,7 +1354,9 @@ def _pull_active_poll(
             {current: (identity["email"], identity["organizationUuid"])},
         )
     except Exception as e:
-        _logger.debug("pending poll re-plan failed for account %s: %s", current, type(e).__name__)
+        _logger.debug(
+            "pending poll re-plan failed for %s: %s", engine._name(current), type(e).__name__
+        )
 
 
 def _hold(
@@ -1535,11 +1541,17 @@ def _account_hold(
         return None
     if moved:
         engine._emit(aw.ConfigWarningEvent(
-            message=f"hold on #{found.slot} lifted: the active account changed since it was set"
+            message=(
+                f"hold on {engine._name(found.slot)} lifted: the active account "
+                "changed since it was set"
+            )
         ))
     elif account_hold.current(found, now) is not None:
         engine._emit(aw.ConfigWarningEvent(
-            message=f"hold on #{found.slot} lifted: #{live} is the active account now"
+            message=(
+                f"hold on {engine._name(found.slot)} lifted: "
+                f"{engine._name(live)} is the active account now"
+            )
         ))
     return None
 
@@ -1568,7 +1580,10 @@ def _end_hold_after_switch(
         _logger.debug("could not clear the account hold: %s", type(e).__name__)
         return
     engine._emit(aw.ConfigWarningEvent(
-        message=f"hold on #{current} lifted: the engine switched to #{landed}"
+        message=(
+            f"hold on {engine._name(current)} lifted: the engine switched to "
+            f"{engine._name(landed)}"
+        )
     ))
 
 
@@ -1597,7 +1612,8 @@ def _note_drift(engine: aw.AutoSwitchEngine, rt: MaximizeRuntime, current: str) 
             engine._emit(aw.ConfigWarningEvent(
                 message=(
                     f"the live login changed outside cc-swap: "
-                    f"#{entry.get('from') or '?'} -> #{current} "
+                    f"{engine._name(entry['from']) if entry.get('from') else '?'} -> "
+                    f"{engine._name(current)} "
                     "(a /login in a Claude Code session?)"
                 )
             ))

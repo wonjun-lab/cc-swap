@@ -36,11 +36,12 @@ import subprocess
 import sys
 import time
 from collections.abc import Callable, Iterable, Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Literal
 
 from claude_swap import __version__, oauth, paths, shared_login
+from claude_swap.maximize.names import cli_arg
 
 Severity = Literal["ok", "info", "warn", "error"]
 SEVERITIES: tuple[Severity, ...] = ("ok", "info", "warn", "error")
@@ -72,22 +73,32 @@ SERVICE_ENV = "CC_SWAP_SERVICE"
 @dataclass(frozen=True)
 class Finding:
     """One doctor result: ``scope`` is ``env``, ``accounts`` (all slots) or
-    one slot (``#3``)."""
+    one slot (``#3``, the JSON contract); ``name`` is that slot's display
+    name (maximize/names.py), what the human output shows."""
 
     check: str
     severity: Severity
     detail: str
     fix: str = ""
     scope: str = "env"
+    name: str = ""
+
+    @property
+    def where(self) -> str:
+        """What a human reads for the scope: the account's name."""
+        return self.name or self.scope
 
     def to_json(self) -> dict:
-        return {
+        out = {
             "check": self.check,
             "scope": self.scope,
             "severity": self.severity,
             "detail": self.detail,
             "fix": self.fix or None,
         }
+        if self.name:
+            out["name"] = self.name
+        return out
 
 
 def exit_code(findings: Iterable[Finding]) -> int:
@@ -404,6 +415,22 @@ class Context:
                 p.service_status() if p.platform in ("darwin", "linux") else None,
             )
         return self._service[0]
+
+    @property
+    def names(self) -> dict[str, str]:
+        """``{slot: display name}`` (maximize/names.py): what every finding
+        calls an account."""
+        from claude_swap.maximize.names import record_names
+
+        return record_names((self.sequence or {}).get("accounts"))
+
+    def name(self, number: object) -> str:
+        """Slot ``number``'s display name; an unknown slot its email's local
+        part (``self.slots``), else ``#N``."""
+        from claude_swap.maximize.names import name_of
+
+        slot = self.slots.get(str(number)) if number is not None else None
+        return name_of(self.names, number, slot.email if slot is not None else "")
 
     @property
     def strategy(self) -> str:
@@ -1034,12 +1061,13 @@ def check_live_login(ctx: Context) -> list[Finding]:
             (s.number for s in ctx.slots.values() if live_fp and s.fp == live_fp), None
         )
         if owner:
+            who = ctx.name(owner)
             return [Finding(
                 "live-login", "error",
-                f"the live token is #{owner}'s login, but ~/.claude.json names an "
-                f"account no slot has{_shared_tail(live.value, f'#{owner}')}",
+                f"the live token is {who}'s login, but ~/.claude.json names an "
+                f"account no slot has{_shared_tail(live.value, who)}",
                 "run claude and /login as the account you want, then cc-swap add; "
-                f"or re-login #{owner}: cc-swap login {owner}",
+                f"or re-login {who}: cc-swap login {cli_arg(who)}",
             )]
         return [Finding(
             "live-login", "warn",
@@ -1056,32 +1084,35 @@ def check_live_login(ctx: Context) -> list[Finding]:
         if other:
             return [Finding(
                 "live-login", "error",
-                f"~/.claude.json names #{number} but the live token is #{other}'s "
-                f"login{_shared_tail(live.value, f'#{number} or #{other}')}",
-                shared_login.fix([other, number])
+                f"~/.claude.json names {ctx.name(number)} but the live token is "
+                f"{ctx.name(other)}'s login"
+                f"{_shared_tail(live.value, f'{ctx.name(number)} or {ctx.name(other)}')}",
+                shared_login.fix([other, number], ctx.names)
                 if shared_login.refresh_fingerprint(live.value)
                 else "run claude and /login as the right account, then cc-swap add",
             )]
     if slot.credentials is None and slot.unreadable is None:
         return [Finding(
             "live-login", "warn",
-            f"the live login is #{number}, which has no stored backup",
+            f"the live login is {ctx.name(number)}, which has no stored backup",
             f"cc-swap add --slot {number}",
         )]
     active = (ctx.sequence or {}).get("activeAccountNumber")
     note = ""
     if active is not None and str(active) != number:
-        note = f"; sequence.json still says #{active} (corrected on the next switch)"
+        note = (
+            f"; sequence.json still says {ctx.name(active)} (corrected on the next switch)"
+        )
     if live_fp and slot.fp and slot.fp != live_fp:
         return [Finding(
             "live-login", "info",
-            f"the live login is #{number}; its backup is another generation "
+            f"the live login is {ctx.name(number)}; its backup is another generation "
             f"(rt {oauth.fingerprint8(slot.credentials)} vs "
             f"{oauth.fingerprint8(live.value)}){note}",
             "nothing to do unless a re-login just happened: then cc-swap add "
             f"--slot {number}",
         )]
-    return [Finding("live-login", "ok", f"the live login is #{number}{note}")]
+    return [Finding("live-login", "ok", f"the live login is {ctx.name(number)}{note}")]
 
 
 _UPSTREAM_PATH = re.compile(
@@ -1336,14 +1367,16 @@ def check_hold(ctx: Context) -> list[Finding]:
     if found.slot != active:
         return [Finding(
             "hold", "info",
-            f"a hold on #{found.slot} is left over; #{active or '?'} is the active account, "
+            f"a hold on {ctx.name(found.slot)} is left over; "
+            f"{ctx.name(active) if active else '?'} is the active account, "
             "so it no longer applies (the engine clears it on its next tick)",
             "cc-swap hold off",
         )]
     if account_hold.moved_away(p.backup_root, found):
         return [Finding(
             "hold", "info",
-            f"a hold on #{found.slot} no longer applies: the active account changed since it "
+            f"a hold on {ctx.name(found.slot)} no longer applies: the active account changed "
+            "since it "
             "was set (switches.jsonl); the engine clears it on its next tick",
             "cc-swap hold off",
         )]
@@ -1355,7 +1388,8 @@ def check_hold(ctx: Context) -> list[Finding]:
         mx = st.MaximizeSettings()
     return [Finding(
         "hold", "info",
-        f"holding #{found.slot} {account_hold.until_text(found, p.now)}: soft, preempt and "
+        f"holding {ctx.name(found.slot)} {account_hold.until_text(found, p.now)}: soft, "
+        "preempt and "
         f"rebalance moves wait — {account_hold.safety_text(mx.hard_5h, mx.hard_7d)} "
         "(cc-swap hold off lifts it)",
     )]
@@ -1500,7 +1534,7 @@ def check_drain(ctx: Context) -> list[Finding]:
         mx = st.MaximizeSettings()
     p = ctx.probes
     k7 = drain.learn_k(history.read(p.backup_root, p.now).points, p.now) if mx.drain_hours > 0 else {}
-    return [Finding("drain", "info", drain.describe(mx.drain_hours, k7))]
+    return [Finding("drain", "info", drain.describe(mx.drain_hours, k7, names=ctx.names))]
 
 
 def priming_guard(
@@ -1529,8 +1563,8 @@ _QUARANTINE_WHY = {
 }
 
 
-def _relogin_fix(number: str) -> str:
-    return oauth.relogin_fix(number)
+def _relogin_fix(ctx: Context, number: str) -> str:
+    return oauth.relogin_fix(ctx.name(number))
 
 
 def check_slots(ctx: Context) -> list[Finding]:
@@ -1565,7 +1599,7 @@ def check_slots(ctx: Context) -> list[Finding]:
         if not creds:
             out.append(Finding(
                 "stored-login", "error", "no stored login",
-                f"cc-swap login {slot.number} (or Fleet → select → r)",
+                f"cc-swap login {cli_arg(ctx.name(slot.number))} (or Fleet → select → r)",
                 scope,
             ))
             continue
@@ -1589,7 +1623,7 @@ def check_slots(ctx: Context) -> list[Finding]:
                 out.append(Finding(
                     "quarantine", "error",
                     f"quarantined: {_QUARANTINE_WHY.get(reason, reason)} — never a switch target",
-                    _relogin_fix(slot.number), scope,
+                    _relogin_fix(ctx, slot.number), scope,
                 ))
         if slot.kind == "api_key":
             continue
@@ -1600,13 +1634,13 @@ def check_slots(ctx: Context) -> list[Finding]:
                 out.append(Finding(
                     "login-deadline", "error",
                     oauth.login_expiry_note_ms(deadline_ms, int(p.now * 1000)) or "login expired",
-                    _relogin_fix(slot.number), scope,
+                    _relogin_fix(ctx, slot.number), scope,
                 ))
             elif left < LOGIN_WARN_S:
                 out.append(Finding(
                     "login-deadline", "warn",
                     oauth.login_expiry_note_ms(deadline_ms, int(p.now * 1000)) or "login expires soon",
-                    _relogin_fix(slot.number) + " (a new login starts a new ~30-day deadline)",
+                    _relogin_fix(ctx, slot.number) + " (a new login starts a new ~30-day deadline)",
                     scope,
                 ))
     out += _duplicates(ctx)
@@ -1622,7 +1656,7 @@ def check_slots(ctx: Context) -> list[Finding]:
 
 
 def _duplicates(ctx: Context) -> list[Finding]:
-    """``switcher._duplicate_account_warnings``, by slot number only."""
+    """``switcher._duplicate_account_warnings``, by display name only."""
     out: list[Finding] = []
     by_fp: dict[str, str] = {}
     by_identity: dict[tuple[str, str], str] = {}
@@ -1634,18 +1668,18 @@ def _duplicates(ctx: Context) -> list[Finding]:
                 # cc-swap: one refresh token in two slots (shared_login.py).
                 out.append(Finding(
                     "shared-login", "error",
-                    f"#{other} and #{slot.number} hold the same login (one slot's "
-                    f"backup was overwritten); "
-                    f"{_SHARED_TAIL.format(f'#{other} or #{slot.number}')}",
-                    shared_login.fix([slot.number, other]),
+                    f"{ctx.name(other)} and {ctx.name(slot.number)} hold the same login "
+                    "(one slot's backup was overwritten); "
+                    f"{_SHARED_TAIL.format(f'{ctx.name(other)} or {ctx.name(slot.number)}')}",
+                    shared_login.fix([slot.number, other], ctx.names),
                     f"#{slot.number}",
                 ))
             elif other:
                 out.append(Finding(
                     "duplicate", "error",
-                    f"#{other} and #{slot.number} hold the same login: one slot's "
-                    "backup was overwritten",
-                    f"log in as the account #{slot.number} should hold and run "
+                    f"{ctx.name(other)} and {ctx.name(slot.number)} hold the same login: "
+                    "one slot's backup was overwritten",
+                    f"log in as the account {ctx.name(slot.number)} should hold and run "
                     f"cc-swap add --slot {slot.number}",
                     f"#{slot.number}",
                 ))
@@ -1657,8 +1691,9 @@ def _duplicates(ctx: Context) -> list[Finding]:
             if other and other != slot.number:
                 out.append(Finding(
                     "duplicate", "error",
-                    f"#{other} and #{slot.number} authenticate as the same account",
-                    f"remove one of them: cc-swap remove {slot.number}",
+                    f"{ctx.name(other)} and {ctx.name(slot.number)} authenticate as the "
+                    "same account",
+                    f"remove one of them: cc-swap remove {cli_arg(ctx.name(slot.number))}",
                     f"#{slot.number}",
                 ))
             elif not other:
@@ -1677,7 +1712,7 @@ def _shared_with_profiles(ctx: Context) -> list[Finding]:
     root = ctx.probes.backup_root
     live_number = _slot_for_identity(ctx)
     holders: list[tuple[str, str | None, str | None]] = [
-        (f"#{s.number}", s.number, shared_login.refresh_fingerprint(s.credentials))
+        (ctx.name(s.number), s.number, shared_login.refresh_fingerprint(s.credentials))
         for s in ctx.slots.values() if s.kind != "api_key"
     ]
     live_fp = shared_login.refresh_fingerprint(ctx.live.value)
@@ -1701,14 +1736,14 @@ def _shared_with_profiles(ctx: Context) -> list[Finding]:
                 )
             ) else None
             where = (
-                shared_login.profile_label(owner) if owner
-                else f"a leftover cswap run profile made for #{profile.owner}"
+                shared_login.profile_label(owner, ctx.names) if owner
+                else f"a leftover cswap run profile made for {ctx.name(profile.owner)}"
             )
             out.append(Finding(
                 "shared-login", "error",
                 f"{label} holds the same login as {where}; "
                 f"{_SHARED_TAIL.format(label)}",
-                shared_login.fix([n for n in (number, owner) if n]),
+                shared_login.fix([n for n in (number, owner) if n], ctx.names),
                 f"#{number}" if number else "accounts",
             ))
     return out
@@ -1744,7 +1779,10 @@ def run_checks(probes: Probes | None = None) -> list[Finding]:
     findings: list[Finding] = []
     for check in (*ENV_CHECKS, check_slots):
         try:
-            findings += check(ctx)
+            findings += [
+                replace(f, name=ctx.name(f.scope[1:])) if f.scope.startswith("#") else f
+                for f in check(ctx)
+            ]
         except Exception as e:  # one broken probe must not hide the others
             findings.append(Finding(
                 check.__name__.removeprefix("check_"), "error",

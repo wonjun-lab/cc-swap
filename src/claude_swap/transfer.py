@@ -241,16 +241,19 @@ def export_accounts(
             creds_text = switcher._read_account_credentials(num, email)
             config_text = switcher._read_account_config(num, email)
             if not creds_text or not config_text:
+                from claude_swap.maximize.names import labeled, record_names, name_of
+
+                shown = labeled(name_of(record_names(accounts_map), num, email), email)
                 if explicit_account:
                     if not creds_text:
                         raise CredentialReadError(
-                            f"no backup credentials found for account {num} ({email})"
+                            f"no backup credentials found for {shown}"
                         )
                     raise ConfigError(
-                        f"no backup config found for account {num} ({email})"
+                        f"no backup config found for {shown}"
                     )
                 _eprint(
-                    f"Skipping Account-{num} ({email}): no stored "
+                    f"Skipping {shown}: no stored "
                     f"credentials/config — re-add with: "
                     f"cc-swap add --slot {num}"
                 )
@@ -418,11 +421,22 @@ def import_accounts(
 
         alias = raw.get("alias") or None
         if alias:
+            from claude_swap.maximize.names import fold
+
             alias_key = normalize_alias(alias)  # already validated in pass-1 above
-            if alias_key in seen_aliases:
+            if fold(alias_key) in seen_aliases:
                 raise TransferError(f"duplicate alias in export: {alias_key}")
-            seen_aliases.add(alias_key)
+            seen_aliases.add(fold(alias_key))
             owner = local_aliases.get(alias_key)
+            # cc-swap: nor may it read like another local account's name
+            # (alias or display name, case and ·/./: aside; maximize/names.py).
+            own_slot = switcher._find_account_slot(local_data, email, org_uuid)
+            taken = switcher._alias_in_use(alias_key, exclude_num=own_slot)
+            if taken is not None:
+                rec = (local_data.get("accounts") or {}).get(taken) or {}
+                taken_by = (rec.get("email", ""), rec.get("organizationUuid", "") or "")
+                if taken_by != (email, org_uuid):
+                    owner = taken_by
             if owner is not None and owner != (email, org_uuid):
                 _eprint(
                     f"Warning: alias '{alias_key}' for {email} already used by an "
@@ -533,7 +547,7 @@ def import_accounts(
             live_pids = switcher._live_session_pids(target_num, entry["email"])
             if live_pids:
                 _eprint(
-                    f"Warning: {entry['email']} (slot {target_num}) has a live "
+                    f"Warning: {entry['email']} has a live "
                     f"session-mode instance (PID {', '.join(map(str, live_pids))}); "
                     "its session profile keeps the pre-import credentials until "
                     "it is restarted via 'cswap run'."
@@ -590,7 +604,7 @@ def import_accounts(
         written_slots.add(target_num)
 
         if outcome == "overwrote":
-            _eprint(f"Overwrote {entry['email']} (slot {target_num})")
+            _eprint(f"Overwrote {entry['email']}")
             if had_strike:
                 # Store-fact wording on purpose: import rewrites the backup,
                 # so for the active slot the next poll may still exercise the
@@ -612,12 +626,12 @@ def import_accounts(
             # Describe the observed trigger (the quarantine verdict), not the
             # token itself — a stale verdict can sit over newer working creds.
             _eprint(
-                f"Replaced {entry['email']} (slot {target_num} was "
+                f"Replaced {entry['email']} (it was "
                 "quarantined: refresh token dead)"
             )
             replaced += 1
         else:
-            _eprint(f"Imported {entry['email']} → slot {target_num}")
+            _eprint(f"Imported {entry['email']}")
             imported += 1
 
     # Migration UX: if the destination has no recorded active account
@@ -752,9 +766,9 @@ def import_usage(
     adopted = switcher._usage_store.adopt(readings, identities, hold_s=hold_s)
     for num, (email, _org_uuid) in identities.items():
         if num in adopted:
-            _eprint(f"Adopted usage for {email} → slot {num}")
+            _eprint(f"Adopted usage for {email}")
         else:
-            _eprint(f"Kept slot {num}'s own reading for {email}: it is newer")
+            _eprint(f"Kept {email}'s own reading: it is newer")
     summary = (
         f"Done: {len(adopted)} adopted, {len(readings) - len(adopted)} kept, "
         f"{skipped} skipped"

@@ -888,7 +888,7 @@ def test_cli_login_stores_and_exits_zero(temp_home, monkeypatch, capsys, cli_log
     cli_login["login"] = login = FakeLogin()
     assert _cli(monkeypatch, ["four"]) == 0  # an alias resolves like a number
     out = capsys.readouterr().out
-    assert "#4 login stored" in out and "auth login" in out  # the banner
+    assert "four login stored" in out and "auth login" in out  # the banner
     assert login.calls[0][0][-1] == FOUR
     assert _slot_rt(s) == "rt-four-new"
 
@@ -932,7 +932,10 @@ def test_login_is_a_registered_command():
 
 
 def test_relogin_fix_points_at_the_login_command():
-    assert oauth.relogin_fix(4) == "re-login #4: cc-swap login 4, or Fleet → select → r"
+    assert oauth.relogin_fix("four") == "re-login four: cc-swap login four, or Fleet → select → r"
+    assert oauth.relogin_fix("same·Acme Labs").startswith(
+        "re-login same·Acme Labs: cc-swap login 'same·Acme Labs'"
+    )
 
 
 # -- session shells, interrupts, leftovers (review round 3) ----------------------------

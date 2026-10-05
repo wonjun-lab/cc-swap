@@ -59,10 +59,13 @@ def last_resort_entry(accounts: Mapping, num: str, email: str) -> str:
     if alias:
         return alias
     from claude_swap.exceptions import ConfigError
+    from claude_swap.maximize.names import cli_arg, name_of, names_list, record_names
 
+    names = record_names(accounts)
+    name = name_of(names, num, email)
     raise ConfigError(
-        f"{email} is shared by Account-{num} and Account-{', Account-'.join(shared)}; "
-        f"give Account-{num} an alias first (cc-swap alias {num} NAME) so "
+        f"{email} is shared by {names_list(names, [num, *shared])}; "
+        f"give {name} an alias first (cc-swap alias {cli_arg(name)} NAME) so "
         "last-resort names only that account"
     )
 

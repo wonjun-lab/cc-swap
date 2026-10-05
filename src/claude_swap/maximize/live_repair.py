@@ -35,6 +35,7 @@ from pathlib import Path
 
 from claude_swap import oauth
 from claude_swap.exceptions import ConfigError, CredentialReadError
+from claude_swap.maximize.names import name_of
 
 #: A claude.ai access token lives this long; a token's issue time is its
 #: ``expiresAt`` minus this.
@@ -53,13 +54,25 @@ class MixedLogin:
     file_mtime: float
     file_creds: str       # never printed
     keychain_creds: str
+    # The display names (maximize/names.py) of X's and Y's slots.
+    x_name: str = ""
+    y_name: str = ""
+
+    @property
+    def x_label(self) -> str:
+        """X by name; an unmanaged X by its address's local part (this
+        text reaches the engine's log)."""
+        return self.x_name or name_of({}, self.x_slot, self.email)
+
+    @property
+    def y_label(self) -> str:
+        return self.y_name or name_of({}, self.y_slot)
 
 
 def explain(m: MixedLogin) -> str:
-    x = f"#{m.x_slot} ({m.email})" if m.x_slot else m.email
     return (
-        f"mixed live login: ~/.claude.json names {x}, but the Keychain still holds "
-        f"#{m.y_slot}'s login and ~/.claude/.credentials.json a newer one — a /login "
+        f"mixed live login: ~/.claude.json names {m.x_label}, but the Keychain still holds "
+        f"{m.y_label}'s login and ~/.claude/.credentials.json a newer one — a /login "
         f"that ran while the Keychain was locked (e.g. over SSH) saved its token in "
         f"plaintext. Run: {COMMAND}"
     )
@@ -152,7 +165,11 @@ def _scan_slots(switcher, identity, kc_fp, file_fp, path, mtime, text, kc) -> Mi
             y_slot = str(num)
     if y_slot is None or y_slot == x_slot:
         return None
-    return MixedLogin(email, org, uuid, x_slot, y_slot, path, mtime, text, kc)
+    names = switcher.account_names() if hasattr(switcher, "account_names") else {}
+    return MixedLogin(
+        email, org, uuid, x_slot, y_slot, path, mtime, text, kc,
+        name_of(names, x_slot, email) if x_slot else "", name_of(names, y_slot),
+    )
 
 
 def _verify_owner(m: MixedLogin) -> None:
@@ -244,11 +261,10 @@ def repair(switcher, *, confirm: Callable[[str], bool]) -> str:
             "~/.claude.json agree, or ~/.claude/.credentials.json holds no newer login)."
         )
     _verify_owner(m)
-    target = f"#{m.x_slot}" if m.x_slot else "a new account"
     question = (
         f"{explain(m)}\n\nThe plaintext login is {m.email}'s (checked). Write it into the "
-        f"Keychain{f' and slot {target}' if m.x_slot else ''} and remove "
-        f"{m.file_path}? #{m.y_slot}'s login stays stored in its slot."
+        f"Keychain{f' and {m.x_label}' if m.x_slot else ''} and remove "
+        f"{m.file_path}? {m.y_label}'s login stays stored in its slot."
     )
     if not confirm(question):
         return "Cancelled; nothing was changed."
@@ -311,11 +327,11 @@ def repair(switcher, *, confirm: Callable[[str], bool]) -> str:
             pass
     switcher._logger.info(
         "repair-live: plaintext login (rt %s) moved into the Keychain%s",
-        oauth.fingerprint8(m.file_creds), f" and #{m.x_slot}" if m.x_slot else "",
+        oauth.fingerprint8(m.file_creds), f" and {m.x_label}" if m.x_slot else "",
     )
     if m.x_slot:
         return (
-            f"Repaired: the Keychain and #{m.x_slot} hold {m.email}'s login; "
+            f"Repaired: the Keychain and {m.x_label} hold {m.email}'s login; "
             f"{m.file_path} was removed."
         )
     return (

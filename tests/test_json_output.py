@@ -169,6 +169,16 @@ class TestJsonHelpers:
         row = account_row(1, "a@x.com", "", "", True, None, alias="dev")
         assert row["alias"] == "dev"
 
+    def test_account_row_and_ref_carry_a_name(self):
+        from claude_swap.json_output import account_ref, account_row
+
+        assert account_row(1, "a@example.com", "", "", True, None)["name"] == "a"
+        assert account_row(1, "a@example.com", "", "", True, None, name="w")["name"] == "w"
+        assert account_ref(3, "b@example.com") == {
+            "number": 3, "email": "b@example.com", "name": "b",
+        }
+        assert account_ref(3, "b@example.com", "work")["name"] == "work"
+
     def test_account_row_omits_alias_when_unset(self):
         from claude_swap.json_output import account_row
 
@@ -259,6 +269,9 @@ class TestListJson:
         by_num = {a["number"]: a for a in payload["accounts"]}
         assert by_num[1]["alias"] == "dev"
         assert "alias" not in by_num[2]
+        # Additive ``name``: the display name every human surface uses.
+        assert by_num[1]["name"] == "dev"
+        assert by_num[2]["name"] == "account2"
 
     def test_list_payload_reports_login_expiry_from_the_stored_credential(
         self, temp_home: Path, mock_claude_config: Path,
@@ -407,6 +420,7 @@ class TestStatusJson:
         assert capsys.readouterr().out == ""
         active = payload["active"]
         assert active["number"] == 1
+        assert active["name"] == "test"  # additive: the display name
         assert active["managed"] is True
         assert active["usageStatus"] == "ok"
         assert active["usage"]["fiveHour"]["resetsAt"] == "2026-01-01T00:00:00Z"
@@ -465,6 +479,7 @@ class TestStatusJson:
             payload = switcher.status(json_output=True)
 
         assert payload["active"]["alias"] == "dev"
+        assert payload["active"]["name"] == "dev"
 
 
 # --------------------------------------------------------------------------- #
@@ -543,8 +558,8 @@ class TestSwitchJson:
         assert result["switched"] is True
         assert result["strategy"] == "direct"
         assert result["reason"] == "switched"
-        assert result["from"] == {"number": 1, "email": "test@example.com"}
-        assert result["to"] == {"number": 2, "email": "account2@example.com"}
+        assert result["from"] == {"number": 1, "email": "test@example.com", "name": "test"}
+        assert result["to"] == {"number": 2, "email": "account2@example.com", "name": "account2"}
         assert result["warnings"] == []
 
     def test_switch_to_already_active_short_circuits(
@@ -563,7 +578,7 @@ class TestSwitchJson:
         perform.assert_not_called()  # short-circuited before any write
         assert result["switched"] is False
         assert result["reason"] == "already-active"
-        assert result["from"] == result["to"] == {"number": 1, "email": "test@example.com"}
+        assert result["from"] == result["to"] == {"number": 1, "email": "test@example.com", "name": "test"}
 
     def test_switch_to_force_self_activation_reports_activated(
         self, temp_home: Path, mock_claude_config: Path,
@@ -585,8 +600,8 @@ class TestSwitchJson:
         assert capsys.readouterr().out == ""
         assert result["switched"] is False
         assert result["reason"] == "activated"
-        assert result["from"] == result["to"] == {"number": 1, "email": "test@example.com"}
-        assert result["message"].startswith("Activated Account-1")
+        assert result["from"] == result["to"] == {"number": 1, "email": "test@example.com", "name": "test"}
+        assert result["message"] == "Activated test from stored backup"
         # The live login was really rewritten from the stored backup.
         assert json.loads(live["creds"])["claudeAiOauth"]["accessToken"] == "sk-imported-1"
 
@@ -608,8 +623,8 @@ class TestSwitchJson:
         assert capsys.readouterr().out == ""
         assert result["switched"] is True
         assert result["reason"] == "switched"
-        assert result["from"] == {"number": 1, "email": "test@example.com"}
-        assert result["to"] == {"number": 2, "email": "account2@example.com"}
+        assert result["from"] == {"number": 1, "email": "test@example.com", "name": "test"}
+        assert result["to"] == {"number": 2, "email": "account2@example.com", "name": "account2"}
         # Backup-current was skipped: slot 1's stored creds are untouched.
         assert creds[("1", "test@example.com")] == slot1_before
 
@@ -629,7 +644,7 @@ class TestSwitchJson:
         switcher._write_json(switcher.sequence_file, single)
         result = switcher.switch(json_output=True)
         assert result["switched"] is False
-        assert result["from"] == result["to"] == {"number": 1, "email": "test@example.com"}
+        assert result["from"] == result["to"] == {"number": 1, "email": "test@example.com", "name": "test"}
 
     def test_switch_to_from_unmanaged_account(
         self, temp_home: Path, mock_claude_config: Path,
@@ -655,7 +670,7 @@ class TestSwitchJson:
             for p in patches:
                 p.stop()
         assert result["switched"] is True
-        assert result["from"] == {"number": None, "email": "test@example.com"}
+        assert result["from"] == {"number": None, "email": "test@example.com", "name": "test"}
         assert result["to"]["number"] == 2
 
     def test_switch_to_ambiguous_email_raises(
@@ -702,7 +717,7 @@ class TestSwitchJson:
         add.assert_not_called()
         assert result["switched"] is False
         assert result["reason"] == "unmanaged-account"
-        assert result["from"] == {"number": None, "email": "test@example.com"}
+        assert result["from"] == {"number": None, "email": "test@example.com", "name": "test"}
 
 
 class TestAccountRowFailure:

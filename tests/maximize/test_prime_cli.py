@@ -54,9 +54,9 @@ def test_dry_run_prints_plan_by_slot_only(cli_rig, capsys):
     harness, fake = cli_rig
     prime_cli.prime_command(["--dry-run"])
     out = capsys.readouterr().out
-    assert "#1  skip (active)" in out
-    assert "#2  would prime now (window cold, attempt 1/2)" in out
-    assert "#3  skip (window-on)" in out
+    assert "a  skip (active)" in out
+    assert "b  would prime now (window cold, attempt 1/2)" in out
+    assert "c  skip (window-on)" in out
     assert "@example.com" not in out
     assert fake.calls() == []
 
@@ -68,7 +68,7 @@ def test_prime_runs_even_when_disabled_and_verifies(cli_rig, capsys):
         prime_cli.prime_command(["2"])
     assert exc.value.code == 0
     out = capsys.readouterr().out
-    assert "Account-2: 5h window primed" in out
+    assert "b: 5h window primed" in out
     assert "@example.com" not in out
     [call] = fake.calls()
     assert call["env"]["CLAUDE_CODE_OAUTH_TOKEN"] == "sk-2"
@@ -141,15 +141,15 @@ def test_dry_run_then_prime_never_silently_does_nothing(store_rig, capsys):
     endpoint["errors"]["2"] = "http-429"
 
     prime_cli.prime_command(["--dry-run", "2"])
-    assert "#2  would prime now (window cold, attempt 1/2)" in capsys.readouterr().out
+    assert "b  would prime now (window cold, attempt 1/2)" in capsys.readouterr().out
 
     code = _run_prime(["2"])
     out = capsys.readouterr().out
     assert fake.calls() == []
     assert "Nothing to prime." not in out
-    [line] = [ln for ln in out.splitlines() if "#2" in ln or "Account-2" in ln]
+    [line] = [ln for ln in out.splitlines() if ln.startswith(("b ", "b:"))]
     assert line == (
-        "#2  not primed (no usage reading from the last 60s: the last usage "
+        "b  not primed (no usage reading from the last 60s: the last usage "
         "fetch failed (http-429); fetches back off for 30s more)"
     )
     assert "@example.com" not in out
@@ -160,7 +160,7 @@ def test_dry_run_then_prime_never_silently_does_nothing(store_rig, capsys):
     harness.clock.advance(600)  # past the failure backoff
     assert _run_prime(["2"]) == 0
     out = capsys.readouterr().out
-    assert "Account-2: 5h window primed" in out
+    assert "b: 5h window primed" in out
     assert len(fake.calls()) == 1
 
 
@@ -177,9 +177,9 @@ def test_prime_reports_every_account_it_did_not_launch(store_rig, capsys, monkey
     out = capsys.readouterr().out
     assert fake.calls() == []
     assert "Nothing to prime." not in out
-    assert "#1  skip (active)" in out
-    [line] = [ln for ln in out.splitlines() if "#2" in ln or "Account-2" in ln]
-    assert line == "#2  not primed (access token not ready (transient))"
+    assert "a  skip (active)" in out
+    [line] = [ln for ln in out.splitlines() if ln.startswith(("b ", "b:"))]
+    assert line == "b  not primed (access token not ready (transient))"
     assert "@example.com" not in out
     assert code == 1
 
@@ -196,7 +196,7 @@ def test_manual_prime_reports_reasons_when_nothing_is_eligible(cli_rig):
     assert fake.calls() == []
     assert (report.events, report.pending, report.not_primed) == ([], [], {})
     assert report.lines() == [
-        "#1  skip (active)", "#3  skip (window-on)", "Nothing to prime.",
+        "a  skip (active)", "c  skip (window-on)", "Nothing to prime.",
     ]
     assert report.failed is False
     dry = prime_cli.manual_prime(
@@ -204,9 +204,9 @@ def test_manual_prime_reports_reasons_when_nothing_is_eligible(cli_rig):
         emit=seen.append, sleep=harness.clock.advance, clock=harness.clock,
     )
     assert dry.lines() == [
-        "#1  skip (active)",
-        "#2  would prime now (window cold, attempt 1/2)",
-        "#3  skip (window-on)",
+        "a  skip (active)",
+        "b  would prime now (window cold, attempt 1/2)",
+        "c  skip (window-on)",
     ]
     assert "@" not in "\n".join(report.lines() + dry.lines())
 
@@ -233,7 +233,7 @@ def test_dry_run_reports_the_version_guard_pause_like_a_real_run(cli_rig, capsys
     out = capsys.readouterr().out
     assert "would prime now" not in out
     assert "Priming is paused: prime verify failed for claude 2.1.230" in out
-    assert "#2  not primed (priming is paused, see above)" in out
+    assert "b  not primed (priming is paused, see above)" in out
 
     assert _run_prime(["2"]) == 1
     real = capsys.readouterr().out
@@ -246,15 +246,15 @@ def test_dry_run_reports_a_relogin_pause_like_a_real_run(cli_rig, capsys):
     from claude_swap.maximize import pause
 
     harness, fake = cli_rig
-    pause.pause(harness.switcher.backup_dir, "re-login #3", now=harness.clock())
+    pause.pause(harness.switcher.backup_dir, "re-login c", now=harness.clock())
 
     assert _dry_run(["2"]) == 1
     dry = capsys.readouterr().out
-    assert "#2  not primed (switching paused (re-login #3))" in dry
+    assert "b  not primed (switching paused (re-login c))" in dry
 
     assert _run_prime(["2"]) == 1
     real = capsys.readouterr().out
-    assert "#2  not primed (switching paused (re-login #3))" in real
+    assert "b  not primed (switching paused (re-login c))" in real
     assert fake.calls() == []
 
 
@@ -267,7 +267,7 @@ def test_dry_run_notes_auto_off(cli_rig, capsys):
     pause.set_auto_off(harness.switcher.backup_dir, True, by="cli", now=harness.clock())
     assert _dry_run([]) == 0
     out = capsys.readouterr().out
-    assert "#2  would prime now" in out
+    assert "b  would prime now" in out
     assert "auto-switching is OFF" in out and "cc-swap prime" in out
 
 

@@ -214,7 +214,6 @@ def account_card_text(
     now = now if now is not None else time.time()
 
     text = Text()
-    text.append(f"{acc.number:>2}  ", style=f"bold {palette.foreground}")
     if acc.alias:
         text.append(acc.alias, style=f"bold {palette.accent}")
         text.append(f" ({acc.email})", style=palette.foreground)
@@ -306,14 +305,13 @@ def mini_account_text(
 ) -> Text:
     """One minimized line for an inactive account.
 
-    ``2  work@acme.dev [personal]   5h 92% · 7d 63%`` — pcts only, severity
+    ``work@acme.dev [personal]   5h 92% · 7d 63%`` — pcts only, severity
     colored (by maximize's soft/hard marks when ``window_ticks`` names the
     window, as the bars are); a window at/over 100% brings its reset
     countdown along, and a maxed per-model window shows as ``Fable (!)``.
     Sentinel states show their label instead.
     """
     text = Text(no_wrap=True, overflow="ellipsis")
-    text.append(f"{acc.number:>2}  ", style=f"bold {palette.muted}")
     if acc.alias:
         text.append(acc.alias, style=f"bold {palette.accent}")
         text.append(f" ({acc.email})", style=palette.foreground)

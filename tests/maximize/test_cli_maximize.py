@@ -250,7 +250,7 @@ class TestLastResort:
         del data["accounts"]["3"]["alias"]
         switcher._write_json(switcher.sequence_file, data)
         assert self._cmd(["add", "3"]) == 1
-        assert "give Account-3 an alias first" in capsys.readouterr().err
+        assert "give work·Team an alias first (cc-swap alias work·Team NAME)" in capsys.readouterr().err
         assert self._stored() is None
 
     def test_remove_last_entry_unsets_the_key(self, temp_home):
@@ -280,7 +280,7 @@ class TestLastResort:
         set_setting(_backup_root(), "maximize.lastResort", "work@co.com")
         self._cmd(["remove", "2"])
         assert self._stored() is None
-        assert "Also returned Account-3" in capsys.readouterr().out
+        assert "Also returned team" in capsys.readouterr().out
 
     def test_remove_clears_an_entry_that_names_no_account(self, temp_home, capsys):
         # Left by an older `remove N`: resolving the email failed, so it
@@ -301,7 +301,7 @@ class TestLastResort:
         set_setting(_backup_root(), "maximize.lastResort", "team@co.com,ghost@x.com")
         assert self._cmd(["list"]) == 0
         out = capsys.readouterr().out
-        assert "team@co.com → Account-3" in out
+        assert "team@co.com → team" in out
         assert "ghost@x.com → (no matching account)" in out
 
     def test_bare_command_lists(self, temp_home, capsys):

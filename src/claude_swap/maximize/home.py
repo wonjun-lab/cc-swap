@@ -51,6 +51,7 @@ from claude_swap.maximize import drain
 from claude_swap.maximize import fleet as fx
 from claude_swap.maximize import hold as account_hold
 from claude_swap.maximize import policy
+from claude_swap.maximize.names import name_of
 from claude_swap.settings import MaximizeSettings
 
 if TYPE_CHECKING:
@@ -354,13 +355,9 @@ MAX_BAR = 24
 MIN_BAR = 6
 #: The percentage after a bar: `` 62%``.
 PCT_W = 4
-#: The account column is never wider than this for the name itself (the
-#: dim `` #4`` slot after it comes on top), …
-NAME_CAP = 32
-#: … and gives up characters only down to this before the bars go (the
-#: percentages stay): ``team.shared@…`` tells accounts apart, ``team.s…``
-#: does not.
-MIN_NAME = 13
+#: (The account column is as wide as the longest name, always: a name is
+#: what every command takes, so it is never cut — the other columns give
+#: way, and past that the row's end is clipped.)
 #: Blank columns between two columns, and when room is tight.
 GAP, TIGHT_GAP = 2, 1
 
@@ -381,7 +378,6 @@ class TableNeeds:
 
     rows: int = 0
     name: int = 0          # the longest display name, in cells
-    slot: int = 3          # the longest `` #4`` after a name, its space included
     plan: int = 0          # the longest plan label
     reset5: int = 0        # the longest 5h resets cell, with the clock …
     reset5_short: int = 0  # … and without it
@@ -400,12 +396,6 @@ def plan_text(row: fx.FleetRow) -> str:
     return NOT_KNOWN if row.plan == "?" else row.plan
 
 
-def account_slot(row: fx.FleetRow) -> str:
-    """The dim slot number after the name: `` #4`` (what the attention line
-    and the CLI call it)."""
-    return f" #{row.number}"
-
-
 def table_needs(
     rows: Sequence[fx.FleetRow],
     statuses: Mapping[str, tuple[str, Tone] | None],
@@ -420,7 +410,6 @@ def table_needs(
     return TableNeeds(
         rows=len(rows),
         name=widest(r.name for r in rows),
-        slot=widest(account_slot(r) for r in rows),
         plan=widest(plan_text(r) for r in rows),
         reset5=widest(row_resets(r, "5h", now, clock=True) for r in rows),
         reset5_short=widest(row_resets(r, "5h", now, clock=False) for r in rows),
@@ -486,7 +475,7 @@ def _columns(
         return key, max(width, cells(HEADERS[key]))
 
     usage = bar + 1 + PCT_W if bar else PCT_W
-    out = [head("order", 1), head("account", name + needs.slot)]
+    out = [head("order", 1), head("account", name)]
     if plan:
         out.append(head("plan", needs.plan))
     out += [
@@ -505,7 +494,7 @@ def _span(columns: Sequence[tuple[str, int]], gap: int) -> int:
 
 def _name_room(room: int, needs: TableNeeds, columns: Sequence[tuple[str, int]], gap: int) -> int:
     """Cells left for the name when every other column takes its width."""
-    return room - (_span(columns, gap) - dict(columns)["account"]) - needs.slot
+    return room - (_span(columns, gap) - dict(columns)["account"])
 
 
 #: The most lines the attention notes take (:func:`attention_lines`).
@@ -523,16 +512,15 @@ def table_plan(
     """The table's columns for a ``width`` x ``height`` terminal.
 
     Everything shows while it fits: bars up to :data:`MAX_BAR`, the reset
-    clocks, the plan, the whole name (up to :data:`NAME_CAP`). When it does
-    not, in this order: the bars shorten to :data:`MIN_BAR`; the columns
-    move closer (:data:`TIGHT_GAP`); the reset clocks go (the countdowns
-    stay); the plan column goes; the status column takes its shorter
-    wording (:func:`short_status`, ``login 1d`` for ``login 1d left``); the
-    name shortens with … (to :data:`MIN_NAME`); then the bars go, leaving
-    the percentages, and the name takes what is left (the status keeps its
-    full wording again once the whole name fits). ``order``, the resets and
-    the status columns never go, so a terminal too narrow even for that
-    clips the row's end.
+    clocks, the plan, the whole name. When it does not, in this order: the
+    bars shorten to :data:`MIN_BAR`; the columns move closer
+    (:data:`TIGHT_GAP`); the reset clocks go (the countdowns stay); the plan
+    column goes; the status column takes its shorter wording
+    (:func:`short_status`, ``login 1d`` for ``login 1d left``); then the
+    bars go, leaving the percentages; then the 7d resets go, then the 5h
+    ones. The name is never cut and the status never goes: ``order``, the
+    whole name, the percentages and the status stay, so only a terminal too
+    narrow even for those clips the row's end.
 
     Height: ``attention`` is how many lines the attention notes would like
     (:func:`attention_want`; True: one). The first always shows; the others
@@ -545,7 +533,7 @@ def table_plan(
     nothing, and never below :data:`SUMMARY_MIN_ROWS` rows. The table itself
     is used at every size."""
     room = text_width(width)
-    name = min(needs.name, NAME_CAP)
+    name = needs.name
     columns: list[tuple[str, int]] | None = None
     short = False
     for clock, plan, gap in ((True, True, GAP), (True, True, TIGHT_GAP),
@@ -556,7 +544,7 @@ def table_plan(
         if bar >= MIN_BAR:
             columns = _columns(needs, bar=bar, clock=clock, plan=plan, name=name)
             break
-    if columns is None:  # the status shortens, then the name, then the bars go
+    if columns is None:  # the status shortens, then the bars go; never the name
         clock, plan, gap = False, False, TIGHT_GAP
 
         def fit_at(bar: int) -> tuple[int, int | None]:
@@ -574,12 +562,23 @@ def table_plan(
 
         bar = MIN_BAR
         fit, status = fit_at(bar)
-        if fit < min(name, MIN_NAME):
+        if fit < name:
             bar = 0
             fit, status = fit_at(bar)
         short = status is not None
-        columns = _columns(needs, bar=bar, clock=clock, plan=plan,
-                           name=max(min(name, fit), 1), status=status)
+        columns = _columns(needs, bar=bar, clock=clock, plan=plan, name=name, status=status)
+        # A row that still does not fit loses its end, and the status is
+        # last: before that, the resets go (7d, then 5h; the percentages
+        # stay), so the status is never what is cut away.
+        for gone in ("reset7", "reset5"):
+            if _span(columns, gap) <= room:
+                break
+            columns = [c for c in columns if c[0] != gone]
+        if status is not None:  # room again for the status's own wording?
+            whole = [(k, max(needs.status, cells(HEADERS["status"])) if k == "status" else w)
+                     for k, w in columns]
+            if _span(whole, gap) <= room:
+                columns, short = whole, False
     blanks = height >= BLANKS_MIN_ROWS
     want = int(attention)
     fixed_lines = 1 + 1 + 1 + min(want, 1) + 2 * int(blanks)  # status, header, footer
@@ -618,9 +617,9 @@ class Capacity:
 
     usable: int                              # accounts counted
     free5: int                               # under the 5h soft mark, 7d not spent
-    back5: tuple[float, str] | None          # (reset, slot): the soonest 5h back
+    back5: tuple[float, str] | None          # (reset, name): the soonest 5h back
     left7: float                             # Σ (100 − 7d%)/100
-    next7: tuple[float, str] | None          # (reset, slot): the soonest 7d reset
+    next7: tuple[float, str] | None          # (reset, name): the soonest 7d reset
 
 
 def usable_for_capacity(row: fx.FleetRow, now: float) -> bool:
@@ -676,12 +675,12 @@ def capacity(
 
     free = [r for r in usable if free_now(r)]
     waiting = [
-        (r.reset5, r.number) for r in usable
+        (r.reset5, r.name) for r in usable
         if not r.active and not free_now(r) and week_lands(r)
         and r.reset5 is not None and r.reset5 > now and not guarded(r, r.reset5)
     ]
     resets7 = [
-        (r.reset7, r.number) for r in usable if r.reset7 is not None and r.reset7 > now
+        (r.reset7, r.name) for r in usable if r.reset7 is not None and r.reset7 > now
     ]
     left7 = sum(max(0.0, 100.0 - min(r.pct7 or 0.0, 100.0)) / 100.0 for r in usable)
     return Capacity(
@@ -695,7 +694,7 @@ def capacity(
 
 def summary_variants(cap: Capacity, now: float) -> list[list[Seg]]:
     """The summary line as tone segments, longest first, with countdowns
-    (``next back in 1h47m (#1) · next 7d in 2d04h (#2)``, as the table's
+    (``next back in 1h47m (main) · next 7d in 2d04h (side)``, as the table's
     resets count): the 7d room goes first, then the 7d reset, then the 5h
     one."""
     n = cap.free5
@@ -705,13 +704,13 @@ def summary_variants(cap: Capacity, now: float) -> list[list[Seg]]:
     ]
     back: list[Seg] = []
     if cap.back5 is not None:
-        reset, slot = cap.back5
-        back = [(" · next back in ", "dim"), (f"{countdown(reset - now)} (#{slot})", "plain")]
+        reset, who = cap.back5
+        back = [(" · next back in ", "dim"), (f"{countdown(reset - now)} ({who})", "plain")]
     week: list[Seg] = [(" · 7d left this week ≈ ", "dim"), (f"{cap.left7:.1f} accounts", "plain")]
     reset7: list[Seg] = []
     if cap.next7 is not None:
-        reset, slot = cap.next7
-        reset7 = [(" · next 7d in ", "dim"), (f"{countdown(reset - now)} (#{slot})", "plain")]
+        reset, who = cap.next7
+        reset7 = [(" · next 7d in ", "dim"), (f"{countdown(reset - now)} ({who})", "plain")]
     out = [head + back + week + reset7, head + back + reset7, head + back, head]
     unique: list[list[Seg]] = []
     for variant in out:
@@ -851,7 +850,7 @@ def _past_soft(row: fx.FleetRow, mx: MaximizeSettings) -> tuple[str, float, floa
 #: ``#1 7d 84% would pass 90% in ~3h, before your usual quiet time (23:00)``
 #: (``policy._preempt``): the part after the slot number.
 _PREEMPT_WHY_RE = re.compile(
-    r"#\w+ (7d [\d.]+% would pass [\d.]+% in ~\d+[mh], [^—]*?)\s*(?:—|$)"
+    r"(7d [\d.]+% would pass [\d.]+% in ~\d+[mh], [^—]*?)\s*(?:—|$)"
 )
 #: ``preempt cooldown (12 min left): …``
 _PREEMPT_COOLDOWN_RE = re.compile(r"preempt cooldown \((\d+) min left\)")
@@ -869,10 +868,14 @@ def waits_text(waits: Sequence[tuple[str, float, float]], now: float) -> str:
     )
 
 
-def _quoted(reason: str) -> str:
-    """A reason with the slot number it starts with dropped (the sentence
-    has already named the account)."""
-    return re.sub(r"^#\w+ ", "", reason.strip())
+def _quoted(reason: str, act: fx.FleetRow | None = None) -> str:
+    """A reason with the account name it starts with dropped (the sentence
+    has already named the account); a reason from before names starts with
+    the slot (``#3``)."""
+    text = reason.strip()
+    if act is not None and act.name and text.lower().startswith(act.name.lower() + " "):
+        return text[len(act.name) + 1:]
+    return re.sub(r"^#\w+ ", "", text)
 
 
 def _reset_wait_variants(
@@ -880,7 +883,7 @@ def _reset_wait_variants(
 ) -> list[list[Seg]]:
     if not dv.waits:  # the window reset since, or a reason this cannot read
         return [
-            [head, (f" · using {name(act.number)} · {_quoted(dv.reason)}", "plain")],
+            [head, (f" · using {name(act.number)} · {_quoted(dv.reason, act)}", "plain")],
             [head, (f" · {dv.reason}", "plain")],
             [head, (" · waiting out a reset", "plain")],
             [head],
@@ -890,9 +893,9 @@ def _reset_wait_variants(
     return [
         [head, (f" · using {name(act.number)} · {waits}, waiting it out ", "plain"),
          (RESET_WAIT_TAIL, "dim")],
-        [head, (f" · #{act.number} {waits}, waiting it out {RESET_WAIT_TAIL}", "plain")],
-        [head, (f" · #{act.number} {waits}, waiting it out", "plain")],
-        [head, (f" · #{act.number} {first}, waiting", "plain")],
+        [head, (f" · {act.name} {waits}, waiting it out {RESET_WAIT_TAIL}", "plain")],
+        [head, (f" · {act.name} {waits}, waiting it out", "plain")],
+        [head, (f" · {act.name} {first}, waiting", "plain")],
         [head, (" · waiting out a reset", "plain")],
         [head],
     ]
@@ -910,7 +913,7 @@ def _preempt_hold_variants(
     why = _preempt_why(dv.reason)
     cooldown = _PREEMPT_COOLDOWN_RE.search(dv.reason or "")
     target = name(dv.target) if dv.target else "the next account"
-    short_target = f"#{dv.target}" if dv.target else "the next account"
+    short_target = target
     move = "would move" if dry else "will move"
     if cooldown:  # it still waits for a pause once the cooldown is over
         when = f"when you pause after the cooldown ({cooldown.group(1)}m left)"
@@ -919,15 +922,15 @@ def _preempt_hold_variants(
         when, short_when = "when you pause", "on pause"
     if why is None:
         return [
-            [head, (f" · using {name(act.number)} · {_quoted(dv.reason)}", "plain")],
+            [head, (f" · using {name(act.number)} · {_quoted(dv.reason, act)}", "plain")],
             [head, (f" · to {short_target} {short_when} (preempt)", "plain")],
             [head],
         ]
     pace = why.split(", ", 1)[0]  # 7d 84% would pass 90% in ~3h
     return [
         [head, (f" · using {name(act.number)} · {why} — {move} to {target} {when}", "plain")],
-        [head, (f" · #{act.number} {why} — to {short_target} {when}", "plain")],
-        [head, (f" · #{act.number} {pace} — to {short_target} {short_when}", "plain")],
+        [head, (f" · {act.name} {why} — to {short_target} {when}", "plain")],
+        [head, (f" · {act.name} {pace} — to {short_target} {short_when}", "plain")],
         [head, (f" · to {short_target} {short_when} (preempt)", "plain")],
         [head],
     ]
@@ -970,7 +973,7 @@ def _safety_moving(dv: fx.DecisionView) -> bool:
 #: ``#1 7d 99% — riding to the limit, switching in ~2m (learned) or at your
 #: next pause`` (``policy._hard_or_ride``): the windows, the minutes, how.
 _RIDE_RE = re.compile(
-    r"#\w+ ((?:5h|7d) [\d.]+%(?: / (?:5h|7d) [\d.]+%)*) — riding to the limit, "
+    r"((?:5h|7d) [\d.]+%(?: / (?:5h|7d) [\d.]+%)*) — riding to the limit, "
     r"switching in ~(\d+)m \((\w+)\)"
 )
 
@@ -983,8 +986,8 @@ def _ride_variants(
     m = _RIDE_RE.search(dv.reason or "")
     if m is None:
         return [
-            [head, (f" · using {name(act.number)} · {_quoted(dv.reason)}", "plain")],
-            [head, (f" · #{act.number} riding to the limit", "plain")],
+            [head, (f" · using {name(act.number)} · {_quoted(dv.reason, act)}", "plain")],
+            [head, (f" · {act.name} riding to the limit", "plain")],
             [head],
         ]
     label, how = m.group(1), m.group(3)
@@ -997,10 +1000,10 @@ def _ride_variants(
     return [
         [head, (f" · using {name(act.number)} · {label} — riding to the limit, {when} "
                 f"({how}) or at your next pause", "plain")],
-        [head, (f" · #{act.number} {label} — riding to the limit, {when} ({how}) "
+        [head, (f" · {act.name} {label} — riding to the limit, {when} ({how}) "
                 "or at your next pause", "plain")],
-        [head, (f" · #{act.number} {label} — riding, {when} or on pause", "plain")],
-        [head, (f" · #{act.number} riding, {short}", "plain")],
+        [head, (f" · {act.name} {label} — riding, {when} or on pause", "plain")],
+        [head, (f" · {act.name} riding, {short}", "plain")],
         [head],
     ]
 
@@ -1009,12 +1012,12 @@ def _hard_stay_variants(
     head: Seg, act: fx.FleetRow, dv: fx.DecisionView, name
 ) -> list[list[Seg]]:
     """Past a hard mark, but no account has more room: it stays until 100%."""
-    why = _quoted((dv.reason or "").split(";", 1)[0])
+    why = _quoted((dv.reason or "").split(";", 1)[0], act)
     return [
         [head, (f" · using {name(act.number)} · {why} — no account has more room, it stays ",
                 "plain"), ("(switches at once at 100%)", "dim")],
-        [head, (f" · #{act.number} {why} — no account has more room, it stays", "plain")],
-        [head, (f" · #{act.number} past hard — nowhere roomier, it stays", "plain")],
+        [head, (f" · {act.name} {why} — no account has more room, it stays", "plain")],
+        [head, (f" · {act.name} past hard — nowhere roomier, it stays", "plain")],
         [head],
     ]
 
@@ -1041,7 +1044,7 @@ def _hold_variants(
     until = f" until {clock}" if clock else ""
     span = f"{until} ({left} left)" if left else until
     safety = account_hold.safety_text(mx.hard_5h, mx.hard_7d)
-    short = f" #{act.number}"
+    short = f" {act.name}"
     return [
         [*head, (f" {name(act.number)}{span} — {safety} ", "plain"), ("(h to change)", "dim")],
         [*head, (f"{short}{span} — {safety}", "plain")],
@@ -1062,8 +1065,8 @@ def _preempt_switch_variants(
         out.append([head, (f"{move} ", "plain"), (f"— {why}", "dim")])
     out += [
         [head, (f"{move} (preempt)", "plain")],
-        [head, (f" · {verb} → #{dv.target} while idle (preempt)", "plain")],
-        [head, (f" · {verb} → #{dv.target}", "plain")],
+        [head, (f" · {verb} → {name(dv.target)} while idle (preempt)", "plain")],
+        [head, (f" · {verb} → {name(dv.target)}", "plain")],
         [head],
     ]
     return out
@@ -1108,7 +1111,7 @@ def status_variants(
 
     def name(n: str | None) -> str:
         r = by.get(n or "")
-        return f"#{n} {r.name}" if r else (f"#{n}" if n else "?")
+        return r.name if r else (name_of({}, n) if n else "?")
 
     if sit == "paused":
         why = "re-login" if dv.reason == "relogin" else (dv.reason or "a pause")
@@ -1208,16 +1211,16 @@ def status_variants(
         eta = dv.eta_hard_min
         forced = f"(forced at {hard:g}%" + (f", {eta_text(eta)})" if eta is not None else ")")
         target = name(dv.target) if dv.target else "the next account"
-        short_target = f"#{dv.target}" if dv.target else "the next account"
+        short_target = target
         return [
             [head, (f" · using {name(act.number)} · {win} {p} past soft {soft:g}", "plain"),
              (f" — {will} to {target} when you pause ", "plain"), (forced, "dim")],
-            [head, (f" · #{act.number} {win} {p} past soft {soft:g} — to {target} "
+            [head, (f" · {act.name} {win} {p} past soft {soft:g} — to {target} "
                     "when you pause ", "plain"),
              (f"(forced {eta_text(eta)})" if eta is not None else "", "dim")],
-            [head, (f" · #{act.number} {win} {p} past soft {soft:g} — to {target} "
+            [head, (f" · {act.name} {win} {p} past soft {soft:g} — to {target} "
                     "when you pause", "plain")],
-            [head, (f" · #{act.number} {win} {p} — to {short_target} when you pause", "plain")],
+            [head, (f" · {act.name} {win} {p} — to {short_target} when you pause", "plain")],
             [head, (f" · to {short_target} on pause", "plain")],
             [head],
         ]
@@ -1239,7 +1242,7 @@ def status_variants(
             return _preempt_switch_variants(head, dv, name, verb)
         return [
             [head, (f" · {verb} {name(dv.active)} → {name(dv.target)} now{trigger}", "plain")],
-            [head, (f" · {verb} → #{dv.target}", "plain")],
+            [head, (f" · {verb} → {name(dv.target)}", "plain")],
             [head],
         ]
     if dv.kind == "exhausted":
@@ -1263,7 +1266,7 @@ def status_variants(
                 [head, (f" · using {name(act.number)} · {win} {pct:.0f}% past soft {soft:g}"
                         " — nowhere better to go yet, it stays ", "plain"),
                  (f"(forced at {hard:g}%)", "dim")],
-                [head, (f" · #{act.number} {win} {pct:.0f}% past soft {soft:g} — it stays",
+                [head, (f" · {act.name} {win} {pct:.0f}% past soft {soft:g} — it stays",
                         "plain")],
                 [head],
             ]
@@ -1274,7 +1277,7 @@ def status_variants(
                 [head, (f" · using {name(act.number)} · 7d {act.pct7:.0f}%{when}"
                         " — draining it first ", "plain"),
                  (f"(forced at {mx.hard_7d:g}%)", "dim")],
-                [head, (f" · #{act.number} 7d {act.pct7:.0f}%{when} — draining it first",
+                [head, (f" · {act.name} 7d {act.pct7:.0f}%{when} — draining it first",
                         "plain")],
                 [head],
             ]
@@ -1310,8 +1313,10 @@ def seg_len(segs: Sequence[Seg]) -> int:
 
 
 def fit_variant(variants: Sequence[Sequence[Seg]], width: int) -> list[Seg]:
-    """The first (longest) variant that fits ``width``; the last one, cut,
-    when none does."""
+    """The first (longest) variant that fits ``width``; when none does, the
+    last one up to its first segment that does not fit — only a first
+    segment (``Auto ON``, ``Holding``: never a name) is ever cut, so an
+    account's name shows whole or not at all."""
     for variant in variants:
         if seg_len(variant) <= width:
             return list(variant)
@@ -1320,10 +1325,12 @@ def fit_variant(variants: Sequence[Sequence[Seg]], width: int) -> list[Seg]:
     for text, tone in variants[-1]:
         if room <= 0:
             break
-        if len(text) > room:
-            text = fx.clip(text, room)
+        if cells(text) > room:
+            if not out:
+                out.append((fx.clip(text, room), tone))
+            break
         out.append((text, tone))
-        room -= len(text)
+        room -= cells(text)
     return out
 
 
@@ -1359,6 +1366,7 @@ class Notice:
     tone: Tone = "warn"            # "crit" (red) or "warn" (amber)
     alarm: bool = True             # "! " in front: something for you to do
     tail: tuple[str, ...] = ()     # the words after another note on its line
+    name: str = ""                 # the account it names (never cut)
 
     @property
     def tails(self) -> tuple[str, ...]:
@@ -1464,41 +1472,43 @@ def attention_notices(
     if dead:
         r = dead[0]
         more = f" (+{len(dead) - 1} more)" if len(dead) > 1 else ""
-        words = f"#{r.number} {r.name} needs re-login{more}"
+        words = f"{r.name} needs re-login{more}"
         out.append(Notice(
             tuple(words + p for p in press) + (words,), tone="crit", tail=(words,),
+            name=r.name,
         ))
     shared = [r for r in rows if r.shared and r.login != "relogin"]
     if shared:  # cc-swap: shared_login.py — not refreshed until re-logged
         r = shared[0]
         more = f" (+{len(shared) - 1} more)" if len(shared) > 1 else ""
-        words = f"#{r.number} {r.name} shares its login with another place{more}"
-        short = f"#{r.number} shares its login{more}"
+        words = f"{r.name} shares its login with another place{more}"
+        short = f"{r.name} shares its login{more}"
         out.append(Notice(
             tuple(words + p for p in press) + (words, short + " (cc-swap doctor)", short),
-            tone="crit", tail=(words, short),
+            tone="crit", tail=(words, short), name=r.name,
         ))
     if prime_guard and priming:
         out.append(guard_notice(prime_guard, now))
     for r in due:
         left = fx.login_left(r, now) or 0.0
         when = "has expired" if left <= 0 else f"ends in {oauth.login_countdown(left)}"
-        words = f"#{r.number} {r.name} login {when}"
+        words = f"{r.name} login {when}"
         out.append(Notice(
             tuple(words + p for p in press) + (words,),
             tone="crit" if left < fx.LOGIN_URGENT_S else "warn", tail=(words,),
+            name=r.name,
         ))
     locked = [r for r in rows if r.login == "keychain"]
     if locked:
         r = locked[0]
         more = f" (+{len(locked) - 1} more)" if len(locked) > 1 else ""
         short = (
-            f"#{r.number} keychain locked{more} — unlock it, press f",
-            f"#{r.number} keychain locked{more} (f)",
+            f"{r.name} keychain locked{more} — unlock it, press f",
+            f"{r.name} keychain locked{more} (f)",
         )
         out.append(Notice(
-            (f"#{r.number} {r.name} keychain locked{more} — unlock it, press f", *short),
-            tail=short,
+            (f"{r.name} keychain locked{more} — unlock it, press f", *short),
+            tail=short, name=r.name,
         ))
     if linger_off:
         out.append(Notice((
@@ -1515,6 +1525,18 @@ def _first_fit(options: Sequence[str], room: int) -> str | None:
     return next((o for o in options if cells(o) <= room), None)
 
 
+def _cut(notice: Notice, room: int) -> str:
+    """``notice``'s shortest wording cut to ``room`` — the account name it
+    starts with kept whole (only the words after it are cut, or dropped);
+    the row's end is clipped before a name is."""
+    last = notice.variants[-1]
+    if notice.name and last.startswith(notice.name):
+        left = room - cells(notice.name)
+        rest = last[len(notice.name):]
+        return notice.name + (fx.clip(rest, left) if left > 1 else "")
+    return fx.clip(last, max(room, 1))
+
+
 def _attention_line(group: Sequence[Notice], width: int) -> tuple[str, Tone]:
     """One line: the first note (its longest wording that fits, else its
     shortest cut to fit), then as many of the others as fit after it, and
@@ -1524,7 +1546,7 @@ def _attention_line(group: Sequence[Notice], width: int) -> tuple[str, Tone]:
     head, *rest = group
 
     def pack(room: int) -> tuple[str, list[Notice]]:
-        text = _first_fit(head.variants, room) or fx.clip(head.variants[-1], max(room, 1))
+        text = _first_fit(head.variants, room) or _cut(head, room)
         shown = [head]
         for notice in rest:
             extra = _first_fit(notice.tails, room - cells(text) - 3)

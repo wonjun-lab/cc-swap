@@ -37,7 +37,7 @@ from claude_swap.maximize import primer as mxprimer
 from claude_swap.maximize import view as mxview
 from claude_swap.maximize.history import History as UsageHistory
 from claude_swap.maximize.model import AccountView, Hold, Snapshot, Switch
-from claude_swap.maximize.names import display_names
+from claude_swap.maximize.names import display_names, name_of, view_name
 from claude_swap.maximize.plan import parse_plan_override
 from claude_swap.maximize.score import days_left, landable
 from claude_swap.models import AccountSnapshot, AccountsSnapshot
@@ -352,7 +352,9 @@ def fleet_rows(
     shown_rows = {r.number: r for r in mxview.rows(shown_snap, state.primes)}
     trusted_views = {v.number: v for v in msnap.accounts}
     views = {v.number: v for v in shown_snap.accounts}
-    shown = display_names((a.number, a.email, a.alias) for a in snap.accounts)
+    shown = display_names(
+        (a.number, a.email, a.alias, a.org_name if a.org_uuid else "") for a in snap.accounts
+    )
     out: list[FleetRow] = []
     for acc in sorted(snap.accounts, key=lambda a: _slot(a.number)):
         v = views[acc.number]
@@ -442,21 +444,45 @@ class DecisionView:
     # ride: when the learned ride switches (epoch s), so the minutes left
     # stay live; None when unknown.
     ride_until: float | None = None
+    # ``target``'s display name (maximize/names.py), set from the snapshot;
+    # "" = not known (then the label falls back to ``names.name_of``).
+    target_name: str = ""
 
 
-_SLOT_RE = re.compile(r"#(\w+)")
+_SLOT_RE = re.compile(r"#(\w+)")  # a reason from before names (``#3``)
 #: One waited-out window in a reset-wait reason (``policy._reset_wait``):
 #: ``5h 96% — resets in 8m``.
 _WAIT_RE = re.compile(r"\b(5h|7d) [\d.]+% — resets in \d+m")
 
 
-def _target_in(reason: str, active: str | None) -> str | None:
+def _target_in(reason: str, active: str | None, msnap: Snapshot | None = None) -> str | None:
     """The first account a policy reason names that is not the active one
-    (every reason names the target after the active account, if at all)."""
-    for match in _SLOT_RE.finditer(reason or ""):
+    (every reason names the target after the active account, if at all).
+    Reasons name accounts by display name (``names.view_name``); one
+    written before that names them ``#3``."""
+    text = reason or ""
+    found: list[tuple[int, int, str]] = []
+    for v in msnap.accounts if msnap is not None else ():
+        if v.number == active:
+            continue
+        name = view_name(v)
+        pattern = r"(?<![\w.@·#-])" + re.escape(name) + r"(?![\w.@·-])"
+        match = re.search(pattern, text, flags=re.IGNORECASE)
+        if match:
+            found.append((match.start(), -len(name), v.number))
+    if found:
+        return min(found)[2]
+    for match in _SLOT_RE.finditer(text):
         if match.group(1) != active:
             return match.group(1)
     return None
+
+
+def target_label(dv: DecisionView) -> str:
+    """`` → name`` for where ``dv`` is headed, or ""."""
+    if not dv.target:
+        return ""
+    return f" → {dv.target_name or name_of({}, dv.target)}"
 
 
 def _kind(decision: str, pending: bool) -> DecisionKind:
@@ -496,8 +522,10 @@ def _enrich(dv: DecisionView, msnap: Snapshot) -> DecisionView:
         if dv.kind in ("pending", "hold") and msnap.samples and not past_hard
         else None
     )
+    view = msnap.view(dv.target) if dv.target else None
     return replace(
         dv,
+        target_name=view_name(view) if view is not None else dv.target_name,
         growth=waiting.growth if waiting else None,
         window=waiting.window if waiting else None,
         window_min=waiting.window_min if waiting else None,
@@ -506,12 +534,14 @@ def _enrich(dv: DecisionView, msnap: Snapshot) -> DecisionView:
     )
 
 
-def _hold_target(code: str | None, reason: str, active: str | None) -> str | None:
+def _hold_target(
+    code: str | None, reason: str, active: str | None, msnap: Snapshot | None = None
+) -> str | None:
     """Where a coded hold is headed: a preempt waiting for idle and a
     deferred rebalance name their target in the reason; a reset-wait goes
     nowhere."""
     if code in ("preempt", "rebalance-deferred"):
-        return _target_in(reason, active)
+        return _target_in(reason, active, msnap)
     return None
 
 
@@ -532,7 +562,7 @@ def _computed(msnap: Snapshot, *, now: float) -> DecisionView:
                 landing = policy.landing_candidates(msnap)
                 target = landing[0].number if landing else None
             else:
-                target = _hold_target(code, decision.reason, msnap.active)
+                target = _hold_target(code, decision.reason, msnap.active, msnap)
         else:
             kind = _kind(type(decision).__name__.lower(), False)
     return DecisionView(
@@ -564,7 +594,7 @@ def decision_view(
     dv = _decision_view(state, msnap, now=now, poll_s=poll_s, own=own, own_at=own_at)
     if not state.auto_off or dv.kind == "paused":
         return dv
-    target = f" → #{dv.target}" if dv.target else ""
+    target = target_label(dv)
     would = {
         "switch": f"switch ({dv.trigger}){target}",
         "pending": f"switch at the next idle moment{target}",
@@ -605,7 +635,7 @@ def _decision_view(
         dv = DecisionView(
             kind=_kind(own.decision, own.pending),
             active=own.active,
-            target=_target_in(own.reason, own.active),
+            target=_target_in(own.reason, own.active, msnap),
             trigger=own.trigger,
             reason=own.reason,
             at=own_at if own_at is not None else now,
@@ -623,7 +653,7 @@ def _decision_view(
         dv = DecisionView(
             kind=_kind(published.decision, published.pending),
             active=published.active,
-            target=published.target or _target_in(published.reason, published.active),
+            target=published.target or _target_in(published.reason, published.active, msnap),
             trigger=published.trigger,
             reason=published.reason,
             at=published.at,
@@ -653,7 +683,7 @@ def decision_parts(dv: DecisionView, *, now: float) -> tuple[list[tuple[str, int
         suffix = "computed here"
     else:
         suffix = f"{hhmm(dv.at or now)} · {'engine' if dv.source == 'engine' else 'here'}"
-    target = f" → #{dv.target}" if dv.target else ""
+    target = target_label(dv)
     if dv.kind == "off":
         since = f"since {hhmm(dv.at)}" if dv.at else ""
         by = f"by {dv.reason}" if dv.reason else ""
@@ -834,17 +864,17 @@ def switch_warning(row: FleetRow, mx: MaximizeSettings) -> str | None:
         return None
     if row.login == "relogin":
         return (
-            f"#{row.number} {row.name}'s stored login is dead; Claude Code will ask "
+            f"{row.name}'s stored login is dead; Claude Code will ask "
             "you to log in. Re-login it first (r)."
         )
     if row.tier == "excluded":
         return (
-            f"#{row.number} {row.name} is excluded from rotation; maximize will move "
+            f"{row.name} is excluded from rotation; maximize will move "
             "you off it at the next idle moment."
         )
     if not row.landable:
         return (
-            f"#{row.number} {row.name} is not a place maximize would land ({row.land}); "
+            f"{row.name} is not a place maximize would land ({row.land}); "
             "the engine may move you again at the next idle."
         )
     return None
@@ -872,13 +902,13 @@ def relogin_steps(
     where = f"on this machine ({host or 'this host'}{', over SSH' if ssh else ''})"
     claude = claude_path or "claude"
     back = (
-        f"switches back to #{return_to.number} {return_to.name}"
+        f"switches back to {return_to.name}"
         if return_to is not None and return_to.number != row.number
         else "stays on it"
     )
     if row.login != "relogin" and now is not None and login_due(row, now):
         headline = (
-            f"Re-login #{row.number} {row.name} ({row.email}) — its "
+            f"Re-login {row.name} ({row.email}) — its "
             f"{_expiring_text(row, now)}; a fresh login now starts a new "
             "~30-day deadline (refreshing never extends it)."
         )
@@ -889,7 +919,7 @@ def relogin_steps(
             else "its refresh token is dead"
         )
         headline = (
-            f"Re-login #{row.number} {row.name} ({row.email}) — {why}; "
+            f"Re-login {row.name} ({row.email}) — {why}; "
             "only a fresh login fixes it."
         )
     lines = [

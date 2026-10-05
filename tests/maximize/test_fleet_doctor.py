@@ -45,7 +45,7 @@ async def test_fleet_i_opens_inspect_all_logins_with_the_findings(tmp_path, monk
         assert calls == [1]
         text = "\n".join(line.text for line in modal.query_one("#fx-doctor-log", RichLog).lines)
         assert text.index("ERROR") < text.index("WARN") < text.index("ok ")
-        assert "#3 login-deadline: login expires in 2d 1h" in text
+        assert "#3 login-deadline: login expires in 2d 1h" in text  # no name known: the scope
         assert "fix: unlock it" in text
         await pilot.press("r")
         await _open(pilot)

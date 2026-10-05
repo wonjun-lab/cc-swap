@@ -327,6 +327,16 @@ class CredentialStore:
     ``security`` calls, and a fresh process re-evaluates from scratch.
     """
 
+    def _name(self, account_num: str, email: str = "") -> str:
+        """cc-swap: the display name messages call slot ``account_num`` by
+        (maximize/names.py); never raises."""
+        from claude_swap.maximize.names import name_of
+
+        try:
+            return str(self._host.account_name(account_num, email))
+        except Exception:
+            return name_of({}, account_num, email)
+
     def __init__(self, host: _StoreHost):
         self._host = host
         # macOS Keychain usability, learned per-process from real `security`
@@ -1572,8 +1582,8 @@ class CredentialStore:
                 self._kc_delete_backup(account_num, email)
         except (OSError, *macos_keychain.KEYCHAIN_ERRORS) as e:
             raise CredentialError(
-                f"Could not clear stored credentials for slot {account_num} "
-                f"({email}) — aborting before commit: {e}"
+                f"Could not clear stored credentials for "
+                f"{self._name(account_num, email)} — aborting before commit: {e}"
             ) from e
         # Final belt: catches any backend view the deletes above missed. The
         # plain reader cannot serve this — it is the exact reader this
@@ -1585,8 +1595,8 @@ class CredentialStore:
         value, unreadable = self._read_account_credentials_ex(account_num, email)
         if value or unreadable:
             raise CredentialError(
-                f"Could not clear stored credentials for slot {account_num} "
-                f"({email}) — aborting before commit"
+                f"Could not clear stored credentials for "
+                f"{self._name(account_num, email)} — aborting before commit"
             )
 
     def delete_previous_backup(self, account_num: str, email: str) -> None:
@@ -1672,7 +1682,7 @@ class CredentialStore:
             # worse there; what it is not is a cushion that lies.
             self._host._logger.warning(
                 f"Could not retain previous credential generation for "
-                f"account {account_num}: the current backup exists but "
+                f"{self._name(account_num, email)}: the current backup exists but "
                 "could not be read (not absent) — no .prev recovery copy "
                 "will exist for this write"
             )
@@ -1694,7 +1704,7 @@ class CredentialStore:
         except Exception as e:
             self._host._logger.warning(
                 f"Failed to retain previous credential generation for "
-                f"account {account_num}: {e}"
+                f"{self._name(account_num, email)}: {e}"
             )
 
     def _read_previous_backup(self, account_num: str, email: str) -> str:

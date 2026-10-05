@@ -212,6 +212,32 @@ class TestAliasTransfer:
                 )
                 assert "alias" not in seq["accounts"][imported_num]
 
+    def test_import_alias_reading_like_a_local_name_is_dropped(self, temp_home: Path):
+        """An imported alias that reads like a local account's display name
+        (case and ·/./: aside; maximize/names.py) would make a command mean
+        two accounts: it is dropped like a duplicate alias."""
+        dst_home = temp_home.parent / "dst"
+        dst_home.mkdir()
+        src = _linux_switcher(temp_home)
+        _seed_account(src, 1, "alice@example.com", alias="Dev.Shared")
+        out_file = temp_home / "backup.cswap"
+        export_accounts(src, str(out_file))
+
+        with patch("pathlib.Path.home", return_value=dst_home):
+            with patch.dict(os.environ, {"HOME": str(dst_home)}):
+                dst = _linux_switcher(dst_home)
+                _seed_account(dst, 9, "dev.shared@example.com")  # named dev.shared
+
+                import_accounts(dst, str(out_file))
+
+                seq = dst._get_sequence_data()
+                imported = next(
+                    acc for acc in seq["accounts"].values()
+                    if acc["email"] == "alice@example.com"
+                )
+                assert "alias" not in imported
+                assert dst._resolve_account_identifier("dev.shared") == "9"
+
     def test_import_reexport_of_same_account_keeps_own_alias(self, temp_home: Path):
         """Re-importing a backup of an account that already carries the same
         alias locally must not be treated as a collision with itself."""
@@ -362,7 +388,7 @@ class TestConflictPolicy:
         import_accounts(s, str(out), force=True)
 
         captured = capsys.readouterr()
-        assert "Overwrote alice@example.com (slot 3)" in captured.err
+        assert "Overwrote alice@example.com\n" in captured.err
 
         # Alice still at slot 3 with new marker
         alice_creds = s._read_account_credentials("3", "alice@example.com")
@@ -1334,9 +1360,9 @@ class TestExportSkipsBrokenSlots:
 
         captured = capsys.readouterr()
         # Warning must be on stderr, not stdout, so pipe mode stays JSON-clean.
-        assert "Skipping Account-1" in captured.err
-        assert "alice@example.com" in captured.err
-        assert "Skipping Account-1" not in captured.out
+        assert "Skipping alice:" in captured.err
+        assert "cc-swap add --slot 1" in captured.err
+        assert "Skipping alice:" not in captured.out
 
     def test_all_accounts_skips_missing_config_with_stderr_warning(
         self, temp_home: Path, capsys
@@ -1351,7 +1377,7 @@ class TestExportSkipsBrokenSlots:
 
         envelope = json.loads(out.read_text())
         assert [a["email"] for a in envelope["accounts"]] == ["bob@example.com"]
-        assert "Skipping Account-1" in capsys.readouterr().err
+        assert "Skipping alice:" in capsys.readouterr().err
 
     def test_explicit_account_with_missing_credentials_hard_fails(
         self, temp_home: Path
@@ -1435,7 +1461,7 @@ class TestExportSkipsBrokenSlots:
         envelope = json.loads(captured.out)
         assert [a["email"] for a in envelope["accounts"]] == ["bob@example.com"]
         # Warning is on stderr.
-        assert "Skipping Account-1" in captured.err
+        assert "Skipping alice:" in captured.err
 
 
 # ---------------------------------------------------------------------------
@@ -1626,7 +1652,7 @@ class TestImportClearsDeadTokenQuarantine:
         import_accounts(s, str(out), force=False)
 
         err = capsys.readouterr().err
-        assert "Replaced bob@example.com (slot 2 was quarantined: refresh token dead)" in err
+        assert "Replaced bob@example.com (it was quarantined: refresh token dead)" in err
         assert "1 replaced (dead token)" in err
         entry = s._usage_store.entries(ident)["2"]
         assert not entry.token_dead()
@@ -1938,7 +1964,7 @@ class TestForceOverwriteNarratesTheStrikeClear:
         import_accounts(s, str(out), force=True)
 
         err = capsys.readouterr().err
-        assert "Overwrote bob@example.com (slot 2)" in err
+        assert "Overwrote bob@example.com\n" in err
         assert "cleared this slot's stored dead-token strike" in err
         assert "same credential generation" in err
 
@@ -1987,8 +2013,8 @@ class TestForceOverwriteNarratesTheStrikeClear:
         import_accounts(s, str(out), force=True)
 
         err = capsys.readouterr().err
-        assert "Overwrote bob@example.com (slot 2)" in err
-        assert "Overwrote carol@example.com (slot 3)" in err
+        assert "Overwrote bob@example.com\n" in err
+        assert "Overwrote carol@example.com\n" in err
         assert err.count("cleared this slot's stored dead-token strike") == 1
 
     def test_force_overwrite_narrates_a_condemned_generation_without_a_refresh_token(
@@ -2091,7 +2117,7 @@ class TestImportUsage:
         assert entries["2"].age_s == pytest.approx(30.0, abs=5)
         assert entries["1"].last_good is None
         err = capsys.readouterr().err
-        assert "Adopted usage for bob@example.com → slot 2" in err
+        assert "Adopted usage for bob@example.com\n" in err
         assert "Done: 1 adopted, 0 kept, 2 skipped" in err
 
     def test_a_held_account_is_not_fetched(self, temp_home: Path):

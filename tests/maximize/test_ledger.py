@@ -44,7 +44,7 @@ def _record(root: Path, frm, to, **kw) -> dict:
 class TestFile:
     def test_entry_shape_has_slots_host_versions_and_no_identity(self, tmp_path):
         entry = _record(
-            tmp_path, "1", "2", reason="#1 at 5h 96% (a@example.com, sk-ant-oat01-SECRETSECRET)",
+            tmp_path, "1", "2", reason="a at 5h 96% (a@example.com, sk-ant-oat01-SECRETSECRET)",
             strategy="maximize", now=NOW,
         )
         [stored] = entries(tmp_path)
@@ -58,6 +58,18 @@ class TestFile:
         raw = ledger.path_for(tmp_path).read_text()
         assert "@" not in raw and "SECRET" not in raw
         assert "<email>" in stored["reason"] and "<redacted>" in stored["reason"]
+        assert stored["fromName"] is None and stored["toName"] is None  # no roster here
+
+    def test_entry_carries_display_names_beside_the_slots(self, tmp_path):
+        (tmp_path / "sequence.json").write_text(json.dumps({"accounts": {
+            "1": {"email": "dev.shared@example.com"},
+            "2": {"email": "x@example.com", "alias": "ops"},
+        }}))
+        _record(tmp_path, "1", "2", now=NOW)
+        [stored] = entries(tmp_path)
+        assert (stored["from"], stored["to"]) == (1, 2)
+        assert (stored["fromName"], stored["toName"]) == ("dev.shared", "ops")
+        assert "@" not in ledger.path_for(tmp_path).read_text()
 
     @pytest.mark.skipif(sys.platform == "win32", reason="POSIX modes")
     def test_file_is_0600_even_when_it_existed_wider(self, tmp_path):

@@ -20,8 +20,10 @@ Claude Code session) is recorded too, as an ``external`` entry: when the
 next switch leaves a slot other than the ledger's last destination, and by
 the maximize engine when it sees the mismatch on two ticks in a row.
 
-Entries carry slot numbers, the host name and versions — never an email or a
-token (a reason is scrubbed of anything shaped like one). The file is 0600,
+Entries carry slot numbers (``from``/``to``) with the accounts' display
+names at the time (``fromName``/``toName``, maximize/names.py), the host
+name and versions — never an email or a token (a reason is scrubbed of
+anything shaped like one). The file is 0600,
 appended with ``O_APPEND`` under a small lock, and rotated at
 :data:`MAX_BYTES` into ``.1`` .. ``.3``.
 """
@@ -234,6 +236,18 @@ def scrub(text: object) -> str | None:
     return text[:REASON_MAX]
 
 
+def _names(root: Path) -> dict[str, str]:
+    """``{slot: display name}`` off ``root``'s sequence.json (``{}`` when
+    unreadable)."""
+    from claude_swap.maximize.names import roster_names
+
+    return roster_names(root)
+
+
+def _name(names: Mapping[str, str], slot: int | None) -> str | None:
+    return (names.get(str(slot)) or None) if slot is not None else None
+
+
 def _versions(root: Path) -> dict[str, str | None]:
     from claude_swap import __version__
 
@@ -261,6 +275,8 @@ def make_entry(
     host: str | None = None,
 ) -> dict[str, Any]:
     ts = time.time() if now is None else now
+    src, dst = _slot(from_slot), _slot(to_slot)
+    names = _names(root)
     return {
         "v": SCHEMA_VERSION,
         "ts": round(ts, 3),
@@ -268,8 +284,10 @@ def make_entry(
         .isoformat(timespec="seconds")
         .replace("+00:00", "Z"),
         "host": host or host_name(),
-        "from": _slot(from_slot),
-        "to": _slot(to_slot),
+        "from": src,
+        "to": dst,
+        "fromName": _name(names, src),
+        "toName": _name(names, dst),
         "actor": actor,
         "trigger": trigger,
         "source": source,

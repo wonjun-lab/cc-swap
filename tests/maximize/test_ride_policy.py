@@ -57,7 +57,7 @@ class TestArming:
         # first seen now + 0.3 x 30 min - 90 s
         assert d.ride_until == pytest.approx(NOW + 0.3 * 1800 - RIDE_MARGIN_S)
         assert d.reason == (
-            "#1 7d 99% — riding to the limit, switching in ~8m (learned) "
+            "1 7d 99% — riding to the limit, switching in ~8m (learned) "
             "or at your next pause"
         )
 
@@ -166,7 +166,7 @@ class TestNoRide:
     def test_learned_ride_off_switches_at_hard(self):
         d = decide(ride_snap(learned_ride=False))
         assert isinstance(d, Switch) and d.trigger == "hard" and d.ride is None
-        assert d.reason == "#1 7d 99% >= hard 99%; -> #2 (normal, score 2.10)"
+        assert d.reason == "1 7d 99% >= hard 99%; -> 2 (normal, score 2.10)"
 
     def test_a_hard_mark_under_99_never_rides(self):
         d = decide(ride_snap(hard_7d=98.0))
@@ -197,7 +197,7 @@ class TestWindows:
     def test_a_5h_crossing_during_a_7d_ride_switches_at_once(self):
         d = decide(ride_snap(p5=96))
         assert isinstance(d, Switch) and d.trigger == "hard" and d.ride is None
-        assert d.reason.startswith("#1 5h 96% >= hard 95%")
+        assert d.reason.startswith("1 5h 96% >= hard 95%")
 
     def test_a_5h_about_to_force_ends_the_ride(self):
         # 5h 93% climbing 1 pt/min: 95% in ~2 min, within forceEtaMin 3.
@@ -222,7 +222,7 @@ class TestResetAndHold:
         assert isinstance(d, Hold) and d.code == "reset-wait"
         assert d.reset_wait_until == pytest.approx(NOW + 300)
         assert d.reason == (
-            "#1 7d 99% — resets in 5m, waiting it out (switches at once if it hits 100%)"
+            "1 7d 99% — resets in 5m, waiting it out (switches at once if it hits 100%)"
         )
 
     def test_a_reset_after_the_switch_time_does_not_stop_the_ride(self):

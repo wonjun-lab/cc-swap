@@ -424,7 +424,7 @@ class AutoScreen(Screen):
                 continue
             pct = binding_pct(acc.usage.last_good, models)
             entry = Text()
-            entry.append(f"\n  {acc.number:>2}  ", style=palette.foreground)
+            entry.append("\n  ", style=palette.foreground)
             entry.append(acc.email, style=palette.foreground)
             if acc.usage.sentinel is not None:
                 entry.append(
@@ -568,14 +568,18 @@ class AutoScreen(Screen):
         except Exception as exc:  # a display aid must never take the screen down
             text.append(f"\n  unavailable: {exc}", style=palette.muted)
             return text
-        names = {a.number: a.alias or a.email for a in snap.accounts}
+        from claude_swap.maximize.names import display_names
+
+        names = display_names(
+            (a.number, a.email, a.alias, a.org_name if a.org_uuid else "") for a in snap.accounts
+        )
         for row in ranked:
             line = Text()
             line.append(
-                f"\n{'●' if row.active else ' '} {row.number:>2}  ",
+                f"\n{'●' if row.active else ' '}  ",
                 style=palette.accent if row.active else palette.foreground,
             )
-            line.append(f"{names.get(row.number, row.email):<24.24}  ", style=palette.foreground)
+            line.append(f"{names.get(row.number, row.email):<24}  ", style=palette.foreground)
             line.append(
                 f"{mxview.TIER_LABELS.get(row.tier, row.tier):<11}  ",
                 style=palette.foreground if row.tier == "normal" else palette.muted,

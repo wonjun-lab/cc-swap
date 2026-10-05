@@ -72,7 +72,7 @@ def test_healthy_machine_has_no_problems_and_exits_0(world):
     # Environment comes before the accounts.
     scopes = [f.scope for f in findings]
     assert scopes.index("env") == 0
-    assert find(findings, "live-login", "ok")[0].detail.startswith("the live login is #1")
+    assert find(findings, "live-login", "ok")[0].detail.startswith("the live login is user1")
 
 
 def test_doctor_runs_claude_only_with_version(world):
@@ -247,7 +247,7 @@ def test_live_token_of_another_slot_is_an_error(world):
     world.accounts(1, 2, active=1)
     world.login(1, creds(2))  # .claude.json says #1, token is #2's
     [f] = find(run(world), "live-login", "error")
-    assert "#1" in f.detail and "#2's login" in f.detail
+    assert "user1" in f.detail and "user2's login" in f.detail
 
 
 def test_live_login_without_a_backup(world):
@@ -269,7 +269,8 @@ def test_expired_and_expiring_logins(world):
     [expired] = find(findings, "login-deadline", "error", "#2")
     assert expired.detail.startswith("login expired") and "(1h 0m ago)" in expired.detail
     assert "UTC" not in expired.detail  # local time, like list / the auto log / Fleet
-    assert expired.fix == "re-login #2: cc-swap login 2, or Fleet → select → r"
+    assert expired.fix == "re-login user2: cc-swap login user2, or Fleet → select → r"
+    assert expired.name == "user2" and expired.to_json()["name"] == "user2"
     [soon] = find(findings, "login-deadline", "warn", "#3")
     assert soon.detail.startswith("login expires ") and "(in 2d 1h)" in soon.detail
     assert not find(findings, "login-deadline", scope="#4")
@@ -294,7 +295,7 @@ def test_quarantined_slot_is_an_error_until_its_login_changes(world):
     })
     findings = run(world)
     [dead] = find(findings, "quarantine", "error", "#2")
-    assert "refresh token dead" in dead.detail and dead.fix.startswith("re-login #2: ")
+    assert "refresh token dead" in dead.detail and dead.fix.startswith("re-login user2: ")
     [lifting] = find(findings, "quarantine", "info", "#3")
     assert "lifts it" in lifting.detail
 
@@ -303,16 +304,16 @@ def test_missing_stored_login(world):
     world.healthy()
     world.keychain.pop(("claude-swap", f"account-3-{email(3)}"))
     [f] = find(run(world), "stored-login", "error", "#3")
-    assert f.fix.startswith("cc-swap login 3")
+    assert f.fix.startswith("cc-swap login user3")
 
 
 def test_duplicate_lineage_names_both_slots(world):
     world.healthy()
     world.store(3, creds(2))
     [f] = find(run(world), "shared-login", "error")
-    assert "#2 and #3 hold the same login" in f.detail
-    assert "does not refresh #2 or #3" in f.detail
-    assert f.fix == "re-login one of them: cc-swap login 3 or cc-swap login 2"
+    assert "user2 and user3 hold the same login" in f.detail
+    assert "does not refresh user2 or user3" in f.detail
+    assert f.fix == "re-login one of them: cc-swap login user3 or cc-swap login user2"
 
 
 def test_duplicate_setup_token_stays_a_duplicate(world):
@@ -336,8 +337,8 @@ def test_slot_sharing_another_slots_cswap_run_profile(world):
     world.healthy()
     _profile(world, 2, creds(3))  # #2's profile holds #3's login
     [f] = find(run(world), "shared-login", "error", "#3")
-    assert "#3 holds the same login as #2's cswap run profile" in f.detail
-    assert f.fix == "re-login one of them: cc-swap login 3 or cc-swap login 2"
+    assert "user3 holds the same login as user2's cswap run profile" in f.detail
+    assert f.fix == "re-login one of them: cc-swap login user3 or cc-swap login user2"
 
 
 def test_own_cswap_run_profile_is_not_sharing(world):
@@ -354,15 +355,15 @@ def test_macos_profile_keychain_item_is_read(world):
     path = _profile(world, 2, creds(2))  # the plaintext seed is #2's own...
     world.keychain[(keychain_service_name(str(path)), USER)] = creds(3)  # ...the item is not
     [f] = find(run(world), "shared-login", "error", "#3")
-    assert "#2's cswap run profile" in f.detail
+    assert "user2's cswap run profile" in f.detail
 
 
 def test_leftover_profile_is_named_by_slot_number_only(world):
     world.healthy()
     _profile(world, 2, creds(3), slug="old_example.com")
     [f] = find(run(world), "shared-login", "error", "#3")
-    assert "a leftover cswap run profile made for #2" in f.detail
-    assert f.fix == "re-login one of them: cc-swap login 3"
+    assert "a leftover cswap run profile made for user2" in f.detail
+    assert f.fix == "re-login one of them: cc-swap login user3"
 
 
 def test_a_stale_marked_profile_is_not_a_sharer(world):
@@ -386,9 +387,9 @@ def test_live_login_sharing_a_non_live_slot(world):
     world.healthy()
     world.login(1, creds(2))  # ~/.claude.json names #1, the token is #2's
     [f] = find(run(world), "live-login", "error")
-    assert "names #1 but the live token is #2's login" in f.detail
-    assert "does not refresh #1 or #2" in f.detail
-    assert f.fix == "re-login one of them: cc-swap login 2 or cc-swap login 1"
+    assert "names user1 but the live token is user2's login" in f.detail
+    assert "does not refresh user1 or user2" in f.detail
+    assert f.fix == "re-login one of them: cc-swap login user2 or cc-swap login user1"
 
 
 # -- upstream -------------------------------------------------------------------------------
@@ -695,7 +696,7 @@ def test_doctor_command_json(world, monkeypatch, capsys):
     assert payload["schemaVersion"] == 1 and payload["counts"]["error"] == 1
     [row] = [r for r in payload["findings"] if r["severity"] == "error"]
     assert row == {
-        "check": "login-deadline", "scope": "#2", "severity": "error",
+        "check": "login-deadline", "scope": "#2", "name": "user2", "severity": "error",
         "detail": row["detail"], "fix": row["fix"],
     }
 

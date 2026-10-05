@@ -58,6 +58,7 @@ from collections.abc import Mapping, Sequence
 from typing import Literal
 
 from claude_swap.maximize.model import AccountView, Snapshot
+from claude_swap.maximize.names import name_of, view_name
 
 HOUR_S = 3600.0
 #: One 5h window, in hours and seconds.
@@ -221,11 +222,11 @@ def left_text(hours: float) -> str:
 
 
 def text(v: AccountView, snap: Snapshot) -> str:
-    """``#1 7d 86% resets in 18h — draining it first`` (a draining ``v``)."""
+    """``dev 7d 86% resets in 18h — draining it first`` (a draining ``v``)."""
     left = hours_left(v, snap.now)
     when = f"resets in {left_text(left)}" if left is not None else "resets soon"
     pct = f"{v.pct7:g}%" if v.pct7 is not None else "?"
-    return f"#{v.number} 7d {pct} {when} — draining it first"
+    return f"{view_name(v)} 7d {pct} {when} — draining it first"
 
 
 def tag(hours: float) -> str:
@@ -248,22 +249,24 @@ def describe(
     drain_hours: int,
     k7: Mapping[str, float],
     draining_now: Sequence[tuple[str, float]] = (),
+    names: Mapping[str, str] | None = None,
 ) -> str:
     """One line for doctor and ``cc-swap why``: ``7d drain: within 24h of a
-    7d reset · draining #1 (18h) · k learned #2 0.167; others by plan (20x
-    0.165, 5x 0.105)``."""
+    7d reset · draining dev (18h) · k learned ops 0.167; others by plan (20x
+    0.165, 5x 0.105)``. ``names``: ``{slot: display name}``."""
+    names = names or {}
     if drain_hours <= 0:
         return "7d drain: off (maximize.drainHours is 0)"
     parts = [f"within {drain_hours}h of a 7d reset"]
     if draining_now:
         parts.append("draining " + ", ".join(
-            f"#{number} ({left_text(hours)})" for number, hours in draining_now
+            f"{name_of(names, number)} ({left_text(hours)})" for number, hours in draining_now
         ))
     plans = f"(20x {K_20X:g}, 5x {K_5X:g})"
     learned = sorted(k7.items(), key=lambda item: (len(item[0]), item[0]))
     if learned:
         parts.append(
-            "k learned " + ", ".join(f"#{n} {k:.3f}" for n, k in learned)
+            "k learned " + ", ".join(f"{name_of(names, n)} {k:.3f}" for n, k in learned)
             + f"; others by plan {plans}"
         )
     else:

@@ -388,7 +388,10 @@ def snapshot_from_accounts(
             for a in accounts
         },
         records={
-            a.number: {"email": a.email, "alias": a.alias, "disabled": a.disabled}
+            # The organization too: the reasons name accounts as every
+            # other surface does (names.record_names).
+            a.number: {"email": a.email, "alias": a.alias, "disabled": a.disabled,
+                       "organizationUuid": a.org_uuid, "organizationName": a.org_name}
             for a in accounts
         },
         quarantined=set(state.quarantined),
