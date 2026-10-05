@@ -270,7 +270,7 @@ def _recovery_is_useful(
 # Adaptive scheduling: the baseline request volume is O(1) per tick — the
 # active account plus ONE due candidate (stalest data first) — instead of
 # every account in parallel, and the per-account cadence itself (movement,
-# threshold distance, urgent mode, 429 recovery) lives in poll_policy, is
+# the >= 80% active cadence, 429 recovery) lives in poll_policy, is
 # persisted in the usage store by whichever collector fetched, and is shared
 # by every surface. The engine escalates to a full candidate refresh only
 # when a switch could actually be near: active utilization within
@@ -2363,8 +2363,8 @@ class AutoSwitchEngine:
         """Two-phase usage collection with an O(1) baseline.
 
         Phase A fetches the active account (when its persisted poll plan says
-        it is due — poll_policy's urgent mode is what tightens that cadence
-        near the band) plus ONE due candidate (the one with the stalest data
+        it is due — poll_policy's 120 s cadence at >= 80% is what tightens
+        that cadence) plus ONE due candidate (the one with the stalest data
         — never-fetched first, then oldest fetch); everyone else is served
         from the usage store. Phase B refetches ALL candidates and recomputes
         before any switch decision when a switch could be near: active
@@ -2410,7 +2410,7 @@ class AutoSwitchEngine:
         # The active account is nominated when never fetched, poll-due per its
         # persisted plan, or (no plan yet) past the normal cadence floor. The
         # collector's reserve() honors due-ness even inside the serve TTL, so
-        # an urgent plan (60s while burning near the band) actually fetches.
+        # a 120 s plan (the active account at >= 80%) actually fetches.
         # A candidate-style plan (slower than any active plan can be) left
         # over from a role change the switcher never saw (e.g. a manual
         # login) is overridden past the active age cap. Exhausted accounts
@@ -2951,8 +2951,8 @@ class AutoSwitchEngine:
     def _respect_poll_plan(self, delay: float) -> float:
         """Shorten a normal-cadence sleep to the store's own next-poll time.
 
-        The planner tightens the active row to URGENT_INTERVAL_S while it
-        burns toward the threshold, but the loop always slept
+        The planner tightens the active row to ACTIVE_HIGH_USAGE_INTERVAL_S
+        while it is at >= 80%, but the loop always slept
         ``interval_seconds`` — so the plan ran late. Measured mid-episode: the
         row was due 112s ago while the engine still had minutes of sleep left.
 
@@ -2975,7 +2975,7 @@ class AutoSwitchEngine:
             # Bounding due_in instead keeps "only ever shortens" true at every
             # configured interval, and still refuses to poll faster than the
             # planner's own floor when the row is overdue.
-            return min(delay, max(due_in, poll_policy.URGENT_INTERVAL_S))
+            return min(delay, max(due_in, poll_policy.ACTIVE_HIGH_USAGE_INTERVAL_S))
         except Exception:
             return delay
 

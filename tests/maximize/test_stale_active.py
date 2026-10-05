@@ -802,49 +802,42 @@ class TestReportedLimit:
         assert h.tick_with_entries(entries) is TickOutcome.NO_ACTION
 
 
-# -- risk-tied polling ---------------------------------------------------------------------
+# -- active-account polling at >= 80% -------------------------------------------------------
 
 
-def plan(prev: dict | None, new: dict | None, *, elapsed: float = 180.0, recent_429=False,
-         caps=None, prev_interval=180.0, threshold=95.0, active=True) -> float:
+def plan(prev: dict | None, new: dict | None, *, recent_429=False,
+         prev_interval=180.0, threshold=95.0, active=True) -> float:
     _at, interval = poll_policy.plan_after_fetch(
         prev_interval_s=prev_interval, prev_usage=prev, new_usage=new, is_active=active,
         threshold=threshold, models=(), recent_429=recent_429, now=10_000.0,
-        rng=lambda: 0.5, window_caps=caps, prev_fetched_at=10_000.0 - elapsed,
+        rng=lambda: 0.5,
     )
     return interval
 
 
-CAPS = {"5h": 90.0, "7d": 99.0}
-
-
-class TestRiskTiedPolling:
+class TestActivePollingAtEighty:
     def test_far_below_and_moving_keeps_the_normal_cadence(self):
-        assert plan(win(20, 88), win(23, 88), caps=CAPS) == 180.0
+        assert plan(win(20, 10), win(23, 10)) == 180.0
 
     def test_not_moving_backs_off(self):
-        assert plan(win(20, 88), win(20, 88), caps=CAPS) == 270.0
-        assert plan(win(20, 88), win(20, 88), caps=CAPS, prev_interval=300) == 300.0
+        assert plan(win(20, 79), win(20, 79)) == 270.0
+        assert plan(win(20, 79), win(20, 79), prev_interval=300) == 300.0
 
-    def test_within_20_minutes_of_the_cap_every_2_minutes(self):
-        # +3 in 3 min = 1/min: 90 is 15 min from 75.
-        assert plan(win(72, 88), win(75, 88), caps=CAPS) == poll_policy.NEAR_INTERVAL_S
+    def test_79_is_the_normal_cadence_and_80_is_120_s(self):
+        assert plan(win(75, 10), win(79, 10)) == 180.0
+        assert plan(win(75, 10), win(80, 10)) == 120.0
 
-    def test_within_8_minutes_every_60_s(self):
-        assert plan(win(80, 88), win(84, 88), caps=CAPS) == poll_policy.URGENT_INTERVAL_S
-
-    def test_a_7d_in_the_80s_is_not_urgent_on_its_own_cap(self):
-        # The incident's 7d: 88 vs hard 99, a point every ~10 min. Upstream's
-        # min(hard) band (threshold 90 - 15 = 75) put it at 60 s.
-        assert plan(win(5, 87), win(6, 88), threshold=90.0) == 60.0
-        assert plan(win(5, 87), win(6, 88), caps=CAPS, threshold=90.0) == 180.0
+    def test_a_7d_at_80_is_120_s_and_at_79_is_not(self):
+        assert plan(win(5, 78), win(6, 79)) == 180.0
+        assert plan(win(5, 79), win(6, 80)) == 120.0
+        assert plan(win(5, 88), win(5, 88)) == 120.0  # not moving: still 120 s
 
     def test_a_recent_429_keeps_the_aimd_floor(self):
-        assert plan(win(80, 88), win(84, 88), caps=CAPS, recent_429=True) >= \
+        assert plan(win(80, 88), win(84, 88), recent_429=True) >= \
             poll_policy.POST_429_MIN_INTERVAL_S
 
-    def test_an_alternate_never_goes_urgent(self):
-        assert plan(win(80, 88), win(84, 88), caps=CAPS, active=False) >= 180.0
+    def test_an_alternate_is_unchanged(self):
+        assert plan(win(80, 88), win(84, 88), active=False) >= 180.0
 
     def test_retry_after_zero_backs_off_at_least_two_minutes(self):
         from claude_swap.usage_store import _failure_backoff_s

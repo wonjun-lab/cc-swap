@@ -328,10 +328,10 @@ def test_the_ride_is_published_with_its_switch_time(temp_home):
     assert h.state()[RIDE_KEY]["riding"] == ["7d"]
     [event] = of(h, MaximizeDecisionEvent)[-1:]
     assert event.ride_until == pytest.approx(record["rideUntil"])
-    # The ride polls the active account at the urgent 60 s cadence (its
-    # switch is within 15 minutes).
+    # The ride polls the active account at the 120 s high-usage cadence
+    # (its switch is within 15 minutes).
     entry = h.switcher._usage_store.entries({"1": (EMAILS[1], "")})["1"]
-    assert entry.next_poll_at == pytest.approx(h.clock.now + 60)
+    assert entry.next_poll_at == pytest.approx(h.clock.now + 120)
 
 
 def armed(h, window: str = "7d", account: str = "1") -> dict:

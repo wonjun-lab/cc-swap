@@ -75,47 +75,81 @@ class TestIntervalAdaptation:
         assert interval == poll_policy.CANDIDATE_DEFAULT_INTERVAL_S
 
 
-class TestUrgentMode:
-    def _urgent_kwargs(self, **overrides):
+class TestHighUsageCadence:
+    """The active account is read every 120 s at >= 80% (5h or 7d), else on
+    the normal cadence; a 429 wins."""
+
+    def _kwargs(self, **overrides):
         kwargs = dict(
             prev_interval_s=poll_policy.MIN_INTERVAL_S,
-            prev_usage=_usage(78),
-            new_usage=_usage(82),  # moving, inside the 75..90 band
+            prev_usage=_usage(70),
+            new_usage=_usage(79),
             is_active=True,
             threshold=90.0,
         )
         kwargs.update(overrides)
         return kwargs
 
-    def test_active_moving_in_band_goes_urgent(self):
-        _, interval = _plan(**self._urgent_kwargs())
-        assert interval == poll_policy.URGENT_INTERVAL_S
+    def test_the_constants(self):
+        assert poll_policy.ACTIVE_HIGH_USAGE_PCT == 80.0
+        assert poll_policy.ACTIVE_HIGH_USAGE_INTERVAL_S == 120.0
 
-    def test_candidate_never_goes_urgent(self):
-        _, interval = _plan(**self._urgent_kwargs(is_active=False))
-        assert interval == poll_policy.MIN_INTERVAL_S  # plain movement halving
-
-    def test_no_movement_no_urgency(self):
-        _, interval = _plan(**self._urgent_kwargs(new_usage=_usage(78)))
-        assert interval > poll_policy.URGENT_INTERVAL_S
-
-    def test_below_the_band_no_urgency(self):
-        _, interval = _plan(
-            **self._urgent_kwargs(prev_usage=_usage(40), new_usage=_usage(50))
-        )
+    def test_79_percent_keeps_the_normal_cadence(self):
+        _, interval = _plan(**self._kwargs())  # moving: halving, floored
         assert interval == poll_policy.MIN_INTERVAL_S
+        _, backoff = _plan(**self._kwargs(new_usage=_usage(79), prev_usage=_usage(79)))
+        assert backoff == 270.0  # unmoved: the usual x1.5 back-off
 
-    def test_recent_429_suppresses_urgency(self):
-        _, interval = _plan(**self._urgent_kwargs(recent_429=True))
-        assert interval == poll_policy.POST_429_MIN_INTERVAL_S
+    def test_80_percent_is_every_120_s(self):
+        _, interval = _plan(**self._kwargs(new_usage=_usage(80)))
+        assert interval == 120.0
 
-    def test_urgent_then_unmoved_snaps_back_to_the_floor(self):
-        # Once movement stops, the next interval is the normal floor — never
-        # a sub-floor decay chain (60 → 90 → 135 …) off the urgent base.
+    def test_it_holds_at_120_s_whether_or_not_it_moves(self):
         _, interval = _plan(
-            **self._urgent_kwargs(
-                prev_interval_s=poll_policy.URGENT_INTERVAL_S,
-                new_usage=_usage(78),  # unmoved
+            **self._kwargs(
+                prev_interval_s=300.0, prev_usage=_usage(85), new_usage=_usage(85)
+            )
+        )
+        assert interval == 120.0
+
+    def test_unknown_previous_reading_still_uses_it(self):
+        _, interval = _plan(**self._kwargs(prev_usage=None, new_usage=_usage(90)))
+        assert interval == 120.0
+
+    def test_a_7d_at_or_above_80_is_every_120_s(self):
+        usage = {"five_hour": {"pct": 10.0}, "seven_day": {"pct": 80.0}}
+        _, interval = _plan(**self._kwargs(prev_usage=usage, new_usage=usage))
+        assert interval == 120.0
+        low = {"five_hour": {"pct": 10.0}, "seven_day": {"pct": 79.0}}
+        _, interval = _plan(**self._kwargs(prev_usage=low, new_usage=low))
+        assert interval == 270.0
+
+    def test_candidate_is_unchanged(self):
+        _, interval = _plan(**self._kwargs(is_active=False, new_usage=_usage(85)))
+        assert interval == poll_policy.MIN_INTERVAL_S  # plain movement halving
+        _, still = _plan(
+            **self._kwargs(
+                is_active=False, prev_interval_s=300.0,
+                prev_usage=_usage(85), new_usage=_usage(85),
+            )
+        )
+        assert still == 450.0
+
+    def test_a_429_overrides_the_120_s_cadence(self):
+        _, interval = _plan(**self._kwargs(new_usage=_usage(85), recent_429=True))
+        assert interval == poll_policy.POST_429_MIN_INTERVAL_S
+        _, grown = _plan(
+            **self._kwargs(
+                new_usage=_usage(85), recent_429=True, prev_interval_s=540.0
+            )
+        )
+        assert grown == 810.0  # AIMD growth
+
+    def test_below_80_after_120_s_snaps_back_to_the_floor(self):
+        # A sub-floor base (the 120 s plan) never decays through 135 s polls.
+        _, interval = _plan(
+            **self._kwargs(
+                prev_interval_s=120.0, prev_usage=_usage(79), new_usage=_usage(79)
             )
         )
         assert interval == poll_policy.MIN_INTERVAL_S
@@ -305,11 +339,9 @@ class TestBudgetInvariants:
         assert poll_policy.RECENT_429_WINDOW_S >= 3600.0
         assert poll_policy.POST_429_MIN_INTERVAL_S >= poll_policy.MIN_INTERVAL_S
 
-    def test_urgent_episode_alone_fits_inside_the_window_cap(self):
-        # Urgent mode is bounded by construction: each further urgent poll
-        # needs ≥ MOVEMENT_DELTA_PCT of movement, so the slowest qualifying
-        # burn crosses the escalation band in margin/delta polls — inside the
-        # ~28-30 request rolling-hour window even before the post-429 floor
-        # (which absorbs any overshoot) is considered.
-        polls = poll_policy.ESCALATION_MARGIN_PCT / poll_policy.MOVEMENT_DELTA_PCT
-        assert polls < 27
+    def test_one_machine_at_the_high_cadence_sits_at_the_budget(self):
+        # 3600 / 120 = 30 reads an hour: at the measured ~28-30 budget, which
+        # is why a second machine on the account is expected to see 429s and
+        # the post-429 plan must keep winning over this cadence.
+        assert 3600.0 / poll_policy.ACTIVE_HIGH_USAGE_INTERVAL_S == 30.0
+        assert poll_policy.POST_429_MIN_INTERVAL_S > poll_policy.ACTIVE_HIGH_USAGE_INTERVAL_S

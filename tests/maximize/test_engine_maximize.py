@@ -218,7 +218,7 @@ class TestResetWait:
         reset_at = h.clock.now + 13 * 60
         for p5 in (93, 94, 95, 96):     # 1 pt / 3 min: 100% always well after the reset
             assert h.tick_with_usage(self.usage(h, p5, reset_at)) is TickOutcome.NO_ACTION
-            assert self.next_poll(h) == pytest.approx(h.clock.now + 60)   # urgent poll
+            assert self.next_poll(h) == pytest.approx(h.clock.now + 120)   # 120 s high-usage poll
             h.clock.advance(180)
         h.clock.advance(300)            # past the reset: 5h restarts near zero
         assert h.tick_with_usage(
@@ -281,7 +281,7 @@ class TestResetWait:
         h.clock.advance(26 * 60)
         h.tick_with_usage(self.usage(h, 93, reset_at))
         assert no_switch_reasons(h) == ["reset-wait"] * 2
-        assert self.next_poll(h) == pytest.approx(h.clock.now + 60)
+        assert self.next_poll(h) == pytest.approx(h.clock.now + 120)
 
     def test_urgent_poll_respects_a_recent_429(self, temp_home):
         h = make(temp_home)

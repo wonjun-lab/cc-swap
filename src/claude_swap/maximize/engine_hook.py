@@ -11,7 +11,7 @@ and maps the decision back onto those upstream paths:
                       failure was systemic)
 * ``Hold``          → ``NoSwitchEvent``; a pending hold also pulls the active
                       account's next poll to ``pending_poll_s``, a reset-aware
-                      wait (``reset-wait``) to the urgent 60 s cadence
+                      wait (``reset-wait``) to the 120 s high-usage cadence
 * ``Indeterminate`` → ``None``: ``_tick_inner`` continues into its own
                       unknown-usage counting and failover
 * ``Exhausted``     → ``AllExhaustedEvent`` + reset-aware sleep, or a
@@ -30,7 +30,7 @@ account's last acted-on decision rode), and what was learned
 (``rideLearning``, q per window). A ride the engine ended with its
 hard switch before 100% raises q; 100% read while it rode halves q; an
 idle switch, a dry run, ``auto off`` and an unreadable tick teach nothing.
-A ride polls the active account at the urgent 60 s cadence over its last
+A ride polls the active account at the 120 s high-usage cadence over its last
 ``RESET_WAIT_URGENT_S``, at ``pendingPollS`` before that.
 
 Per-engine state lives on a :class:`MaximizeRuntime` attached to the engine
@@ -112,9 +112,9 @@ DECISION_KEY = "maximizeDecision"
 # An unchanged decision is rewritten this often, so a reader can tell a
 # steady engine from a stopped one by the record's age.
 PUBLISH_REFRESH_S = 300.0
-# A reset-aware wait polls the active account every URGENT_INTERVAL_S only
-# over the last this-many seconds before the reset: at most 15 polls a wait,
-# the planner's own bound on an urgent episode, whatever resetWaitMin says.
+# A reset-aware wait polls the active account every ACTIVE_HIGH_USAGE_INTERVAL_S
+# only over the last this-many seconds before the reset: at most 8 polls a
+# wait, whatever resetWaitMin says.
 RESET_WAIT_URGENT_S = 900.0
 # The active account's learned ride (see the module docstring).
 RIDE_KEY = "maximizeRide"
@@ -179,11 +179,10 @@ class MaximizeRuntime:
 def poll_threshold(s: MaximizeSettings) -> float:
     """The threshold both poll inputs key on: the hard caps (spec §4.1).
 
-    It feeds ``_collect_scheduled_usage``'s candidate escalation and the
-    planner's 60 s urgent mode. Keying either on soft would re-poll every
-    candidate from "binding >= 35%" all week, and hold the active account
-    at 60 s polls while a soft switch waits for idle, past the ~30/hour
-    per-account budget. The pending wait has its own cadence
+    It feeds ``_collect_scheduled_usage``'s candidate escalation. Keying
+    that on soft would re-poll every candidate from "binding >= 35%" all
+    week, and hold the active account at tight polls while a soft switch
+    waits for idle, past the ~30/hour per-account budget. The pending wait has its own cadence
     (``pending_poll_s``, see ``_pull_active_poll``).
     """
     return min(s.hard_5h, s.hard_7d)
@@ -191,13 +190,8 @@ def poll_threshold(s: MaximizeSettings) -> float:
 
 def _apply_poll_inputs(engine: aw.AutoSwitchEngine, s: MaximizeSettings) -> None:
     # apply_threshold sets settings.threshold (escalation, PollEvent label)
-    # and switcher.set_poll_policy_inputs (urgent mode) in one call.
+    # and switcher.set_poll_policy_inputs in one call.
     engine.apply_threshold(poll_threshold(s))
-    # Each window's urgency keys on its own hard cap (poll_policy), not on
-    # min(hard): a 7d in the 80s is far from a 98% cap.
-    setter = getattr(engine.switcher, "set_poll_window_caps", None)
-    if callable(setter):
-        setter({"5h": float(s.hard_5h), "7d": float(s.hard_7d)})
 
 
 #: A switch is near enough for the engine to refetch every candidate when a
@@ -1331,7 +1325,7 @@ def _pull_active_poll(
     ``fetchedAt + poll_policy.MIN_INTERVAL_S`` whatever the settings say (a
     session override skips the loader's clamp): the per-account poll budget
     is shared by every machine. A reset-aware wait (``urgent``) polls at the
-    planner's urgent cadence, ``poll_policy.URGENT_INTERVAL_S``, so a climb
+    planner's high-usage cadence, ``poll_policy.ACTIVE_HIGH_USAGE_INTERVAL_S``, so a climb
     to 100% is caught quickly (``_hold`` bounds how long). Only ever pulls
     the next poll earlier. A token that 429'd recently keeps the planner's
     post-429 cadence (spec §5.6), and the collector still enforces any live
@@ -1341,7 +1335,7 @@ def _pull_active_poll(
     if fetched_at is None or entry.recent_429(now):
         return
     if urgent:
-        interval = poll_policy.URGENT_INTERVAL_S
+        interval = poll_policy.ACTIVE_HIGH_USAGE_INTERVAL_S
     else:
         interval = max(float(rt.settings.pending_poll_s), poll_policy.MIN_INTERVAL_S)
     deadline = max(now, fetched_at + interval)
@@ -1373,8 +1367,8 @@ def _hold(
     elif until is not None and until - now <= RESET_WAIT_URGENT_S:
         _pull_active_poll(engine, rt, current, entry, now, urgent=True)
     elif decision.code == "ride" and decision.ride_until is not None:
-        # The urgent cadence over the ride's last RESET_WAIT_URGENT_S (the
-        # planner's bound on an urgent episode), pendingPollS before that.
+        # The high-usage cadence over the ride's last RESET_WAIT_URGENT_S,
+        # pendingPollS before that.
         _pull_active_poll(
             engine, rt, current, entry, now,
             urgent=decision.ride_until - now <= RESET_WAIT_URGENT_S,
