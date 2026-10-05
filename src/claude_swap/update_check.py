@@ -70,7 +70,13 @@ _TOKEN_ENV_VARS = ("GITHUB_TOKEN", "GH_TOKEN")
 _GH_TOKEN_TIMEOUT = 3
 # A token is one run of printable ASCII; anything else is not spliced into a header.
 _TOKEN_RE = re.compile(r"[\x21-\x7e]+")
-_TOKEN_HINT = "Set GITHUB_TOKEN (or run `gh auth login`) to raise the rate limit."
+_TOKEN_HINT = (
+    "Try again later, or authenticate to raise the limit: set GITHUB_TOKEN "
+    "or log in with `gh auth login`."
+)
+# How much of a 403 body is read to look for "rate limit" (GitHub's wording
+# for the secondary limits, which carry no X-RateLimit headers).
+_BODY_PEEK_BYTES = 4096
 
 _VERSION_RE = re.compile(
     r"(\d+(?:\.\d+)*)(?:[-_.]?(alpha|beta|preview|pre|rc|a|b|c)[-_.]?(\d+)?)?",
@@ -226,10 +232,11 @@ def _upgrade_command(method: str | None, tag: str | None = None) -> list[str] | 
 class _LookupFailed(Exception):
     """GitHub did not give a usable answer.
 
-    ``reason`` is short enough for "could not reach GitHub (<reason>)";
+    ``reason`` is short enough for "couldn't reach GitHub (<reason>)";
     ``hint`` says what might help, when something does; ``status`` is the HTTP
     status when there was one; ``rate_limited`` is whether the status was one
-    of GitHub's rate limits.
+    of GitHub's rate limits, and ``until`` the local ``HH:MM`` it lifts, if
+    GitHub said.
     """
 
     def __init__(
@@ -238,12 +245,14 @@ class _LookupFailed(Exception):
         hint: str | None = None,
         status: int | None = None,
         rate_limited: bool = False,
+        until: str | None = None,
     ):
         super().__init__(reason)
         self.reason = reason
         self.hint = hint
         self.status = status
         self.rate_limited = rate_limited
+        self.until = until
 
 
 @functools.lru_cache(maxsize=1)
@@ -312,12 +321,28 @@ def _clock_time(reset: str | None, retry_after: str | None) -> str | None:
         return None
 
 
+def _body_mentions_rate_limit(exc: urllib.error.HTTPError) -> bool:
+    """Whether an error body says "rate limit". Reads a bounded prefix and
+    never raises: a body that cannot be read is simply not evidence."""
+    try:
+        body = exc.read(_BODY_PEEK_BYTES)
+        return "rate limit" in body.decode("utf-8", "replace").lower()
+    except Exception:
+        return False
+
+
 def _http_failure(exc: urllib.error.HTTPError, authenticated: bool) -> _LookupFailed:
-    """Put an HTTP error status into words, spotting GitHub's rate limits."""
+    """Put an HTTP error status into words, spotting GitHub's rate limits:
+    a 429, or a 403 that says so in its headers (``X-RateLimit-Remaining: 0``,
+    ``Retry-After``) or, failing those, in its body."""
     headers = exc.headers
     remaining = headers.get("X-RateLimit-Remaining") if headers is not None else None
     retry_after = headers.get("Retry-After") if headers is not None else None
-    if exc.code == 429 or (exc.code == 403 and (remaining == "0" or retry_after)):
+    if (
+        exc.code == 429
+        or (exc.code == 403 and (remaining == "0" or retry_after))
+        or (exc.code == 403 and _body_mentions_rate_limit(exc))
+    ):
         reset = headers.get("X-RateLimit-Reset") if headers is not None else None
         until = _clock_time(reset, retry_after)
         return _LookupFailed(
@@ -325,6 +350,7 @@ def _http_failure(exc: urllib.error.HTTPError, authenticated: bool) -> _LookupFa
             hint=None if authenticated else _TOKEN_HINT,
             status=exc.code,
             rate_limited=True,
+            until=until,
         )
     return _LookupFailed(f"HTTP {exc.code}", status=exc.code)
 
@@ -543,7 +569,14 @@ def _report_lookup_failure(latest: _Latest) -> None:
     failure = latest.failure
     if failure is None:
         return
-    message = f"cc-swap: could not reach GitHub ({failure.reason})"
+    if failure.rate_limited:
+        resets = f" (resets at {failure.until})" if failure.until else ""
+        message = f"cc-swap: GitHub API rate limit reached{resets}; couldn't check for a newer cc-swap"
+    else:
+        message = (
+            f"cc-swap: couldn't reach GitHub ({failure.reason}); "
+            "couldn't check for a newer cc-swap"
+        )
     if latest.tag is not None:
         message += (
             f"; using cached {latest.tag} from {_format_age(latest.cached_age or 0)}"

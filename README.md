@@ -366,7 +366,7 @@ cc-swap why      # the engine's last decision and its reason code, explained
 
 **Priming paused after an update.** Expected after every Claude Code update; the engine re-verifies on its own within a tick or two. If it says the automatic verify failed, run `cc-swap prime verify`.
 
-**`cc-swap upgrade` says `cannot confirm the latest release`.** It could not reach GitHub (often the 60-requests-an-hour anonymous rate limit) and would not guess. It changed nothing. Wait and retry, or set `GITHUB_TOKEN` (or log in with the GitHub CLI, `gh auth login`) so the lookup is authenticated.
+**`cc-swap upgrade` says `cannot confirm the latest release`.** It could not reach GitHub (often the 60-requests-an-hour anonymous rate limit) and would not guess. It changed nothing. Wait and retry, or set `GITHUB_TOKEN` (or log in with the GitHub CLI, `gh auth login`) so the lookup is authenticated. `cc-swap upgrade --check` exits `2` in this case (`0` up to date, `10` update available, `1` no release published), so a script never mistakes a failed check for being current.
 
 **`cc-swap auto` exits with code 4.** Another engine, usually the service, is already running on this machine. Only one runs at a time. Use the service, or run `cc-swap service uninstall` first.
 
