@@ -9,9 +9,10 @@ hard cap, and on a lighter day nobody does. So an account is *draining*
 its 7d hard cap, and either
 
 * the reset is at most ``drainHours`` hours away (the **hours rule**), or
-* draining what is left under the hard cap needs at least
-  :data:`HEADROOM_SHARE` of the 5h windows left before the reset, at its
-  learned rate (the **headroom rule**)::
+* the reset is at most :data:`HEADROOM_MAX_H` hours away and draining
+  what is left under the hard cap needs at least :data:`HEADROOM_SHARE` of
+  the 5h windows left before it, at its learned rate (the **headroom
+  rule**)::
 
       hard7d − pct7 ≥ HEADROOM_SHARE × windows_left × k × 100
       windows_left  = hours to the 7d reset ÷ 5
@@ -30,19 +31,23 @@ headroom rule fire later, never move you off anything.
 What draining changes (maximize/policy.py): its 7d soft trigger does not
 fire (no ``soft`` or ``preempt`` move off it on 7d); it is landable while
 its 7d is under ``hard7d − landingMargin`` (the 5h rules are unchanged);
-within a tier draining accounts are tried first, the earliest 7d reset
-first; and ``rebalance`` never moves off a draining account except to
-another draining one that resets sooner. Hard caps, at-limit, the
+within a tier a draining account with useful room (:func:`preferred`: at
+least :data:`MIN_ROOM_5H` 5h points it could take before a mark,
+:func:`room_5h`) is tried first, the earliest 7d reset first, and one with
+less competes on its score as usual; ``rebalance`` moves onto a draining
+account only when it has that room, and never moves off a draining
+account except to another such one that resets sooner. Hard caps, at-limit, the
 login-expiry guard, last resort, quarantine and holds are unchanged.
 
 ``k`` is learned from the usage history the engine already keeps
 (``usage_history.jsonl``, maximize/history.py): each account's first
 reading per clock hour, 8 days. Nothing new is stored. :func:`learn_k`
 splits an account's points into single 5h windows and takes the median of
-Δ7d/Δ5h over windows that used at least :data:`K_MIN_D5` points of 5h
-(both readings are whole percents, floored, so a short window's ratio is
-mostly rounding). Fewer than :data:`K_MIN_WINDOWS` such windows: the plan's
-default (:func:`fallback_k`).
+Δ7d/Δ5h over windows that used at least :data:`K_MIN_D5` points of 5h and
+moved the 7d at all (both readings are whole percents, floored, so a short
+window's ratio is mostly rounding, and a reading stuck on its 7d says
+nothing). Fewer than :data:`K_MIN_WINDOWS` such windows: the plan's default
+(:func:`fallback_k`).
 """
 
 from __future__ import annotations
@@ -61,6 +66,12 @@ WINDOW_S = WINDOW_H * HOUR_S
 #: The headroom rule fires when the 7d room needs this share of the 5h
 #: windows left before the reset.
 HEADROOM_SHARE = 0.8
+#: ... and only this close to the reset: a k misread low cannot make an
+#: account draining most of its week.
+HEADROOM_MAX_H = 72.0
+#: A draining account goes first only with at least this much room, in 5h
+#: points (a quarter of a 5h window): :func:`room_5h`.
+MIN_ROOM_5H = 25.0
 
 #: 7d points per 5h point when nothing is learned, by plan (measured on
 #: real 20x and 5x accounts: a full 5h window is ~16.5% / ~10.5% of 7d).
@@ -70,10 +81,10 @@ K_DEFAULT = K_20X
 #: A window counts toward k only when its 5h rose at least this much ...
 K_MIN_D5 = 40.0
 #: ... and k is learned from at least this many such windows.
-K_MIN_WINDOWS = 2
+K_MIN_WINDOWS = 3
 #: A learned k outside this range is a misread (a window split wrong): kept
 #: inside it.
-K_MIN = 0.02
+K_MIN = 0.05
 K_MAX = 0.5
 
 Rule = Literal["hours", "headroom"]
@@ -89,7 +100,7 @@ def fallback_k(plan: str | None) -> float:
 
 def window_ratios(points: Sequence, number: str) -> list[float]:
     """Δ7d/Δ5h for each single 5h window of account ``number`` whose 5h rose
-    at least :data:`K_MIN_D5`, oldest first.
+    at least :data:`K_MIN_D5` and whose 7d rose at all, oldest first.
 
     ``points`` are usage-history points (``history.UsagePoint``: ``ts``,
     ``number``, ``pct5``, ``pct7``), any order. A window ends where its 5h
@@ -111,7 +122,7 @@ def window_ratios(points: Sequence, number: str) -> list[float]:
     for w in windows:
         d5 = w[-1].pct5 - w[0].pct5
         d7 = w[-1].pct7 - w[0].pct7
-        if d5 >= K_MIN_D5 and d7 >= 0:
+        if d5 >= K_MIN_D5 and d7 > 0:
             out.append(d7 / d5)
     return out
 
@@ -164,6 +175,8 @@ def rule(v: AccountView, snap: Snapshot) -> Rule | None:
         return None
     if left <= s.drain_hours:
         return "hours"
+    if left > HEADROOM_MAX_H:
+        return None
     k, _ = k_for(v, snap.k7)
     if room >= HEADROOM_SHARE * (left / WINDOW_H) * k * 100.0:
         return "headroom"
@@ -172,6 +185,27 @@ def rule(v: AccountView, snap: Snapshot) -> Rule | None:
 
 def draining(v: AccountView, snap: Snapshot) -> bool:
     return rule(v, snap) is not None
+
+
+def room_5h(v: AccountView, snap: Snapshot) -> float:
+    """What landing on ``v`` buys before a mark moves you off again, in 5h
+    points: the 5h room under ``soft5h − landingMargin``, or the 7d room
+    under ``hard7d − landingMargin`` turned into 5h points at its k
+    (``7d room ÷ k``), whichever is less. ``-inf`` with usage unknown."""
+    s = snap.settings
+    if v.pct5 is None or v.pct7 is None:
+        return -math.inf
+    k, _ = k_for(v, snap.k7)
+    room5 = s.soft_5h - s.landing_margin - v.pct5
+    room7 = (s.hard_7d - s.landing_margin - v.pct7) / k
+    return min(room5, room7)
+
+
+def preferred(v: AccountView, snap: Snapshot) -> bool:
+    """A draining ``v`` worth trying first: at least :data:`MIN_ROOM_5H` of
+    room (:func:`room_5h`). With less, landing there buys a few minutes
+    before a forced move; it competes on its score instead."""
+    return draining(v, snap) and room_5h(v, snap) >= MIN_ROOM_5H
 
 
 # -- words ------------------------------------------------------------------------------

@@ -84,11 +84,14 @@ reset is close (within ``drainHours``, or so close that what is left under
 ``hard7d`` needs most of the 5h windows to the reset) is *draining*. Its 7d
 soft mark is set aside: no ``soft`` or ``preempt`` move off it on 7d, and it
 is landable while its 7d is under ``hard7d − landingMargin``. Within a tier
-``landing_candidates`` puts draining accounts first, the earliest 7d reset
-first (:func:`drain_first`). Rebalance (b) tries the first draining
-candidate before the best other one, and never moves off a draining active
-account except to a draining one whose 7d resets sooner (so it cannot
-bounce back). Hard caps, at-limit, the login-expiry guard, last resort,
+``landing_candidates`` puts a draining account with useful room
+(``drain.preferred``: at least a quarter 5h window before a mark) first,
+the earliest 7d reset first (:func:`drain_first`); one with less competes
+on its score. Preempt takes a draining target only when its 7d would not
+reach ``hard7d`` within the horizon either. Rebalance (b) tries the first
+such draining candidate before the best other one, and never moves off a
+draining active account except to such a one whose 7d resets sooner (so it
+cannot bounce back). Hard caps, at-limit, the login-expiry guard, last resort,
 quarantine and holds are unchanged. With no draining account every decision
 is what it was without the drain.
 
@@ -173,11 +176,12 @@ def can_land(v: AccountView, snap: Snapshot) -> bool:
 
 
 def drain_first(ranked: list[AccountView], snap: Snapshot) -> list[AccountView]:
-    """``ranked`` (``rank`` order) with the draining accounts first within
-    each tier, the earliest 7d reset first. Stable: with none draining it is
-    ``ranked`` unchanged, and the rest keep their order."""
+    """``ranked`` (``rank`` order) with the draining accounts that have
+    useful room (``drain.preferred``) first within each tier, the earliest
+    7d reset first. Stable: with none it is ``ranked`` unchanged, and the
+    rest (a draining account with little room included) keep their order."""
     def key(v: AccountView) -> tuple:
-        if draining(v, snap):
+        if drain.preferred(v, snap):
             return (TIER_ORDER[v.tier], 0, v.reset7 if v.reset7 is not None else math.inf)
         return (TIER_ORDER[v.tier], 1, 0.0)
 
@@ -753,12 +757,16 @@ def _hours(hours: float) -> str:
     return f"~{max(1, round(hours * 60))}m" if hours < 1 else f"~{hours:.0f}h"
 
 
-def soft7_eta_h(v: AccountView, rate: float, snap: Snapshot) -> float | None:
-    """Hours until ``v``'s 7d passes soft7d at ``rate`` pct/hour; None when
-    it never does: not climbing, or its 7d window resets first."""
+def soft7_eta_h(
+    v: AccountView, rate: float, snap: Snapshot, mark: float | None = None
+) -> float | None:
+    """Hours until ``v``'s 7d passes soft7d (or ``mark``) at ``rate``
+    pct/hour; None when it never does: not climbing, or its 7d window
+    resets first."""
     if rate <= 0:
         return None
-    hours = max(snap.settings.soft_7d - v.pct7, 0.0) / rate
+    mark = snap.settings.soft_7d if mark is None else mark
+    hours = max(mark - v.pct7, 0.0) / rate
     if v.reset7 is not None and v.reset7 <= snap.now + hours * 3600.0:
         return None
     return hours
@@ -799,10 +807,23 @@ def crosses_soft7_within(
     (:func:`landed_rate7`), when that is within ``horizon``; else None. The
     one check preempt picks a target with and rebalance skips a candidate by,
     so neither lands where preempt would move off again. Never for a
-    draining ``v``: its 7d soft mark is set aside."""
+    draining ``v``: its 7d soft mark is set aside, so preempt never moves
+    off it (:func:`reaches_hard7_within` is preempt's check for one)."""
     if draining(v, snap):
         return None
     hours = soft7_eta_h(v, landed_rate7(snap, a, v), snap)
+    return hours if hours is not None and hours <= horizon else None
+
+
+def reaches_hard7_within(
+    snap: Snapshot, a: AccountView, v: AccountView, horizon: float
+) -> float | None:
+    """Hours until ``v``'s 7d would reach hard7d once you are on it
+    (:func:`landed_rate7`), when that is within ``horizon`` and before its
+    7d reset; else None. Preempt's check for a draining target: a pre-emptive
+    move onto an account that a hard switch would end inside the same busy
+    stretch moves the forced switch, it does not avoid it."""
+    hours = soft7_eta_h(v, landed_rate7(snap, a, v), snap, mark=snap.settings.hard_7d)
     return hours if hours is not None and hours <= horizon else None
 
 
@@ -830,7 +851,8 @@ def _preempt(
     for v in landing:
         if TIER_ORDER[v.tier] > TIER_ORDER[a.tier]:
             continue
-        if crosses_soft7_within(snap, a, v, horizon) is None:
+        check = reaches_hard7_within if draining(v, snap) else crosses_soft7_within
+        if check(snap, a, v, horizon) is None:
             target = v
             break
     if target is None:
@@ -896,11 +918,12 @@ def _deferred_to(snap: Snapshot, gain: float) -> QuietWindow | None:
 
 
 def _rebalance_tries(pool: list[AccountView], snap: Snapshot) -> list[AccountView]:
-    """The candidates rebalance (b) weighs, in turn: the first draining one,
-    then the first other one (``pool`` is in landing order). With none
-    draining that is ``pool[0]`` alone, as without the drain."""
-    first_draining = next((v for v in pool if draining(v, snap)), None)
-    first_other = next((v for v in pool if not draining(v, snap)), None)
+    """The candidates rebalance (b) weighs, in turn: the first draining one
+    with useful room (``drain.preferred``), then the first other one
+    (``pool`` is in landing order). With none of the first kind that is
+    ``pool[0]`` alone, as without the drain."""
+    first_draining = next((v for v in pool if drain.preferred(v, snap)), None)
+    first_other = next((v for v in pool if not drain.preferred(v, snap)), None)
     return [v for v in (first_draining, first_other) if v is not None]
 
 
@@ -925,11 +948,13 @@ def _rebalance(
         pool = [v for v in landing if v.number not in skipped]
         a_draining = draining(a, snap)
         if a_draining:
-            # Off a draining account only onto one that resets sooner: never
-            # back to a non-draining one, and never back and forth.
+            # Off a draining account only onto one that resets sooner (with
+            # useful room): never back to a non-draining one, and never back
+            # and forth.
             pool = [
                 v for v in pool
-                if draining(v, snap) and (v.reset7 or math.inf) < (a.reset7 or math.inf)
+                if drain.preferred(v, snap)
+                and (v.reset7 or math.inf) < (a.reset7 or math.inf)
             ]
         top = next(
             (

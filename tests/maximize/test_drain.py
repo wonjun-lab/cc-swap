@@ -90,6 +90,17 @@ class TestPredicate:
         learned = replace(one(with_plan(v, "20x")), k7={"1": 0.10})   # 48
         assert drain.rule(with_plan(v, "20x"), learned) == "headroom"
 
+    def test_the_headroom_rule_only_within_72_hours(self):
+        # A low k (0.05) would make an empty account "draining" days ahead.
+        assert drain.HEADROOM_MAX_H == 72
+        for left, expected in ((70, "headroom"), (72, "headroom"), (80, None), (150, None)):
+            v = hours("1", 0, 0, left)
+            s = replace(one(v), k7={"1": 0.05})
+            assert drain.rule(v, s) == expected, left
+        # The hours rule is not capped by it.
+        v = hours("1", 0, 88, 100)
+        assert drain.rule(v, one(v, drain_hours=120)) == "hours"
+
     def test_the_soft_band_is_left_to_the_hours_rule_by_default(self):
         # 85-98% leaves at most 13 pts: the headroom rule fires only within
         # ~5 h (20x) or ~8 h (5x) of the reset, inside the hours rule.
@@ -131,9 +142,28 @@ class TestLearnK:
             *window("1", 0, (0, 20), (10, 15)),
             *window("1", 6 * H, (0, 50, 90), (15, 23, 30)),
             *window("1", 12 * H, (0, 45, 80), (30, 37, 43)),
+            *window("1", 18 * H, (0, 50, 100), (43, 51, 60)),
         ]
-        assert len(drain.window_ratios(points, "1")) == 2
-        assert drain.learn_k(points)["1"] == pytest.approx((15 / 90 + 13 / 80) / 2, abs=1e-4)
+        assert len(drain.window_ratios(points, "1")) == 3
+        assert drain.learn_k(points)["1"] == pytest.approx(15 / 90, abs=1e-4)
+
+    def test_windows_whose_7d_did_not_move_say_nothing(self):
+        # A reading stuck on its 7d (or a whole 5h window under one 7d
+        # point) would say k 0: such windows used to drag k to its floor,
+        # and the headroom rule then fired most of every week.
+        stuck = [p for i in range(4) for p in window("1", i * 6 * H, (0, 50, 100), (40, 40, 40))]
+        assert drain.window_ratios(stuck, "1") == []
+        assert drain.learn_k(stuck) == {}
+        mixed = stuck + [*window("1", 30 * H, (0, 50, 100), (40, 48, 56)),
+                         *window("1", 36 * H, (0, 50, 100), (56, 64, 73)),
+                         *window("1", 42 * H, (0, 50, 100), (73, 80, 90))]
+        assert drain.learn_k(mixed) == {"1": 0.17}
+
+    def test_k_has_a_floor(self):
+        low = [p for i in range(3)
+               for p in window("1", i * 6 * H, (0, 50, 100), (10 + i, 10 + i, 11 + i))]
+        assert drain.window_ratios(low, "1") == pytest.approx([0.01] * 3)
+        assert drain.K_MIN == 0.05 and drain.learn_k(low) == {"1": 0.05}
 
     def test_a_window_ends_at_a_5h_or_7d_drop_or_after_5_hours(self):
         # One stretch of hourly points: a 5h reset (90 -> 10) splits it, a
@@ -151,7 +181,9 @@ class TestLearnK:
         assert len(ratios) == 1   # 0..5 h, then 6..7 h (+10: too short)
 
     def test_too_few_windows_fall_back_to_the_plan(self):
-        points = window("1", 0, (0, 50, 100), (10, 18, 27))
+        assert drain.K_MIN_WINDOWS == 3
+        points = [*window("1", 0, (0, 50, 100), (10, 18, 27)),
+                  *window("1", 6 * H, (0, 50, 100), (27, 35, 44))]
         assert drain.learn_k(points) == {}
         v = acct("1")
         assert drain.k_for(with_plan(v, "20x"), {}) == (0.165, False)
@@ -162,14 +194,17 @@ class TestLearnK:
     def test_a_misread_k_stays_in_range_and_accounts_are_apart(self):
         points = [
             *window("1", 0, (0, 50), (0, 40)), *window("1", 6 * H, (0, 50), (0, 45)),
+            *window("1", 12 * H, (0, 50), (0, 30)),
             *window("2", 0, (0, 50, 100), (50, 55, 60)), *window("2", 6 * H, (0, 50), (60, 65)),
+            *window("2", 12 * H, (0, 50), (65, 70)),
         ]
         assert drain.learn_k(points) == {"1": drain.K_MAX, "2": 0.1}
 
     def test_future_points_are_ignored(self):
-        points = [*window("1", 0, (0, 50), (0, 8)), *window("1", 6 * H, (0, 50), (8, 16))]
-        assert drain.learn_k(points, now=3 * H) == {}
-        assert drain.learn_k(points, now=12 * H) == {"1": 0.16}
+        points = [*window("1", 0, (0, 50), (0, 8)), *window("1", 6 * H, (0, 50), (8, 16)),
+                  *window("1", 12 * H, (0, 50), (16, 24))]
+        assert drain.learn_k(points, now=8 * H) == {}
+        assert drain.learn_k(points, now=18 * H) == {"1": 0.16}
 
 
 # -- the policy -------------------------------------------------------------------------
@@ -197,12 +232,38 @@ class TestLanding:
             "1", acct("1", 96, 40),
             acct("2", 0, 0, reset7_d=6),          # best score, not draining
             hours("3", 0, 87, 20),
-            hours("4", 0, 89, 10),
+            hours("4", 0, 88, 10),
             hours("5", 0, 60, 30, tier="last_resort"),
-            hours("6", 0, 90, 12, tier="last_resort"),
+            hours("6", 0, 80, 12, tier="last_resort"),
             acct("7", 0, 50, reset7_d=6),
         )
         assert [v.number for v in landing_candidates(s)] == ["4", "3", "2", "7", "6", "5"]
+
+    def test_a_draining_account_with_little_5h_room_competes_on_its_score(self):
+        # #2 drains (7d 88%, 20 h) but its 5h is at 40: 5 pts to soft5h -
+        # margin, a few minutes before the 5h soft mark moves you on. The
+        # 5h-fresh #3 (better score) goes first; with #2's 5h fresh it is #2.
+        def landing(p5):
+            s = snap("1", acct("1", 96, 40), hours("2", p5, 88, 20), acct("3", 0, 40, reset7_d=2))
+            return [v.number for v in landing_candidates(s)]
+
+        assert drain.MIN_ROOM_5H == 25
+        assert landing(40) == ["3", "2"]
+        assert landing(20) == ["2", "3"]   # 25 pts of 5h room: the floor
+        assert landing(21) == ["3", "2"]
+
+    def test_a_draining_account_with_little_7d_room_competes_on_its_score(self):
+        # 7d 92% leaves 1 pt to hard7d - margin: ~6 5h points at k 0.165.
+        def landing(p7, k7=None):
+            s = snap("1", acct("1", 96, 40), hours("2", 0, p7, 20), acct("3", 0, 40, reset7_d=2))
+            if k7 is not None:
+                s = replace(s, k7=k7)
+            return [v.number for v in landing_candidates(s)]
+
+        assert landing(92) == ["3", "2"]
+        assert landing(87) == ["2", "3"]      # 6 pts / 0.165 = 36 5h points
+        assert landing(88.9) == ["3", "2"]    # 4.1 / 0.165 = 24.8: under the floor
+        assert landing(88.9, {"2": 0.1}) == ["2", "3"]   # 41 at its learned k
 
     def test_the_guards_still_apply(self):
         guarded = replace(hours("2", 0, 88, 18), login_deadline=NOW + 60)
@@ -262,6 +323,24 @@ class TestActiveDraining:
         got = decide(make())
         assert isinstance(got, Hold) and "draining it first" in got.reason
 
+    def test_preempt_onto_a_draining_target_checks_its_hard_mark(self):
+        # Drain-on counterpart of test_policy's crossing-candidate case: #2
+        # drains (6 h to its reset) and its soft mark is set aside, but at
+        # the active's 2 pts/h it would reach hard7d 98 in 4 h, inside the
+        # 5 h horizon and before its reset. Not a target; #3 is.
+        crossing = acct("2", 10, 90, reset7_d=0.25)
+        s = tp.preempt_snap(candidate=crossing)
+        assert drain.draining(crossing, s)
+        got = decide(s)
+        assert not (isinstance(got, Switch) and got.trigger == "preempt")
+        both = replace(s, accounts=(*s.accounts, acct("3", 10, 60, reset7_d=6)))
+        got = decide(both)
+        assert isinstance(got, Switch) and got.trigger == "preempt" and got.target == "3"
+        # 86%: 6 h to 98, past the horizon: a fine target.
+        slow = tp.preempt_snap(candidate=acct("2", 10, 86, reset7_d=0.25))
+        got = decide(slow)
+        assert isinstance(got, Switch) and got.trigger == "preempt" and got.target == "2"
+
     def test_an_account_hold_words_it_as_a_hold(self):
         s = replace(snap("1", hours("1", 20, 92, 18), acct("2", 0, 10, reset7_d=6),
                          samples="idle"), hold_until=NOW + H)
@@ -302,6 +381,21 @@ class TestRebalance:
                         acct("3", 0, 0, reset7_d=2))
         got = decide(s)
         assert isinstance(got, Switch) and got.target == "3"
+
+    def test_rebalance_onto_a_draining_account_only_with_room(self):
+        # #2 (5h 30: 15 pts of room) drains and scores best; #3 drains with
+        # room. Rebalance prefers #3; #2 is weighed on its score only.
+        s = self.cooled(acct("1", 10, 60, reset7_d=3), hours("2", 30, 80, 20),
+                        hours("3", 0, 85, 22))
+        got = decide(s)
+        assert isinstance(got, Switch) and got.target == "3"
+        s = self.cooled(acct("1", 10, 60, reset7_d=3), hours("2", 30, 80, 20),
+                        hours("3", 30, 85, 22))
+        got = decide(s)
+        assert isinstance(got, Switch) and got.target == "2"   # plain score order
+        # Off a draining account: never onto one without room.
+        s = self.cooled(hours("1", 10, 80, 20), hours("2", 30, 85, 4))
+        assert isinstance(decide(s), Hold)
 
     def test_cooldown_and_idle_still_hold_it(self):
         s = snap("1", acct("1", 10, 60, reset7_d=3), hours("2", 0, 80, 20), samples="idle",
@@ -426,11 +520,12 @@ class TestSurfaces:
     def test_view_drain_k7_follows_the_settings_like_the_engine(self):
         from claude_swap.maximize import view as mxview
 
-        points = (*window("1", 0, (0, 50), (0, 8)), *window("1", 6 * H, (0, 50), (8, 16)))
+        points = (*window("1", 0, (0, 50), (0, 8)), *window("1", 6 * H, (0, 50), (8, 16)),
+                  *window("1", 12 * H, (0, 50), (16, 24)))
         h = History(points=points)
-        assert mxview.drain_k7(h, MaximizeSettings(), 12 * H) == {"1": 0.16}
-        assert mxview.drain_k7(h, MaximizeSettings(drain_hours=0), 12 * H) == {}
-        assert mxview.drain_k7(None, MaximizeSettings(), 12 * H) == {}
+        assert mxview.drain_k7(h, MaximizeSettings(), 18 * H) == {"1": 0.16}
+        assert mxview.drain_k7(h, MaximizeSettings(drain_hours=0), 18 * H) == {}
+        assert mxview.drain_k7(None, MaximizeSettings(), 18 * H) == {}
 
 
 # -- the engine end to end --------------------------------------------------------------
@@ -480,8 +575,9 @@ class TestEngine:
 
         h = make(temp_home)
         now = h.clock.now
-        points = [*window("2", now - 20 * H, (0, 50, 100), (10, 18, 27)),
-                  *window("2", now - 12 * H, (0, 50, 100), (27, 35, 44))]
+        points = [*window("2", now - 30 * H, (0, 50, 100), (10, 18, 27)),
+                  *window("2", now - 20 * H, (0, 50, 100), (27, 35, 44)),
+                  *window("2", now - 10 * H, (0, 50, 100), (44, 52, 61))]
         path = hist.path_for(h.switcher.backup_dir)
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text("".join(

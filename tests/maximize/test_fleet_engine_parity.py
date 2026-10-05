@@ -214,14 +214,20 @@ def test_fleets_next_is_the_engines_target(name, snap, mx, state):
 
 def test_the_drain_fixtures_put_draining_accounts_first():
     by_name = {f[0]: f for f in FIXTURES}
-    expected = {"draining": ["3", "2", "4", "6"], "draining by room": ["2", "3"],
-                "draining active": ["3", "2"]}
-    for name, order in expected.items():
+    # (order, draining slots). #3 in "draining" and in "draining active"
+    # drains with under a quarter 5h window of 7d room: it is landable but
+    # competes on its score.
+    expected = {
+        "draining": (["2", "3", "4", "6"], {"2", "3", "5"}),
+        "draining by room": (["2", "3"], {"2"}),
+        "draining active": (["2", "3"], {"1", "3"}),
+    }
+    for name, (order, draining) in expected.items():
         _, snap, mx, state = by_name[name]
         engine = _engine_snapshot(snap, mx, state)
         assert [v.number for v in policy.landing_candidates(engine)] == order, name
         rows = {r.number: r for r in fx.fleet_rows(snap, mx, PRIME, state, now=NOW)}
-        assert rows[order[0]].drain, name
+        assert {n for n, r in rows.items() if r.drain} == draining, name
     _, snap, mx, state = by_name["draining active"]
     decision = policy.decide(_engine_snapshot(snap, mx, state))
     assert isinstance(decision, Hold) and "draining it first" in decision.reason

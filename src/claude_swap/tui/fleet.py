@@ -206,7 +206,12 @@ def fleet_rows_now(app: "CswapApp", snap: AccountsSnapshot | None = None) -> lis
         state = mxview.read_state(root)
     except Exception:
         state = mxview.MaximizeState()
-    return fx.fleet_rows(snap, mx, prime, state, now=time.time())
+    now = time.time()
+    # The usage history (cached while the file is unchanged) gives the
+    # near-reset drain its learned k, as on the Fleet screen.
+    return fx.fleet_rows(
+        snap, mx, prime, state, now=now, history=mxview.read_history(root, now)
+    )
 
 
 def _resolve_claude(app: "CswapApp") -> str | None:
@@ -1184,7 +1189,7 @@ class FleetScreen(Screen):
         if snap is None:
             return
         now = time.time()
-        msnap = fx.fleet_snapshot(snap, self._mx, self._state, now=now)
+        msnap = fx.fleet_snapshot(snap, self._mx, self._state, now=now, history=self._history)
         names = {r.number: r.name for r in self._rows}
         choices = []
         for plan in plan_rows(msnap, self._state.primes, self._prime, now):
