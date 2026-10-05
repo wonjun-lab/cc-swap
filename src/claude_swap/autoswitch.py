@@ -1014,6 +1014,12 @@ class AutoSwitchEngine:
         data = oauth.extract_oauth_data(creds)
         if not data:
             return "invalid_grant"
+        if self._shared_elsewhere(number, creds):
+            # cc-swap (shared_login.py): another slot or `cswap run` profile
+            # holds this refresh token. Activating it puts a second copy in
+            # the live store, and Claude Code's first refresh logs the other
+            # out — not a target until one of them is re-logged.
+            return "shared-login"
         now_ms = self.clock() * 1000
         expires_at = data.get("expiresAt")
         near_expiry = (
@@ -1059,6 +1065,20 @@ class AutoSwitchEngine:
             # send the user to check a connection that is fine.
             return outcome.error
         return "transient"
+
+    def _shared_elsewhere(self, number: str, creds: str) -> bool:
+        """Whether another slot or another slot's ``cswap run`` profile holds
+        this refresh token (``switcher.shared_login_places``; the live login
+        is left out: activating the slot makes it this slot's). False when
+        the switcher has no such check or it cannot run."""
+        check = getattr(self.switcher, "shared_login_places", None)
+        if check is None:
+            return False
+        try:
+            places = check(number, creds, is_active=True)
+        except Exception:
+            return False
+        return isinstance(places, list) and bool(places)
 
     def _login_dead(self, number: str) -> bool:
         """``switcher.dead_login_reason`` (the check ``switch_to`` refuses
@@ -2509,7 +2529,11 @@ class AutoSwitchEngine:
                     )
                 )
                 return TickOutcome.NO_ACTION
-            if result and result.get("reason") == "login-dead" and not result.get("switched"):
+            if (
+                result
+                and result.get("reason") in ("login-dead", "shared-login")
+                and not result.get("switched")
+            ):
                 # switch_to's last-moment check: the target's stored login
                 # is dead (expired / quarantined), so it was not activated.
                 # Nothing changed; the caller moves on to its next candidate.

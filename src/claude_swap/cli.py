@@ -1564,7 +1564,10 @@ new deadline. Other machines keep their own logins: run this there too.
                 sys.exit(1)
             if args.new:
                 outcome = rl.login_new(
-                    switcher, new, claude=claude, adopt_existing=_ask_adopt_existing,
+                    switcher, new, claude=claude,
+                    adopt_existing=lambda n, e: _ask_adopt_existing(
+                        n, e, live=switcher.current_account_number() == n,
+                    ),
                 )
             else:
                 outcome = rl.relogin(switcher, num, claude=claude)
@@ -1595,13 +1598,21 @@ new deadline. Other machines keep their own logins: run this there too.
     sys.exit(1)
 
 
-def _ask_adopt_existing(number: str, email: str) -> bool:
+def _ask_adopt_existing(number: str, email: str, *, live: bool = False) -> bool:
     """``login --new`` signed in as an account already in slot ``number``:
     offer to keep this fresh login as that slot's re-login (a terminal
-    only; otherwise refused)."""
+    only; otherwise refused). ``live``: that slot is the account Claude Code
+    is logged in as, so the re-login rewrites the live login too — said in
+    the prompt."""
     if not sys.stdin.isatty():
         return False
     warning(f"{email} is already #{number}.")
+    if live:
+        warning(
+            f"#{number} is the account Claude Code is logged in as: storing this "
+            "login as its re-login replaces the live login too (like "
+            f"cc-swap login {number})."
+        )
     try:
         answer = input(f"Store this login as #{number}'s new login instead? [y/N] ")
     except EOFError:
@@ -1837,8 +1848,9 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
         action="store_true",
         help=(
             "With 'switch <num|email>': switch even to an account whose stored "
-            "login is dead (expired or quarantined), which is refused otherwise; "
-            "the current login is still backed up first"
+            "login is dead (expired or quarantined) or shared with another "
+            "slot, which is refused otherwise; the current login is still "
+            "backed up first"
         ),
     )
     parser.add_argument(

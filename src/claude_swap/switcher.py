@@ -217,7 +217,7 @@ _RELOGIN_REMEDY = oauth.RELOGIN_STEPS
 
 #: ``switch --json`` no-op reasons that mean "refused": the CLI exits 1 for
 #: them, as it does when the human path raises ``SwitchRefusedError``.
-SWITCH_REFUSED_REASONS = frozenset({"login-dead", "no-candidates"})
+SWITCH_REFUSED_REASONS = frozenset({"login-dead", "no-candidates", "shared-login"})
 
 SENTINEL_NOTES = {
     USAGE_TOKEN_EXPIRED: "token expired — refresh deferred this pass; retries automatically",
@@ -2556,6 +2556,9 @@ class ClaudeAccountSwitcher:
                         f"slot {num} is taken (Account-{num}); pick a free one"
                     )
             config_file = self.configs_dir / f".claude-config-{num}-{email}.json"
+            # A `.prev` left on this key by an account removed from it must
+            # never be recovered onto the new one (cf. _relocate_locked).
+            self._store.delete_previous_backup(num, email)
             written = False
             try:
                 self._write_account_credentials(num, email, credentials)
@@ -2714,25 +2717,29 @@ class ClaudeAccountSwitcher:
                 data["lastUpdated"] = get_timestamp()
                 self._write_json(self.sequence_file, data)
 
-    def shared_login_places(
-        self, account_num: str, credentials: str, *, is_active: bool
-    ) -> list[tuple[str, str | None]]:
-        """Where else slot ``account_num``'s ``credentials`` (the bytes about
-        to be refreshed) hold the same refresh token, as ``(label, slot)``
-        pairs (``slot``: the slot to re-login for that place, if any).
+    def _shared_holders(self, account_num: str) -> dict[str, list[tuple[str, str | None]]]:
+        """cc-swap fork (``shared_login.py``): refresh-token fingerprint →
+        the places OTHER than slot ``account_num`` that hold it, as
+        ``(label, slot to re-login or None)``: every other slot's backup and
+        every ``cswap run`` profile that is not this slot's own nor marked
+        stale (it re-bootstraps before its next use). Local reads only; a
+        read that fails is unknown, never "shared", and never puts the
+        process into Keychain file mode (``peek_account_credentials``)."""
+        from claude_swap.session import (
+            is_session_stale,
+            read_session_credentials,
+            session_dir_for,
+        )
 
-        cc-swap fork (``shared_login.py``): another slot's backup; another
-        slot's ``cswap run`` profile; the live login unless this slot IS the
-        live account (``is_active``). The slot's own ``cswap run`` profile is
-        its own copy and never counts. Reads only; compares fingerprints."""
-        from claude_swap.session import read_session_credentials, session_dir_for
-
-        fp = shared_login.refresh_fingerprint(credentials)
-        if fp is None:
-            return []
         num = str(account_num)
         accounts = (self._get_sequence_data() or {}).get("accounts") or {}
-        places: list[tuple[str, str | None]] = []
+        holders: dict[str, list[tuple[str, str | None]]] = {}
+
+        def note(credentials: str | None, label: str, slot: str | None) -> None:
+            fp = shared_login.refresh_fingerprint(credentials)
+            if fp is not None:
+                holders.setdefault(fp, []).append((label, slot))
+
         own_profile: Path | None = None
         for other, record in accounts.items():
             if not isinstance(record, dict) or record.get("kind") == "api_key":
@@ -2741,56 +2748,87 @@ class ClaudeAccountSwitcher:
             if str(other) == num:
                 own_profile = session_dir_for(self.backup_dir, num, email)
                 continue
-            held, _unreadable = self._read_account_credentials_ex(str(other), email)
-            if held and shared_login.refresh_fingerprint(held) == fp:
-                places.append((f"#{other}", str(other)))
+            note(self._store.peek_account_credentials(str(other), email),
+                 f"#{other}", str(other))
         for owner, path in shared_login.session_profiles(self.backup_dir):
-            if own_profile is not None and path == own_profile:
+            if (own_profile is not None and path == own_profile) or is_session_stale(path):
                 continue
-            held = read_session_credentials(path)
-            if held and shared_login.refresh_fingerprint(held) == fp:
-                record = accounts.get(owner)
-                current = isinstance(record, dict) and path == session_dir_for(
-                    self.backup_dir, owner, str(record.get("email") or "")
-                )
-                places.append(
-                    (shared_login.profile_label(owner), owner) if current
-                    else (f"a leftover cswap run profile made for #{owner}", None)
-                )
+            record = accounts.get(owner)
+            current = isinstance(record, dict) and path == session_dir_for(
+                self.backup_dir, owner, str(record.get("email") or "")
+            )
+            note(
+                read_session_credentials(path),
+                *((shared_login.profile_label(owner), owner) if current
+                  else (f"a leftover cswap run profile made for #{owner}", None)),
+            )
+        return holders
+
+    def _live_shares(self, account_num: str, fp: str | None) -> str | None:
+        """When slot ``account_num`` is NOT the live account and the live
+        login holds refresh token ``fp`` too: the live account's slot (``""``
+        for an unmanaged live login). The live account is resolved again
+        right after the live read, so a switch landing between the two is
+        not mistaken for sharing. None otherwise, or when unknown."""
+        if fp is None:
+            return None
+        live = self._read_active_credentials()
+        if not live.value or live.degraded:
+            return None
+        if shared_login.refresh_fingerprint(live.value) != fp:
+            return None
+        current = self.current_account_number()
+        if current == str(account_num):
+            return None
+        return current or ""
+
+    def shared_login_places(
+        self, account_num: str, credentials: str, *, is_active: bool
+    ) -> list[tuple[str, str | None]]:
+        """Where else slot ``account_num``'s ``credentials`` hold the same
+        refresh token, as ``(label, slot to re-login or None)``: another
+        slot's backup, another slot's ``cswap run`` profile, and — unless the
+        slot is the live account (``is_active``) — the live login. The slot's
+        own copies never count. Reads only; compares fingerprints."""
+        fp = shared_login.refresh_fingerprint(credentials)
+        if fp is None:
+            return []
+        places = list(self._shared_holders(account_num).get(fp, []))
         if not is_active:
-            live = self._read_active_credentials()
-            if (
-                live.value
-                and not live.degraded
-                and shared_login.refresh_fingerprint(live.value) == fp
-            ):
-                places.append(("the live login", self.current_account_number()))
+            live_slot = self._live_shares(account_num, fp)
+            if live_slot is not None:
+                places.append(("the live login", live_slot or None))
         return places
 
-    def _refuse_shared_refresh(
-        self, account_num: str, credentials: str, *, is_active: bool
-    ) -> bool:
-        """Whether a refresh of ``credentials`` must not happen because the
-        refresh token is held elsewhere too (logged, slot numbers and a
-        fingerprint prefix only). A check that cannot run never refuses."""
+    def _shared_for_gate(
+        self, account_num: str, credentials: str
+    ) -> tuple[list[tuple[str, str | None]], bool]:
+        """``(other places, held by the live login of another account)`` for
+        the bytes the consume gate is about to POST. A check that cannot run
+        refuses nothing (it must never freeze refreshes)."""
         try:
-            places = self.shared_login_places(
-                account_num, credentials, is_active=is_active
-            )
+            fp = shared_login.refresh_fingerprint(credentials)
+            if fp is None:
+                return [], False
+            places = list(self._shared_holders(account_num).get(fp, []))
+            return places, self._live_shares(account_num, fp) is not None
         except Exception:
             self._logger.debug("shared-login check for account %s failed",
                                account_num, exc_info=True)
-            return False
-        if not places:
-            return False
+            return [], False
+
+    def _log_shared_refusal(
+        self, account_num: str, credentials: str, places, *, deferred: bool = False
+    ) -> None:
+        """One line per refusal: slot numbers and a fingerprint prefix only."""
         self._logger.warning(
             "Not refreshing account %s: its refresh token (rt %s) is also held "
-            "by %s; refreshing would log the other copy out. Re-login one of "
-            "them (cc-swap login N); cc-swap doctor names them.",
+            "by %s; refreshing would log the other copy out. %s",
             account_num, oauth.fingerprint8(credentials),
             ", ".join(label for label, _slot in places),
+            "Deferred (cc-swap doctor checks the live login)." if deferred
+            else "Re-login one of them (cc-swap login N); cc-swap doctor names them.",
         )
-        return True
 
     def _audited_refresh(
         self,
@@ -3039,6 +3077,12 @@ class ClaudeAccountSwitcher:
                             input_oauth = prof_oauth
                             refresh_source = "profile"
                 consumed_fp = oauth.credential_fingerprint(refresh_input)
+                # cc-swap (shared_login.py): who else holds the bytes about
+                # to be POSTed, read under the account lock (a switch or swap
+                # writes under it, so live bytes and live identity agree).
+                shared_places, live_shared = self._shared_for_gate(
+                    account_num, refresh_input
+                )
         except LockError:
             # Nothing consumed yet — a holder (switch, collector, CC) owns
             # the slot; defer cleanly rather than raise through callers
@@ -3107,10 +3151,19 @@ class ClaudeAccountSwitcher:
             gate_active = False
         # cc-swap: one refresh token in two places (shared_login.py). The
         # POST would rotate it and kill the other copy; which one survives
-        # must be the user's re-login, not this pass. Deterministic until
-        # one is re-logged, so a distinct kind (nothing consumed, no strike).
-        if self._refuse_shared_refresh(account_num, refresh_input, is_active=gate_active):
+        # must be the user's re-login, not this pass. Another slot or
+        # profile: deterministic until one is re-logged, so a distinct kind
+        # (nothing consumed, no strike). The live login of another account:
+        # a deferral (it may be a switch's moment; doctor's live-login check
+        # reports the lasting shape).
+        if shared_places:
+            self._log_shared_refusal(account_num, refresh_input, shared_places)
             return oauth.RefreshOutcome(None, shared_login.SHARED_LOGIN)
+        if live_shared:
+            self._log_shared_refusal(
+                account_num, refresh_input, [("the live login", None)], deferred=True,
+            )
+            return oauth.RefreshOutcome(None, "transient")
         result = self._audited_refresh(
             refresh_input, caller=caller, slot=account_num,
             active=gate_active, source=refresh_source,
@@ -5131,12 +5184,17 @@ class ClaudeAccountSwitcher:
             )
             return FetchRecord(error="store-unmirrored")
 
-        # cc-swap: the live login's refresh token is held by another slot or
-        # another slot's `cswap run` profile too (shared_login.py). Every
-        # recovery below may POST it (or the slot's backup copy of it), which
-        # would kill the other copy; serving a valid token above is fine.
-        if self._refuse_shared_refresh(account_num, creds, is_active=True):
-            return FetchRecord(error=shared_login.SHARED_LOGIN)
+        # cc-swap (shared_login.py): refresh tokens held by another slot or
+        # another slot's `cswap run` profile, read before the locks (local
+        # reads). Applied only at the POST below, to the bytes chosen there:
+        # the restores (a still-valid backup, the pinned re-login) POST
+        # nothing and must stay free to heal.
+        try:
+            shared_holders = self._shared_holders(account_num)
+        except Exception:
+            self._logger.debug("shared-login check for account %s failed",
+                               account_num, exc_info=True)
+            shared_holders = {}
 
         # Attribution against the slot's
         # stored backup decides HOW to recover, never whether to give up
@@ -5450,6 +5508,16 @@ class ClaudeAccountSwitcher:
                         restore_source = backup
                         working = backup
                     else:
+                        shared_places = shared_holders.get(
+                            shared_login.refresh_fingerprint(refresh_input) or "", []
+                        )
+                        if shared_places:
+                            # cc-swap: the grant about to be POSTed is held
+                            # elsewhere too; POSTing would log that copy out.
+                            self._log_shared_refusal(
+                                account_num, refresh_input, shared_places
+                            )
+                            return FetchRecord(error=shared_login.SHARED_LOGIN)
                         # The POST runs while holding the account FileLock
                         # (contended by `cswap switch` with a 10s acquire
                         # budget) and CC's credential locks. Bound it well
@@ -7386,6 +7454,13 @@ class ClaudeAccountSwitcher:
             )
             if refused is not None:
                 return refused
+            refused = self._refuse_shared_target(
+                target_account,
+                self._get_current_account() if force else identity,
+                json_output,
+            )
+            if refused is not None:
+                return refused
 
         op = self._perform_switch(
             target_account,
@@ -7442,6 +7517,52 @@ class ClaudeAccountSwitcher:
             int(target), data.get("accounts", {}).get(target, {}).get("email", "")
         )
         payload["loginProblem"] = dead
+        payload["override"] = override
+        return payload
+
+    def _refuse_shared_target(
+        self, target: str, identity: tuple[str, str] | None, json_output: bool
+    ) -> dict | None:
+        """cc-swap fork (shared_login.py): refuse a manual switch onto a slot
+        whose stored refresh token another slot or another slot's ``cswap
+        run`` profile holds too — once live, Claude Code's first refresh logs
+        that copy out. Like :meth:`_refuse_dead_target` (``--allow-dead-login``
+        switches anyway); reason ``shared-login``. None when fine, unknown,
+        or the target is the live account."""
+        data = self._get_sequence_data() or {}
+        current = (
+            self._find_account_slot(data, identity[0], identity[1])
+            if identity is not None else None
+        )
+        if current == target:
+            return None
+        email = (data.get("accounts", {}).get(target, {}) or {}).get("email", "")
+        try:
+            stored = self._store.peek_account_credentials(target, email)
+            places = (
+                self.shared_login_places(target, stored, is_active=True) if stored else []
+            )
+        except Exception:
+            places = []
+        if not places:
+            return None
+        override = f"cc-swap switch {target} --allow-dead-login"
+        message = (
+            f"Not switching to Account-{target}: its login is also held by "
+            f"{', '.join(label for label, _slot in places)}, and a refresh token "
+            "works once — Claude Code's first refresh would log that copy out. "
+            f"Fix: {shared_login.fix([target, *(s for _l, s in places if s)])}. "
+            f"To switch anyway: {override}"
+        )
+        if not json_output:
+            raise SwitchRefusedError(message, reason=shared_login.SHARED_LOGIN)
+        cur_email = (data.get("accounts", {}).get(str(current), {}) or {}).get("email", "")
+        ref = account_ref(int(current), cur_email) if current else None
+        payload = self._switch_noop(
+            strategy="direct", reason=shared_login.SHARED_LOGIN, to_ref=ref,
+            message=message,
+        )
+        payload["target"] = account_ref(int(target), email)
         payload["override"] = override
         return payload
 

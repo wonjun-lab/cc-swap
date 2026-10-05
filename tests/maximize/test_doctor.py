@@ -365,6 +365,23 @@ def test_leftover_profile_is_named_by_slot_number_only(world):
     assert f.fix == "re-login one of them: cc-swap login 3"
 
 
+def test_a_stale_marked_profile_is_not_a_sharer(world):
+    world.healthy()
+    path = _profile(world, 2, creds(3))
+    (path.parent / f".{path.name}.cswap-stale-credentials").write_text("")
+    assert not find(run(world), "shared-login")
+
+
+def test_a_live_setup_token_under_another_name_is_not_called_shared(world):
+    world.healthy()
+    token = json.dumps({"claudeAiOauth": {"accessToken": "at-SECRET-setup"}})
+    world.store(2, token)
+    world.login(1, token)
+    [f] = find(run(world), "live-login", "error")
+    assert "does not refresh" not in f.detail
+    assert "re-login one of them" not in f.fix
+
+
 def test_live_login_sharing_a_non_live_slot(world):
     world.healthy()
     world.login(1, creds(2))  # ~/.claude.json names #1, the token is #2's

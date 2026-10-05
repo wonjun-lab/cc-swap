@@ -166,7 +166,28 @@ def test_an_account_already_in_a_slot_is_refused(temp_home):
     assert "already #4" in outcome.message and "cc-swap login 4" in outcome.message
     assert _slot_rt(s) == "rt-four-dead"  # #4 untouched
     assert json.dumps(s._get_sequence_data(), sort_keys=True) == before
-    assert not _leftover_profiles(s) and not _stashed_rts(s)
+    assert not _leftover_profiles(s)
+    # The fresh login is not thrown away: kept unclaimed.
+    assert "cc-swap unclaimed" in outcome.message and _stashed_rts(s) == ["rt-four-new"]
+
+
+def test_a_relogin_offer_that_mismatches_keeps_the_login(temp_home):
+    """Matched by account uuid under a new email: the re-login's identity
+    check refuses it, and the fresh login is kept unclaimed."""
+    s = _switcher(temp_home)
+    outcome = _run(s, FakeLogin(email="renamed@example.com"),
+                   adopt_existing=lambda n, e: True)
+    assert outcome.status == rl.MISMATCH and outcome.number == "4"
+    assert "cc-swap unclaimed" in outcome.message and _stashed_rts(s) == ["rt-four-new"]
+    assert _slot_rt(s) == "rt-four-dead"
+
+
+def test_a_stale_previous_generation_on_the_new_key_is_dropped(temp_home):
+    s = _switcher(temp_home)
+    prev = s._store._prev_backup_path("6", NEW)
+    prev.write_text("stale")
+    assert _run(s, _new_login()).ok
+    assert not prev.exists()
 
 
 def test_the_duplicate_check_ignores_email_case_and_matches_the_uuid(temp_home):
@@ -291,9 +312,12 @@ def test_cli_new_duplicate_offers_the_relogin_on_a_terminal(temp_home, monkeypat
                                                            cli_new):
     s = _switcher(temp_home)
     cli_new["login"] = FakeLogin()
-    monkeypatch.setattr(cli, "_ask_adopt_existing", lambda n, e: True)
+    asked = []
+    monkeypatch.setattr(cli, "_ask_adopt_existing",
+                        lambda n, e, **kw: asked.append(kw) or True)
     assert _cli(monkeypatch, ["--new"]) == 0
     assert _slot_rt(s) == "rt-four-new"
+    assert asked == [{"live": False}]  # #1 is live, not #4
 
 
 def test_cli_new_taken_slot_exits_one_before_the_browser(temp_home, monkeypatch, capsys,
@@ -320,6 +344,17 @@ def test_cli_new_without_claude_prints_the_manual_steps(temp_home, monkeypatch, 
     out = capsys.readouterr().out
     assert "Add a new account by hand" in out and "cc-swap add" in out
     assert not login.calls and not _leftover_profiles(s)
+
+
+def test_the_offer_says_when_it_rewrites_the_live_login(monkeypatch, capsys):
+    monkeypatch.setattr("sys.stdin.isatty", lambda: True, raising=False)
+    monkeypatch.setattr("builtins.input", lambda prompt: "n")
+    assert cli._ask_adopt_existing("4", FOUR, live=True) is False
+    captured = capsys.readouterr()
+    assert "replaces the live login too" in captured.out + captured.err
+    cli._ask_adopt_existing("4", FOUR, live=False)
+    captured = capsys.readouterr()
+    assert "live login" not in captured.out + captured.err
 
 
 def test_ask_adopt_existing_needs_a_terminal(monkeypatch):

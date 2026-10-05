@@ -1352,6 +1352,36 @@ class CredentialStore:
                 self._host._logger.warning(f"Failed to read credentials from Keychain: {e}")
         return ""
 
+    def peek_account_credentials(self, account_num: str, email: str) -> str | None:
+        """A slot's backup for a comparison only (cc-swap fork: the
+        shared-login check reads every OTHER slot). Same ``.enc``-wins order
+        as :meth:`_read_account_credentials`, but the Keychain is asked
+        directly, never through ``_kc_call``: a failing read of an unrelated
+        slot must not put this process into file mode. ``""`` when there is
+        none, None when it could not be read (unknown, not "absent")."""
+        enc_file = self._backup_enc_path(account_num, email)
+        try:
+            encoded = enc_file.read_text(encoding="utf-8").strip()
+        except FileNotFoundError:
+            encoded = ""
+        except OSError:
+            return None
+        if encoded:
+            try:
+                decoded = base64.b64decode(encoded, validate=True).decode("utf-8")
+            except Exception:
+                decoded = ""
+            if decoded:
+                return decoded
+        if self._host.platform != Platform.MACOS:
+            return ""
+        try:
+            return macos_keychain.get_password(
+                SECURITY_SERVICE, self._backup_username(account_num, email)
+            ) or ""
+        except macos_keychain.KEYCHAIN_ERRORS:
+            return None
+
     def _read_account_credentials_ex(
         self, account_num: str, email: str
     ) -> tuple[str, bool]:

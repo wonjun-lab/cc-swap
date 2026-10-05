@@ -55,6 +55,12 @@ def _switcher(home: Path, *, live: str | None = None) -> ClaudeAccountSwitcher:
     return s
 
 
+def _live(home: Path, n: int) -> None:
+    (home / ".claude.json").write_text(json.dumps({"oauthAccount": {
+        "emailAddress": _email(n), "organizationUuid": "", "accountUuid": f"uuid-{n}",
+    }}))
+
+
 def _profile(s, n, value: str, *, email: str | None = None) -> Path:
     path = session_dir_for(s.backup_dir, str(n), email or _email(n))
     path.mkdir(parents=True, exist_ok=True)
@@ -129,14 +135,30 @@ def test_a_leftover_profile_is_named_without_its_email(temp_home):
     assert label == "a leftover cswap run profile made for #3" and slot is None
 
 
-def test_live_login_held_by_a_slot_that_is_not_live(temp_home):
+def test_live_login_held_by_a_slot_that_is_not_live_is_deferred(temp_home):
+    """Not POSTed, but a deferral rather than ``shared-login``: the shape is
+    also a switch's moment; doctor's live-login check reports the lasting one."""
     s = _switcher(temp_home, live=_creds("rt-2"))  # ~/.claude.json names #1
     assert s.shared_login_places("2", _creds("rt-2"), is_active=False) == [
         ("the live login", "1")
     ]
     outcome, post = _consume(s, 2)
-    assert outcome.error == shared_login.SHARED_LOGIN
+    assert outcome.error == "transient"
     post.assert_not_called()
+
+
+def test_a_switch_landing_during_the_live_read_is_not_sharing(temp_home, monkeypatch):
+    """The live account is resolved again right after the live read."""
+    s = _switcher(temp_home)
+    real = s._read_active_credentials
+
+    def switched_meanwhile():
+        _live(temp_home, 2)  # the switch to #2 writes its identity now
+        s._write_credentials(_creds("rt-2"))
+        return real()
+
+    monkeypatch.setattr(s, "_read_active_credentials", switched_meanwhile)
+    assert s._live_shares("2", shared_login.refresh_fingerprint(_creds("rt-2"))) is None
 
 
 def test_the_live_accounts_backup_is_its_own_copy(temp_home):
@@ -205,3 +227,144 @@ def test_fix_names_every_slot_once():
         "re-login one of them: cc-swap login 3 or cc-swap login 2"
     )
     assert shared_login.fix([]).startswith("re-login")
+
+
+def test_a_stale_marked_profile_is_not_a_sharer(temp_home):
+    from claude_swap.session import mark_session_stale
+
+    s = _switcher(temp_home)
+    path = _profile(s, 3, _creds("rt-2"))
+    mark_session_stale(path)
+    assert s.shared_login_places("2", _creds("rt-2"), is_active=False) == []
+
+
+def test_an_unreadable_keychain_item_is_unknown_and_keeps_keychain_mode(
+    temp_home, monkeypatch, block_real_keychain
+):
+    from claude_swap import macos_keychain
+    from claude_swap.models import Platform
+
+    monkeypatch.setattr(Platform, "detect", classmethod(lambda cls: Platform.MACOS))
+    s = _switcher(temp_home)
+    s._store._host.platform = Platform.MACOS
+    for n in (1, 2, 3):  # no .enc files: every backup lives in the Keychain
+        (s.credentials_dir / f".creds-{n}-{_email(n)}.enc").unlink(missing_ok=True)
+    real = macos_keychain.get_password
+
+    def denied(service, account):
+        if account.startswith("account-3-"):
+            raise macos_keychain.KEYCHAIN_ERRORS[0]("rc=36")
+        return real(service, account)
+
+    monkeypatch.setattr(macos_keychain, "get_password", denied)
+    assert s._store.peek_account_credentials("3", _email(3)) is None
+    assert s.shared_login_places("2", _creds("rt-2"), is_active=True) == []
+    assert s._store._keychain_usable_cache is not False
+
+
+# -- the active account: only the POST is refused, never a restore ------------------------
+
+
+def _new_login_on_1(s) -> str:
+    new = _creds("rt-1-new", expires=FRESH)
+    s.store_relogin("1", new, {"emailAddress": _email(1), "organizationUuid": "",
+                              "accountUuid": "uuid-1"})
+    return new
+
+
+def test_pinned_relogin_heal_runs_although_the_old_login_is_shared(temp_home):
+    """#1 and #3 shared rt-1 → cc-swap login 1 (live) → an old session writes
+    the old login back: the live bytes are #3's token under #1's name. The
+    pin restores the new login without a POST — nothing may refuse that."""
+    s = _switcher(temp_home)
+    s._write_account_credentials("3", _email(3), _creds("rt-1"))
+    new = _new_login_on_1(s)
+    s._write_credentials(_creds("rt-1"))  # the old session's write-back
+    with (
+        patch("claude_swap.oauth.try_refresh_oauth_credentials") as post,
+        patch("claude_swap.oauth.request_usage_data", return_value={}),
+    ):
+        record = s._fetch_active_usage("1", _email(1), _creds("rt-1"))
+    post.assert_not_called()
+    assert record.error != shared_login.SHARED_LOGIN
+    assert oauth.extract_oauth_data(s._read_credentials())["refreshToken"] == "rt-1-new"
+    assert s._read_account_credentials("1", _email(1)) == new
+
+
+def test_a_newer_backup_is_restored_although_the_stale_live_is_shared(temp_home):
+    """A stale sync put #3's (expired) token live under #1's name; #1's own
+    backup is newer and valid: restored, no POST, no refusal."""
+    s = _switcher(temp_home)
+    s._write_account_credentials("1", _email(1), _creds("rt-1", expires=FRESH))
+    s._write_credentials(_creds("rt-3"))
+    with (
+        patch("claude_swap.oauth.try_refresh_oauth_credentials") as post,
+        patch("claude_swap.oauth.request_usage_data", return_value={}),
+    ):
+        record = s._fetch_active_usage("1", _email(1), _creds("rt-3"))
+    post.assert_not_called()
+    assert record.error != shared_login.SHARED_LOGIN
+    assert oauth.extract_oauth_data(s._read_credentials())["refreshToken"] == "rt-1"
+
+
+def test_a_backup_chosen_for_the_post_is_checked_too(temp_home):
+    """The bytes POSTed are the backup (the live bytes are older and not its
+    lineage) and #3 holds that backup's token: refused at the POST."""
+    s = _switcher(temp_home)
+    s._write_account_credentials("3", _email(3), _creds("rt-1"))  # #3 = #1's backup
+    older = _creds("rt-x", expires=500)
+    s._write_credentials(older)
+    with patch("claude_swap.oauth.try_refresh_oauth_credentials") as post:
+        record = s._fetch_active_usage("1", _email(1), older)
+    post.assert_not_called()
+    assert record.error == shared_login.SHARED_LOGIN
+
+
+# -- freshen, manual switch, cswap run ----------------------------------------------------
+
+
+def test_freshen_refuses_a_shared_candidate_even_with_a_valid_token(temp_home):
+    from claude_swap.autoswitch import AutoSwitchEngine
+
+    s = _switcher(temp_home)
+    for n in (2, 3):
+        s._write_account_credentials(str(n), _email(n), _creds("rt-2", expires=FRESH))
+    engine = AutoSwitchEngine.__new__(AutoSwitchEngine)
+    engine.switcher = s
+    engine.clock = lambda: 1_790_000_000.0
+    assert engine._freshen_target("2", _email(2)) == shared_login.SHARED_LOGIN
+    s._write_account_credentials("3", _email(3), _creds("rt-3", expires=FRESH))
+    assert engine._freshen_target("2", _email(2)) == "ok"
+
+
+def test_a_manual_switch_onto_a_shared_slot_is_refused(temp_home):
+    import pytest
+
+    from claude_swap.exceptions import SwitchRefusedError
+
+    s = _switcher(temp_home)
+    s._write_account_credentials("3", _email(3), _creds("rt-2"))
+    with pytest.raises(SwitchRefusedError) as info:
+        s.switch_to("2")
+    assert info.value.reason == shared_login.SHARED_LOGIN
+    assert "also held by #3" in str(info.value) and "--allow-dead-login" in str(info.value)
+    payload = s.switch_to("2", json_output=True)
+    assert payload["reason"] == shared_login.SHARED_LOGIN and not payload["switched"]
+    assert s.current_account_number() == "1"
+
+
+def test_cswap_run_refuses_to_seed_a_shared_login(temp_home):
+    import pytest
+
+    from claude_swap.exceptions import SessionError
+    from claude_swap.session import SessionManager
+
+    s = _switcher(temp_home)
+    s._write_account_credentials("3", _email(3), _creds("rt-2"))
+    with (
+        patch("claude_swap.oauth.try_refresh_oauth_credentials") as post,
+        pytest.raises(SessionError, match="also held by #3"),
+    ):
+        SessionManager(s).setup_session("2", share=False)
+    post.assert_not_called()
+    assert not session_dir_for(s.backup_dir, "2", _email(2)).exists()

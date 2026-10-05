@@ -550,6 +550,15 @@ def _read_slot_credentials(p: Probes, slot: Slot) -> None:
             slot.unreadable = f"Keychain rc={rc}"
 
 
+def _stale_profile(path: Path) -> bool:
+    from claude_swap.session import is_session_stale
+
+    try:
+        return is_session_stale(path)
+    except Exception:
+        return False
+
+
 def _read_profile_credentials(p: Probes, path: Path) -> str | None:
     """A ``cswap run`` profile's login the way Claude reads it: on macOS its
     hashed Keychain item first, else its ``.credentials.json``."""
@@ -597,6 +606,7 @@ def gather(p: Probes) -> Context:
         profiles=[
             Profile(owner, path, _read_profile_credentials(p, path))
             for owner, path in shared_login.session_profiles(p.backup_root)
+            if not _stale_profile(path)  # re-bootstrapped before its next use
         ],
     )
 
@@ -999,6 +1009,14 @@ _SHARED_TAIL = (
 )
 
 
+def _shared_tail(credentials: str | None, who: str) -> str:
+    """``; <_SHARED_TAIL>`` when ``credentials`` carry a refresh token (a
+    setup-token is not one-time use: nothing is withheld for it)."""
+    if shared_login.refresh_fingerprint(credentials) is None:
+        return ""
+    return "; " + _SHARED_TAIL.format(who)
+
+
 def check_live_login(ctx: Context) -> list[Finding]:
     live = ctx.live
     if live.identity is None:
@@ -1019,7 +1037,7 @@ def check_live_login(ctx: Context) -> list[Finding]:
             return [Finding(
                 "live-login", "error",
                 f"the live token is #{owner}'s login, but ~/.claude.json names an "
-                f"account no slot has; {_SHARED_TAIL.format(f'#{owner}')}",
+                f"account no slot has{_shared_tail(live.value, f'#{owner}')}",
                 "run claude and /login as the account you want, then cc-swap add; "
                 f"or re-login #{owner}: cc-swap login {owner}",
             )]
@@ -1039,8 +1057,10 @@ def check_live_login(ctx: Context) -> list[Finding]:
             return [Finding(
                 "live-login", "error",
                 f"~/.claude.json names #{number} but the live token is #{other}'s "
-                f"login; {_SHARED_TAIL.format(f'#{number} or #{other}')}",
-                shared_login.fix([other, number]),
+                f"login{_shared_tail(live.value, f'#{number} or #{other}')}",
+                shared_login.fix([other, number])
+                if shared_login.refresh_fingerprint(live.value)
+                else "run claude and /login as the right account, then cc-swap add",
             )]
     if slot.credentials is None and slot.unreadable is None:
         return [Finding(

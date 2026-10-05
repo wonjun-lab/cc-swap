@@ -598,13 +598,20 @@ class NewLoginAttempt(LoginAttempt):
             try:
                 self.target = target_for(switcher, existing)  # type: ignore[assignment]
             except (AccountNotFoundError, ValidationError) as e:
-                return Outcome(FAILED, existing, f"{e}; nothing stored")
-            return LoginAttempt.finish(self, switcher)
-        return Outcome(
-            DUPLICATE, existing,
-            f"{email} is already #{existing}; nothing stored. To renew that "
-            f"login: cc-swap login {existing}",
-        )
+                return Outcome(FAILED, existing, _kept(
+                    switcher, existing, creds, f"{e}; not stored",
+                ))
+            outcome = LoginAttempt.finish(self, switcher)
+            if outcome.status == MISMATCH:  # e.g. the same account under a new email
+                return Outcome(MISMATCH, existing, _kept(
+                    switcher, existing, creds, outcome.message,
+                ))
+            return outcome
+        return Outcome(DUPLICATE, existing, _kept(
+            switcher, existing, creds,
+            f"{email} is already #{existing}; not stored as a new account. To "
+            f"renew that login: cc-swap login {existing}",
+        ))
 
     @staticmethod
     def _stored(number: str, email: str, account: Mapping, creds: str) -> Outcome:
@@ -618,6 +625,18 @@ class NewLoginAttempt(LoginAttempt):
         plan = plan_label(rate_limit_tier_from_credentials(creds))
         tag = f"{org} · {plan}" if plan else org
         return Outcome(STORED, number, f"new account #{number} stored ({email} [{tag}])")
+
+
+def _kept(switcher, number: str, creds: str, message: str) -> str:
+    """``message``, after keeping a fresh login that was not stored as an
+    unclaimed entry (``cc-swap unclaimed``): a finished browser login is
+    never simply thrown away."""
+    try:
+        entry = switcher.stash_relogin_credential(number, creds, "login-new-not-stored")
+    except Exception:
+        _logger.warning("Could not keep the unstored new login", exc_info=True)
+        return message
+    return f"{message}. This login was kept as {entry} (cc-swap unclaimed)"
 
 
 def _new_not_stored(switcher, creds: str, error: BaseException) -> str:

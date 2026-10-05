@@ -67,10 +67,8 @@ ACCOUNT_ITEMS: tuple[tuple[str, str, str], ...] = (
     ("d", "Delete account…", "delete"),
     ("i", "Inspect all logins (doctor)", "verify"),
 )
-ACCOUNT_KEYS = (
-    "enter select · a add · s sign in · t token · r re-login · n name · d delete · "
-    "i inspect · b back · q quit"
-)
+#: One line within 80 columns: ``enter`` selects and ``q`` quits everywhere.
+ACCOUNT_KEYS = "a add · s new · t token · r re-login · n name · d delete · i inspect · b back"
 MENU_KEYS = "letter or ↑↓ enter · esc close"
 
 
