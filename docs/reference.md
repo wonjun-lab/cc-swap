@@ -473,6 +473,8 @@ When an account has a prepaid credit balance or a credit grant, Fleet's detail p
 
 Accounts with none of these show no line. Pay-as-you-go extra usage, when it is turned on, keeps its own `$$` usage bar.
 
+The free cloud-session credit, once claimed in Claude's settings, shows as a separate line: `cloud credit $0 / $250 · expires Nov 5` (amount spent, the credit, and when it expires, all as the usage response reports them; `· locked: <reason>` when the server sends one). It comes in the usage response the poller already fetches, so it costs no extra request. In `--json` it is `usage.cloudCredit` (`limit`, `used`, `remaining`, `expiresAt`, `lockedReason`). Accounts without the credit show nothing.
+
 The data comes from two read-only organization endpoints that Claude Code also calls (`prepaid/credits` and `overage_credit_grant`). The usage endpoint is not involved, so this never spends the 5h/7d polling budget, and nothing here changes a switch decision. Each account is read at most once an hour. Fleet's `f` refreshes it as well, at most once a minute. A failed read keeps the last reading and backs off on its own (5 minutes, doubling, up to 6 hours, or longer when the server asks). An account whose access token has expired is skipped until the usage polling has refreshed the token. Readings are stored in `cache/credits.json` in the backup root.
 
 ## Classic dashboard and watch view

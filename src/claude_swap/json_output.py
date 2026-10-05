@@ -137,6 +137,16 @@ def usage_to_json(usage: dict, fetched_at: float | None = None) -> dict:
         out["spend"] = spend_out
     if "scoped" in usage:
         out["scoped"] = [_scoped_window_to_json(w, fetched_at) for w in usage["scoped"]]
+    cloud = usage.get("cloud_credit")
+    if isinstance(cloud, dict):
+        # Additive, display-only; not read back by usage_from_json.
+        out["cloudCredit"] = {
+            "limit": cloud.get("limit"),
+            "used": cloud.get("used"),
+            "remaining": cloud.get("remaining"),
+            "expiresAt": cloud.get("resets_at"),
+            "lockedReason": cloud.get("locked_reason"),
+        }
     return out
 
 

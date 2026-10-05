@@ -432,6 +432,32 @@ def summary(credits: dict | None, now: float) -> str | None:
     return " · ".join(parts) or None
 
 
+def _dollars(value: float) -> str:
+    return f"${value:,.0f}" if float(value).is_integer() else f"${value:,.2f}"
+
+
+def cloud_credit_summary(usage: dict | None, now: float) -> str | None:
+    """``$0 / $250 · expires Nov 5`` for the cloud-session credit the usage
+    poll carries (``oauth.parse_cloud_credit``); None when the account has
+    none or it has expired. Everything shown comes from the block itself."""
+    cloud = usage.get("cloud_credit") if isinstance(usage, dict) else None
+    if not isinstance(cloud, dict) or not isinstance(cloud.get("limit"), (int, float)):
+        return None
+    expires = _parse_ts(cloud.get("resets_at"))
+    if expires is not None and expires <= now:
+        return None
+    used = cloud.get("used")
+    text = (
+        f"{_dollars(used)} / {_dollars(cloud['limit'])}"
+        if isinstance(used, (int, float)) else _dollars(cloud["limit"])
+    )
+    if expires is not None:
+        text += f" · expires {_day(expires)}"
+    if cloud.get("locked_reason"):
+        text += f" · locked: {cloud['locked_reason']}"
+    return text
+
+
 def _major(minor: int, currency: str | None) -> float:
     return float(minor) if (currency or "USD").upper() in _ZERO_DECIMAL else minor / 100
 

@@ -6866,6 +6866,11 @@ class ClaudeAccountSwitcher:
             print(f"  {label} {muted(f'[{tag}]')}{markers} {muted(f'#{num}')}")
             for line in _usage_entry_lines(entries[str(num)]):
                 print(f"    {line}")
+            cloud_line = credits_mod.cloud_credit_summary(
+                entries[str(num)].last_good, now
+            )
+            if cloud_line:
+                print(f"    {muted('cloud credit:')} {cloud_line}")
             credit_line = credits_mod.summary(credits.get(str(num)), now)
             if credit_line:
                 print(f"    {muted('credits:')} {credit_line}")

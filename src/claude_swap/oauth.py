@@ -749,7 +749,42 @@ def build_usage_result(data: dict) -> dict | None:
         if scoped:
             result["scoped"] = scoped
 
-    return result if result else None
+    if not result:
+        return None
+    # Display only, added after the emptiness check so a response with no
+    # windows still reads as "no usage" to every decision path.
+    cloud = parse_cloud_credit(data.get("iguana_necktie"))
+    if cloud is not None:
+        result["cloud_credit"] = cloud
+    return result
+
+
+def parse_cloud_credit(block: object) -> dict | None:
+    """The cloud-session credit (``iguana_necktie`` in the usage response):
+    ``{"limit", "used", "remaining", "resets_at", "locked_reason"}`` in
+    dollars, or None when the account has none (the API sends null until
+    the credit is claimed). ``resets_at`` is when the credit expires."""
+    if not isinstance(block, dict):
+        return None
+
+    def num(key: str) -> float | None:
+        value = block.get(key)
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            return None
+        return float(value)
+
+    limit = num("limit_dollars")
+    if limit is None:
+        return None
+    resets_at = block.get("resets_at")
+    locked = block.get("locked_reason")
+    return {
+        "limit": limit,
+        "used": num("used_dollars"),
+        "remaining": num("remaining_dollars"),
+        "resets_at": resets_at if isinstance(resets_at, str) and resets_at else None,
+        "locked_reason": locked if isinstance(locked, str) and locked else None,
+    }
 
 
 def relevant_windows(
