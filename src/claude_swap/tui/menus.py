@@ -38,7 +38,7 @@ MAIN_MENU: tuple[MenuEntry, ...] = (
     MenuEntry("f", "Fetch latest usage", "fetch"),
     MenuEntry("x", "Exclude", "exclude", "keep it out of automatic switching"),
     MenuEntry("a", "Account settings…", "accounts",
-              "add · re-login · rename · delete · inspect logins"),
+              "add · sign in · re-login · rename · delete · inspect logins"),
     MenuEntry("e", "Engine log", "engine", "what the engine did and why"),
     MenuEntry("v", "View switch history", "history", "every switch, newest first"),
     MenuEntry("c", "Classic dashboard", "classic", "the upstream claude-swap screen"),
@@ -60,6 +60,7 @@ RESERVED_KEYS: tuple[str, ...] = ("w", "?", "j", "k", "b", "g")
 
 ACCOUNT_ITEMS: tuple[tuple[str, str, str], ...] = (
     ("a", "Add current login", "add"),
+    ("s", "Sign in a new account…", "new"),
     ("t", "Token or API key…", "token"),
     ("r", "Re-login…", "relogin"),
     ("n", "Name (alias)…", "alias"),
@@ -67,8 +68,8 @@ ACCOUNT_ITEMS: tuple[tuple[str, str, str], ...] = (
     ("i", "Inspect all logins (doctor)", "verify"),
 )
 ACCOUNT_KEYS = (
-    "enter select · a add · t token · r re-login · n name · d delete · i inspect · "
-    "b back · q quit"
+    "enter select · a add · s sign in · t token · r re-login · n name · d delete · "
+    "i inspect · b back · q quit"
 )
 MENU_KEYS = "letter or ↑↓ enter · esc close"
 

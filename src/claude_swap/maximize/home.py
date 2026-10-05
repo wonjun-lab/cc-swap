@@ -1377,8 +1377,9 @@ def attention_notices(
     relogin_paused: bool = False,
 ) -> list[Notice]:
     """What the attention lines name, most important first: a dead login
-    (red), priming paused, logins that end within a week (red inside the
-    last day), a locked keychain, a Linux service that stops at logout.
+    (red), a login shared with another place (red, ``FleetRow.shared``),
+    priming paused, logins that end within a week (red inside the last
+    day), a locked keychain, a Linux service that stops at logout.
     Empty when nothing needs you.
 
     ``prime_guard`` (``prime_verify.PausedView``, or its note) is named
@@ -1398,6 +1399,16 @@ def attention_notices(
         words = f"#{r.number} {r.name} needs re-login{more}"
         out.append(Notice(
             tuple(words + p for p in press) + (words,), tone="crit", tail=(words,),
+        ))
+    shared = [r for r in rows if r.shared and r.login != "relogin"]
+    if shared:  # cc-swap: shared_login.py — not refreshed until re-logged
+        r = shared[0]
+        more = f" (+{len(shared) - 1} more)" if len(shared) > 1 else ""
+        words = f"#{r.number} {r.name} shares its login with another place{more}"
+        short = f"#{r.number} shares its login{more}"
+        out.append(Notice(
+            tuple(words + p for p in press) + (words, short + " (cc-swap doctor)", short),
+            tone="crit", tail=(words, short),
         ))
     if prime_guard and priming:
         out.append(guard_notice(prime_guard, now))

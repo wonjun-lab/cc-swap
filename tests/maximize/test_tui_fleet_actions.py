@@ -362,7 +362,7 @@ class TestAccounts:
             ]
             menu = screen.query_one("#fx-ac-menu", ListView)
             menu.focus()
-            menu.index = 2  # Re-login…
+            menu.index = 3  # Re-login…
             await pilot.press("enter")
             await pilot.pause()
             prompt = screen.query_one("#fx-ac-prompt", Static).render().plain
@@ -373,7 +373,7 @@ class TestAccounts:
             assert isinstance(app.screen, AccountsScreen)
             assert screen.query_one("#fx-ac-prompt", Static).render().plain == ""
             menu.focus()
-            menu.index = 2
+            menu.index = 3
             await pilot.press("enter")
             await pilot.pause()
             table.move_cursor(row=table.get_row_index("4"))
@@ -656,7 +656,8 @@ class StoringSwitcher(IdentitySwitcher):
         return {"activated": False}
 
 
-def _fake_claude_login(email: str, *, code=0, seen: list | None = None, write=True):
+def _fake_claude_login(email: str, *, code=0, seen: list | None = None, write=True,
+                       uuid: str = "uuid-4"):
     """What ``claude auth login`` leaves in its CLAUDE_CONFIG_DIR."""
     from pathlib import Path
 
@@ -667,7 +668,7 @@ def _fake_claude_login(email: str, *, code=0, seen: list | None = None, write=Tr
         if not write:
             return code
         (profile / ".claude.json").write_text(json.dumps({"oauthAccount": {
-            "emailAddress": email, "organizationUuid": "", "accountUuid": "uuid-4"}}))
+            "emailAddress": email, "organizationUuid": "", "accountUuid": uuid}}))
         (profile / ".credentials.json").write_text(json.dumps({"claudeAiOauth": {
             "accessToken": "sk-ant-oat01-new", "refreshToken": "rt-new",
             "expiresAt": 99999999999000}}))
@@ -799,3 +800,87 @@ class TestLaunchedRelogin:
             await pilot.press("escape")
             await _open(pilot)
         assert not list(tmp_path.glob("relogin-*"))
+
+
+# -- m → a → s signs in a new account (maximize/relogin.py, login --new) -----------------
+
+
+class NewAccountSwitcher(StoringSwitcher):
+    """StoringSwitcher plus ``store_new_login`` (records, stores nothing real)."""
+
+    def __init__(self, *a, **kw):
+        super().__init__(*a, **kw)
+        self.added: list[tuple[str, str]] = []
+
+    @staticmethod
+    def slot_for_login(data, email, org, uuid=""):
+        from claude_swap.switcher import ClaudeAccountSwitcher
+
+        return ClaudeAccountSwitcher.slot_for_login(data, email, org, uuid)
+
+    def store_new_login(self, credentials, oauth_account, *, slot=None, on_commit=None):
+        self.added.append((oauth_account["emailAddress"], str(slot)))
+        if on_commit is not None:
+            on_commit("5")
+        return "5"
+
+
+async def _press_s_in_account_settings(pilot) -> None:
+    await _open(pilot)
+    await pilot.press("m", "a")
+    await _open(pilot)
+    await pilot.press("s")
+    for _ in range(4):
+        await _open(pilot)
+        await pilot.app.workers.wait_for_complete()
+
+
+@pytest.mark.asyncio
+class TestNewAccountLogin:
+    async def test_s_signs_in_and_stores_a_new_account(self, tmp_path, monkeypatch):
+        _settings(tmp_path)
+        fake = NewAccountSwitcher(_accounts(), tmp_path)
+        app = make_app(fake)
+        seen: list = []
+        async with app.run_test(size=(140, 40)) as pilot:
+            suspended = _launchable(
+                monkeypatch, app,
+                _fake_claude_login("brand@example.com", seen=seen, uuid="uuid-brand"),
+            )
+            toasts = _toasts(app)
+            await _press_s_in_account_settings(pilot)
+            assert suspended == [True]
+            assert fake.added == [("brand@example.com", "None")]
+            assert fake.stored == []  # not a re-login
+            assert any("new account #5 stored" in t[0] for t in toasts)
+            assert not app.busy
+        argv, profile = seen[0]
+        assert argv[1:] == ["auth", "login", "--claudeai"]
+        assert not profile.exists() and not list(tmp_path.glob("relogin-*"))
+        assert not any(c[0] == "switch_to" for c in fake.calls)
+
+    async def test_an_account_already_in_a_slot_is_refused(self, tmp_path, monkeypatch):
+        _settings(tmp_path)
+        fake = NewAccountSwitcher(_accounts(), tmp_path)
+        app = make_app(fake)
+        async with app.run_test(size=(140, 40)) as pilot:
+            _launchable(monkeypatch, app, _fake_claude_login("user3@example.com", uuid="u3"))
+            toasts = _toasts(app)
+            await _press_s_in_account_settings(pilot)
+            assert fake.added == [] and fake.stored == []
+            [(message, severity)] = [t for t in toasts if "already #3" in t[0]]
+            assert severity == "warning" and "press r" in message
+        assert not list(tmp_path.glob("relogin-*"))
+
+    async def test_without_auth_login_it_says_how_by_hand(self, tmp_path, monkeypatch):
+        _settings(tmp_path)
+        fake = NewAccountSwitcher(_accounts(), tmp_path)
+        app = make_app(fake)
+        async with app.run_test(size=(140, 40)) as pilot:
+            suspended = _launchable(
+                monkeypatch, app, _fake_claude_login("brand@example.com"), supported=False
+            )
+            toasts = _toasts(app)
+            await _press_s_in_account_settings(pilot)
+            assert suspended == [] and fake.added == []
+            assert any("Add a new account by hand" in t[0] for t in toasts)

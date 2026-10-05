@@ -9,7 +9,7 @@ import os
 import sys
 
 from claude_swap import __version__, paths, printer
-from claude_swap.exceptions import ClaudeSwitchError
+from claude_swap.exceptions import ClaudeSwitchError, ValidationError
 from claude_swap.json_output import error_envelope
 from claude_swap.printer import (
     accent,
@@ -1468,48 +1468,76 @@ menu bar only display. Re-run `cc-swap service install` after upgrading.
 
 
 def _login_command(argv: list[str]) -> None:
-    """Handle `cc-swap login NUM|EMAIL|ALIAS`.
+    """Handle `cc-swap login NUM|EMAIL|ALIAS` and `cc-swap login --new`.
 
     Runs ``claude auth login --email <the account's email>`` in a throwaway
     profile, checks the new login is that account, and stores it into its
     slot (maximize/relogin.py). The live login is untouched unless the
-    account IS the live one; then it gets the new login too. Without a
-    usable claude it prints the manual steps instead (exit 1).
+    account IS the live one; then it gets the new login too. With ``--new``
+    the login (``--email`` only pre-fills it) is added as a new account —
+    the next free slot or ``--slot N`` — and the live login is never
+    touched; an account already in a slot is refused. Without a usable
+    claude it prints the manual steps instead (exit 1).
     """
     parser = argparse.ArgumentParser(
         prog="cc-swap login",
         description=(
             "Re-login an account: launches Claude Code's own login for it "
             "(sign in in the browser; over SSH paste the code), checks the new "
-            "login is that account and stores it into its slot."
+            "login is that account and stores it into its slot. With --new, "
+            "signs in an account cc-swap does not have yet and adds it, "
+            "without touching the live login."
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
   cc-swap login 4
   cc-swap login team@example.com
+  cc-swap login --new
+  cc-swap login --new --slot 6 --email new@example.com
 
 Logins expire about a month after they were made; a fresh login starts a
 new deadline. Other machines keep their own logins: run this there too.
         """,
     )
-    parser.add_argument("account", metavar="NUM|EMAIL|ALIAS")
+    parser.add_argument("account", metavar="NUM|EMAIL|ALIAS", nargs="?")
+    parser.add_argument(
+        "--new", action="store_true",
+        help="sign in a new account and add it (the live login is not touched)",
+    )
+    parser.add_argument("--slot", metavar="N", default=None,
+                        help="with --new: the free slot to store it in (default: the next)")
+    parser.add_argument("--email", metavar="EMAIL", default=None,
+                        help="with --new: pre-fill the sign-in with this email")
     parser.add_argument(
         "--claude-path", metavar="PATH", default=None,
         help="claude executable (default: prime.claudePath, else ~/.local/bin/claude)",
     )
     parser.add_argument("--debug", action="store_true", help="Enable debug logging")
     args = parser.parse_args(argv)
+    if args.new and args.account:
+        parser.error("--new adds an account: drop NUM|EMAIL|ALIAS (or drop --new to re-login it)")
+    if not args.new and not args.account:
+        parser.error("name the account to re-login (NUM|EMAIL|ALIAS), or pass --new")
+    if not args.new and (args.slot is not None or args.email is not None):
+        parser.error("--slot and --email go with --new")
 
     from claude_swap.maximize import relogin as rl
     from claude_swap.maximize.primer import resolve_claude_path
     from claude_swap.settings import load_prime_settings
 
+    num = email = ""
     try:
         switcher = ClaudeAccountSwitcher(debug=args.debug)
         _guard_root(switcher)
-        num, email, _ = switcher.resolve_account(args.account)
-        rl.target_for(switcher, num)  # an API-key slot has no login to renew
+        if args.new:
+            if args.email is not None and not switcher._validate_email(args.email):
+                raise ValidationError(f"Invalid email format: {args.email}")
+            new = rl.NewAccount(slot=args.slot, email=(args.email or "").strip())
+            rl.check_new_slot(switcher, new.slot)  # before anything is launched
+        else:
+            num, email, _ = switcher.resolve_account(args.account)
+            rl.target_for(switcher, num)  # an API-key slot has no login to renew
         configured = args.claude_path
         if configured is None:
             try:
@@ -1519,6 +1547,10 @@ new deadline. Other machines keep their own logins: run this there too.
         claude = resolve_claude_path(configured)
         from claude_swap.maximize import claude_exec
 
+        steps = (
+            (lambda c: rl.guided_new_steps(c)) if args.new
+            else (lambda c: rl.guided_steps(num, email, c))
+        )
         # The user's own run: a just-updated claude runs with a warning.
         with claude_exec.manual("cc-swap login", warn=lambda m: warning(m, file=sys.stderr)):
             if claude is None or not rl.login_supported(claude):
@@ -1527,10 +1559,15 @@ new deadline. Other machines keep their own logins: run this there too.
                     if claude else "claude was not found (pass --claude-path)"
                 )
                 warning(f"Cannot launch the login here: {why}.")
-                for line in rl.guided_steps(num, email, claude):
+                for line in steps(claude):
                     print(line)
                 sys.exit(1)
-            outcome = rl.relogin(switcher, num, claude=claude)
+            if args.new:
+                outcome = rl.login_new(
+                    switcher, new, claude=claude, adopt_existing=_ask_adopt_existing,
+                )
+            else:
+                outcome = rl.relogin(switcher, num, claude=claude)
     except ClaudeSwitchError as e:
         error(f"Error: {e}")
         sys.exit(1)
@@ -1538,21 +1575,38 @@ new deadline. Other machines keep their own logins: run this there too.
         print(f"\n{dimmed('Operation cancelled')}")
         sys.exit(130)
     except Exception as e:  # e.g. OSError: say so, never a traceback
-        error(f"Error: re-login failed ({type(e).__name__}: {e}); nothing was changed")
+        error(f"Error: login failed ({type(e).__name__}: {e}); nothing was changed")
         sys.exit(1)
     if outcome.ok:
         print(f"{accent('Stored')} {outcome.message}")
         sys.exit(0)
     if outcome.status == rl.UNAVAILABLE:
         warning(f"Cannot launch the login here: {outcome.message}.")
-        for line in rl.guided_steps(num, email, claude):
+        for line in steps(claude):
             print(line)
         sys.exit(1)
     if outcome.status == rl.CANCELLED:
         print(dimmed(outcome.message))
         sys.exit(130)
-    error(f"Re-login #{num}: {outcome.message}")
+    if args.new:
+        error(f"New account: {outcome.message}")
+    else:
+        error(f"Re-login #{num}: {outcome.message}")
     sys.exit(1)
+
+
+def _ask_adopt_existing(number: str, email: str) -> bool:
+    """``login --new`` signed in as an account already in slot ``number``:
+    offer to keep this fresh login as that slot's re-login (a terminal
+    only; otherwise refused)."""
+    if not sys.stdin.isatty():
+        return False
+    warning(f"{email} is already #{number}.")
+    try:
+        answer = input(f"Store this login as #{number}'s new login instead? [y/N] ")
+    except EOFError:
+        return False
+    return answer.strip().lower() in ("y", "yes")
 
 
 def main() -> None:
@@ -1669,6 +1723,7 @@ cc-swap:
   %(prog)s prime [N ...] [--dry-run]  open idle accounts' 5h windows now
   %(prog)s prime verify [--live]      re-check priming isolation after Claude Code changed
   %(prog)s login <num|email>          re-login an account (launches claude's login)
+  %(prog)s login --new [--slot N]     sign in a new account and add it
   %(prog)s repair-live [--yes]        fix a /login saved in plaintext while the Keychain was locked
   %(prog)s service install            run auto-switch as a background service
   %(prog)s doctor [--json]            check logins, Keychain, service; say what to fix

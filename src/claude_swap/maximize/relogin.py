@@ -26,6 +26,14 @@ Otherwise the live login is not touched — nothing switches and no engine
 pause is involved. A login that could not be stored is kept as an unclaimed
 entry (``cc-swap unclaimed``), so a finished browser login is never lost.
 
+``cc-swap login --new`` (and Fleet's *Sign in a new account*) runs the same
+login without ``--email`` (or with the one the user gave) to ADD an account:
+:class:`NewLoginAttempt` reads the identity from the profile, refuses an
+account that is already in a slot (pointing at ``cc-swap login N``; the CLI
+may offer to keep the login as that slot's re-login instead), and otherwise
+stores it in the next free slot (or ``--slot N``) through
+``switcher.store_new_login``. The live login is never read or written.
+
 The profile — directory and Keychain item — is removed whatever happens:
 success, mismatch, Ctrl-C, SIGTERM/SIGHUP, a crash. A profile a killed
 process left behind is swept (with its Keychain item) by the next attempt
@@ -66,6 +74,7 @@ MISMATCH = "mismatch"
 CANCELLED = "cancelled"
 FAILED = "failed"
 UNAVAILABLE = "unavailable"  # claude (or its `auth login`) cannot be run: guide instead
+DUPLICATE = "duplicate"  # login --new: that account is already in a slot (``number``)
 
 
 @dataclass(frozen=True)
@@ -108,7 +117,9 @@ def target_for(switcher, number: str) -> Target:
 
 
 def login_argv(claude: str, email: str) -> list[str]:
-    return [claude, "auth", "login", "--claudeai", "--email", email]
+    """``claude auth login --claudeai``, pre-filled with ``email`` if any."""
+    argv = [claude, "auth", "login", "--claudeai"]
+    return [*argv, "--email", email] if email else argv
 
 
 def _manual():
@@ -392,11 +403,15 @@ class LoginAttempt:
         if self._saved_a_login():
             return None
         if code is None:
-            return Outcome(CANCELLED, num, f"re-login #{num} cancelled; nothing stored")
+            return Outcome(CANCELLED, num, f"{self.what()} cancelled; nothing stored")
         return Outcome(
             FAILED, num,
             f"claude auth login exited {code} (cancelled or failed); nothing stored",
         )
+
+    def what(self) -> str:
+        """The attempt, as messages name it."""
+        return f"re-login #{self.target.number}"
 
     def _saved_a_login(self) -> bool:
         try:
@@ -499,6 +514,176 @@ def _oracle_problem(switcher, target: Target, pair: Mapping) -> str | None:
         return None
     seen = resolved.get("email") or resolved.get("uuid") or "another account"
     return f"the new token belongs to {seen}, expected {target.email}"
+
+
+@dataclass(frozen=True)
+class NewAccount:
+    """``cc-swap login --new``: the slot asked for (None: the next free one)
+    and the email to pre-fill (``""``: the user picks in the browser)."""
+
+    slot: str | None = None
+    email: str = ""
+    number: str = ""  # Outcome.number until a slot is chosen
+
+
+class NewLoginAttempt(LoginAttempt):
+    """``claude auth login`` for an account cc-swap does not have yet."""
+
+    def __init__(self, root: Path, new: NewAccount, claude: str) -> None:
+        super().__init__(root, new, claude)  # type: ignore[arg-type]
+
+    def what(self) -> str:
+        return "sign-in of a new account"
+
+    def banner(self) -> str:
+        who = f" as {self.target.email}" if self.target.email else ""
+        return (
+            f"\ncc-swap: signing in a new account{who} with `claude auth login`.\n"
+            "Finish in the browser; over SSH open the printed URL on any device "
+            "and paste the code here.\n"
+            "Ctrl-C cancels. The live login is not touched; an account cc-swap "
+            "already has is not added twice.\n"
+        )
+
+    def finish(  # type: ignore[override]
+        self,
+        switcher,
+        *,
+        adopt_existing: Callable[[str, str], bool] | None = None,
+    ) -> Outcome:
+        """Store the profile's login as a new account. An account already in
+        a slot is refused (DUPLICATE, ``number`` = that slot) unless
+        ``adopt_existing(number, email)`` says to keep it as that slot's
+        re-login, which then runs the re-login checks and store."""
+        from claude_swap.exceptions import DuplicateAccountError
+
+        try:
+            creds, account = self.read_login()
+        except Exception as e:
+            return Outcome(FAILED, "", f"could not read the new login: {e}")
+        pair = _full_pair(creds)
+        if pair is None:
+            return Outcome(FAILED, "", "claude saved no login; nothing stored")
+        if account is None:
+            return Outcome(FAILED, "", "the new login names no account; nothing stored")
+        # ``--email`` only pre-fills the browser form: whoever signed in is
+        # the new account (checked against the slots below).
+        email = str(account.get("emailAddress") or "").strip()
+        data = switcher._get_sequence_data() or {}
+        existing = switcher.slot_for_login(
+            data, email, str(account.get("organizationUuid") or ""),
+            str(account.get("accountUuid") or "").strip(),
+        )
+        if existing is None:
+            committed: list[str] = []
+            try:
+                number = switcher.store_new_login(
+                    creds, account, slot=self.target.slot, on_commit=committed.append,
+                )
+            except DuplicateAccountError as e:
+                existing = e.number  # added meanwhile: same answer as below
+            except Exception as e:
+                if committed:  # stored; only the after-work failed
+                    _logger.warning("new account #%s: stored, then %s: %s",
+                                    committed[0], type(e).__name__, e)
+                    return self._stored(committed[0], email, account, creds)
+                return Outcome(FAILED, "", _new_not_stored(switcher, creds, e))
+            except BaseException as e:  # Ctrl-C / SIGTERM mid-store: keep it, then unwind
+                if not committed:
+                    _new_not_stored(switcher, creds, e)
+                raise
+            else:
+                return self._stored(number, email, account, creds)
+        if adopt_existing is not None and adopt_existing(existing, email):
+            try:
+                self.target = target_for(switcher, existing)  # type: ignore[assignment]
+            except (AccountNotFoundError, ValidationError) as e:
+                return Outcome(FAILED, existing, f"{e}; nothing stored")
+            return LoginAttempt.finish(self, switcher)
+        return Outcome(
+            DUPLICATE, existing,
+            f"{email} is already #{existing}; nothing stored. To renew that "
+            f"login: cc-swap login {existing}",
+        )
+
+    @staticmethod
+    def _stored(number: str, email: str, account: Mapping, creds: str) -> Outcome:
+        """The success message: the account, its organization and the plan
+        its credential names (``rateLimitTier``, as every slot's plan)."""
+        from claude_swap.maximize.plan import plan_label, rate_limit_tier_from_credentials
+
+        org = str(account.get("organizationName") or "") or (
+            "org" if account.get("organizationUuid") else "personal"
+        )
+        plan = plan_label(rate_limit_tier_from_credentials(creds))
+        tag = f"{org} · {plan}" if plan else org
+        return Outcome(STORED, number, f"new account #{number} stored ({email} [{tag}])")
+
+
+def _new_not_stored(switcher, creds: str, error: BaseException) -> str:
+    """The failure message of a new account; the login is kept unclaimed."""
+    from claude_swap.exceptions import ClaudeSwitchError
+
+    why = str(error) if isinstance(error, ClaudeSwitchError) and str(error) else (
+        f"{type(error).__name__}: {error}"
+    )
+    message = f"not stored ({why}); the live login is unchanged"
+    try:
+        entry = switcher.stash_relogin_credential("new", creds, "login-new-unstored")
+    except Exception:
+        _logger.warning("Could not keep the unstored new login", exc_info=True)
+        return message
+    return f"{message}. The new login was kept as {entry} (cc-swap unclaimed)"
+
+
+def login_new(
+    switcher,
+    new: NewAccount,
+    *,
+    claude: str,
+    run: Callable[[Sequence[str], Mapping[str, str], Path], int | None] = run_interactive,
+    announce: Callable[[str], None] | None = print,
+    base_env: Mapping[str, str] | None = None,
+    adopt_existing: Callable[[str, str], bool] | None = None,
+) -> Outcome:
+    """The whole ``cc-swap login --new`` (the TUI runs the same steps
+    around ``App.suspend``). A taken ``--slot`` is refused before the
+    browser (and re-checked when storing)."""
+    check_new_slot(switcher, new.slot)
+    refuse = getattr(switcher, "_refuse_session_shell", None)
+    if refuse is not None:
+        refuse()  # before the browser, not after: store_new_login would refuse anyway
+    with terminate_as_interrupt(), NewLoginAttempt(switcher.backup_dir, new, claude) as attempt:
+        if announce is not None:
+            announce(attempt.banner())
+        early = attempt.launch(run, base_env=base_env)
+        if early is not None:
+            return early
+        return attempt.finish(switcher, adopt_existing=adopt_existing)
+
+
+def check_new_slot(switcher, slot: str | None) -> None:
+    """``ValidationError`` when ``slot`` is not a free slot number."""
+    if slot is None:
+        return
+    if not str(slot).isdigit() or int(str(slot)) < 1:
+        raise ValidationError(f"--slot takes a slot number >= 1, not {slot}")
+    accounts = (switcher._get_sequence_data() or {}).get("accounts") or {}
+    if str(int(str(slot))) in accounts:
+        raise ValidationError(
+            f"slot {int(str(slot))} is taken (Account-{int(str(slot))}); "
+            "pick a free one, or omit --slot"
+        )
+
+
+def guided_new_steps(claude: str | None) -> list[str]:
+    """Adding an account by hand, for when claude cannot be launched here."""
+    return [
+        "Add a new account by hand:",
+        f"  1. run  {claude or 'claude'}  and type /login, sign in as the new account",
+        "  2. run  cc-swap add",
+        "  3. switch back to the account you were on",
+    ]
 
 
 def guided_steps(number: str, email: str, claude: str | None) -> list[str]:

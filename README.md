@@ -282,6 +282,10 @@ To renew (early, or once it has expired), run `cc-swap login 4`, or in Fleet sel
 
 When claude can't be launched (not found, or too old for `claude auth login`), cc-swap shows the manual steps instead: run `claude`, `/login` as that account, then `cc-swap add`. cc-swap recognises the account and updates its slot instead of adding a duplicate.
 
+To add another account the same way without touching the login you are using, run `cc-swap login --new` (Fleet: `m` → `a` → `s`). It is stored in the next free slot (`--slot N` to choose); an account cc-swap already has is refused with its `cc-swap login N`.
+
+Two places holding the same login (two slots, or a slot and another slot's `cswap run` profile) cannot both stay logged in: a refresh token works once. `cc-swap doctor` reports it as `shared-login`, and cc-swap does not refresh that login until you re-login one of them.
+
 ### Use several machines
 
 Each machine keeps its own logins. Log in and `cc-swap add` on every machine separately, and renew logins on each machine that needs it rather than copying one login between machines. Usage from all machines counts against the same quota, and cc-swap only trusts what the server reports, so the engines don't need to coordinate. With priming on, each machine waits a random 45 to 300 seconds after a reset before priming, and a machine skips an account whose window another machine already opened.

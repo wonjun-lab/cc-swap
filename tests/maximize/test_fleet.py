@@ -608,6 +608,33 @@ def test_attention_warns_of_logins_expiring_within_a_week():
     assert f"login expires {local_clock(NOW + DAY + 9 * H)} (in 1d 9h)" in steps
 
 
+def test_attention_names_a_login_shared_with_another_place():
+    """cc-swap (shared_login.py): a refresh refused as ``shared-login``."""
+    from claude_swap.maximize import home
+
+    shared = replace(usage(10.0, 20.0), last_error="shared-login")
+    rows = fleet.fleet_rows(
+        accounts(acc(1, active=True), acc(2, shared, alias="side")),
+        MX, PRIME, MaximizeState(), now=NOW,
+    )
+    assert rows[1].shared and not rows[0].shared
+    notices = home.attention_notices(rows, now=NOW)
+    assert home.attention_lines(notices, 200) == [
+        ("! #2 side shares its login with another place — select it, press r", "crit"),
+    ]
+    assert home.attention_lines(notices, 40) == [("! #2 shares its login (cc-swap doctor)", "crit")]
+    # After a dead login, before an expiring one.
+    mixed = fleet.fleet_rows(
+        accounts(acc(1, active=True), _expiring(3, DAY + 9 * H, alias="soon"),
+                 acc(2, shared, alias="side"),
+                 acc(4, sentinel=USAGE_RELOGIN_REQUIRED, alias="old")),
+        MX, PRIME, MaximizeState(), now=NOW,
+    )
+    assert [n.variants[-1] for n in home.attention_notices(mixed, now=NOW)] == [
+        "#4 old needs re-login", "#2 shares its login", "#3 soon login ends in 1d 9h",
+    ]
+
+
 # -- actions ------------------------------------------------------------------------------
 
 

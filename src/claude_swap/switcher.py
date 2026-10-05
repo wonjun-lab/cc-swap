@@ -27,7 +27,7 @@ from claude_swap.exceptions import (
     SwitchRefusedError,
     ValidationError,
 )
-from claude_swap import oauth, pace
+from claude_swap import oauth, pace, shared_login
 from claude_swap.claude_locks import claude_config_lock, claude_credentials_lock
 from claude_swap.json_output import (
     SCHEMA_VERSION,
@@ -204,6 +204,8 @@ ERROR_NOTES = {
         "the stored login has expired (Claude Code logins expire about a "
         f"month after login) — re-login: {oauth.RELOGIN_STEPS}"
     ),
+    # cc-swap: one refresh token in two places (shared_login.py).
+    shared_login.SHARED_LOGIN: shared_login.NOTE,
 }
 
 # The remedy for a dead lineage is the same whatever killed it; the note is
@@ -2470,6 +2472,131 @@ class ClaudeAccountSwitcher:
             dedupe=True,
         )
 
+    @staticmethod
+    def slot_for_login(data: dict, email: str, org: str, uuid: str = "") -> str | None:
+        """The slot already holding the account ``(email, org)`` — the email
+        compared case-insensitively — or, when ``uuid`` is given, that
+        account uuid in that org. None when it is a new account."""
+        want = email.strip().lower()
+        accounts = (data or {}).get("accounts") or {}
+        for num, record in accounts.items():
+            if not isinstance(record, dict):
+                continue
+            rec_org = str(record.get("organizationUuid") or "")
+            if rec_org != org:
+                continue
+            if str(record.get("email") or "").strip().lower() == want:
+                return str(num)
+            if uuid and str(record.get("uuid") or "").strip() == uuid:
+                return str(num)
+        return None
+
+    def store_new_login(
+        self,
+        credentials: str,
+        oauth_account: dict,
+        *,
+        slot: int | str | None = None,
+        on_commit=None,
+    ) -> str:
+        """Store a login made OUTSIDE the live store (``cc-swap login --new``
+        runs ``claude auth login`` in a throwaway profile) as a NEW account;
+        returns its slot number. The live login is never read or written,
+        and nothing switches.
+
+        cc-swap fork. Stored the way ``add`` stores a new account: the
+        credential backup, a config holding the profile's ``oauthAccount``
+        (all a switch splices from it), the ``sequence.json`` record (email,
+        uuid, organization; no alias) appended to the rotation. The plan
+        comes from the credential's ``rateLimitTier`` like every slot's.
+
+        Re-checked under the account lock: :class:`DuplicateAccountError`
+        when the account is already in a slot (its ``number`` says which),
+        ``ValidationError`` when ``slot`` is taken or not a slot number,
+        ``CredentialReadError`` for anything but a full OAuth token pair. A
+        failure before the record is written removes the files it wrote.
+        ``on_commit(number)`` runs once the record is written.
+        """
+        from claude_swap.exceptions import DuplicateAccountError
+
+        email = str(oauth_account.get("emailAddress") or "").strip()
+        org = str(oauth_account.get("organizationUuid") or "")
+        uuid = str(oauth_account.get("accountUuid") or "").strip()
+        if not email:
+            raise CredentialReadError("the new login names no account")
+        pair = None if looks_like_api_key(credentials) else oauth.extract_oauth_data(credentials)
+        if not (pair and pair.get("accessToken") and pair.get("refreshToken")):
+            raise CredentialReadError("the new login carries no OAuth token pair")
+        if slot is not None:
+            try:
+                wanted = int(str(slot))
+            except ValueError:
+                raise ValidationError(f"not a slot number: {slot}") from None
+            if wanted < 1:
+                raise ValidationError("Slot number must be >= 1")
+        self._refuse_session_shell()
+        self._setup_directories()
+        self._init_sequence_file()
+        self._migrate_org_fields()
+        with FileLock(self.lock_file):
+            data = self._get_sequence_data() or {}
+            data.setdefault("accounts", {})
+            data.setdefault("sequence", [])
+            existing = self.slot_for_login(data, email, org, uuid)
+            if existing is not None:
+                raise DuplicateAccountError(
+                    f"{email} is already Account-{existing}", number=existing,
+                )
+            if slot is None:
+                num = str(self._get_next_account_number())
+            else:
+                num = str(wanted)
+                if num in data["accounts"]:
+                    raise ValidationError(
+                        f"slot {num} is taken (Account-{num}); pick a free one"
+                    )
+            config_file = self.configs_dir / f".claude-config-{num}-{email}.json"
+            written = False
+            try:
+                self._write_account_credentials(num, email, credentials)
+                written = True
+                self._write_account_config(
+                    num, email, json.dumps({"oauthAccount": dict(oauth_account)}, indent=2)
+                )
+                data["accounts"][num] = {
+                    "email": email,
+                    "uuid": uuid,
+                    "organizationUuid": org,
+                    "organizationName": str(oauth_account.get("organizationName") or ""),
+                    "added": get_timestamp(),
+                }
+                if int(num) not in data["sequence"]:
+                    data["sequence"].append(int(num))
+                    data["sequence"].sort()
+                data["lastUpdated"] = get_timestamp()
+                self._write_json(self.sequence_file, data)
+            except BaseException:
+                steps = [lambda: config_file.unlink(missing_ok=True)]
+                if written:
+                    steps.insert(0, lambda: self._delete_account_credentials(num, email))
+                for step in steps:
+                    try:
+                        step()
+                    except Exception:
+                        self._logger.error(
+                            "Undoing the failed new account %s: a cleanup step "
+                            "failed.", num, exc_info=True,
+                        )
+                raise
+            if on_commit is not None:
+                on_commit(num)
+        self._usage_store.clear_dead_token([num], {num: (email, org)})
+        self._logger.info(
+            "stored a new login as #%s (rt %s); the live login untouched",
+            num, oauth.fingerprint8(credentials),
+        )
+        return num
+
     #: How far apart two login deadlines must be to count as different
     #: logins. ``refreshTokenExpiresAt`` is re-stamped on every refresh as
     #: now + the remaining lifetime in whole seconds, so one login's value
@@ -2586,6 +2713,84 @@ class ClaudeAccountSwitcher:
                 acct["uuid"] = uuid
                 data["lastUpdated"] = get_timestamp()
                 self._write_json(self.sequence_file, data)
+
+    def shared_login_places(
+        self, account_num: str, credentials: str, *, is_active: bool
+    ) -> list[tuple[str, str | None]]:
+        """Where else slot ``account_num``'s ``credentials`` (the bytes about
+        to be refreshed) hold the same refresh token, as ``(label, slot)``
+        pairs (``slot``: the slot to re-login for that place, if any).
+
+        cc-swap fork (``shared_login.py``): another slot's backup; another
+        slot's ``cswap run`` profile; the live login unless this slot IS the
+        live account (``is_active``). The slot's own ``cswap run`` profile is
+        its own copy and never counts. Reads only; compares fingerprints."""
+        from claude_swap.session import read_session_credentials, session_dir_for
+
+        fp = shared_login.refresh_fingerprint(credentials)
+        if fp is None:
+            return []
+        num = str(account_num)
+        accounts = (self._get_sequence_data() or {}).get("accounts") or {}
+        places: list[tuple[str, str | None]] = []
+        own_profile: Path | None = None
+        for other, record in accounts.items():
+            if not isinstance(record, dict) or record.get("kind") == "api_key":
+                continue
+            email = str(record.get("email") or "")
+            if str(other) == num:
+                own_profile = session_dir_for(self.backup_dir, num, email)
+                continue
+            held, _unreadable = self._read_account_credentials_ex(str(other), email)
+            if held and shared_login.refresh_fingerprint(held) == fp:
+                places.append((f"#{other}", str(other)))
+        for owner, path in shared_login.session_profiles(self.backup_dir):
+            if own_profile is not None and path == own_profile:
+                continue
+            held = read_session_credentials(path)
+            if held and shared_login.refresh_fingerprint(held) == fp:
+                record = accounts.get(owner)
+                current = isinstance(record, dict) and path == session_dir_for(
+                    self.backup_dir, owner, str(record.get("email") or "")
+                )
+                places.append(
+                    (shared_login.profile_label(owner), owner) if current
+                    else (f"a leftover cswap run profile made for #{owner}", None)
+                )
+        if not is_active:
+            live = self._read_active_credentials()
+            if (
+                live.value
+                and not live.degraded
+                and shared_login.refresh_fingerprint(live.value) == fp
+            ):
+                places.append(("the live login", self.current_account_number()))
+        return places
+
+    def _refuse_shared_refresh(
+        self, account_num: str, credentials: str, *, is_active: bool
+    ) -> bool:
+        """Whether a refresh of ``credentials`` must not happen because the
+        refresh token is held elsewhere too (logged, slot numbers and a
+        fingerprint prefix only). A check that cannot run never refuses."""
+        try:
+            places = self.shared_login_places(
+                account_num, credentials, is_active=is_active
+            )
+        except Exception:
+            self._logger.debug("shared-login check for account %s failed",
+                               account_num, exc_info=True)
+            return False
+        if not places:
+            return False
+        self._logger.warning(
+            "Not refreshing account %s: its refresh token (rt %s) is also held "
+            "by %s; refreshing would log the other copy out. Re-login one of "
+            "them (cc-swap login N); cc-swap doctor names them.",
+            account_num, oauth.fingerprint8(credentials),
+            ", ".join(label for label, _slot in places),
+        )
+        return True
 
     def _audited_refresh(
         self,
@@ -2900,6 +3105,12 @@ class ClaudeAccountSwitcher:
             gate_active = self.current_account_number() == str(account_num)
         except Exception:
             gate_active = False
+        # cc-swap: one refresh token in two places (shared_login.py). The
+        # POST would rotate it and kill the other copy; which one survives
+        # must be the user's re-login, not this pass. Deterministic until
+        # one is re-logged, so a distinct kind (nothing consumed, no strike).
+        if self._refuse_shared_refresh(account_num, refresh_input, is_active=gate_active):
+            return oauth.RefreshOutcome(None, shared_login.SHARED_LOGIN)
         result = self._audited_refresh(
             refresh_input, caller=caller, slot=account_num,
             active=gate_active, source=refresh_source,
@@ -4919,6 +5130,13 @@ class ClaudeAccountSwitcher:
                 account_num,
             )
             return FetchRecord(error="store-unmirrored")
+
+        # cc-swap: the live login's refresh token is held by another slot or
+        # another slot's `cswap run` profile too (shared_login.py). Every
+        # recovery below may POST it (or the slot's backup copy of it), which
+        # would kill the other copy; serving a valid token above is fine.
+        if self._refuse_shared_refresh(account_num, creds, is_active=True):
+            return FetchRecord(error=shared_login.SHARED_LOGIN)
 
         # Attribution against the slot's
         # stored backup decides HOW to recover, never whether to give up

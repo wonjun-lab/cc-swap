@@ -40,7 +40,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal
 
-from claude_swap import __version__, oauth, paths
+from claude_swap import __version__, oauth, paths, shared_login
 
 Severity = Literal["ok", "info", "warn", "error"]
 SEVERITIES: tuple[Severity, ...] = ("ok", "info", "warn", "error")
@@ -333,6 +333,19 @@ class Slot:
 
 
 @dataclass
+class Profile:
+    """A ``cswap run`` profile (``<backup_root>/sessions/<num>-<slug>``)."""
+
+    owner: str  # the slot number its directory name gives
+    path: Path
+    credentials: str | None = None
+
+    @property
+    def rt_fp(self) -> str | None:
+        return shared_login.refresh_fingerprint(self.credentials)
+
+
+@dataclass
 class LiveLogin:
     keychain_rc: int | None = None  # macOS only; None when not asked
     keychain_value: str | None = None
@@ -380,6 +393,7 @@ class Context:
     slots: dict[str, Slot]
     state: dict
     live: LiveLogin
+    profiles: list[Profile] = field(default_factory=list)
     _service: tuple[dict | None] | None = field(default=None, repr=False)
 
     def service_status(self) -> dict | None:
@@ -536,6 +550,22 @@ def _read_slot_credentials(p: Probes, slot: Slot) -> None:
             slot.unreadable = f"Keychain rc={rc}"
 
 
+def _read_profile_credentials(p: Probes, path: Path) -> str | None:
+    """A ``cswap run`` profile's login the way Claude reads it: on macOS its
+    hashed Keychain item first, else its ``.credentials.json``."""
+    if p.platform == "darwin":
+        from claude_swap.session import keychain_service_name
+
+        rc, value = _keychain_read(p, keychain_service_name(str(path)), _keychain_account(p))
+        if rc == 0 and value:
+            return value
+    try:
+        text = (path / ".credentials.json").read_text(encoding="utf-8")
+    except (OSError, ValueError):
+        return None
+    return text if text.strip() else None
+
+
 def gather(p: Probes) -> Context:
     raw_settings, settings_problem = _read_json(p.backup_root / "settings.json")
     sequence, sequence_problem = _read_json(p.backup_root / "sequence.json")
@@ -564,6 +594,10 @@ def gather(p: Probes) -> Context:
         slots=dict(sorted(slots.items(), key=lambda kv: _slot_key(kv[0]))),
         state=state or {},
         live=_read_live(p),
+        profiles=[
+            Profile(owner, path, _read_profile_credentials(p, path))
+            for owner, path in shared_login.session_profiles(p.backup_root)
+        ],
     )
 
 
@@ -958,6 +992,13 @@ def live_slot(ctx: Context) -> str | None:
     return _slot_for_identity(ctx)
 
 
+#: Appended to every shared-login detail (the engine side: shared_login.py).
+_SHARED_TAIL = (
+    "a refresh token is used once, so refreshing one copy logs the other "
+    "out — cc-swap does not refresh {} until one is re-logged"
+)
+
+
 def check_live_login(ctx: Context) -> list[Finding]:
     live = ctx.live
     if live.identity is None:
@@ -978,8 +1019,9 @@ def check_live_login(ctx: Context) -> list[Finding]:
             return [Finding(
                 "live-login", "error",
                 f"the live token is #{owner}'s login, but ~/.claude.json names an "
-                "account no slot has",
-                "run claude and /login as the account you want, then cc-swap add",
+                f"account no slot has; {_SHARED_TAIL.format(f'#{owner}')}",
+                "run claude and /login as the account you want, then cc-swap add; "
+                f"or re-login #{owner}: cc-swap login {owner}",
             )]
         return [Finding(
             "live-login", "warn",
@@ -996,8 +1038,9 @@ def check_live_login(ctx: Context) -> list[Finding]:
         if other:
             return [Finding(
                 "live-login", "error",
-                f"~/.claude.json names #{number} but the live token is #{other}'s login",
-                "run claude and /login as the right account, then cc-swap add",
+                f"~/.claude.json names #{number} but the live token is #{other}'s "
+                f"login; {_SHARED_TAIL.format(f'#{number} or #{other}')}",
+                shared_login.fix([other, number]),
             )]
     if slot.credentials is None and slot.unreadable is None:
         return [Finding(
@@ -1525,6 +1568,7 @@ def check_slots(ctx: Context) -> list[Finding]:
                     scope,
                 ))
     out += _duplicates(ctx)
+    out += _shared_with_profiles(ctx)
     if checked and not any(f.severity in ("warn", "error") for f in out):
         out.append(Finding(
             "accounts", "ok",
@@ -1544,7 +1588,17 @@ def _duplicates(ctx: Context) -> list[Finding]:
         fp = slot.fp
         if fp:
             other = by_fp.get(fp)
-            if other:
+            if other and shared_login.refresh_fingerprint(slot.credentials):
+                # cc-swap: one refresh token in two slots (shared_login.py).
+                out.append(Finding(
+                    "shared-login", "error",
+                    f"#{other} and #{slot.number} hold the same login (one slot's "
+                    f"backup was overwritten); "
+                    f"{_SHARED_TAIL.format(f'#{other} or #{slot.number}')}",
+                    shared_login.fix([slot.number, other]),
+                    f"#{slot.number}",
+                ))
+            elif other:
                 out.append(Finding(
                     "duplicate", "error",
                     f"#{other} and #{slot.number} hold the same login: one slot's "
@@ -1567,6 +1621,54 @@ def _duplicates(ctx: Context) -> list[Finding]:
                 ))
             elif not other:
                 by_identity[key] = slot.number
+    return out
+
+
+def _shared_with_profiles(ctx: Context) -> list[Finding]:
+    """cc-swap fork (shared_login.py): a slot, or the live login, holding the
+    same refresh token as a ``cswap run`` profile that is not its own. The
+    slot's own profile shares it by design (kept in step by the engine)."""
+    from claude_swap.session import session_dir_for
+
+    if not ctx.profiles:
+        return []
+    root = ctx.probes.backup_root
+    live_number = _slot_for_identity(ctx)
+    holders: list[tuple[str, str | None, str | None]] = [
+        (f"#{s.number}", s.number, shared_login.refresh_fingerprint(s.credentials))
+        for s in ctx.slots.values() if s.kind != "api_key"
+    ]
+    live_fp = shared_login.refresh_fingerprint(ctx.live.value)
+    if live_fp and not any(fp == live_fp for _l, _n, fp in holders):
+        holders.append(("the live login", live_number, live_fp))
+    out: list[Finding] = []
+    for label, number, fp in holders:
+        if fp is None:
+            continue
+        own = (
+            session_dir_for(root, number, ctx.slots[number].email)
+            if number in ctx.slots else None
+        )
+        for profile in ctx.profiles:
+            if profile.path == own or profile.rt_fp != fp:
+                continue
+            owner = profile.owner if (
+                profile.owner in ctx.slots
+                and profile.path == session_dir_for(
+                    root, profile.owner, ctx.slots[profile.owner].email
+                )
+            ) else None
+            where = (
+                shared_login.profile_label(owner) if owner
+                else f"a leftover cswap run profile made for #{profile.owner}"
+            )
+            out.append(Finding(
+                "shared-login", "error",
+                f"{label} holds the same login as {where}; "
+                f"{_SHARED_TAIL.format(label)}",
+                shared_login.fix([n for n in (number, owner) if n]),
+                f"#{number}" if number else "accounts",
+            ))
     return out
 
 

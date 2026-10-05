@@ -42,6 +42,7 @@ from claude_swap.maximize.plan import parse_plan_override
 from claude_swap.maximize.score import days_left, landable
 from claude_swap.models import AccountSnapshot, AccountsSnapshot
 from claude_swap.settings import SETTING_SPECS, MaximizeSettings, PrimeSettings
+from claude_swap.shared_login import SHARED_LOGIN
 from claude_swap.usage_store import STALE_OK_S
 
 LoginState = Literal["ok", "relogin", "expired", "foreign", "keychain", "api"]
@@ -249,6 +250,9 @@ class FleetRow:
     # that cannot be read keeps the resets of its last good reading in
     # ``reset5``/``reset7`` while they are still ahead.
     reset7: float | None = None
+    # cc-swap (shared_login.py): its last refresh was refused because the
+    # refresh token is also held elsewhere; a re-login resolves it.
+    shared: bool = False
 
 
 def _seen_resets(acc: AccountSnapshot, now: float) -> tuple[float | None, float | None]:
@@ -354,6 +358,7 @@ def fleet_rows(
                     else None
                 ),
                 reset7=v.reset7 if v.reset7 is not None else seen7,
+                shared=acc.usage.last_error == SHARED_LOGIN,
             )
         )
     return out
