@@ -89,6 +89,62 @@ KERNEL = {
 }
 
 
+def _stamp(epoch: float) -> str:
+    """``epoch`` the way ``log stream --style ndjson`` writes it (+0900)."""
+    return datetime.fromtimestamp(epoch, tz=timezone(timedelta(hours=9))).strftime(
+        "%Y-%m-%d %H:%M:%S.%f%z"
+    )
+
+
+def _kernel(at: float | None = None) -> dict:
+    """:data:`KERNEL`, happening at ``at`` (default: now)."""
+    return {**KERNEL, "timestamp": _stamp(time.time() if at is None else at)}
+
+
+def test_the_ndjson_timestamp_is_the_events_time():
+    # the exact shape `log stream --style ndjson` (and `log show`) writes
+    line = json.dumps({**KERNEL, "timestamp": "2026-10-04 22:24:19.003000+0900"})
+    expected = datetime(2026, 10, 4, 13, 24, 19, 3000, tzinfo=timezone.utc).timestamp()
+    assert cw.parse_event(line)["at"] == expected == 1791120259.003
+    for text in (
+        "2026-10-04T22:24:19.003+09:00", "2026-10-04T13:24:19.003Z",
+        "2026-10-04 22:24:19.003000 +0900", "2026-10-04 06:24:19.003-0700",
+    ):
+        assert cw.parse_log_time(text) == pytest.approx(expected), text
+    assert cw.parse_log_time("2026-10-04 22:24:19+0900") == pytest.approx(expected - 0.003)
+    for bad in (None, "", "yesterday", "2026-13-04 22:24:19+0900", 5):
+        assert cw.parse_log_time(bad) is None
+    # unparsable: the time it was read
+    before = time.time()
+    assert cw.parse_event(json.dumps({**KERNEL, "timestamp": "?"}))["at"] >= before
+
+
+def test_old_jsonl_records_are_dated_by_their_ts():
+    # 0.5.3 stored the time a line was READ as `at`
+    record = {"ts": "2026-10-04 22:24:19.003000+0900", "at": 1791300000.0}
+    assert cw.event_time(record) == pytest.approx(1791120259.003)
+    assert cw.event_time({"ts": None, "at": 5.0}) == 5.0 and cw.event_time({}) is None
+
+
+def test_a_line_read_late_is_dated_by_when_it_happened(home, root):
+    link, _real = _install(home, "2.1.289")
+    happened = time.time() + 5
+    w = cw.Watcher(root, lambda: str(link), home=home)
+    w.handle_line(json.dumps(_kernel(happened)) + "\n")
+    ext = cx.current_external(root)
+    assert ext["lastAt"] == pytest.approx(happened, abs=1e-5)
+    assert ext["probeDueAt"] == pytest.approx(happened + cx.PROBE_DELAY_S, abs=1e-5)
+    # a line about a kill before this file was written is about an earlier file
+    w.handle_line(json.dumps(_kernel(time.time() - 3600)) + "\n")
+    assert cx.external_count(cx.current_external(root)) == 1
+    # an ASP line older than PROVENANCE_WINDOW_S is not the kill's
+    w.handle_line(json.dumps({
+        **_asp(_real), "timestamp": _stamp(happened + 1),
+    }) + "\n")
+    w.handle_line(json.dumps(_kernel(happened + 2 + cw.PROVENANCE_WINDOW_S)) + "\n")
+    assert cx.current_external(root)["provenance"] is None
+
+
 def test_the_banner_and_noise_are_not_events():
     assert cw.parse_event("Filtering the log data using \"…\"\n") is None
     assert cw.parse_event("[]") is None
@@ -97,11 +153,12 @@ def test_the_banner_and_noise_are_not_events():
 def test_a_kernel_refusal_of_the_current_claude_is_evidence_not_a_pause(home, root, sent):
     link, real = _install(home, "2.1.289")
     w = cw.Watcher(root, lambda: str(link), home=home)
-    before = time.time()
-    w.handle_line(json.dumps(KERNEL) + "\n")
+    before = time.time() - 1  # the line's stamp has microseconds only
+    line = _kernel()
+    w.handle_line(json.dumps(line) + "\n")
     [event] = _events(root)
     assert event["kind"] == "log-event" and event["pid"] == 0 and event["process"] == "kernel"
-    assert event["message"] == KERNEL["eventMessage"] and event["ts"] == KERNEL["timestamp"]
+    assert event["message"] == KERNEL["eventMessage"] and event["ts"] == line["timestamp"]
     # not a launch of cc-swap's: no mark, no pause, no notification
     assert cx.any_killed(root) is None and sent == []
     binary = cx.stat_binary(str(link))
@@ -112,7 +169,7 @@ def test_a_kernel_refusal_of_the_current_claude_is_evidence_not_a_pause(home, ro
     # the engine's own probe is due a minute later, not during the episode
     assert ext["probeDueAt"] >= before + cx.PROBE_DELAY_S
     assert not cx.external_probe_due(root, binary, time.time())
-    w.handle_line(json.dumps(KERNEL) + "\n")
+    w.handle_line(json.dumps(_kernel()) + "\n")
     assert cx.external_count(cx.current_external(root)) == 2 and sent == []
     [rec, _] = [r for r in cx.read_jsonl(root) if r.get("kind") == "external-kill"]
     assert rec["caller"] == "log stream" and rec["real"] == os.path.realpath(real)
@@ -121,9 +178,9 @@ def test_a_kernel_refusal_of_the_current_claude_is_evidence_not_a_pause(home, ro
 def test_another_files_refusal_is_recorded_but_marks_nothing(home, root, sent):
     link, _ = _install(home, "2.1.290")
     w = cw.Watcher(root, lambda: str(link), home=home)
-    w.handle_line(json.dumps(KERNEL) + "\n")  # names 2.1.289
+    w.handle_line(json.dumps(_kernel()) + "\n")  # names 2.1.289
     # another app's AMFI chatter is not kept at all; a line naming claude is
-    amfid = {**KERNEL, "processImagePath": "/usr/libexec/amfid", "processID": 312}
+    amfid = {**_kernel(), "processImagePath": "/usr/libexec/amfid", "processID": 312}
     w.handle_line(json.dumps({**amfid, "eventMessage": "Some.app: code signature validated"}) + "\n")
     w.handle_line(json.dumps({
         **amfid,
@@ -211,7 +268,7 @@ def test_a_stream_that_cannot_start_never_blocks_the_tick(home, root):
 def test_lines_from_the_child_are_read_off_the_tick(home, root):
     w = cw.Watcher(
         root, lambda: None, home=home,
-        spawn=lambda argv: FakeStream([json.dumps(KERNEL) + "\n"]),
+        spawn=lambda argv: FakeStream([json.dumps(_kernel()) + "\n"]),
     )
     w.tick()
     w._reader.join(timeout=5)
@@ -461,7 +518,7 @@ def test_a_successful_run_outlives_the_old_reports_across_a_restart(home, root, 
     assert ext["probeDueAt"] is None and cx.external_count(ext) == 1
     assert cx.any_killed(root) is None and sent == []
     # new evidence schedules a new probe (not before PROBE_EVERY_S after the last)
-    restarted.handle_line(json.dumps(KERNEL) + "\n")
+    restarted.handle_line(json.dumps(_kernel()) + "\n")
     ext = cx.current_external(root)
     assert ext["probeDueAt"] >= ext["probe"]["at"] + cx.PROBE_EVERY_S
 
@@ -478,11 +535,11 @@ def test_only_the_kernel_marks(home, root, sent):
     link, real = _install(home, "2.1.289")
     w = cw.Watcher(root, lambda: str(link), home=home)
     w.handle_line(json.dumps({
-        **KERNEL, "processImagePath": "/usr/libexec/syspolicyd", "processID": 99,
+        **_kernel(), "processImagePath": "/usr/libexec/syspolicyd", "processID": 99,
         "eventMessage": f"code signature error for {real}: invalid",
     }) + "\n")
     w.handle_line(json.dumps({
-        **KERNEL, "processImagePath": "/usr/libexec/amfid", "processID": 98,
+        **_kernel(), "processImagePath": "/usr/libexec/amfid", "processID": 98,
         "eventMessage": 'load code signature error 2 for file "2.1.289"',
     }) + "\n")
     assert len(_events(root)) == 2  # kept as evidence
@@ -497,7 +554,7 @@ def test_a_bare_name_that_is_not_a_version_never_matches(tmp_path, root, sent):
     brew.chmod(0o755)
     w = cw.Watcher(root, lambda: str(brew), home=tmp_path)
     w.handle_line(json.dumps({
-        **KERNEL, "eventMessage": 'load code signature error 2 for file "claude"',
+        **_kernel(), "eventMessage": 'load code signature error 2 for file "claude"',
     }) + "\n")
     assert cx.any_killed(root) is None
     assert not cw.names_binary("claude", cx.stat_binary(str(brew)))
@@ -565,7 +622,7 @@ def _install_body(home: Path, version: str, body: str) -> tuple[Path, Path]:
 
 def _asp(real: Path | str, pid: int = 56959) -> dict:
     return {
-        **KERNEL,
+        **_kernel(),
         "eventMessage": (
             f"(AppleSystemPolicy) ASP: Unable to apply provenance sandbox: 268451845, "
             f"{pid}, {real}"
@@ -606,7 +663,7 @@ def test_the_provenance_line_goes_with_the_kill_after_it(home, root, sent):
     link, real = _install(home, "2.1.289")
     w = cw.Watcher(root, lambda: str(link), home=home)
     w.handle_line(json.dumps(_asp(real)) + "\n")
-    w.handle_line(json.dumps(KERNEL) + "\n")
+    w.handle_line(json.dumps(_kernel()) + "\n")
     ext = cx.current_external(root)
     assert ext["provenance"]["pid"] == 56959 and "provenance sandbox" in ext["provenance"]["message"]
     [rec] = [r for r in cx.read_jsonl(root) if r.get("kind") == "external-kill"]
@@ -629,7 +686,7 @@ def test_a_kill_line_whose_pid_is_a_cc_swap_run_is_left_to_that_run(home, root, 
     cx.append_record(root, {"kind": "exec", "at": time.time() - 1, "pid": 56959, "caller": "prime"})
     w = cw.Watcher(root, lambda: str(link), home=home)
     w.handle_line(json.dumps(_asp(real)) + "\n")
-    w.handle_line(json.dumps(KERNEL) + "\n")
+    w.handle_line(json.dumps(_kernel()) + "\n")
     assert cx.current_external(root) is None and cx.any_killed(root) is None
 
 
@@ -637,7 +694,7 @@ def test_the_engine_probes_after_the_episode_and_a_working_claude_pauses_nothing
     link, _real = _install(home, "2.1.289")
     clock = Clock(time.time())
     w = cw.Watcher(root, lambda: str(link), home=home, clock=clock, spawn=lambda argv: None)
-    w.handle_line(json.dumps(KERNEL) + "\n")
+    w.handle_line(json.dumps(_kernel()) + "\n")
     w.tick()
     w._scanner.join(5)
     assert w._prober is None  # not during the episode
@@ -669,7 +726,7 @@ def test_a_probe_the_os_kills_takes_the_killed_path(home, root, sent):
 
     link, _real = _install_body(home, "2.1.289", "kill -9 $$\n")
     w = cw.Watcher(root, lambda: str(link), home=home)
-    w.handle_line(json.dumps(KERNEL) + "\n")
+    w.handle_line(json.dumps(_kernel()) + "\n")
     assert cx.probe_external(root, str(link), now=time.time() + cx.PROBE_DELAY_S) == "killed"
     killed = cx.current_killed(root)
     assert killed is not None and killed["caller"] == cx.PROBE_CALLER and len(sent) == 1

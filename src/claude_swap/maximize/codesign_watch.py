@@ -53,7 +53,7 @@ import threading
 import time
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, replace
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -129,9 +129,60 @@ def _spawn(argv: list[str]) -> subprocess.Popen | None:
 # -- live events --------------------------------------------------------------------------
 
 
+_LOG_TIME_RE = re.compile(
+    r"^(\d{4})-(\d{2})-(\d{2})[ T](\d{2}):(\d{2}):(\d{2})(?:[.,](\d{1,9}))?"
+    r"\s*(Z|[+-]\d{2}:?\d{2})?$"
+)
+
+
+def parse_log_time(value: object) -> float | None:
+    """Epoch seconds of a unified-log timestamp, or None. ``log stream
+    --style ndjson`` and ``log show`` write ``2026-10-04 22:24:19.003000+0900``
+    (a space, microseconds, an offset without a colon); ISO forms (``T``,
+    ``+09:00``, ``Z``, no fraction) are accepted too. No offset: local time."""
+    if not isinstance(value, str):
+        return None
+    match = _LOG_TIME_RE.match(value.strip())
+    if match is None:
+        return None
+    year, month, day, hour, minute, second, frac, zone = match.groups()
+    micro = int((frac or "0")[:6].ljust(6, "0"))
+    tz = None
+    if zone:
+        if zone == "Z":
+            tz = timezone.utc
+        else:
+            digits = zone[1:].replace(":", "")
+            delta = timedelta(hours=int(digits[:2]), minutes=int(digits[2:]))
+            tz = timezone(-delta if zone[0] == "-" else delta)
+    try:
+        when = datetime(
+            int(year), int(month), int(day), int(hour), int(minute), int(second), micro,
+            tzinfo=tz,
+        )
+    except ValueError:
+        return None
+    return when.timestamp()
+
+
+def event_time(record: dict[str, Any]) -> float | None:
+    """When a ``codesign-events.jsonl`` record happened: its ``ts`` re-parsed
+    first — 0.5.3 and the first 0.5.4 build stored the time a line was READ
+    as ``at`` — else ``at``."""
+    parsed = parse_log_time(record.get("ts"))
+    if parsed is not None:
+        return parsed
+    at = record.get("at")
+    return float(at) if isinstance(at, (int, float)) and not isinstance(at, bool) else None
+
+
 def parse_event(line: str) -> dict[str, Any] | None:
     """One ``log stream --style ndjson`` line as an event record, or None
-    (the ``Filtering the log data …`` banner, anything that is not one)."""
+    (the ``Filtering the log data …`` banner, anything that is not one).
+    ``at`` is the event's own time (:func:`parse_log_time`), the time the
+    line was read only when its timestamp cannot be parsed: a line that
+    arrives late must still compare with the file's ctime, a successful run
+    and the provenance line before it by when it HAPPENED."""
     try:
         data = json.loads(line)
     except ValueError:
@@ -139,10 +190,11 @@ def parse_event(line: str) -> dict[str, Any] | None:
     if not isinstance(data, dict) or "eventMessage" not in data:
         return None
     image = str(data.get("processImagePath") or "")
+    at = parse_log_time(data.get("timestamp"))
     return {
         "kind": "log-event",
         "ts": data.get("timestamp"),
-        "at": time.time(),
+        "at": time.time() if at is None else at,
         "pid": data.get("processID"),
         "process": os.path.basename(image) or data.get("process"),
         "processImagePath": image or None,
