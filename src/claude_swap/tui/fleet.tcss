@@ -22,9 +22,13 @@ FleetScreen {
     padding: 0 2 0 1;
 }
 
+/* One line, up to three where the table leaves rows over: FleetScreen sets
+   its height to the lines home.table_plan gives it. */
 #fx-attention {
     height: 1;
     padding: 0 2 0 1;
+    text-wrap: nowrap;
+    text-overflow: clip;
 }
 
 /* The capacity summary sits right over the column headers and takes the

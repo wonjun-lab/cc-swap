@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 import time
 from datetime import datetime, timezone
 
@@ -344,7 +345,10 @@ class TestFleetScreen:
             await _open(pilot)
             status = _status(app)
             # A fresh decision in the state file, but no engine: not live.
-            assert status == "Not switching — no engine is running (m to start one)"
+            # The remedy is the service: an engine started here stops with the TUI.
+            assert status == (
+                "Not switching — no engine is running (cc-swap service install starts one)"
+            )
             assert "next" not in _body(app)
             assert app._store_only is False
             assert fake_engine.instances == []  # Fleet never takes the lease itself
@@ -376,7 +380,8 @@ class TestFleetScreen:
             status = _status(app)
             assert status.startswith("Auto ON · the engine has not reported since ")
             assert "(1h ago)" in status and "nothing below is live" in status
-            assert status.endswith("is silent")
+            assert "· cc-swap service install restarts it" in status
+            assert status.endswith("viewer")
             assert "switch to" not in status and "#2" not in status
             assert "next" not in _body(app)
 
@@ -571,16 +576,21 @@ async def test_every_size_shows_the_table_with_headers_and_both_resets(
         # lines only when tall enough.
         top = 1 if height >= 20 else 0
         assert status.region.y == top and attention.region.y == top + 1
+        # The attention lines: as many as the plan gave them (a dead login
+        # and a login that ends soon: one line where both fit, else two
+        # where the table leaves a row over).
+        assert attention.region.height == plan.attention >= 1
+        below = attention.region.y + attention.region.height
         # 200x16 has the rows for the panel but not for the summary too:
         # the summary goes first.
         assert plan.summary is (height >= 20)
         if plan.summary:
-            assert summary.display and summary.region.y == attention.region.y + 1 + top
+            assert summary.display and summary.region.y == below + top
             assert head.region.y == summary.region.y + 1
             assert _plain(app, "#fx-summary").startswith("5h free: ")
         else:
             assert not summary.display
-            assert head.region.y == attention.region.y + 1 + top
+            assert head.region.y == below + top
         assert scroll.region.y == head.region.y + 1
         assert keys.region.y == height - 1 and scroll.region.bottom <= keys.region.y
         assert _status(app).startswith("Auto ON · ")
@@ -1128,13 +1138,182 @@ async def test_the_capacity_summary_sits_over_the_headers(tmp_path, held_by_serv
         screen = app.screen
         summary = _plain(app, "#fx-summary")
         # Usable: #1 (62% 5h, past soft), #2, #3, #4, #6 (#5's login is dead).
-        assert summary.startswith("5h free: 4 accounts · next 5h back ")
-        assert "(#1) · 7d left this week ≈ 3.5 accounts · next 7d reset " in summary
+        # Countdowns, as the table's resets count.
+        assert summary == (
+            "5h free: 4 accounts · next back in 1h47m (#1) · 7d left this week ≈ 3.5 accounts"
+            " · next 7d in 2d04h (#2)"
+        )
         assert screen.query_one("#fx-head").region.y == screen.query_one(
             "#fx-summary").region.y + 1
         await pilot.resize_terminal(80, 24)
         await _open(pilot)
-        assert _plain(app, "#fx-summary") == "5h free: 4 accounts · 7d left this week ≈ 3.5 accounts"
+        # 80 columns keep both countdowns (the 7d room goes).
+        assert _plain(app, "#fx-summary") == (
+            "5h free: 4 accounts · next back in 1h47m (#1) · next 7d in 2d04h (#2)"
+        )
         await pilot.resize_terminal(80, 10)
         await _open(pilot)
         assert not screen.query_one("#fx-summary").display
+
+
+# -- the audit of the 0.5.4 home, at 80x24 and 120x36 -----------------------------------------------
+
+
+def _killed(root) -> None:
+    """claude 2.1.4 SIGKILLed by the OS at launch (a cc-swap launch): the
+    killed mark ``claude_exec`` keeps, for a fake ``claude`` file."""
+    from claude_swap.maximize.claude_exec import stat_binary
+
+    claude = root / "bin" / "claude"
+    claude.parent.mkdir(parents=True, exist_ok=True)
+    claude.write_text("#!/bin/sh\necho 2.1.4\n")
+    claude.chmod(0o755)
+    now = time.time()
+    (root / "claude_exec_state.json").write_text(json.dumps({"killed": {
+        "path": str(claude), "real": str(claude), "identity": stat_binary(str(claude)).identity,
+        "version": "2.1.4", "at": now - 1500, "lastAt": now - 1500, "count": 1,
+        "caller": "prime", "lastCaller": "prime",
+    }}))
+
+
+def _attention(app) -> list[str]:
+    return _plain(app, "#fx-attention").splitlines()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("size", [(80, 24), (120, 36)], ids=["80x24", "120x36"])
+async def test_a_killed_claude_shows_beside_a_dead_login(tmp_path, held_by_service, size):
+    """The killed note used to follow every login on one line and be
+    dropped: it comes right after the dead login now, on a line of its own
+    where the table leaves rows over, and keeps its remedy."""
+    fake = _six(tmp_path)
+    _killed(tmp_path)
+    app = make_app(fake)
+    async with app.run_test(size=size) as pilot:
+        await _open(pilot)
+        lines = _attention(app)
+        assert lines[0] == f"! #5 {NAMES[4]} needs re-login — select it, press r"
+        assert lines[1].startswith("! claude 2.1.4 killed by ")
+        assert "cc-swap doctor" in lines[1] and "priming paused" in lines[1]
+        assert lines[2] == f"! #3 {NAMES[2]} login ends in 1d 4h — select it, press r"
+        assert app.screen._plan.attention == 3
+        # Every row still shows, and the selected account's panel.
+        assert app.screen._order == SIX_ORDER and app.screen._plan.detail
+        if size == (120, 36):
+            assert lines[1].endswith("at launch — priming paused (cc-swap doctor shows the fix)")
+
+
+@pytest.mark.asyncio
+async def test_a_killed_claude_on_a_short_terminal_shares_the_line(tmp_path, held_by_service):
+    fake = _six(tmp_path)
+    _killed(tmp_path)
+    app = make_app(fake)
+    async with app.run_test(size=(120, 10)) as pilot:  # no row to spare
+        await _open(pilot)
+        assert app.screen._plan.attention == 1
+        # The kill rides along in its shortest wording, remedy first.
+        assert _attention(app) == [
+            f"! #5 {NAMES[4]} needs re-login — select it, press r · cc-swap doctor: "
+            f"claude 2.1.4 killed by {'macOS' if sys.platform == 'darwin' else 'the OS'}, "
+            "priming paused"
+        ]
+        assert app.screen.query_one("#fx-scroll").region.height == 6  # every row
+
+
+def _degraded(root) -> FakeSwitcher:
+    """``_six`` with #2's Keychain unreadable and #6's reading 2h old."""
+    from dataclasses import replace
+
+    from claude_swap.json_output import USAGE_KEYCHAIN_UNAVAILABLE
+
+    fake = _six(root)
+    now = time.time()
+    accounts = []
+    for a in fake._accounts:
+        if a.number == "2":
+            a = replace(a, usage=replace(a.usage, sentinel=USAGE_KEYCHAIN_UNAVAILABLE))
+        elif a.number == "6":
+            a = replace(a, usage=replace(a.usage, fetched_at=now - 7200, age_s=7200.0))
+        accounts.append(a)
+    fake._accounts = accounts
+    return fake
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("size", [(80, 24), (120, 36)], ids=["80x24", "120x36"])
+async def test_a_locked_keychain_and_an_old_reading_say_so(tmp_path, held_by_service, size):
+    app = make_app(_degraded(tmp_path))
+    async with app.run_test(size=size) as pilot:
+        await _open(pilot)
+        # At 80 columns the status column gives room to the names: the
+        # tag too wide for it takes its shorter wording.
+        assert _cell(app, "2", "status") == (
+            "keychain (f)" if size == (80, 24) else "keychain locked (f)"
+        )
+        assert _cell(app, "6", "status") == "reading 2h old"
+        assert f"! #2 {NAMES[1]} keychain locked — unlock it, press f" in _attention(app)
+        # No name is cut.
+        for number, name in zip(("1", "2", "3", "4", "5", "6"), NAMES):
+            assert _cell(app, number, "account") == f"{name} #{number}"
+
+
+@pytest.mark.asyncio
+async def test_prime_times_never_cut_a_name_at_80_columns(tmp_path, held_by_service):
+    """A cold account's tag is ``prime now`` / ``prime 19:30`` (it was ``5h
+    off · prime now``, which cut the names at 80 columns)."""
+    fake = _six(tmp_path)
+    state = json.loads((tmp_path / "autoswitch_state.json").read_text())
+    state["maximizeDecision"]["target"] = "3"  # #2 is not next: its prime tag shows
+    (tmp_path / "autoswitch_state.json").write_text(json.dumps(state))
+    app = make_app(fake)
+    async with app.run_test(size=(80, 24)) as pilot:
+        await _open(pilot)
+        for number, name in zip(("1", "2", "3", "4", "5", "6"), NAMES):
+            assert _cell(app, number, "account") == f"{name} #{number}"
+        assert _cell(app, "2", "status").startswith("prime ")
+
+
+@pytest.mark.asyncio
+async def test_a_stopped_service_names_the_command_that_starts_it(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        "claude_swap.tui.fleet.service_status",
+        lambda: {"platform": "darwin", "installed": True, "loaded": False, "running": False,
+                 "state": "not loaded", "pid": None, "logs": []},
+    )
+    app = make_app(_six(tmp_path))
+    async with app.run_test(size=(80, 24)) as pilot:
+        await _open(pilot)
+        assert _status(app) == (
+            "Not switching — the service is stopped (cc-swap service install starts it)"
+        )
+
+
+@pytest.mark.asyncio
+async def test_a_relogin_pause_counts_down_and_asks_for_no_relogin(tmp_path, held_by_service):
+    fake = _six(tmp_path)
+    state = json.loads((tmp_path / "autoswitch_state.json").read_text())
+    state.update(pausedUntil=time.time() + 8 * 60 + 20, pausedReason="relogin")
+    (tmp_path / "autoswitch_state.json").write_text(json.dumps(state))
+    app = make_app(fake)
+    async with app.run_test(size=(80, 24)) as pilot:
+        await _open(pilot)
+        assert _status(app).startswith("Paused · re-login in progress — nothing switches for 8m")
+        assert "press r" not in _plain(app, "#fx-attention")
+        assert f"#5 {NAMES[4]} needs re-login" in _plain(app, "#fx-attention")
+
+
+@pytest.mark.asyncio
+async def test_with_no_account_the_home_says_how_to_add_one(tmp_path, held_by_service):
+    from claude_swap.tui.modals import ConfirmModal
+
+    _settings(tmp_path)
+    app = make_app(FakeSwitcher([], tmp_path))
+    async with app.run_test(size=(80, 24)) as pilot:
+        await _open(pilot)
+        assert _status(app).startswith(
+            "No accounts yet — log in with claude, then press a, or run cc-swap add"
+        )
+        assert _plain(app, "#fx-keys") == "a add · m menu · ? help · q quit"
+        await pilot.press("a")
+        await pilot.pause()
+        assert isinstance(app.screen, ConfirmModal)  # adds the login claude has now

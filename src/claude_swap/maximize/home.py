@@ -6,11 +6,12 @@ Fleet (``tui/fleet.py``) is the maximize home screen. It shows:
   a dim note on the right saying who runs it (:func:`holder_variants`); an
   account hold (``cc-swap hold``, ``h``) on the active account reads
   ``Holding #1 until 15:30 (2h left) — only hard 98%/100% will move you``;
-* at most one attention line, only when something needs you
-  (:func:`attention_parts`);
+* attention lines only when something needs you (:func:`attention_notices`,
+  :func:`attention_lines`): one, and up to three where the table leaves
+  rows over;
 * a capacity summary over the table (:func:`capacity`,
-  :func:`summary_variants`): ``5h free: 4 accounts · next 5h back 07:10
-  (#3) · 7d left this week ≈ 2.3 accounts · next 7d reset Oct 5 12:51``;
+  :func:`summary_variants`): ``5h free: 4 accounts · next back in 1h47m
+  (#3) · 7d left this week ≈ 2.3 accounts · next 7d in 2d04h (#2)``;
 * every account as one row of a table with column headers (``order ·
   account · plan · 5h · 5h resets · 7d · 7d resets · status``), in the order
   :func:`ordered_rows` gives: the ``order`` column numbers where automatic
@@ -141,8 +142,22 @@ def short_left(seconds: float) -> str:
 
 #: The tags in priority order: an account shows only the first that applies.
 TAG_PRIORITY: tuple[str, ...] = (
-    "active", "re-login", "excluded", "next", "login", "last resort", "5h off",
+    "active", "re-login", "keychain", "excluded", "next", "login", "reading old",
+    "last resort", "prime",
 )
+
+#: A reading this old gets a ``reading 25m old`` tag (an account the engine
+#: reads is never this far behind: a candidate is polled every 10 minutes
+#: at most) …
+STALE_TAG_S = 15 * 60.0
+#: … amber from this age on, where the engine no longer trusts it
+#: (``usage_store.TRUST_MAX_AGE_S``: its headroom counts as unknown).
+STALE_WARN_S = 3600.0
+
+
+def reading_age(row: fx.FleetRow, now: float) -> float | None:
+    """How old the account's usage reading is (None: never read)."""
+    return None if row.fetched_at is None else max(now - row.fetched_at, 0.0)
 
 
 def tag_for(
@@ -155,6 +170,8 @@ def tag_for(
         return "● active", "active"
     if row.login == "relogin":
         return "re-login (r)", "crit"
+    if row.login == "keychain":
+        return "keychain locked (f)", "warn"
     if row.tier == "excluded":
         return "excluded", "dim"
     if is_next:
@@ -163,6 +180,9 @@ def tag_for(
         left = fx.login_left(row, now) or 0.0
         tone = "crit" if left < fx.LOGIN_URGENT_S else "warn"
         return (f"login {short_left(left)} left" if left > 0 else "login expired"), tone
+    age = reading_age(row, now)
+    if row.login == "ok" and row.stale and age is not None and age >= STALE_TAG_S:
+        return f"reading {ago_text(age)} old", "warn" if age >= STALE_WARN_S else "dim"
     if row.tier == "last_resort":
         return "last resort", "dim"
     if row.state5 == "cold" and row.login == "ok":  # an API key has no 5h window
@@ -172,8 +192,27 @@ def tag_for(
             when = "now" if (cell.hi or 0.0) <= now else fx.hhmm(cell.hi or now)
         elif priming and cell.kind == "window" and cell.lo is not None:
             when = fx.hhmm(cell.lo)
-        return (f"5h off · prime {when}" if when else "5h off"), "dim"
+        return (f"prime {when}" if when else "5h off"), "dim"
     return None
+
+
+#: Tags with a shorter wording, for a status column that has to give room
+#: to the names (:func:`table_plan`).
+_SHORT_TAGS: tuple[tuple[str, str], ...] = (
+    (r"^keychain locked \(f\)$", "keychain (f)"),
+    (r"^re-login \(r\)$", "re-login"),
+    (r"^login (\w+) left$", r"login \1"),
+    (r"^reading (\w+) old$", r"\1 old"),
+)
+
+
+def short_status(text: str) -> str:
+    """``text``'s shorter wording (``login 1d left`` -> ``login 1d``), or
+    ``text`` itself."""
+    for pattern, short in _SHORT_TAGS:
+        if re.match(pattern, text):
+            return re.sub(pattern, short, text)
+    return text
 
 
 def status_for(
@@ -306,8 +345,13 @@ class TableNeeds:
     reset5_short: int = 0  # … and without it
     reset7: int = 0
     reset7_short: int = 0
-    status: int = 0        # the longest tag
+    status: int = 0        # the longest tag …
     detail: int = 0        # lines the selected account's panel takes (0: none)
+    status_short: int = -1  # … and the longest in its shorter wording (-1: as long)
+
+    @property
+    def status_min(self) -> int:
+        return self.status if self.status_short < 0 else min(self.status_short, self.status)
 
 
 def plan_text(row: fx.FleetRow) -> str:
@@ -342,6 +386,7 @@ def table_needs(
         reset7_short=widest(row_resets(r, "7d", now, clock=False) for r in rows),
         status=widest(s[0] for s in statuses.values() if s),
         detail=detail,
+        status_short=widest(short_status(s[0]) for s in statuses.values() if s),
     )
 
 
@@ -358,6 +403,16 @@ class TablePlan:
     blanks: bool                              # blank lines around the status block
     room: int                                 # the width the screen lays text out in
     summary: bool = False                     # the capacity summary over the headers
+    short_status: bool = False                # tags too wide take their shorter wording
+    attention: int = 0                        # lines the attention notes get
+
+    def status_text(self, text: str) -> str:
+        """A status tag as this plan words it: its shorter wording
+        (:func:`short_status`) when the status column gave room to the names
+        and the tag is wider than what is left."""
+        if self.short_status and cells(text) > self.width("status"):
+            return short_status(text)
+        return text
 
     def width(self, key: str) -> int:
         return dict(self.columns)[key]
@@ -382,7 +437,8 @@ class TablePlan:
 
 
 def _columns(
-    needs: TableNeeds, *, bar: int, clock: bool, plan: bool, name: int
+    needs: TableNeeds, *, bar: int, clock: bool, plan: bool, name: int,
+    status: int | None = None,
 ) -> list[tuple[str, int]]:
     def head(key: str, width: int) -> tuple[str, int]:
         return key, max(width, cells(HEADERS[key]))
@@ -396,7 +452,7 @@ def _columns(
         head("reset5", needs.reset5 if clock else needs.reset5_short),
         head("7d", usage),
         head("reset7", needs.reset7 if clock else needs.reset7_short),
-        head("status", needs.status),
+        head("status", needs.status if status is None else status),
     ]
     return out
 
@@ -410,12 +466,16 @@ def _name_room(room: int, needs: TableNeeds, columns: Sequence[tuple[str, int]],
     return room - (_span(columns, gap) - dict(columns)["account"]) - needs.slot
 
 
+#: The most lines the attention notes take (:func:`attention_lines`).
+MAX_ATTENTION = 3
+
+
 def table_plan(
     width: int,
     height: int,
     needs: TableNeeds,
     *,
-    attention: bool = False,
+    attention: bool | int = False,
     summary: bool = False,
 ) -> TablePlan:
     """The table's columns for a ``width`` x ``height`` terminal.
@@ -424,20 +484,28 @@ def table_plan(
     clocks, the plan, the whole name (up to :data:`NAME_CAP`). When it does
     not, in this order: the bars shorten to :data:`MIN_BAR`; the columns
     move closer (:data:`TIGHT_GAP`); the reset clocks go (the countdowns
-    stay); the plan column goes; the name shortens with … (to
-    :data:`MIN_NAME`); then the bars go, leaving the percentages, and the
-    name takes what is left. ``order``, the resets and the status columns
-    never go, so a terminal too narrow even for that clips the row's end.
+    stay); the plan column goes; the status column takes its shorter
+    wording (:func:`short_status`, ``login 1d`` for ``login 1d left``); the
+    name shortens with … (to :data:`MIN_NAME`); then the bars go, leaving
+    the percentages, and the name takes what is left (the status keeps its
+    full wording again once the whole name fits). ``order``, the resets and
+    the status columns never go, so a terminal too narrow even for that
+    clips the row's end.
 
-    Height: the selected account's panel (``needs.detail`` lines) shows
-    under the table only when every row fits above it. The capacity summary
-    (``summary``: there is one to show) takes one line over the headers; on
-    a short terminal it goes first, before the panel — it shows only where
-    it costs the panel nothing, and never below :data:`SUMMARY_MIN_ROWS`
-    rows. The table itself is used at every size."""
+    Height: ``attention`` is how many lines the attention notes would like
+    (:func:`attention_want`; True: one). The first always shows; the others
+    only take rows the table and the selected account's panel leave over
+    (``TablePlan.attention`` says how many it gets). The panel
+    (``needs.detail`` lines) shows under the table only when every row fits
+    above it. The capacity summary (``summary``: there is one to show) takes
+    one line over the headers; on a short terminal it goes first, before the
+    attention lines and the panel — it shows only where it costs the panel
+    nothing, and never below :data:`SUMMARY_MIN_ROWS` rows. The table itself
+    is used at every size."""
     room = text_width(width)
     name = min(needs.name, NAME_CAP)
     columns: list[tuple[str, int]] | None = None
+    short = False
     for clock, plan, gap in ((True, True, GAP), (True, True, TIGHT_GAP),
                              (False, True, TIGHT_GAP), (False, False, TIGHT_GAP)):
         # Everything but the two bars, at the full name.
@@ -446,34 +514,52 @@ def table_plan(
         if bar >= MIN_BAR:
             columns = _columns(needs, bar=bar, clock=clock, plan=plan, name=name)
             break
-    if columns is None:  # the name shortens, then the bars go
+    if columns is None:  # the status shortens, then the name, then the bars go
         clock, plan, gap = False, False, TIGHT_GAP
+
+        def fit_at(bar: int) -> tuple[int, int | None]:
+            """Cells for the name at ``bar``, and the status column's width
+            when it has to give some of them (None: it keeps its own)."""
+            def room_for(status: int | None) -> int:
+                return _name_room(room, needs, _columns(
+                    needs, bar=bar, clock=False, plan=False, name=0, status=status), gap)
+
+            full = room_for(None)
+            if full >= name or needs.status_min >= needs.status:
+                return full, None
+            status = max(needs.status - (name - full), needs.status_min, cells(HEADERS["status"]))
+            return room_for(status), status
+
         bar = MIN_BAR
-        fit = _name_room(room, needs, _columns(needs, bar=bar, clock=False, plan=False,
-                                               name=0), gap)
+        fit, status = fit_at(bar)
         if fit < min(name, MIN_NAME):
             bar = 0
-            fit = _name_room(room, needs, _columns(needs, bar=0, clock=False, plan=False,
-                                                   name=0), gap)
+            fit, status = fit_at(bar)
+        short = status is not None
         columns = _columns(needs, bar=bar, clock=clock, plan=plan,
-                           name=max(min(name, fit), 1))
+                           name=max(min(name, fit), 1), status=status)
     blanks = height >= BLANKS_MIN_ROWS
-    fixed_lines = 1 + 1 + 1 + int(attention) + 2 * int(blanks)  # status, header, footer
+    want = int(attention)
+    fixed_lines = 1 + 1 + 1 + min(want, 1) + 2 * int(blanks)  # status, header, footer
     rest = height - fixed_lines
     detail = needs.detail > 0 and needs.rows + needs.detail <= rest
+    used = needs.rows + (needs.detail if detail else 0)
+    extra = max(min(want, MAX_ATTENTION) - 1, 0)
+    extra = min(extra, max(rest - used, 0))
     shown = summary and height >= SUMMARY_MIN_ROWS and (
-        not detail or needs.rows + needs.detail + 1 <= rest
+        not detail or used + extra + 1 <= rest
     )
     return TablePlan(
         bar=bar, clock=clock, plan=plan, gap=gap, columns=tuple(columns),
-        detail=detail, blanks=blanks, room=room, summary=shown,
+        detail=detail, blanks=blanks, room=room, summary=shown, short_status=short,
+        attention=min(want, 1) + extra,
     )
 
 
 # -- the capacity summary ------------------------------------------------------------------
 #
-#   5h free: 4 accounts · next 5h back 07:10 (#3) · 7d left this week ≈ 2.3 accounts
-#   · next 7d reset Oct 5 12:51
+#   5h free: 4 accounts · next back in 1h47m (#3) · 7d left this week ≈ 2.3 accounts
+#   · next 7d in 2d04h (#2)
 #
 # Over the accounts automatic switching can use (:func:`usable_for_capacity`).
 # "7d left ≈ N accounts" adds up (100 − 7d%)/100 per account, NOT weighted by
@@ -489,7 +575,7 @@ class Capacity:
     free5: int                               # under the 5h soft mark, 7d not spent
     back5: tuple[float, str] | None          # (reset, slot): the soonest 5h back
     left7: float                             # Σ (100 − 7d%)/100
-    next7: float | None                      # the soonest 7d reset
+    next7: tuple[float, str] | None          # (reset, slot): the soonest 7d reset
 
 
 def usable_for_capacity(row: fx.FleetRow, now: float) -> bool:
@@ -509,19 +595,28 @@ def capacity(
     """The fleet's capacity right now, or None with no account to count.
 
     ``free5``: accounts (the active one included) whose 5h is under its
-    soft mark and whose 7d is under its hard mark. ``back5``: among the
-    others whose 7d is not spent, the soonest 5h reset. ``left7``: the 7d
-    room left, as whole accounts. ``next7``: the soonest 7d reset."""
+    soft mark and whose 7d is under its hard mark. ``back5``: the soonest
+    5h reset of an account (the active one included) that only its 5h
+    keeps from being landed on — by the landing rule
+    (``score.landable``: both windows under their soft marks less
+    ``maximize.landingMargin``), so the account named is one automatic
+    switching could go to once that window resets. ``left7``: the 7d room
+    left, as whole accounts. ``next7``: the soonest 7d reset."""
     usable = [r for r in rows if usable_for_capacity(r, now)]
     if not usable:
         return None
     week_ok = [r for r in usable if (r.pct7 or 0.0) < mx.hard_7d]
     free = [r for r in week_ok if (r.pct5 or 0.0) < mx.soft_5h]
+    margin = mx.landing_margin
     waiting = [
-        (r.reset5, r.number) for r in week_ok
-        if (r.pct5 or 0.0) >= mx.soft_5h and r.reset5 is not None and r.reset5 > now
+        (r.reset5, r.number) for r in usable
+        if (r.pct7 or 0.0) < mx.soft_7d - margin
+        and (r.pct5 or 0.0) >= mx.soft_5h - margin
+        and r.reset5 is not None and r.reset5 > now
     ]
-    resets7 = [r.reset7 for r in usable if r.reset7 is not None and r.reset7 > now]
+    resets7 = [
+        (r.reset7, r.number) for r in usable if r.reset7 is not None and r.reset7 > now
+    ]
     left7 = sum(max(0.0, 100.0 - min(r.pct7 or 0.0, 100.0)) / 100.0 for r in usable)
     return Capacity(
         usable=len(usable),
@@ -533,8 +628,10 @@ def capacity(
 
 
 def summary_variants(cap: Capacity, now: float) -> list[list[Seg]]:
-    """The summary line as tone segments, longest first: the clocks go
-    first (the 7d reset, then the 5h one), then the 7d part."""
+    """The summary line as tone segments, longest first, with countdowns
+    (``next back in 1h47m (#1) · next 7d in 2d04h (#2)``, as the table's
+    resets count): the 7d room goes first, then the 7d reset, then the 5h
+    one."""
     n = cap.free5
     head: list[Seg] = [
         ("5h free: ", "dim"),
@@ -543,13 +640,13 @@ def summary_variants(cap: Capacity, now: float) -> list[list[Seg]]:
     back: list[Seg] = []
     if cap.back5 is not None:
         reset, slot = cap.back5
-        back = [(" · next 5h back ", "dim"),
-                (f"{reset_clock(reset, now, date=False)} (#{slot})", "plain")]
+        back = [(" · next back in ", "dim"), (f"{countdown(reset - now)} (#{slot})", "plain")]
     week: list[Seg] = [(" · 7d left this week ≈ ", "dim"), (f"{cap.left7:.1f} accounts", "plain")]
     reset7: list[Seg] = []
     if cap.next7 is not None:
-        reset7 = [(" · next 7d reset ", "dim"), (reset_clock(cap.next7, now), "plain")]
-    out = [head + back + week + reset7, head + back + week, head + week, head]
+        reset, slot = cap.next7
+        reset7 = [(" · next 7d in ", "dim"), (f"{countdown(reset - now)} (#{slot})", "plain")]
+    out = [head + back + week + reset7, head + back + reset7, head + back, head]
     unique: list[list[Seg]] = []
     for variant in out:
         if variant not in unique:
@@ -892,6 +989,21 @@ def _preempt_switch_variants(
     return out
 
 
+#: What starts (or restarts) the always-on engine.
+SERVICE_INSTALL = "cc-swap service install"
+
+
+def empty_variants() -> list[list[Seg]]:
+    """The sentence while no account is managed yet: what adds the first."""
+    head: Seg = ("No accounts yet", "warnb")
+    return [
+        [head, (" — log in with claude, then press a, or run cc-swap add", "plain")],
+        [head, (" — log in with claude, then press a", "plain")],
+        [head, (" — a adds one", "plain")],
+        [head],
+    ]
+
+
 def status_variants(
     es: fx.EngineStatus,
     dv: fx.DecisionView,
@@ -919,11 +1031,17 @@ def status_variants(
         return f"#{n} {r.name}" if r else (f"#{n}" if n else "?")
 
     if sit == "paused":
-        until = fx.hhmm(dv.at) if dv.at else "?"
         why = "re-login" if dv.reason == "relogin" else (dv.reason or "a pause")
+        if dv.at is None:
+            return [
+                [("Paused", "warnb"), (f" · {why} in progress — nothing switches", "plain")],
+                [("Paused", "warnb")],
+            ]
+        left = account_hold.left_text(max(dv.at - now, 0.0))
         return [
-            [("Paused", "warnb"), (f" · {why} in progress — nothing switches until {until}", "plain")],
-            [("Paused", "warnb"), (f" until {until}", "plain")],
+            [("Paused", "warnb"),
+             (f" · {why} in progress — nothing switches for {left}", "plain")],
+            [("Paused", "warnb"), (f" for {left}", "plain")],
             [("Paused", "warnb")],
         ]
     if sit == "auto-off":
@@ -934,12 +1052,18 @@ def status_variants(
             [("Auto OFF", "warnb")],
         ]
     if sit == "no-engine":
+        # The remedy is the service: an engine started here (m → mode)
+        # stops when this TUI quits.
         stopped = bool(es.service and es.service.get("installed"))
-        why = "the service is installed but stopped" if stopped else "no engine is running"
+        why = "the service is stopped" if stopped else "no engine is running"
+        verb = "starts it" if stopped else "starts one"
+        off: Seg = ("Not switching", "warnb")
         return [
-            [("Not switching", "warnb"), (f" — {why} ", "plain"), ("(m to start one)", "dim")],
-            [("Not switching", "warnb"), (" — no engine ", "plain"), ("(m)", "dim")],
-            [("Not switching", "warnb")],
+            [off, (f" — {why} ", "plain"), (f"({SERVICE_INSTALL} {verb})", "dim")],
+            [off, (f" — {why} ", "plain"), (f"({SERVICE_INSTALL})", "dim")],
+            [off, (" — no engine ", "plain"), (f"({SERVICE_INSTALL})", "dim")],
+            [off, (" — no engine", "plain")],
+            [off],
         ]
     dry = es.holder == "here-dry"
     head: Seg = ("Dry run", "warnb") if dry else ("Auto ON", "okb")
@@ -948,13 +1072,23 @@ def status_variants(
         when = fx.hhmm(last) if last else "?"
         ago = f" ({ago_text(now - last)} ago)" if last else ""
         stale_head: Seg = (head[0], "warnb")
-        return [
+        service = es.holder == "service" or bool((es.service or {}).get("installed"))
+        restart: list[Seg] = [(f" · {SERVICE_INSTALL} restarts it", "dim")] if service else []
+        out = [
+            [stale_head, (f" · the engine has not reported since {when}{ago} — "
+                          "nothing below is live ", "warn"), ("(m → e engine log)", "dim"),
+             *restart],
+            [stale_head, (f" · engine silent since {when}{ago} — nothing below is live", "warn"),
+             *restart],
+            [stale_head, (f" · engine silent since {when}{ago}", "warn"), *restart],
+            [stale_head, (f" · engine silent since {when}", "warn"), *restart],
             [stale_head, (f" · the engine has not reported since {when}{ago} — "
                           "nothing below is live ", "warn"), ("(m → e engine log)", "dim")],
             [stale_head, (f" · engine silent since {when}{ago} ", "warn"), ("(m → e)", "dim")],
             [stale_head, (f" · engine silent since {when}", "warn")],
             [stale_head, (" · engine silent", "warn")],
         ]
+        return out[:4] + out[6:] if restart else out[4:]
     act = by.get(dv.active or "") or next((r for r in rows if r.active), None)
     live_act = next((r for r in rows if r.active), None) or act
     if live_act is not None and sit in ("live", "waiting"):
@@ -1101,59 +1235,210 @@ def status_line(
     return sentence, note
 
 
-# -- the attention line ------------------------------------------------------------------
+# -- the attention lines -----------------------------------------------------------------
+#
+# Up to three lines, most important first: a dead login, then priming paused
+# (claude killed by the OS, an update settling, a version not verified yet),
+# then logins that end soon, a locked keychain, a Linux service that stops
+# at logout. Each note has wordings from longest to shortest and a line
+# takes the longest that fits, so its remedy (``press r``, ``cc-swap
+# doctor``, ``cc-swap prime verify``) is not cut off. The first line is
+# always there when anything is; the others only take rows the table
+# leaves over (``table_plan``), and the notes that do not get a line of
+# their own share the last one, as many as fit.
 
 
-def attention_parts(
+@dataclass(frozen=True)
+class Notice:
+    """One thing the attention lines name (:func:`attention_notices`)."""
+
+    variants: tuple[str, ...]      # longest first, without the leading "! "
+    tone: Tone = "warn"            # "crit" (red) or "warn" (amber)
+    alarm: bool = True             # "! " in front: something for you to do
+    tail: tuple[str, ...] = ()     # the words after another note on its line
+
+    @property
+    def tails(self) -> tuple[str, ...]:
+        return self.tail or self.variants
+
+
+def _version_step(previous: str | None, version: str | None) -> str:
+    """``claude 2.1.3→2.1.4`` (``claude 2.1.4``, ``claude``)."""
+    if previous and version:
+        return f"claude {previous}→{version}"
+    return f"claude {version}" if version else "claude"
+
+
+def guard_notice(guard, now: float) -> Notice:
+    """Priming paused (``prime_verify.PausedView``; a bare note string is
+    quoted as it is), worded for every width with its remedy kept: killed
+    by the OS points at ``cc-swap doctor``, a version only you can verify at
+    ``cc-swap prime verify``. A pause the engine lifts by itself (an update
+    settling, a version it re-verifies) is amber with no ``!``."""
+    if isinstance(guard, str):
+        return Notice((f"priming {guard}",))
+    kind, version = guard.kind, guard.version
+    this = _version_step(None, version)
+    if kind == "killed":
+        by = guard.system
+        return Notice((
+            f"{this} killed by {by} at launch — priming paused (cc-swap doctor shows the fix)",
+            f"{this} killed by {by} — priming paused (fix: cc-swap doctor)",
+            f"cc-swap doctor: {this} killed by {by}, priming paused",
+            "cc-swap doctor: claude killed, priming paused",
+        ))
+    if kind == "settle":
+        left = eta_text(max(guard.until - now, 0.0) / 60.0) if guard.until else "a few minutes"
+        return Notice((
+            f"priming paused: waiting for the claude update to settle ({left} left, "
+            "resumes by itself)",
+            f"priming paused: claude update settling, {left} left, resumes by itself",
+            f"priming paused: {left} left, resumes by itself",
+            f"priming paused: {left} left",
+        ), alarm=False)
+    step = _version_step(guard.previous, version)
+    if kind == "changed" and guard.auto:
+        return Notice((
+            f"priming paused: {step}, the engine re-verifies it on its own "
+            "(or cc-swap prime verify)",
+            f"priming paused: {step}, re-verifying on its own",
+            f"priming paused: {this}, re-verifying on its own",
+            "priming paused: re-verifying on its own",
+        ), alarm=False)
+    if kind == "changed":
+        return Notice((
+            f"priming paused: {step} not verified yet — run cc-swap prime verify",
+            f"priming paused: {step} — run cc-swap prime verify",
+            "priming paused: run cc-swap prime verify",
+            "run cc-swap prime verify",
+        ))
+    if kind == "failed" and guard.auto:
+        return Notice((
+            f"priming paused: prime verify failed for {this}, the engine retries it on "
+            "its own (or cc-swap prime verify)",
+            f"priming paused: verify of {this} failed, retrying on its own",
+            "priming paused: verify failed, retrying on its own",
+            "priming paused: retrying on its own",
+        ), alarm=False)
+    if kind == "failed":
+        return Notice((
+            f"priming paused: prime verify failed for {this} — run cc-swap prime verify",
+            "priming paused: verify failed — run cc-swap prime verify",
+            "priming paused: run cc-swap prime verify",
+            "run cc-swap prime verify",
+        ))
+    return Notice((f"priming {guard.note}",), alarm=not guard.auto)
+
+
+def attention_notices(
     rows: Sequence[fx.FleetRow],
     *,
     now: float,
-    prime_guard: str | None = None,
+    prime_guard=None,
     priming: bool = False,
     linger_off: bool = False,
-) -> tuple[list[str], Tone] | None:
-    """The attention line's parts, most important first (the widget keeps
-    as many as fit), and its tone: red for a dead login or one inside its
-    last day, amber otherwise. None when nothing needs you.
+    relogin_paused: bool = False,
+) -> list[Notice]:
+    """What the attention lines name, most important first: a dead login
+    (red), priming paused, logins that end within a week (red inside the
+    last day), a locked keychain, a Linux service that stops at logout.
+    Empty when nothing needs you.
 
-    ``prime_guard`` (``prime_verify.paused_note``) is named only while
-    priming would otherwise run (``priming``)."""
+    ``prime_guard`` (``prime_verify.PausedView``, or its note) is named
+    only while priming would otherwise run (``priming``).
+    ``relogin_paused``: a re-login is under way (switching is paused for
+    it), so the notes do not ask for one (``select it, press r``)."""
+    out: list[Notice] = []
     dead = [r for r in rows if r.login == "relogin"]
     due = sorted(
         (r for r in rows if fx.login_due(r, now)),
         key=lambda r: fx.login_left(r, now) or 0.0,
     )
-    parts: list[str] = []
+    press = () if relogin_paused else (" — select it, press r",)
     if dead:
         r = dead[0]
         more = f" (+{len(dead) - 1} more)" if len(dead) > 1 else ""
-        parts.append(f"! #{r.number} {r.name} needs re-login{more} — select it, press r")
+        words = f"#{r.number} {r.name} needs re-login{more}"
+        out.append(Notice(
+            tuple(words + p for p in press) + (words,), tone="crit", tail=(words,),
+        ))
+    if prime_guard and priming:
+        out.append(guard_notice(prime_guard, now))
     for r in due:
         left = fx.login_left(r, now) or 0.0
         when = "has expired" if left <= 0 else f"ends in {oauth.login_countdown(left)}"
-        if parts:
-            parts.append(f"#{r.number} {r.name} login {when}")
-        else:
-            parts.append(f"! #{r.number} {r.name} login {when} — select it, press r")
-    if prime_guard and priming:
-        guard = f"priming {prime_guard}"
-        parts.append(guard if parts else f"! {guard}")
+        words = f"#{r.number} {r.name} login {when}"
+        out.append(Notice(
+            tuple(words + p for p in press) + (words,),
+            tone="crit" if left < fx.LOGIN_URGENT_S else "warn", tail=(words,),
+        ))
+    locked = [r for r in rows if r.login == "keychain"]
+    if locked:
+        r = locked[0]
+        more = f" (+{len(locked) - 1} more)" if len(locked) > 1 else ""
+        short = (
+            f"#{r.number} keychain locked{more} — unlock it, press f",
+            f"#{r.number} keychain locked{more} (f)",
+        )
+        out.append(Notice(
+            (f"#{r.number} {r.name} keychain locked{more} — unlock it, press f", *short),
+            tail=short,
+        ))
     if linger_off:
-        note = "the service stops at logout (loginctl enable-linger $USER)"
-        parts.append(note if parts else f"! {note}")
-    if not parts:
-        return None
-    urgent = any((fx.login_left(r, now) or 0.0) < fx.LOGIN_URGENT_S for r in due)
-    return parts, "crit" if dead or urgent else "warn"
+        out.append(Notice((
+            "the service stops at logout (loginctl enable-linger $USER)",
+            "service stops at logout: loginctl enable-linger $USER",
+        )))
+    return out
 
 
-def attention_line(parts: Sequence[str], width: int) -> str:
-    """The first part (cut to ``width``), then as many more as fit."""
-    text = fx.clip(parts[0], width) if parts else ""
-    for extra in parts[1:]:
-        if len(text) + 3 + len(extra) <= width:
+_SEVERITY = {"warn": 0, "crit": 1}
+
+
+def _first_fit(options: Sequence[str], room: int) -> str | None:
+    return next((o for o in options if cells(o) <= room), None)
+
+
+def _attention_line(group: Sequence[Notice], width: int) -> tuple[str, Tone]:
+    """One line: the first note (its longest wording that fits, else its
+    shortest cut to fit), then as many of the others as fit after it; red
+    when any note on it is, ``!`` when any asks for something."""
+    room = width - (2 if any(n.alarm for n in group) else 0)
+    head, *rest = group
+    text = _first_fit(head.variants, room) or fx.clip(head.variants[-1], max(room, 1))
+    shown = [head]
+    for notice in rest:
+        extra = _first_fit(notice.tails, room - cells(text) - 3)
+        if extra is not None:
             text += " · " + extra
-    return text
+            shown.append(notice)
+    tone = max((n.tone for n in shown), key=lambda t: _SEVERITY.get(t, 0))
+    return ("! " if any(n.alarm for n in shown) else "") + text, tone
+
+
+def attention_lines(
+    notices: Sequence[Notice], width: int, lines: int = 1
+) -> list[tuple[str, Tone]]:
+    """The notes laid out in at most ``lines`` lines of ``width`` cells,
+    each ``(text, tone)``: all on one line when their longest wordings fit
+    there, else one line each (the longest wording that fits), the last
+    line taking the rest when there are more notes than lines."""
+    if not notices:
+        return []
+    lines = max(lines, 1)
+    alarm = "! " if any(n.alarm for n in notices) else ""
+    whole = alarm + " · ".join([notices[0].variants[0], *(n.tails[0] for n in notices[1:])])
+    if cells(whole) <= width:
+        return [_attention_line(notices, width)]
+    if len(notices) <= lines:
+        return [_attention_line([n], width) for n in notices]
+    head = [_attention_line([n], width) for n in notices[: lines - 1]]
+    return head + [_attention_line(notices[lines - 1:], width)]
+
+
+def attention_want(notices: Sequence[Notice], width: int) -> int:
+    """How many lines the notes would like (at most :data:`MAX_ATTENTION`)."""
+    return len(attention_lines(notices, width, MAX_ATTENTION))
 
 
 # -- the footer ----------------------------------------------------------------------------
@@ -1163,18 +1448,25 @@ KEY_HINTS: tuple[tuple[str, str], ...] = (
     ("enter", "switch"), ("r", "re-login"), ("l", "last resort"), ("h", "hold"),
     ("m", "menu"), ("?", "help"), ("q", "quit"),
 )
+#: The footer while no account is managed yet: the account keys would do
+#: nothing, ``a`` adds the login claude has now.
+EMPTY_KEY_HINTS: tuple[tuple[str, str], ...] = (
+    ("a", "add"), ("m", "menu"), ("?", "help"), ("q", "quit"),
+)
 
 
-def key_hints(width: int) -> list[tuple[str, str]]:
+def key_hints(width: int, *, empty: bool = False) -> list[tuple[str, str]]:
     """The footer's ``(key, what)`` pairs: every word when it fits
     (``enter switch · r re-login · …``), else the keys with only menu, help
-    and quit spelled out, else the keys alone."""
+    and quit spelled out, else the keys alone. ``empty``: no account yet
+    (:data:`EMPTY_KEY_HINTS`)."""
     def text(pairs) -> str:
         return " · ".join(f"{k} {w}" if w else k for k, w in pairs)
 
-    if len(text(KEY_HINTS)) <= width:
-        return list(KEY_HINTS)
-    short = [(k, w if k in ("m", "?", "q") else "") for k, w in KEY_HINTS]
+    hints = EMPTY_KEY_HINTS if empty else KEY_HINTS
+    if len(text(hints)) <= width:
+        return list(hints)
+    short = [(k, w if k in ("a", "m", "?", "q") else "") for k, w in hints]
     if len(text(short)) <= width:
         return short
-    return [(k, "") for k, _w in KEY_HINTS]
+    return [(k, "") for k, _w in hints]

@@ -94,12 +94,26 @@ class TestGate:
         assert prime_guard(tmp_path) is None
         pv.record_verified(tmp_path, "2.1.3", by=pv.VERIFIED_BY_CLI)
         pv.current_version(tmp_path, _claude(tmp_path), reader=Reader("2.1.4"))
-        note = prime_guard(tmp_path)
-        parts, tone = home.attention_parts([], now=0.0, prime_guard=note, priming=True)
-        assert parts == [
-            "! priming paused: claude 2.1.3 -> 2.1.4 (the engine re-verifies it; or cc-swap prime verify)"
+        guard = prime_guard(tmp_path)
+        assert (guard.kind, guard.previous, guard.version, guard.auto) == (
+            "changed", "2.1.3", "2.1.4", True,
+        )
+        assert guard.note == pv.paused_note(tmp_path)
+        notices = home.attention_notices([], now=0.0, prime_guard=guard, priming=True)
+        # The engine lifts it by itself: amber, no "!", at every width.
+        assert home.attention_lines(notices, 117) == [(
+            "priming paused: claude 2.1.3→2.1.4, the engine re-verifies it on its own "
+            "(or cc-swap prime verify)", "warn",
+        )]
+        assert home.attention_lines(notices, 77) == [
+            ("priming paused: claude 2.1.3→2.1.4, re-verifying on its own", "warn"),
         ]
-        assert tone == "warn"
+        # With prime.autoVerify off only you can lift it: "!" and the command.
+        manual = pv.paused_view(tmp_path, auto_verify=False)
+        lines = home.attention_lines(
+            home.attention_notices([], now=0.0, prime_guard=manual, priming=True), 50,
+        )
+        assert lines == [("! priming paused: run cc-swap prime verify", "warn")]
 
     def test_an_unreadable_version_pauses_once_a_version_was_verified(self, tmp_path):
         pv.record_verified(tmp_path, "2.1.3", by=pv.VERIFIED_BY_CLI)

@@ -191,7 +191,8 @@ def table_row(row: fx.FleetRow, mark: str, plan: home.TablePlan, ctx: Ctx) -> Te
             cell = _resets_cell(row, "5h" if key == "reset5" else "7d", plan, ctx)
         else:
             status = ctx.status(row)
-            cell = Text(status[0], style=tone_style(status[1], p)) if status else Text()
+            cell = (Text(plan.status_text(status[0]), style=tone_style(status[1], p))
+                    if status else Text())
         line.append(pad_to(cell, width))
     return pad_to(line, plan.room)
 
@@ -420,18 +421,24 @@ def summary_text(cap: home.Capacity, width: int, now: float, palette: Palette) -
     return line
 
 
-def attention_text(parts: Sequence[str], tone: str, width: int, palette: Palette) -> Text:
-    return Text(
-        home.attention_line(parts, width), style=f"bold {tone_style(tone, palette)}",
-        no_wrap=True, overflow="ellipsis",
-    )
+def attention_text(
+    notices: Sequence[home.Notice], width: int, lines: int, palette: Palette
+) -> Text:
+    """The attention notes in at most ``lines`` lines (``home.attention_lines``),
+    each in its own colour."""
+    text = Text(no_wrap=True, overflow="ellipsis")
+    for i, (line, tone) in enumerate(home.attention_lines(notices, width, lines)):
+        if i:
+            text.append("\n")
+        text.append(line, style=f"bold {tone_style(tone, palette)}")
+    return text
 
 
-def keys_text(width: int, palette: Palette) -> Text:
+def keys_text(width: int, palette: Palette, *, empty: bool = False) -> Text:
     """``enter switch · r re-login · l last resort · h hold · m menu · ? help
-    · q quit``."""
+    · q quit`` (``a add · m menu · ? help · q quit`` with no account yet)."""
     keys = Text(no_wrap=True, overflow="ellipsis")
-    for i, (key, what) in enumerate(home.key_hints(width)):
+    for i, (key, what) in enumerate(home.key_hints(width, empty=empty)):
         if i:
             keys.append(" · ", style=palette.muted)
         keys.append(key, style=f"bold {palette.accent}")

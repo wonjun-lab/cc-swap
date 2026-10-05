@@ -15,6 +15,7 @@ from claude_swap.maximize import fleet as fx
 from claude_swap.maximize import hold as account_hold
 from claude_swap.maximize import home, policy
 from claude_swap.maximize.model import Forecast, QuietWindow, Sample
+from claude_swap.maximize.prime_verify import PausedView
 from claude_swap.maximize.view import MaximizeState, window_ticks
 from claude_swap.settings import MaximizeSettings
 from claude_swap.tui import fleet_render as render
@@ -345,22 +346,59 @@ def test_tags_follow_their_priority():
     for row, is_next, expected in cases:
         assert home.tag_for(row, is_next=is_next, now=NOW) == expected, (row, is_next)
     assert home.tag_for(replace(base, state5="running"), is_next=False, now=NOW) is None
-    assert home.TAG_PRIORITY[0] == "active" and home.TAG_PRIORITY[-1] == "5h off"
+    assert home.TAG_PRIORITY[0] == "active" and home.TAG_PRIORITY[-1] == "prime"
 
 
 def test_cold_tag_shows_the_prime_time_only_while_priming_runs():
     row = _by(_fleet()[3])["2"]  # cold, due now
     assert row.prime.kind == "due"
     text, tone = home.tag_for(row, is_next=False, now=NOW)
-    assert text.startswith("5h off · prime ") and tone == "dim"
+    assert text.startswith("prime ") and tone == "dim"
     assert home.tag_for(row, is_next=False, now=NOW, priming=False) == ("5h off", "dim")
     late = replace(row, prime=fx.PrimeCell("due", NOW - 120, NOW - 60, ""))
-    assert home.tag_for(late, is_next=False, now=NOW) == ("5h off · prime now", "dim")
+    assert home.tag_for(late, is_next=False, now=NOW) == ("prime now", "dim")
     window = replace(row, prime=fx.PrimeCell("window", NOW + H, NOW + H + 60, ""))
-    assert home.tag_for(window, is_next=False, now=NOW)[0] == f"5h off · prime {fx.hhmm(NOW + H)}"
+    assert home.tag_for(window, is_next=False, now=NOW)[0] == f"prime {fx.hhmm(NOW + H)}"
     # No window to speak of: an API key, a login cc-swap cannot read.
-    for login in ("api", "keychain", "foreign", "expired"):
+    for login in ("api", "foreign", "expired"):
         assert home.tag_for(replace(row, login=login), is_next=False, now=NOW) is None
+
+
+def test_a_locked_keychain_and_an_old_reading_get_a_tag():
+    row = replace(_by(_fleet()[3])["2"], state5="running")
+    assert home.tag_for(replace(row, login="keychain"), is_next=True, now=NOW) == (
+        "keychain locked (f)", "warn",
+    )
+    old = replace(row, stale=True, fetched_at=NOW - 25 * 60)
+    assert home.tag_for(old, is_next=False, now=NOW) == ("reading 25m old", "dim")
+    older = replace(row, stale=True, fetched_at=NOW - 2 * H)
+    assert home.tag_for(older, is_next=False, now=NOW) == ("reading 2h old", "warn")
+    # A few minutes behind is the usual cadence: no tag.
+    assert home.tag_for(replace(row, stale=True, fetched_at=NOW - 6 * 60),
+                        is_next=False, now=NOW) is None
+    # Where switching goes next still says so.
+    assert home.tag_for(older, is_next=True, now=NOW) == ("next", "accent")
+
+
+def test_the_status_column_gives_way_before_a_name_is_cut():
+    """80 columns, the audit's six names and a locked keychain: the status
+    column takes the shorter wording of the tags that are too wide, so no
+    name is cut."""
+    needs = replace(NEEDS, name=18, status=19, status_short=12)
+    plan = home.table_plan(80, 24, needs)
+    assert plan.width("account") == 18 + 3 and plan.short_status
+    assert plan.width("status") < 19
+    assert plan.status_text("keychain locked (f)") == "keychain (f)"
+    assert plan.status_text("login 1d left") == "login 1d left"   # it fits as it is
+    assert plan.status_text("reading 2h old") == "reading 2h old"
+    # Room for everything: the full wording.
+    wide = home.table_plan(160, 40, needs)
+    assert not wide.short_status and wide.status_text("keychain locked (f)") == (
+        "keychain locked (f)"
+    )
+    assert home.short_status("login 1d left") == "login 1d"
+    assert home.short_status("reading 2h old") == "2h old"
+    assert home.short_status("prime 19:30") == "prime 19:30"
 
 
 # -- situation ---------------------------------------------------------------------------------
@@ -434,7 +472,10 @@ def test_dry_run_says_would():
 @pytest.mark.parametrize(("sit", "es", "first"), [
     ("auto-off", replace(SERVICE, auto_off=True),
      "Auto OFF — nothing switches automatically (m to turn on)"),
-    ("no-engine", NONE, "Not switching — no engine is running (m to start one)"),
+    ("no-engine", NONE,
+     "Not switching — no engine is running (cc-swap service install starts one)"),
+    ("no-engine", replace(NONE, service={"installed": True, "running": False}),
+     "Not switching — the service is stopped (cc-swap service install starts it)"),
 ])
 def test_off_sentences(sit, es, first):
     dv = replace(_pending(), kind="off") if sit == "auto-off" else _pending()
@@ -453,6 +494,39 @@ def test_stale_sentence_says_since_when_and_claims_nothing():
     assert all("switch to" not in _plain(v) for v in variants)
 
 
+def test_a_silent_service_says_what_restarts_it():
+    dv = replace(_pending(), source="computed")
+    variants = _sentence(SERVICE, dv, "stale", published_at=NOW - 40 * 60)
+    texts = [_plain(v) for v in variants]
+    assert texts[0].endswith(" · cc-swap service install restarts it")
+    # 80 columns keep the remedy.
+    at80 = _plain(home.fit_variant(variants, home.text_width(80)))
+    assert at80 == f"Auto ON · engine silent since {fx.hhmm(NOW - 2400)} · cc-swap service " \
+        "install restarts it"
+    # Another process's engine: the service would not restart it.
+    other = [_plain(v) for v in _sentence(OTHER, dv, "stale", published_at=NOW - 40 * 60)]
+    assert not any("service install" in t for t in other)
+
+
+def test_no_engine_points_at_the_service_not_at_an_engine_in_this_tui():
+    stopped = replace(NONE, service={"installed": True, "running": False})
+    variants = _sentence(stopped, _pending(), "no-engine")
+    assert all("m to start" not in _plain(v) for v in variants)
+    assert _plain(home.fit_variant(variants, home.text_width(80))) == (
+        "Not switching — the service is stopped (cc-swap service install starts it)"
+    )
+    facts = "\n".join(fx.mode_facts(stopped))
+    assert "To start it: cc-swap service install" in facts
+
+
+def test_with_no_account_the_sentence_and_footer_say_how_to_add_one():
+    first = _plain(home.empty_variants()[0])
+    assert first == "No accounts yet — log in with claude, then press a, or run cc-swap add"
+    assert len(first) <= home.text_width(80)
+    assert home.key_hints(120, empty=True) == [("a", "add"), ("m", "menu"), ("?", "help"),
+                                               ("q", "quit")]
+
+
 def test_waiting_sentence_claims_no_decision():
     variants = _sentence(OTHER, replace(_pending(), source="computed"), "waiting")
     assert _plain(variants[0]) == "Auto ON · using #1 main · waiting for the engine's next check"
@@ -462,7 +536,7 @@ def test_waiting_sentence_claims_no_decision():
 def test_paused_sentence():
     dv = fx.DecisionView("paused", "1", None, None, "relogin", at=NOW + 300)
     first = _plain(_sentence(SERVICE, dv, "paused")[0])
-    assert first == f"Paused · re-login in progress — nothing switches until {fx.hhmm(NOW + 300)}"
+    assert first == "Paused · re-login in progress — nothing switches for 5m"
 
 
 def test_hold_sentences_tell_all_fine_from_stuck_past_soft():
@@ -661,7 +735,16 @@ def test_status_line_keeps_the_note_when_there_is_room():
     assert note == "viewer · service pid 4121 is switching"
 
 
-# -- the attention line -----------------------------------------------------------------------------
+# -- the attention lines ----------------------------------------------------------------------------
+
+KILLED = PausedView("killed", "paused: claude 2.1.4 is killed by the OS at launch (SIGKILL; see "
+                    "cc-swap doctor)", True, version="2.1.4", system="macOS")
+#: 80 columns lay text out in 77.
+W80 = home.text_width(80)
+
+
+def _attention(rows, width, lines=home.MAX_ATTENTION, **kw):
+    return home.attention_lines(home.attention_notices(rows, now=NOW, **kw), width, lines)
 
 
 def test_attention_names_dead_logins_first_then_expiring_ones():
@@ -669,27 +752,108 @@ def test_attention_names_dead_logins_first_then_expiring_ones():
     by = _by(rows)
     rows = [replace(by["4"], login_deadline=NOW + 28 * H) if r.number == "4" else r
             for r in rows]
-    parts, tone = home.attention_parts(rows, now=NOW)
-    assert parts[0] == "! #3 old needs re-login — select it, press r"
-    assert parts[1] == "#4 work login ends in 1d 4h"
-    assert tone == "crit"
-    assert home.attention_line(parts, 200) == " · ".join(parts)
-    assert home.attention_line(parts, 50) == parts[0]
-    assert len(home.attention_line(parts, 30)) == 30
+    dead = "! #3 old needs re-login — select it, press r"
+    # Wide: both on one line, red (a dead login).
+    assert _attention(rows, 200) == [(f"{dead} · #4 work login ends in 1d 4h", "crit")]
+    # Narrower: a line each, every one saying what to do, each in its own colour.
+    assert _attention(rows, 60) == [
+        (dead, "crit"), ("! #4 work login ends in 1d 4h — select it, press r", "warn"),
+    ]
+    # One line only: the dead login, and the other when it fits after it.
+    assert _attention(rows, 60, lines=1) == [(dead, "crit")]
+    assert _attention(rows, 30, lines=1) == [("! #3 old needs re-login", "crit")]
+    assert _attention(rows, 20, lines=1) == [("! " + fx.clip("#3 old needs re-login", 18),
+                                              "crit")]
 
 
 def test_attention_tone_and_extra_parts():
     rows = [r for r in _fleet()[3] if r.login != "relogin"]
-    assert home.attention_parts(rows, now=NOW) is None
+    assert home.attention_notices(rows, now=NOW) == []
     soon = [replace(rows[1], login_deadline=NOW + 3 * DAY)]
-    parts, tone = home.attention_parts(soon, now=NOW)
-    assert parts == ["! #2 side login ends in 3d 0h — select it, press r"] and tone == "warn"
+    assert _attention(soon, 200) == [("! #2 side login ends in 3d 0h — select it, press r",
+                                      "warn")]
     guard = "paused: claude 2.1.3 -> 2.1.4 (cc-swap prime verify)"
-    assert home.attention_parts(rows, now=NOW, prime_guard=guard, priming=False) is None
-    parts, tone = home.attention_parts(rows, now=NOW, prime_guard=guard, priming=True)
-    assert parts == [f"! priming {guard}"] and tone == "warn"
-    parts, _ = home.attention_parts(rows, now=NOW, linger_off=True)
-    assert "loginctl enable-linger" in parts[0]
+    assert home.attention_notices(rows, now=NOW, prime_guard=guard, priming=False) == []
+    assert _attention(rows, 200, prime_guard=guard, priming=True) == [
+        (f"! priming {guard}", "warn"),
+    ]
+    (line, _tone), = _attention(rows, 200, linger_off=True)
+    assert "loginctl enable-linger" in line
+
+
+def test_a_killed_claude_comes_right_after_a_dead_login_and_keeps_its_remedy():
+    """The note used to follow every login item on one line and be dropped:
+    it now comes second, and every wording names cc-swap doctor."""
+    rows = _fleet()[3]
+    by = _by(rows)
+    rows = [replace(by["4"], login_deadline=NOW + 28 * H) if r.number == "4" else r
+            for r in rows]
+    lines = _attention(rows, W80, prime_guard=KILLED, priming=True)
+    assert [t for t, _ in lines] == [
+        "! #3 old needs re-login — select it, press r",
+        "! claude 2.1.4 killed by macOS — priming paused (fix: cc-swap doctor)",
+        "! #4 work login ends in 1d 4h — select it, press r",
+    ]
+    assert _attention(rows, 117, prime_guard=KILLED, priming=True)[1][0] == (
+        "! claude 2.1.4 killed by macOS at launch — priming paused (cc-swap doctor shows the fix)"
+    )
+    notice = home.guard_notice(KILLED, NOW)
+    assert notice.alarm and all("cc-swap doctor" in v for v in notice.variants)
+    # Two lines: the rest share the second, as much as fits.
+    two = _attention(rows, W80, lines=2, prime_guard=KILLED, priming=True)
+    assert len(two) == 2 and "killed by macOS" in two[1][0]
+
+
+@pytest.mark.parametrize(("view", "width", "line", "alarm"), [
+    # The engine re-verifies it: amber, no "!".
+    (PausedView("changed", "n", True, version="2.1.4", previous="2.1.3"), W80,
+     "priming paused: claude 2.1.3→2.1.4, re-verifying on its own", False),
+    # Only you can: "!" and the command.
+    (PausedView("changed", "n", False, version="2.1.4", previous="2.1.3"), 117,
+     "! priming paused: claude 2.1.3→2.1.4 not verified yet — run cc-swap prime verify", True),
+    (PausedView("changed", "n", False, version="2.1.4", previous="2.1.3"), W80,
+     "! priming paused: claude 2.1.3→2.1.4 — run cc-swap prime verify", True),
+    (PausedView("changed", "n", False, version="2.1.4", previous="2.1.3"), 45,
+     "! priming paused: run cc-swap prime verify", True),
+    (PausedView("failed", "n", False, version="2.1.4"), 60,
+     "! priming paused: verify failed — run cc-swap prime verify", True),
+    (PausedView("failed", "n", True, version="2.1.4"), W80,
+     "priming paused: verify of claude 2.1.4 failed, retrying on its own", False),
+    # Settling: minutes, not seconds, and it resumes by itself.
+    (PausedView("settle", "n", True, until=NOW + 412), W80,
+     "priming paused: claude update settling, ~7m left, resumes by itself", False),
+])
+def test_priming_paused_is_worded_for_the_width(view, width, line, alarm):
+    (text, tone), = _attention([], width, prime_guard=view, priming=True)
+    assert text == line and tone == "warn"
+    assert home.guard_notice(view, NOW).alarm is alarm
+
+
+def test_a_relogin_pause_does_not_ask_for_a_relogin():
+    rows = _fleet()[3]
+    (line, _tone), = _attention(rows, 200, relogin_paused=True)
+    assert line == "! #3 old needs re-login"
+
+
+def test_a_locked_keychain_says_how_to_unlock_it():
+    rows = [replace(r, login="keychain") if r.number == "2" else r
+            for r in _fleet()[3] if r.login != "relogin"]
+    assert _attention(rows, 200) == [("! #2 side keychain locked — unlock it, press f", "warn")]
+    assert _attention(rows, 42) == [("! #2 keychain locked — unlock it, press f", "warn")]
+
+
+def test_attention_lines_take_only_rows_the_table_leaves():
+    # 80x24 with six accounts and a six-line panel leaves five rows over.
+    plan = home.table_plan(80, 24, NEEDS, attention=3, summary=True)
+    assert plan.attention == 3 and plan.detail and plan.summary
+    # Short: the rows and the panel keep theirs; one line only.
+    plan = home.table_plan(80, 16, NEEDS, attention=3, summary=True)
+    assert plan.detail and (plan.attention, plan.summary) == (1, False)
+    # One row over: a second line, which comes before the summary.
+    plan = home.table_plan(80, 17, NEEDS, attention=3, summary=True)
+    assert plan.detail and (plan.attention, plan.summary) == (2, False)
+    assert home.table_plan(80, 24, NEEDS, attention=False).attention == 0
+    assert home.table_plan(80, 24, NEEDS, attention=True).attention == 1
 
 
 # -- footer --------------------------------------------------------------------------------------------
@@ -817,7 +981,7 @@ def test_the_account_cell_cuts_the_name_but_keeps_the_slot():
                                                          now=NOW)]
     ctx = render.Ctx(P, window_ticks(MX), NOW)
     statuses = {r.number: ctx.status(r) for r in rows}
-    for width, whole in ((160, True), (80, False)):
+    for width, whole in ((160, True), (75, False)):
         plan = home.table_plan(width, 40, home.table_needs(rows, statuses, now=NOW))
         cells = [_cell(plan, line, "account")
                  for line in render.render_table(rows, plan, ctx, selected=None,
@@ -1050,7 +1214,21 @@ def test_capacity_counts_the_accounts_switching_can_use():
     assert cap.free5 == 2                          # 2 and 3 (8's week is spent)
     assert cap.back5 == (NOW + 1 * H, "4")         # 1 is back later, 8's week is spent
     assert cap.left7 == pytest.approx((60 + 80 + 70 + 50 + 1) / 100)
-    assert cap.next7 == NOW + 2 * DAY              # the dead/excluded/lapsed ones skipped
+    assert cap.next7 == (NOW + 2 * DAY, "2")       # the dead/excluded/lapsed ones skipped
+
+
+def test_the_account_named_back_is_one_switching_could_land_on():
+    """``next back`` follows the landing rule (both windows under soft less
+    the margin), not ``7d under hard``: an account whose week is past its
+    soft mark never comes back as a place to land."""
+    mx = replace(MX, soft_7d=80.0, hard_7d=98.0, landing_margin=5.0)
+    rows = [
+        _cap_row(1, 20, 10, active=True),
+        _cap_row(2, 70, 85, reset5=NOW + 0.5 * H, reset7=NOW + 3 * DAY),  # 7d past soft-5
+        _cap_row(3, 48, 30, reset5=NOW + 1.5 * H, reset7=NOW + 4 * DAY),  # 5h past soft-5
+    ]
+    cap = home.capacity(rows, mx, NOW)
+    assert cap.back5 == (NOW + 1.5 * H, "3")
 
 
 def test_capacity_with_nothing_to_count_is_none():
@@ -1060,20 +1238,21 @@ def test_capacity_with_nothing_to_count_is_none():
 
 def test_the_summary_line_and_how_it_gives_way():
     cap = home.capacity(CAP_ROWS, MX, NOW)
-    back = home.reset_clock(NOW + H, NOW, date=False)
-    week = home.reset_clock(NOW + 2 * DAY, NOW)
     variants = [_plain(v) for v in home.summary_variants(cap, NOW)]
+    # Countdowns, as the table's resets count; the 7d room goes first.
     assert variants == [
-        f"5h free: 2 accounts · next 5h back {back} (#4) · 7d left this week ≈ 2.6 accounts"
-        f" · next 7d reset {week}",
-        f"5h free: 2 accounts · next 5h back {back} (#4) · 7d left this week ≈ 2.6 accounts",
-        "5h free: 2 accounts · 7d left this week ≈ 2.6 accounts",
+        "5h free: 2 accounts · next back in 1h00m (#4) · 7d left this week ≈ 2.6 accounts"
+        " · next 7d in 2d00h (#2)",
+        "5h free: 2 accounts · next back in 1h00m (#4) · next 7d in 2d00h (#2)",
+        "5h free: 2 accounts · next back in 1h00m (#4)",
         "5h free: 2 accounts",
     ]
     for width in (200, 90, 70, 40, 15):
         line = render.summary_text(cap, width, NOW, P)
         assert line.cell_len <= width or width < len(variants[-1])
-    assert render.summary_text(cap, 70, NOW, P).plain == variants[2]
+    # 80 columns (77 to lay out in) keep both countdowns.
+    assert render.summary_text(cap, 77, NOW, P).plain == variants[1]
+    assert render.summary_text(cap, 60, NOW, P).plain == variants[2]
     assert render.summary_text(cap, 40, NOW, P).plain == variants[3]
 
 

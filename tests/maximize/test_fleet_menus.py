@@ -116,7 +116,8 @@ def test_help_explains_the_jargon_and_lists_every_key():
     text = "\n".join(f"{t} {w}" for t, w in entries)
     for term in ("soft mark", "hard mark", "next", "last resort", "pace / score", "priming",
                  "viewer / lease", "landable", "dry run", "● active", "re-login (r)",
-                 "excluded", "5h off · prime"):
+                 "excluded", "prime 19:30", "keychain locked (f)", "reading 2h old",
+                 "! lines"):
         assert term in terms, term
     for key in (*menus.HOME_KEYS, *menus.SHORTCUT_KEYS, "w", "ctrl+f", "ctrl+t"):
         assert key in text, key
