@@ -50,6 +50,7 @@ from claude_swap.credentials import (  # noqa: F401  (constants re-exported for 
     SECURITY_SERVICE,
     ActiveCredentials,
     CredentialStore,
+    holds_only_shared_fields,
     looks_like_api_key,
     merge_shared_credential_fields,
     shared_credential_fields,
@@ -2129,7 +2130,9 @@ class ClaudeAccountSwitcher:
                 return False, f"{KEYCHAIN_REFUSAL}; retry in a GUI terminal"
             if live is None:
                 return False, f"#{num}'s live login could not be read"
-            if not live or looks_like_api_key(live):
+            if not live or looks_like_api_key(live) or holds_only_shared_fields(live):
+                # cc-swap: no login to back up (an MCP-only live credential
+                # included — Claude Code's Keychain-unavailable fallback).
                 return True, ""
             live_fp = oauth.credential_fingerprint(live)
             backup = self._read_account_credentials(num, email)
@@ -7358,6 +7361,10 @@ class ClaudeAccountSwitcher:
           ``"unresolved"`` and the fail-open backup copied the empty tokens
           over the slot's only surviving refresh token. Never written into
           any slot; nothing worth preserving either.
+        - ``"no-login"``       — (cc-swap) a credential object with only the
+          machine-shared fields (``mcpOAuth`` …) and no ``claudeAiOauth``:
+          Claude Code's fallback file while the Keychain was unavailable.
+          No login to capture; config backup only.
         - ``"alien"``          — a *structurally complete* identity (uuid +
           email + organization) that matches no managed slot (unmanaged
           login, recycled email wearing a managed address, or an email+org
@@ -7394,6 +7401,13 @@ class ClaudeAccountSwitcher:
             live_oauth.get("accessToken") or live_oauth.get("refreshToken")
         ):
             return ("wiped", None)
+        if holds_only_shared_fields(original_creds):
+            # cc-swap: only MCP logins, no Claude login (Claude Code's
+            # fallback file while the Keychain was unavailable). It would
+            # otherwise fall to "unresolved" and its fail-open backup would
+            # write it over the slot's login. Its MCP state composes into
+            # the activated login as usual.
+            return ("no-login", None)
         resolved = provenance.get("resolved")
         if resolved is None or provenance.get("live") != original_creds:
             if self._probe_verdicts.get(
@@ -7787,7 +7801,12 @@ class ClaudeAccountSwitcher:
                 # login actually being the fresher generation. A failed stash
                 # aborts, except under --force where the user explicitly
                 # asked for the overwrite.
-                if rollback_creds and rollback_creds != target_creds:
+                if (
+                    rollback_creds and rollback_creds != target_creds
+                    # cc-swap: MCP logins only — no login to keep; they
+                    # compose into the activated login below.
+                    and not holds_only_shared_fields(rollback_creds)
+                ):
                     try:
                         self._stash_live_credential(
                             rollback_creds,
@@ -8029,6 +8048,16 @@ class ClaudeAccountSwitcher:
                         warning(msg)
                     else:
                         warnings_out.append(msg)
+                elif kind == "no-login":
+                    # cc-swap: the live credential holds only MCP logins —
+                    # nothing of this slot's to capture. Config backup only.
+                    self._write_account_config(
+                        current_account, current_email, original_config
+                    )
+                    self._logger.info(
+                        f"Backed up account {current_account} (config only; the "
+                        "live credential holds no Claude login, only MCP logins)"
+                    )
                 elif kind == "wiped":
                     # Claude Code emptied the live token fields in place
                     # (its invalid_grant reaction). The blob carries nothing

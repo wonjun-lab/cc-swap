@@ -174,6 +174,49 @@ def test_plaintext_fallback_while_keychain_is_locked_is_info(world):
     assert find(findings, "plaintext", "info")
 
 
+#: What Claude Code writes to ~/.claude/.credentials.json while the Keychain is
+#: unavailable: its MCP OAuth tokens only, no claudeAiOauth.
+MCP_ONLY = json.dumps({"mcpOAuth": {"srv|abc": {
+    "serverName": "srv", "accessToken": "mcp-SECRET-at", "refreshToken": "mcp-SECRET-rt",
+}}})
+
+
+def test_an_mcp_only_plaintext_file_is_no_stale_login(world):
+    world.healthy()
+    world.cred_file().write_text(MCP_ONLY)
+    findings = run(world)
+    assert not find(findings, "plaintext", "warn") and not find(findings, "plaintext", "error")
+    [f] = find(findings, "plaintext", "info")
+    assert "holds only MCP logins" in f.detail and "differs" not in f.detail
+    assert "rt " not in f.detail
+    assert problems(findings) == []
+
+
+def test_an_mcp_only_plaintext_file_is_no_login_when_the_keychain_has_none(world):
+    world.accounts(1, 2, active=1)
+    world.login(1, keychain_rc=44, plaintext=MCP_ONLY)
+    findings = run(world)
+    # the Keychain has no login, and the file does not stand in for one
+    [f] = find(findings, "keychain", "error")
+    assert "rc=44" in f.detail
+    assert not find(findings, "live-login", "warn")
+    [p] = find(findings, "plaintext")
+    assert p.severity == "info" and "holds only MCP logins" in p.detail
+
+
+def test_an_mcp_only_file_on_linux_is_no_login(tmp_path):
+    world = World(tmp_path, platform="linux")
+    world.accounts(1, 2, active=1)
+    world.login(1, plaintext=MCP_ONLY)
+    [f] = find(run(world), "plaintext", "error")
+    assert "names an account but ~/.claude/.credentials.json holds only MCP logins" in f.detail
+    bare = World(tmp_path / "bare", platform="linux")
+    bare.accounts(1, 2)
+    bare.login(None, plaintext=MCP_ONLY)
+    [f] = find(run(bare), "plaintext", "warn")
+    assert f.detail.startswith("no live login")
+
+
 def test_linux_credentials_file_readable_by_others(tmp_path):
     world = World(tmp_path, platform="linux")
     world.healthy()

@@ -225,6 +225,24 @@ ACCOUNT_CREDENTIAL_KEYS = frozenset({
 })
 
 
+def holds_only_shared_fields(credentials: str | None) -> bool:
+    """Whether a credential object carries no Claude login, only the
+    machine-shared fields (``mcpOAuth`` …) — cc-swap fork.
+
+    Claude Code writes ``~/.claude/.credentials.json`` with just its MCP
+    OAuth tokens when the macOS Keychain is unavailable at that moment; the
+    login itself stays in the Keychain. Such a file is no login (no stale
+    one either): never identify, fingerprint, back up or export it as one.
+    Its shared fields still compose into an activated login as usual.
+    """
+    data = _credential_object(credentials)
+    return (
+        data is not None
+        and "claudeAiOauth" not in data
+        and any(key in data for key in SHARED_CREDENTIAL_KEYS)
+    )
+
+
 def shared_credential_fields(credentials: str | None) -> dict | None:
     """Return the machine-shared fields of a Claude OAuth credential object.
 
@@ -723,6 +741,12 @@ class CredentialStore:
                 # there is; hardcoding False made it render as "no credentials"
                 # and sent the user to a re-login that cannot help.
                 return ActiveCredentials(None, keychain_failed, keychain_failed)
+            if keychain_failed and holds_only_shared_fields(text):
+                # cc-swap: the fallback file holds only MCP logins (what
+                # Claude Code writes there while the Keychain is unavailable):
+                # it does not cover the unreadable login, so the read stays
+                # "keychain unavailable" instead of serving it as one.
+                text = ""
             if text.strip():
                 return ActiveCredentials(text, False, keychain_failed)
 
@@ -1116,6 +1140,12 @@ class CredentialStore:
         if not cred_file.exists():
             return
         try:
+            # cc-swap: a file holding only MCP logins (Claude Code wrote it
+            # while the Keychain was unavailable) must not gain a plaintext
+            # copy of the login; its mtime is all a running session needs.
+            if holds_only_shared_fields(cred_file.read_text(encoding="utf-8")):
+                os.utime(cred_file)
+                return
             self._write_active_credentials_file(credentials)
         except Exception as e:
             self._host._logger.warning(

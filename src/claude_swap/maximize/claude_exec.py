@@ -34,6 +34,18 @@ now does four things:
    doctor`` print the fix. A new identity of that path, or any successful
    run of it, clears the mark. The engine never re-runs a killed identity.
 
+A kill of a ``claude`` cc-swap did NOT launch (the kernel's line in the
+unified log, a crash report — :mod:`codesign_watch`) never pauses anything by
+itself: on 2026-10-04 macOS killed 37 ``claude`` launched by another app
+(``ASP: Unable to apply provenance sandbox``) while ``claude --version`` ran
+fine from a shell. It is recorded as evidence (:func:`note_external_kill`,
+``external`` in the state file) and the engine runs its own bounded probe
+(:func:`probe_external`: ``claude --version`` through :func:`run`, a minute
+after the latest kill, at most once per :data:`PROBE_EVERY_S` per identity).
+A probe that runs records the success (old evidence can never mark the file
+again) and doctor says cc-swap's own launches work; a probe the OS kills
+takes the SIGKILL path above.
+
 Every child also gets ``DISABLE_AUTOUPDATER=1``: priming launches several
 ``claude`` right after each 5h reset, and each would otherwise start Claude
 Code's background updater against the shared install — racing on the very
@@ -84,6 +96,26 @@ KILL_GRACE_S = 5.0
 REMEMBER_MAX = 20
 #: ``cc-swap doctor`` still mentions a rewrite seen this recently.
 REWRITE_RECENT_S = 7 * 86400.0
+
+#: Kills of a ``claude`` cc-swap did not launch (:func:`note_external_kill`):
+#: the engine probes ``claude --version`` this long after the latest one (not
+#: during the episode), at the latest this long after the first one still
+#: unprobed, and at most once per :data:`PROBE_EVERY_S` per binary identity.
+PROBE_DELAY_S = 60.0
+PROBE_MAX_DEFER_S = 300.0
+PROBE_EVERY_S = 600.0
+PROBE_TIMEOUT_S = 30.0
+PROBE_CALLER = "external-kill probe"
+#: ``cc-swap doctor`` shows such kills this long (a warning for the first day).
+EXTERNAL_RECENT_S = 7 * 86400.0
+EXTERNAL_WARN_S = 86400.0
+#: Crash reports remembered per identity (each is counted once).
+EXTERNAL_REPORTS_MAX = 600
+#: 0.5.3 recorded kills seen outside cc-swap's runs as a killed mark with one
+#: of these callers; :func:`load_state` turns such a mark into evidence.
+LEGACY_EXTERNAL_CALLERS = frozenset({"log stream", "crash report"})
+#: A killed mark recorded by this version: a ``claude`` cc-swap launched.
+ORIGIN_CC_SWAP = "cc-swap"
 
 CODESIGN = "/usr/bin/codesign"
 XATTR = "/usr/bin/xattr"
@@ -341,7 +373,44 @@ def load_state(root: Path | None) -> dict[str, Any]:
         raw = json.loads((Path(root) / STATE_FILENAME).read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return {}
-    return raw if isinstance(raw, dict) else {}
+    if not isinstance(raw, dict):
+        return {}
+    _upgrade_legacy_external(raw)
+    return raw
+
+
+def _num(value: object) -> float | None:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    return float(value)
+
+
+def _upgrade_legacy_external(state: dict) -> None:
+    """A killed mark 0.5.3 set from a kill it only SAW (``log stream``, a
+    crash report) is evidence now, not a pause: it becomes the ``external``
+    entry with a probe due at once (:func:`probe_external`). In memory for
+    every reader; written by the next update of the state."""
+    killed = state.get("killed")
+    if not (
+        isinstance(killed, dict) and "origin" not in killed
+        and killed.get("caller") in LEGACY_EXTERNAL_CALLERS
+    ):
+        return
+    state.pop("killed", None)
+    ext = state.get("external")
+    if isinstance(ext, dict) and ext.get("identity") == killed.get("identity"):
+        return
+    first = _num(killed.get("at")) or 0.0
+    last = _num(killed.get("lastAt")) or first
+    state["external"] = {
+        "path": killed.get("path"), "real": killed.get("real"),
+        "identity": killed.get("identity"), "version": killed.get("version"),
+        "firstAt": first, "lastAt": last,
+        "sources": {str(killed.get("caller")): int(killed.get("count") or 1)},
+        "launchers": {}, "reports": [], "provenance": None,
+        "diagnostics": killed.get("diagnostics"), "upgraded": True,
+        "probe": None, "pendingSince": last, "probeDueAt": last,
+    }
 
 
 def _mutate(root: Path | None, fn: Callable[[dict], bool]) -> None:
@@ -519,6 +588,13 @@ def observe(root: Path | None, binary: Binary, *, now: float | None = None) -> N
             found["unkilled"] = killed
             state.pop("killed", None)
             changed = True
+        ext = state.get("external")
+        if (
+            isinstance(ext, dict) and _same_binary(ext, binary)
+            and ext.get("identity") != binary.identity
+        ):
+            state.pop("external", None)  # about an earlier file at this path
+            changed = True
         return changed
 
     try:
@@ -621,6 +697,7 @@ def _log_show(pid: int | None) -> str:
         'eventMessage CONTAINS "AMFI"',
         'eventMessage CONTAINS[c] "CODE SIGNING"',
         'sender == "AppleMobileFileIntegrity"',
+        'eventMessage CONTAINS "provenance sandbox"',
     ]
     if pid:
         clauses.insert(0, f"processID == {int(pid)}")
@@ -655,7 +732,16 @@ def write_kill_diagnostics(root: Path, record: Mapping[str, Any], binary: Binary
         ):
             rc, out, err = _tool(argv, TOOL_TIMEOUT_S)
             parts += ["", f"## {title} (rc {rc})", out.strip(), err.strip()]
-        parts += ["", "## log show --last 2m (claude / AMFI / CODE SIGNING)", _log_show(record.get("pid"))]
+        parts += [
+            "", "## log show --last 2m (claude / AMFI / CODE SIGNING / provenance sandbox)",
+            _log_show(record.get("pid")),
+        ]
+    ext = load_state(root).get("external")
+    if isinstance(ext, dict) and ext.get("identity") == binary.identity:
+        parts += [
+            "", "## kills of this file cc-swap did not launch (log stream, crash reports)",
+            json.dumps(ext, indent=2, sort_keys=True, default=str),
+        ]
     parts += ["", f"Fix (not applied): {fix_command(binary.real or binary.path)}", ""]
     try:
         Path(root).mkdir(parents=True, exist_ok=True)
@@ -698,6 +784,7 @@ def _on_killed(root: Path, record: dict, binary: Binary, now: float) -> None:
             "version": _known_version(root, binary), "at": now, "lastAt": now,
             "caller": record.get("caller"), "pid": record.get("pid"),
             "exit": record.get("exit"), "count": 1, "diagnostics": None,
+            "origin": ORIGIN_CC_SWAP,
         }
         first.append(True)
         return True
@@ -736,14 +823,15 @@ def mark_killed_by_os(
     detail: str,
     pid: int | None = None,
 ) -> bool:
-    """A kill seen outside cc-swap's own runs (``log stream``, a crash
-    report) — maybe of the user's ``claude`` — for the binary at
-    ``claude_path``: the same "killed by the OS" state as a SIGKILL of a
-    cc-swap run (priming paused, one notification per identity,
-    diagnostics). A kill older than the file's current ctime is about an
-    earlier file at that path and is ignored; one already counted is too,
-    and so is one from before a successful run of this identity
-    (:func:`ran_ok_since`): only new evidence marks it again.
+    """A kill of a ``claude`` cc-swap launched, seen afterwards (a crash
+    report whose pid is one of cc-swap's runs: :func:`cc_swap_launch`) for
+    the binary at ``claude_path``: the same "killed by the OS" state as a
+    SIGKILL of a cc-swap run (priming paused, one notification per
+    identity, diagnostics). A kill nobody can tie to cc-swap goes to
+    :func:`note_external_kill` instead. A kill older than the file's current
+    ctime is about an earlier file at that path and is ignored; one already
+    counted is too, and so is one from before a successful run of this
+    identity (:func:`ran_ok_since`): only new evidence marks it again.
     Returns whether it was recorded."""
     binary = stat_binary(claude_path)
     if binary.identity is None or binary.ctime_ns is None or at < binary.ctime_ns / 1e9:
@@ -757,7 +845,8 @@ def mark_killed_by_os(
         # only newer evidence may mark it again — across engine restarts.
         return False
     record = {
-        "kind": "external-kill", "ts": _iso(at), "at": at, "caller": source,
+        "kind": "seen-kill", "ts": _iso(at), "at": at, "caller": source,
+        "launchedBy": ORIGIN_CC_SWAP,
         "pid": pid, "exit": None, "signal": SIGKILL_NUM, "detail": detail[:500],
         **binary.to_json(),
     }
@@ -765,6 +854,266 @@ def mark_killed_by_os(
     append_record(root, record)
     _on_killed(root, record, binary, at)
     return True
+
+
+def cc_swap_launch(root: Path | None, pid: int | None, at: float, *,
+                   window_s: float = 3600.0, records: list[dict] | None = None) -> dict | None:
+    """The ``claude`` run cc-swap recorded (``claude-exec.jsonl``, or
+    ``records`` read from it already) with process id ``pid`` that started
+    within ``window_s`` before ``at`` (pids are reused; the window keeps an
+    old run from matching), or None."""
+    if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
+        return None
+    for rec in reversed(read_jsonl(root) if records is None else records):
+        t = _num(rec.get("at"))
+        if (
+            rec.get("kind") == "exec" and rec.get("pid") == pid and t is not None
+            and at - window_s <= t <= at + 5.0
+        ):
+            return rec
+    return None
+
+
+# -- kills of a claude cc-swap did not launch ---------------------------------------------------
+
+
+def external_count(ext: Mapping[str, Any]) -> int:
+    """How many kills the evidence stands for: the larger of the per-source
+    counts (one kill shows up both as a kernel line and as a crash report)."""
+    sources = ext.get("sources")
+    counts = [
+        int(v) for v in (sources.values() if isinstance(sources, dict) else ())
+        if isinstance(v, int) and not isinstance(v, bool)
+    ]
+    return max(counts) if counts else 0
+
+
+def _ok_at(state: Mapping[str, Any], binary: Binary) -> float | None:
+    """When this identity last ran fine (:func:`_note_ok`), or None."""
+    ok = state.get("ok")
+    entry = ok.get(binary.real) if isinstance(ok, dict) else None
+    if isinstance(entry, dict) and entry.get("identity") == binary.identity:
+        return _num(entry.get("at"))
+    return None
+
+
+def _schedule_probe(state: dict, ext: dict, binary: Binary, at: float) -> None:
+    """A probe of ``binary`` is due :data:`PROBE_DELAY_S` after the kill at
+    ``at`` (no later than :data:`PROBE_MAX_DEFER_S` after the first kill not
+    yet probed), never sooner than :data:`PROBE_EVERY_S` after the last
+    probe — unless a run of this identity, or a probe, came after it."""
+    ok_at = _ok_at(state, binary)
+    if ok_at is not None and at <= ok_at:
+        return
+    probe = ext.get("probe")
+    probed = _num(probe.get("at")) if isinstance(probe, dict) else None
+    if probed is not None and at <= probed:
+        return
+    if _num(ext.get("probeDueAt")) is None:
+        ext["pendingSince"] = at
+    pending = _num(ext.get("pendingSince"))
+    pending = at if pending is None else pending
+    due = min(at + PROBE_DELAY_S, pending + PROBE_MAX_DEFER_S)
+    if probed is not None:
+        due = max(due, probed + PROBE_EVERY_S)
+    ext["probeDueAt"] = due
+
+
+def note_external_kill(
+    root: Path,
+    claude_path: str,
+    *,
+    source: str,
+    at: float,
+    detail: str,
+    pid: int | None = None,
+    launcher: str | None = None,
+    provenance: Mapping[str, Any] | None = None,
+    report: str | None = None,
+) -> bool:
+    """A kill of the ``claude`` at ``claude_path`` that cc-swap did not
+    launch (or cannot tell: the kernel's line names no process): evidence,
+    never a pause. Counted in the state's ``external`` entry for this
+    identity (per source, per launching app, the ASP provenance line that
+    came with it; a crash report ``report`` once), logged in
+    ``claude-exec.jsonl``, and a probe scheduled (:func:`_schedule_probe`,
+    :func:`probe_external`). A kill older than the file's current ctime is
+    about an earlier file at that path and is ignored. Returns whether it
+    was recorded."""
+    binary = stat_binary(claude_path)
+    if binary.identity is None or binary.ctime_ns is None or at < binary.ctime_ns / 1e9:
+        return False
+    recorded: list[bool] = []
+
+    def mutate(state: dict) -> bool:
+        ext = state.get("external")
+        if not isinstance(ext, dict) or ext.get("identity") != binary.identity:
+            ext = state["external"] = {
+                "path": binary.path, "real": binary.real, "identity": binary.identity,
+                "version": _known_version(Path(root), binary),
+                "firstAt": at, "lastAt": at, "sources": {}, "launchers": {},
+                "reports": [], "provenance": None, "probe": None,
+                "pendingSince": None, "probeDueAt": None,
+            }
+        reports = ext.get("reports") if isinstance(ext.get("reports"), list) else []
+        if report and report in reports:
+            return False
+        if report:
+            reports.append(report)
+            ext["reports"] = reports[-EXTERNAL_REPORTS_MAX:]
+        sources = _section(ext, "sources")
+        sources[source] = int(sources.get(source) or 0) + 1
+        if launcher:
+            launchers = _section(ext, "launchers")
+            launchers[launcher] = int(launchers.get(launcher) or 0) + 1
+        if provenance:
+            ext["provenance"] = dict(provenance)
+        first, last = _num(ext.get("firstAt")), _num(ext.get("lastAt"))
+        ext["firstAt"] = at if first is None else min(first, at)
+        ext["lastAt"] = at if last is None else max(last, at)
+        _schedule_probe(state, ext, binary, at)
+        recorded.append(True)
+        return True
+
+    _mutate(root, mutate)
+    if not recorded:
+        return False
+    record = {
+        "kind": "external-kill", "ts": _iso(at), "at": at, "caller": source,
+        "pid": pid, "launcher": launcher, "signal": SIGKILL_NUM, "detail": detail[:500],
+        "provenance": dict(provenance) if provenance else None, **binary.to_json(),
+    }
+    _logger.warning(
+        "claude killed by the OS, not a cc-swap launch (%s%s); priming goes on and "
+        "the engine checks claude itself: %s",
+        source, f", launched by {launcher}" if launcher else "",
+        json.dumps(record, default=str),
+    )
+    append_record(root, record)
+    return True
+
+
+def current_external(root: Path | None) -> dict | None:
+    """The kill evidence of :func:`note_external_kill`, only while its
+    launcher path still resolves to that identity. Read-only."""
+    ext = load_state(root).get("external")
+    if not isinstance(ext, dict):
+        return None
+    for path in (ext.get("path"), ext.get("real")):
+        if isinstance(path, str) and path:
+            return ext if stat_binary(path).identity == ext.get("identity") else None
+    return None
+
+
+def probe_pending(root: Path | None, now: float) -> bool:
+    """Whether a probe of any identity is due (no ``stat``: the tick's
+    cheap pre-check before :func:`external_probe_due`)."""
+    ext = load_state(root).get("external")
+    due = _num(ext.get("probeDueAt")) if isinstance(ext, dict) else None
+    return due is not None and due <= now
+
+
+def external_probe_due(root: Path | None, binary: Binary, now: float) -> bool:
+    """Whether :func:`probe_external` would run ``binary`` now."""
+    ext = load_state(root).get("external")
+    if not isinstance(ext, dict) or binary.identity is None:
+        return False
+    due = _num(ext.get("probeDueAt"))
+    return ext.get("identity") == binary.identity and due is not None and due <= now
+
+
+def probe_external(root: Path, claude_path: str, *, now: float | None = None) -> str | None:
+    """The engine's own check after kills cc-swap did not launch: ``claude
+    --version`` through :func:`run` as an engine launch (the guard still
+    applies: a file still settling or already killed is not run). Exit 0
+    records a successful run (no older evidence can mark this identity
+    again) and the probe's result; a SIGKILL takes the killed-by-the-OS
+    path (pause, one notification, doctor's error with the fix). Runs only
+    when a probe is due (:func:`external_probe_due`), claimed under the
+    state lock so two engines never both run it; when a run of this file
+    already succeeded after the latest kill, that is the answer and nothing
+    runs. Returns the result (``ok``, ``killed``, ``exit N`` …) or None when
+    nothing was due. Never raises."""
+    now = time.time() if now is None else now
+    binary = stat_binary(claude_path)
+    claimed: dict[str, Any] = {}
+
+    def claim(state: dict) -> bool:
+        ext = state.get("external")
+        if (
+            binary.identity is None or not isinstance(ext, dict)
+            or ext.get("identity") != binary.identity
+        ):
+            return False
+        due = _num(ext.get("probeDueAt"))
+        if due is None or due > now:
+            return False
+        ext["probeDueAt"] = None
+        ext["pendingSince"] = None
+        ok_at = _ok_at(state, binary)
+        last = _num(ext.get("lastAt")) or 0.0
+        if ok_at is not None and last <= ok_at:
+            ext["probe"] = {"at": ok_at, "result": "ok", "by": "a cc-swap run"}
+            claimed["result"] = "ok"
+            return True
+        ext["probe"] = {"at": now, "result": "running"}
+        claimed["run"] = True
+        return True
+
+    try:
+        _mutate(root, claim)
+        if "result" in claimed:
+            return claimed["result"]
+        if "run" not in claimed:
+            return None
+        result, retry_at = _run_probe(root, claude_path, binary, now)
+    except Exception as e:  # the probe never breaks a tick
+        _logger.debug("claude exec: external-kill probe failed: %s", type(e).__name__)
+        result, retry_at = f"error ({type(e).__name__})", None
+
+    def settle(state: dict) -> bool:
+        ext = state.get("external")
+        if not isinstance(ext, dict) or ext.get("identity") != binary.identity:
+            return False
+        ext["probe"] = {"at": now, "result": result}
+        if retry_at is not None and _num(ext.get("probeDueAt")) is None:
+            ext["probeDueAt"] = retry_at
+            ext["pendingSince"] = now
+        return True
+
+    try:
+        _mutate(root, settle)
+    except Exception:
+        pass
+    log = _logger.info if result == "ok" else _logger.warning
+    log("claude exec: external-kill probe of %s: %s", binary.real, result)
+    return result
+
+
+def _run_probe(root: Path, claude_path: str, binary: Binary,
+               now: float) -> tuple[str, float | None]:
+    """``(result, retry_at)`` of one ``claude --version`` probe."""
+    try:
+        done = run(
+            [claude_path, "--version"], caller=PROBE_CALLER, timeout=PROBE_TIMEOUT_S,
+            root=root, manual=None,
+        )
+    except ExecRefused as e:
+        if killed_entry(root, binary) is not None:
+            return "not run: " + e.reason, None
+        # Still settling after an update: again once it has.
+        left = settle_left(binary, settle_seconds(root), now)
+        return "not run: " + e.reason, now + max(left, PROBE_DELAY_S)
+    except subprocess.TimeoutExpired:
+        return f"timed out after {PROBE_TIMEOUT_S:.0f}s", None
+    except OSError as e:
+        return f"could not run ({type(e).__name__})", None
+    rc = done.returncode
+    if rc == 0:
+        return "ok", None
+    if rc in (-SIGKILL_NUM, SHELL_KILLED_RC):
+        return "killed", None
+    return f"exit {rc}", None
 
 
 def _note_ok(state: dict, binary: Binary, now: float) -> None:
