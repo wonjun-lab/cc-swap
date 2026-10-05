@@ -44,12 +44,33 @@ class ActiveWatch:
     last_note: str | None = None
     #: The backup root (the switch ledger and ``cswap run`` profiles).
     root: Any = None
+    #: Every ``cswap run`` sessionId seen while it ran: sticky, so a
+    #: session's refusals stay set aside after it exits (its pid file goes).
+    run_sessions: set[str] = field(default_factory=set)
+    #: sessionId -> its earliest refusal seen (kept after the hit itself is
+    #: pruned): a session refused before the account went live is presumed
+    #: to still hold the previous login's token.
+    first_refusal: dict[str, float] = field(default_factory=dict)
     #: (slot, {window: pct/hour}, {window: source}) from the last estimate:
     #: the policy's pace when the samples cannot measure one.
     rates: tuple[str, dict[str, float], dict[str, str]] | None = None
 
     def poll(self, now: float) -> None:
+        if self.root is not None:
+            try:
+                self.run_sessions |= limit_watch.run_session_ids(self.root)
+            except Exception:
+                pass
+            if len(self.run_sessions) > 4096:
+                self.run_sessions = set(list(self.run_sessions)[-2048:])
         new = self.watcher.poll(now)
+        for h in new:
+            if h.session_id is not None and h.ts < self.first_refusal.get(h.session_id, float("inf")):
+                self.first_refusal[h.session_id] = h.ts
+        if len(self.first_refusal) > 1024:
+            self.first_refusal = dict(
+                sorted(self.first_refusal.items(), key=lambda kv: kv[1])[-512:]
+            )
         if new:
             self.hits = (self.hits + new)[-MAX_HITS:]
         self.hits = [
@@ -115,6 +136,22 @@ def _since(state: Mapping, current: str, watch: ActiveWatch) -> float | None:
     if watch.witnessed and watch.seen is not None and watch.seen[0] == current:
         times.append(watch.seen[1])
     return max(times) if times else None
+
+
+def _old_token(watch: ActiveWatch, hit: Any, since: float | None) -> bool:
+    """A refusal from a Claude Code session that was already being refused
+    before the account went live: such a session keeps its token in memory
+    after a switch (it re-reads the login only on a 401), so its later
+    refusals are the previous account's — until it gets a real answer
+    after ``since``, which proves it is on a login with quota now."""
+    sid = getattr(hit, "session_id", None)
+    if since is None or sid is None:
+        return False
+    first = watch.first_refusal.get(sid)
+    if first is None or first >= since:
+        return False
+    answered = watch.watcher.answered.get(sid)
+    return not (answered is not None and since <= answered < hit.ts)
 
 
 def engine_root(watch: ActiveWatch):
@@ -183,22 +220,22 @@ def estimate_active(
     )
     since = _since(state, current, watch)
     reported = None
-    hits = watch.hits
-    if hits:
-        # Refusals from ``cswap run`` sessions on other accounts that share
-        # this transcript directory (--share-history) are theirs.
-        try:
-            others = limit_watch.run_session_ids(watch.root)
-        except Exception:
-            others = set()
-        hits = [h for h in hits if h.session_id is None or h.session_id not in others]
+    since_g = None if since is None else since + est.SWITCH_GRACE_S
+    # Refusals from ``cswap run`` sessions on other accounts that share this
+    # transcript directory (--share-history) are theirs; so are those of a
+    # session still on the previous login's token (see _old_token).
+    hits = [
+        h for h in watch.hits
+        if (h.session_id is None or h.session_id not in watch.run_sessions)
+        and not _old_token(watch, h, since_g)
+    ]
     if hits and not isinstance(value, str):
         reported = est.reported(
             number=current,
             value=value,
             entry=entry,
             hits=hits,
-            since=None if since is None else since + est.SWITCH_GRACE_S,
+            since=since_g,
             now=now,
             base=projected,
         )

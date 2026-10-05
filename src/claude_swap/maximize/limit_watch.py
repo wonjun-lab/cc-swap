@@ -151,6 +151,31 @@ def parse_line(line: bytes) -> LimitHit | None:
     return None
 
 
+_ASSISTANT = b'"assistant"'
+_SESSION = b'"sessionId"'
+
+
+def parse_ok(line: bytes) -> tuple[str, float] | None:
+    """``(sessionId, ts)`` when the line is an assistant reply that is not an
+    API error: that session's requests are being answered (it is on a login
+    with quota). None otherwise."""
+    if _ASSISTANT not in line or _SESSION not in line or _MARKER in line:
+        return None
+    try:
+        record = json.loads(line)
+    except (ValueError, UnicodeDecodeError):
+        return None
+    if not isinstance(record, dict) or record.get("type") != "assistant":
+        return None
+    if record.get("isApiErrorMessage") or record.get("error"):
+        return None
+    sid = record.get("sessionId")
+    ts = _epoch(record.get("timestamp"))
+    if not isinstance(sid, str) or not sid or ts is None:
+        return None
+    return sid, ts
+
+
 @dataclass
 class _Cursor:
     ident: tuple[int, int]       # (st_dev, st_ino): a replaced file starts over
@@ -181,6 +206,8 @@ class TranscriptWatcher:
     dirs: dict[str, float] = field(default_factory=dict)
     walked_at: float | None = None
     top: str | None = None
+    #: sessionId -> when it last got a real (non-error) answer.
+    answered: dict[str, float] = field(default_factory=dict)
 
     def _walk(self, top: Path) -> bool:
         """The full walk: every ``.jsonl`` under ``top`` (bounded), into
@@ -335,6 +362,15 @@ class TranscriptWatcher:
                     hit = parse_line(line)
                     if hit is not None:
                         hits.append(hit)
+                        continue
+                    ok = parse_ok(line)
+                    if ok is not None:
+                        sid, ts = ok
+                        if ts > self.answered.get(sid, 0.0):
+                            self.answered[sid] = ts
+            if len(self.answered) > MAX_TRACKED:
+                newest = sorted(self.answered.items(), key=lambda kv: kv[1])[-MAX_TRACKED:]
+                self.answered = dict(newest)
             if len(self.cursors) > MAX_TRACKED:
                 keep = {path for _m, path, _s in files}
                 for path in list(self.cursors):

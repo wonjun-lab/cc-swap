@@ -416,6 +416,19 @@ def limit_record(ts: float, window: str = "five_hour", resets: float | None = No
     })
 
 
+class TestParseOk:
+    def test_a_real_answer(self):
+        line = json.dumps({"type": "assistant", "sessionId": "S", "timestamp": iso(1000.0),
+                           "message": {"role": "assistant", "content": []}}).encode()
+        assert limit_watch.parse_ok(line) == ("S", 1000.0)
+
+    def test_an_api_error_or_another_record_is_not(self):
+        assert limit_watch.parse_ok(limit_record(1000.0).encode()) is None
+        user = json.dumps({"type": "user", "sessionId": "S", "timestamp": iso(1.0),
+                           "message": {"role": "user", "content": "assistant"}}).encode()
+        assert limit_watch.parse_ok(user) is None
+
+
 class TestParseLine:
     def test_session_and_weekly_limits(self):
         hit = limit_watch.parse_line(limit_record(1000.0, resets=5000.0).encode())
@@ -596,7 +609,7 @@ class TestReportedLimit:
     known moment the account went live."""
 
     def setup(self, temp_home, *, record_ts=None, record_reset="own", own_reset="future",
-              session_id="redacted", fetched_after=False, text_only=False):
+              session_id="redacted", fetched_after=False, text_only=False, fetched_ago=120.0):
         h = make(temp_home)
         h.clock.now = time.time()
         now = h.clock.now
@@ -616,7 +629,7 @@ class TestReportedLimit:
             json.dumps({"type": "user", "message": {"content": secret}}) + "\n"
             + json.dumps(record) + "\n"
         )
-        fetched = now if fetched_after else now - 120
+        fetched = now if fetched_after else now - fetched_ago
         value = win(40, 40, r5=own) if own is not None else win(40, 40)
         entries = {
             "1": UsageEntry(last_good=value, fetched_at=fetched, age_s=now - fetched),
@@ -711,6 +724,72 @@ class TestReportedLimit:
         h, entries, _ = self.setup(temp_home, own_reset="past",
                                    record_reset=ten_min(time.time() + 4 * H))
         assert h.tick_with_entries(entries) is TickOutcome.NO_ACTION   # since unknown
+
+    def test_a_reset_match_before_the_switch_is_the_previous_accounts(self, temp_home):
+        # Re-review 1: after a priming pass two accounts' 5h windows often
+        # reset on the same 10-minute mark. #2's refusal from before the
+        # switch onto #1 matches #1's reset but is not #1's. (No sessionId:
+        # the old-token rule cannot help, the since rule must.)
+        # #1's reading predates the refusal, so it cannot overrule it.
+        h, entries, _ = self.setup(temp_home, record_ts=time.time() - 900, session_id=None,
+                                   fetched_ago=1000.0)
+        entries["1"] = replace(entries["1"], trust_extended=True)   # on its own plan
+        h.engine._mutate_state(lambda s: s.update(lastSwitchAt=h.clock.now - 600,
+                                                  lastSwitchTo="1"))
+        assert h.tick_with_entries(entries) is TickOutcome.NO_ACTION
+
+    def test_a_reset_match_after_the_switch_counts(self, temp_home):
+        h, entries, _ = self.setup(temp_home, record_ts=time.time() - 60)
+        h.engine._mutate_state(lambda s: s.update(lastSwitchAt=h.clock.now - 600,
+                                                  lastSwitchTo="1"))
+        assert h.tick_with_entries(entries) is TickOutcome.SWITCHED
+
+    def old_token_setup(self, temp_home, *, answered_after_switch: bool):
+        """Session S was refused on #2 (reset X) before the switch onto #1
+        10 min ago, and is refused again 1 min ago, still on #2's token
+        (reset X). #1's 5h window has not started (no reset in its
+        reading), so only the since rule could take the refusal."""
+        h, entries, _ = self.setup(temp_home, own_reset=None, record_ts=time.time() - 900,
+                                   record_reset=ten_min(time.time() + H), session_id="S")
+        now = h.clock.now
+        h.engine._mutate_state(lambda s: s.update(lastSwitchAt=now - 600, lastSwitchTo="1"))
+        lines = []
+        if answered_after_switch:
+            lines.append(json.dumps({
+                "type": "assistant", "sessionId": "S", "timestamp": iso(now - 300),
+                "message": {"role": "assistant", "content": [{"type": "text", "text": "ok"}]},
+            }))
+        again = json.loads(limit_record(now - 60, resets=ten_min(now + H)))
+        again["sessionId"] = "S"
+        lines.append(json.dumps(again))
+        transcript = temp_home / ".claude" / "projects" / "-redacted" / "s.jsonl"
+        with transcript.open("a") as fh:
+            fh.write("\n".join(lines) + "\n")
+        return h, entries
+
+    def test_a_session_still_on_the_old_token_is_not_the_live_account(self, temp_home):
+        # Re-review 2: its new refusals are the previous account's.
+        h, entries = self.old_token_setup(temp_home, answered_after_switch=False)
+        assert h.tick_with_entries(entries) is TickOutcome.NO_ACTION
+        h.clock.advance(60)
+        assert h.tick_with_entries(entries) is TickOutcome.NO_ACTION
+
+    def test_once_that_session_is_answered_its_refusals_count_again(self, temp_home):
+        h, entries = self.old_token_setup(temp_home, answered_after_switch=True)
+        assert h.tick_with_entries(entries) is TickOutcome.SWITCHED
+
+    def test_a_run_session_stays_set_aside_after_it_exits(self, temp_home):
+        # Re-review 3: the exclusion is sticky; the pid file goes on exit
+        # while the refusal stays in memory until its reset.
+        h, entries, _ = self.setup(temp_home, session_id="run-session")
+        sessions = h.switcher.backup_dir / "sessions" / "2-b_example.com" / "sessions"
+        sessions.mkdir(parents=True)
+        pid_file = sessions / "4242.json"
+        pid_file.write_text(json.dumps({"pid": 4242, "sessionId": "run-session"}))
+        assert h.tick_with_entries(entries) is TickOutcome.NO_ACTION
+        pid_file.unlink()
+        h.clock.advance(60)
+        assert h.tick_with_entries(entries) is TickOutcome.NO_ACTION
 
     def test_the_ledger_entry_must_land_on_the_live_account(self, temp_home):
         from claude_swap.maximize import ledger

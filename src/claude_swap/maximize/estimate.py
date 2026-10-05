@@ -306,7 +306,9 @@ def reported(
 
     * its ``resetsAt`` is the live account's own reset for that window, as
       its last reading reports it (within ``RESET_MATCH_S``; both are on
-      10-minute marks), or
+      10-minute marks) — and, when ``since`` is known, it came after it
+      (two accounts' windows often reset on the same 10-minute mark after
+      a priming pass), or
     * that window of the reading has no future reset (rolled over since,
       or off) and the refusal came after ``since`` — when this account
       became the live one, plus a grace for a session still on the old
@@ -328,6 +330,8 @@ def reported(
             continue
         if ts > now + 300.0:
             continue
+        if since is not None and ts < since:
+            continue  # before this account went live: another account's
         own_reset = read[window][1] if window in read else None
         matched = (
             resets is not None
