@@ -312,16 +312,22 @@ def help_entries(idle_pattern: str | None = None) -> list[tuple[str, str]]:
                      "15:30' means you asked to stay on it (h)"),
         ("right note", "who runs the engine — viewer · service pid N is switching: the "
                        "background service switches, this screen only watches"),
-        ("! line", "only when something needs you: a dead or expiring login, priming "
-                   "paused after a Claude Code update, a service that stops at logout"),
+        ("! lines", "only when something needs you, with what to do: a dead or expiring "
+                    "login, priming paused (claude killed by the OS at launch, an update "
+                    "settling, a new version not verified yet), a locked keychain, a "
+                    "service that stops at logout. ! = something for you to do; a pause "
+                    "that lifts by itself has none. Up to three lines when the table "
+                    "leaves rows over"),
         ("summary", "the line over the table, over the accounts automatic switching can "
                     "use (not a dead, expired or excluded login, not an API key). 5h free: "
-                    "those whose 5h is under its soft mark (the active one included; a "
-                    "spent 7d does not count). next 5h back: the soonest 5h reset among the "
-                    "rest. 7d left this week ≈ N accounts: the 7d room left, (100 − 7d%)/100 "
+                    "those it could switch to now (both windows under their soft marks "
+                    "less the landing margin, no login about to end), plus the active one "
+                    "while under its soft marks. next back in: how long until another "
+                    "account, kept off only by its 5h, comes back. 7d left "
+                    "this week ≈ N accounts: the 7d room left, (100 − 7d%)/100 "
                     "per account added up as whole accounts — not weighted by plan, so a "
-                    "20x and a 5x account count alike. next 7d reset: the soonest weekly "
-                    "reset. A short terminal drops it first"),
+                    "20x and a 5x account count alike. next 7d in: how long until the "
+                    "soonest weekly reset, and whose. A short terminal drops it first"),
         ("order", "● the active account; 1, 2, 3 … where automatic switching goes "
                   "next, in that order; – never (a dead login, an excluded account). "
                   "The table lists the accounts in this order"),
@@ -343,11 +349,16 @@ def help_entries(idle_pattern: str | None = None) -> list[tuple[str, str]]:
         ("", "Status (each account shows the most important one)"),
         ("● active", "the account Claude Code uses now"),
         ("re-login (r)", "its stored login is dead: select it and press r"),
+        ("keychain locked (f)", "its login cannot be read from the macOS keychain: "
+                                "unlock it, then f fetches"),
         ("excluded", "never picked automatically (m → x includes it again)"),
         ("next", "where automatic switching goes next"),
         ("login 3d left", "the login reaches its fixed deadline soon: r renews it early"),
+        ("reading 2h old", "its usage was last read that long ago (amber from an hour: "
+                           "the engine no longer trusts it)"),
         ("last resort", "used only when every other account is at its limit (l toggles)"),
-        ("5h off · prime", "its 5h window has not started; priming starts it at that time"),
+        ("prime 19:30", "its 5h window has not started; priming starts it then (now: at "
+                        "the next tick; 5h off: priming does not run)"),
         ("primed", "priming opened the 5h window it is in (shown when nothing above "
                    "applies)"),
         ("", ""),

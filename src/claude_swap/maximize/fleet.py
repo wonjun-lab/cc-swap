@@ -952,6 +952,7 @@ def _holder_facts(es: EngineStatus) -> list[str]:
         from claude_swap.maximize.service import state_text
 
         lines.append(f"The service is installed but not running ({state_text(service)}).")
+        lines.append("To start it: cc-swap service install")
     else:
         lines.append("For an always-on engine: cc-swap service install")
     if service.get("linger") is False:

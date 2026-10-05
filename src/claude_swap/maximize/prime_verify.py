@@ -477,17 +477,70 @@ def _auto_verify_setting(root: Path) -> bool:
         return False
 
 
+@dataclass(frozen=True)
+class PausedView:
+    """Why priming is paused, for displays (:func:`paused_view`): Fleet
+    words it for the width it has (``home.guard_notice``).
+
+    ``kind``: ``killed`` (the OS kills ``claude`` at launch), ``settle``
+    (waiting for an update to settle, until ``until``), ``changed`` (a new
+    version not verified yet: ``previous`` -> ``version``) or ``failed`` (a
+    verify of ``version`` failed). ``auto``: no reminder is due — the
+    engine lifts it by itself (an update settling, a version it
+    re-verifies), or, for ``killed``, you were notified once already (the
+    mark clears only when the ``claude`` path changes or a run of it
+    succeeds: Fleet still asks you to act on it)."""
+
+    kind: str
+    note: str
+    auto: bool
+    version: str | None = None
+    previous: str | None = None
+    until: float | None = None
+    #: Who kills ``claude`` (``macOS``: its code signing; else ``the OS``).
+    system: str = "the OS"
+
+
+def paused_view(
+    root: Path, *, auto_verify: bool | None = None, now: float | None = None
+) -> PausedView | None:
+    """:func:`paused_state` as a :class:`PausedView`, or None."""
+    from claude_swap.maximize import claude_exec
+
+    now = time.time() if now is None else now
+    held = claude_exec.display_state(root, now)
+    if held is not None:
+        # Killed by the OS (notified once on its own) or waiting for an
+        # update to settle (the engine resumes by itself): no reminder.
+        kind, value = held
+        if kind == "killed":
+            return PausedView(
+                "killed", f"paused: {claude_exec.killed_text(value)}", True,
+                version=_text(value.get("version")),
+                system="macOS" if sys.platform == "darwin" else "the OS",
+            )
+        return PausedView(
+            "settle", f"paused: {claude_exec.settle_text(value - now)}", True, until=value,
+        )
+    note, auto, kind, version, previous = _verify_pause(root, auto_verify)
+    if note is None:
+        return None
+    return PausedView(kind, note, auto, version=version, previous=previous)
+
+
 def paused_state(root: Path, *, auto_verify: bool | None = None) -> tuple[str | None, bool]:
     """``(note, auto)``: :func:`paused_note`'s text, and whether the engine
     will lift this pause itself (``prime.autoVerify``, read from settings
     when not given) — a version change it has not given up on yet."""
-    from claude_swap.maximize.claude_exec import display_note
+    view = paused_view(root, auto_verify=auto_verify)
+    return (view.note, view.auto) if view is not None else (None, False)
 
-    held = display_note(root)
-    if held is not None:
-        # Killed by the OS (notified once on its own) or waiting for an
-        # update to settle (the engine resumes by itself): no reminder.
-        return f"paused: {held}", True
+
+def _verify_pause(
+    root: Path, auto_verify: bool | None
+) -> tuple[str | None, bool, str, str | None, str | None]:
+    """``(note, auto, kind, version, previous)`` for a pause the recorded
+    verify state makes (a failed verify, a version change), else a None note."""
     data = load(root)
     if auto_verify is None:
         auto_verify = _auto_verify_setting(root)
@@ -501,16 +554,20 @@ def paused_state(root: Path, *, auto_verify: bool | None = None) -> tuple[str | 
         # nextAt is ignored: a retry that is merely waiting still counts.
         return auto_verify_due(root, verdict, float("inf"), data) is not None
 
-    def note(head: str, engine: bool) -> tuple[str, bool]:
-        return f"paused: {head} ({AUTO_HINT if engine else 'cc-swap prime verify'})", engine
+    def hint(engine: bool) -> str:
+        return AUTO_HINT if engine else "cc-swap prime verify"
 
     failed = failed_verify(root, data)
     if failed is not None:
-        return note(_failed_text(failed), auto("failed", _text(failed.get("version"))))
+        version = _text(failed.get("version"))
+        engine = auto("failed", version)
+        return f"paused: {_failed_text(failed)} ({hint(engine)})", engine, "failed", version, None
     verified = _text(data.get("verifiedClaudeVersion"))
     if verified is not None and current is not None and current != verified:
-        return note(f"claude {verified} -> {current}", auto("changed"))
-    return None, False
+        engine = auto("changed")
+        return (f"paused: claude {verified} -> {current} ({hint(engine)})", engine,
+                "changed", current, verified)
+    return None, False, "", None, None
 
 
 def paused_note(root: Path, *, auto_verify: bool | None = None) -> str | None:

@@ -1269,20 +1269,34 @@ def _set_settling(root: Path, value: dict | None) -> None:
     _mutate(root, mutate)
 
 
-def display_note(root: Path | None, now: float | None = None) -> str | None:
-    """For displays (no subprocess): the killed mark, else a settle wait
-    the engine recorded that is still running, else None."""
+def display_state(
+    root: Path | None, now: float | None = None
+) -> tuple[str, dict] | tuple[str, float] | None:
+    """For displays (no subprocess): ``("killed", mark)``, else ``("settle",
+    until)`` for a settle wait the engine recorded that is still running,
+    else None."""
     state = load_state(root)
     killed = current_killed(root)
     if killed is not None:
-        return killed_text(killed)
+        return "killed", killed
     settling = state.get("settling")
     now = time.time() if now is None else now
     if isinstance(settling, dict):
         until = settling.get("until")
         if isinstance(until, (int, float)) and not isinstance(until, bool) and until > now:
-            return settle_text(until - now)
+            return "settle", float(until)
     return None
+
+
+def display_note(root: Path | None, now: float | None = None) -> str | None:
+    """For displays (no subprocess): the killed mark, else a settle wait
+    the engine recorded that is still running, else None."""
+    now = time.time() if now is None else now
+    held = display_state(root, now)
+    if held is None:
+        return None
+    kind, value = held
+    return killed_text(value) if kind == "killed" else settle_text(value - now)
 
 
 # -- one launch ----------------------------------------------------------------------------------

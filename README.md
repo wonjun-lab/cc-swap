@@ -102,9 +102,9 @@ cc-swap           # Fleet, the live view (also: cc-swap tui)
 Fleet shows, from top to bottom:
 
 - **One sentence** saying what automatic switching is doing and who runs the engine (`viewer · service pid 4121 is switching`).
-- **An attention line**, only when something needs you: a login that needs renewing, a login that ends within a week, priming paused after a Claude Code update.
-- **A capacity summary**: how many accounts still have 5h room, when the next 5h window comes back, and roughly how many accounts' worth of weekly quota is left.
-- **One row per account**: the order automatic switching would try them in (`●` is the active one), the short name and slot number (`main #1`), plan, 5h and 7d bars with their reset times, and a status such as `next`, `last resort`, `excluded`, `login 3d left` or `re-login (r)`. Each bar has an amber tick at the soft threshold and a red tick at the hard one.
+- **Attention lines**, only when something needs you, each with what to do about it: a login that needs renewing, priming paused (Claude Code killed by macOS at launch, an update settling, a new version not verified yet), a login that ends within a week, a locked keychain. One line, up to three when the table leaves rows over.
+- **A capacity summary**: how many accounts still have 5h room, how long until the next account comes back and the next weekly reset, and roughly how many accounts' worth of weekly quota is left.
+- **One row per account**: the order automatic switching would try them in (`●` is the active one), the short name and slot number (`main #1`), plan, 5h and 7d bars with their reset times, and a status such as `next`, `last resort`, `excluded`, `login 3d left`, `re-login (r)`, `keychain locked (f)`, `reading 2h old` or `prime 19:30`. Each bar has an amber tick at the soft threshold and a red tick at the hard one.
 - **The selected account in full**: organization, plan, login deadline, priming, and every usage window it has.
 
 Fleet keys:
@@ -354,7 +354,7 @@ cc-swap why      # the engine's last decision and its reason code, explained
 
 **It didn't switch.** Run `cc-swap why`. Common answers: `maximize-pending` (a soft threshold is crossed and it is waiting for you to pause), `reset-wait` (the window resets soon), `hold` (you held the account), `auto-off` (automatic switching is off), `no-qualifying-candidate` (no other account is far enough below the thresholds). Every code is explained in the [reference](docs/reference.md#why-didnt-it-switch).
 
-**Nothing switches at all.** Check that an engine is running: `cc-swap service status`. Fleet's top line reads `Not switching — no engine is running` when none is. Run `cc-swap service install` (or `cc-swap init --apply`).
+**Nothing switches at all.** Check that an engine is running: `cc-swap service status`. Fleet's top line reads `Not switching — no engine is running` when none is (`Not switching — the service is stopped` when it is installed but not running). Run `cc-swap service install` (or `cc-swap init --apply`): an engine started from Fleet's menu stops when Fleet quits.
 
 **"Keychain unreadable; holding" or `rc=36` (macOS).** The login Keychain is locked, the session can't reach it (for example over SSH), or a `/login` is still being written. cc-swap stops switching rather than overwrite a login it can't see, and resumes by itself once the Keychain answers. Unlock the login keychain. If it lasts more than 15 minutes you get a notification and the service restarts itself.
 

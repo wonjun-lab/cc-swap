@@ -579,18 +579,20 @@ def test_attention_warns_of_logins_expiring_within_a_week():
         _expiring(5, 20 * DAY, alias="fine"),
     )
     rows = fleet.fleet_rows(snap, MX, PRIME, MaximizeState(), now=NOW)
-    assert home.attention_parts(rows, now=NOW) == (
-        ["! #2 side login ends in 1d 9h — select it, press r"], "warn"
-    )
+
+    def lines(rows, width=200):
+        return home.attention_lines(home.attention_notices(rows, now=NOW), width)
+
+    assert lines(rows) == [("! #2 side login ends in 1d 9h — select it, press r", "warn")]
     soon = fleet.fleet_rows(
         accounts(acc(1, active=True), _expiring(3, 20 * H, alias="soon"),
                  _expiring(4, 2 * DAY, alias="next")),
         MX, PRIME, MaximizeState(), now=NOW,
     )
-    assert home.attention_parts(soon, now=NOW) == (
-        ["! #3 soon login ends in 20h 0m — select it, press r", "#4 next login ends in 2d 0h"],
+    assert lines(soon) == [(
+        "! #3 soon login ends in 20h 0m — select it, press r · #4 next login ends in 2d 0h",
         "crit",
-    )
+    )]
     assert fleet.login_due(soon[1], NOW) and not fleet.login_due(rows[2], NOW)
     # A dead login leads; an expiring one rides along.
     mixed = fleet.fleet_rows(
@@ -598,10 +600,9 @@ def test_attention_warns_of_logins_expiring_within_a_week():
                  acc(3, sentinel=USAGE_RELOGIN_REQUIRED, alias="old")),
         MX, PRIME, MaximizeState(), now=NOW,
     )
-    assert home.attention_parts(mixed, now=NOW) == (
-        ["! #3 old needs re-login — select it, press r", "#2 side login ends in 1d 9h"],
-        "crit",
-    )
+    assert lines(mixed) == [(
+        "! #3 old needs re-login — select it, press r · #2 side login ends in 1d 9h", "crit",
+    )]
     steps = "\n".join(fleet.relogin_steps(rows[1], ssh=False, host="h", claude_path=None,
                                           return_to=rows[0], now=NOW))
     assert f"login expires {local_clock(NOW + DAY + 9 * H)} (in 1d 9h)" in steps

@@ -78,6 +78,7 @@ from claude_swap.tui.fleet_render import tone_style  # noqa: F401 (fleet_account
 from claude_swap.tui.theme import Palette
 
 if TYPE_CHECKING:
+    from claude_swap.maximize.prime_verify import PausedView
     from claude_swap.tui.app import CswapApp
 
 LEASE_PROBE_S = 5.0
@@ -111,13 +112,15 @@ def host_name() -> str:
     return socket.gethostname().split(".")[0] or "this host"
 
 
-def prime_guard(root: Path) -> str | None:
-    """Priming paused after a Claude Code update (no subprocess: what the
-    engine last saw, from ``prime_verify.json``)."""
-    from claude_swap.maximize.prime_verify import paused_note
+def prime_guard(root: Path) -> PausedView | None:
+    """Why priming is paused (``prime_verify.PausedView``: killed by the OS,
+    an update settling, a version not verified yet) or None. No subprocess:
+    what the engine last saw, from ``prime_verify.json`` and
+    ``claude_exec_state.json``."""
+    from claude_swap.maximize.prime_verify import paused_view
 
     try:
-        return paused_note(root)
+        return paused_view(root)
     except Exception:
         return None
 
@@ -442,7 +445,7 @@ class FleetScreen(Screen):
         Binding("p", "menu('prime')", "Prime now", show=False),
         Binding("f", "menu('fetch')", "Fetch", show=False),
         Binding("x", "menu('exclude')", "Exclude", show=False),
-        Binding("a", "menu('accounts')", "Account settings", show=False),
+        Binding("a", "accounts_key", "Account settings", show=False),
         Binding("e,g", "menu('engine')", "Engine log", show=False),
         Binding("v", "menu('history')", "Switch history", show=False),
         Binding("c", "menu('classic')", "Classic dashboard", show=False),
@@ -475,7 +478,7 @@ class FleetScreen(Screen):
         self._situation: home.Situation | None = None
         self._hostname = host_name()
         self._fx_timers: list = []
-        self._prime_guard: str | None = None
+        self._prime_guard: PausedView | None = None
 
     # -- composition ------------------------------------------------------------------
 
@@ -718,7 +721,13 @@ class FleetScreen(Screen):
             )
             self._scroll_to_sel = True
         self._render_accounts(rows, ctx, attention, palette)
-        self.query_one("#fx-keys", Static).update(render.keys_text(width, palette))
+        self.query_one("#fx-keys", Static).update(
+            render.keys_text(width, palette, empty=self._empty())
+        )
+
+    def _empty(self) -> bool:
+        """No account is managed yet (the snapshot is in, with no rows)."""
+        return self.app.snapshot is not None and not self._rows
 
     def _priming(self, es: fx.EngineStatus, sit: home.Situation) -> bool:
         """Whether priming runs now (the next prime time is worth showing)."""
@@ -727,55 +736,65 @@ class FleetScreen(Screen):
     def _render_top(
         self, es: fx.EngineStatus, dv: fx.DecisionView, sit: home.Situation,
         now: float, width: int, palette: Palette,
-    ) -> bool:
-        """The status sentence and the attention line; whether the
-        attention line shows."""
+    ) -> list[home.Notice]:
+        """The status sentence; the attention notes (laid out with the
+        table, which decides how many lines they get)."""
         published = self._state.decision
-        variants = home.status_variants(
-            es, dv, self._rows, self._mx, sit, now=now,
-            published_at=published.at if published else None,
-            hold=self._state.hold, hold_read=True,
-        )
+        if self._empty():
+            variants = home.empty_variants()
+        else:
+            variants = home.status_variants(
+                es, dv, self._rows, self._mx, sit, now=now,
+                published_at=published.at if published else None,
+                hold=self._state.hold, hold_read=True,
+            )
         sentence, note = home.status_line(variants, home.holder_variants(es, sit), width)
         self.query_one("#fx-status", Static).update(
             render.status_text(sentence, note, width, palette)
         )
         service = es.service or {}
-        attention = home.attention_parts(
+        return home.attention_notices(
             self._rows, now=now, prime_guard=self._prime_guard,
             priming=self._prime.enabled and sit != "auto-off",
             linger_off=service.get("linger") is False,
+            relogin_paused=sit == "paused" and dv.reason == "relogin",
         )
+
+    def _show_attention(
+        self, notices: list[home.Notice], lines: int, palette: Palette
+    ) -> None:
+        """The attention notes in ``lines`` lines (none: hidden)."""
         widget = self.query_one("#fx-attention", Static)
-        widget.display = attention is not None
-        if attention is not None:
-            parts, tone = attention
-            widget.update(render.attention_text(parts, tone, width, palette))
-        return attention is not None
+        widget.display = bool(notices) and lines > 0
+        if widget.display:
+            text = render.attention_text(notices, self._width(), lines, palette)
+            widget.styles.height = len(text.plain.splitlines())
+            widget.update(text)
 
     def _render_accounts(
-        self, rows: list[fx.FleetRow], ctx: render.Ctx, attention: bool, palette: Palette,
+        self, rows: list[fx.FleetRow], ctx: render.Ctx, notices: list[home.Notice],
+        palette: Palette,
     ) -> None:
-        """The capacity summary, the column headers, the table and the
-        selected account's panel, laid out by ``home.table_plan`` for this
-        terminal."""
+        """The attention notes, the capacity summary, the column headers,
+        the table and the selected account's panel, laid out by
+        ``home.table_plan`` for this terminal."""
         body = self.query_one("#fx-body", FleetBody)
         head = self.query_one("#fx-head", Static)
         summary = self.query_one("#fx-summary", Static)
         detail = self.query_one("#fx-detail", Static)
         size = self.size
         width, height = size.width or 120, size.height or 36
+        want = home.attention_want(notices, self._width()) if notices else 0
         if not rows:
             self._plan = None
             body.layout_map = render.Body()
-            body.update(Text(
-                "loading…" if self.app.snapshot is None
-                else "No managed accounts yet: m → a (Account settings) adds one.",
-                style=palette.muted,
-            ))
+            # No account yet: the sentence says how to add one.
+            body.update(Text("loading…" if self.app.snapshot is None else "",
+                             style=palette.muted))
             head.display = detail.display = summary.display = False
             self.set_class(False, "-summary")
-            self._fit_scroll(height, attention, 0)
+            self._show_attention(notices, want, palette)
+            self._fit_scroll(height, want, 0)
             return
         row = self.current_row()
         acc = self._accounts.get(row.number) if row is not None else None
@@ -784,8 +803,9 @@ class FleetScreen(Screen):
             rows, statuses, now=ctx.now, detail=render.detail_height(row, acc, ctx),
         )
         cap = home.capacity(rows, self._mx, ctx.now)
-        plan = home.table_plan(width, height, needs, attention=attention, summary=cap is not None)
+        plan = home.table_plan(width, height, needs, attention=want, summary=cap is not None)
         self._plan = plan
+        self._show_attention(notices, plan.attention, palette)
         summary.display = plan.summary
         self.set_class(plan.summary, "-summary")
         if plan.summary and cap is not None:
@@ -800,23 +820,21 @@ class FleetScreen(Screen):
         detail.display = plan.detail
         if plan.detail:
             detail.update(render.render_detail(row, acc, plan.room, ctx))
-        self._fit_scroll(height, attention, needs.detail if plan.detail else 0,
+        self._fit_scroll(height, plan.attention, needs.detail if plan.detail else 0,
                          summary=plan.summary)
         if self._scroll_to_sel:
             self._scroll_to_sel = False
             self.call_after_refresh(self._scroll_selected_into_view)
 
     def _fit_scroll(
-        self, height: int, attention: bool, detail_lines: int, *, summary: bool = False
+        self, height: int, attention: int, detail_lines: int, *, summary: bool = False
     ) -> None:
         """Cap the table at the rows the fixed lines leave: the status line,
-        the attention line, the blank lines, the capacity summary, the
+        the attention lines, the blank lines, the capacity summary, the
         column headers, the selected account's panel (``table_plan`` shows
         it only when every row fits above it) and the footer always stay on
         screen."""
-        fixed = 1 + 1 + 1  # status line, column headers, footer
-        if attention:
-            fixed += 1
+        fixed = 1 + 1 + 1 + attention  # status line, column headers, footer
         if summary:
             fixed += 1
         if height >= home.BLANKS_MIN_ROWS:
@@ -901,6 +919,14 @@ class FleetScreen(Screen):
 
     def action_menu(self, action: str) -> None:
         self.dispatch_menu(action)
+
+    def action_accounts_key(self) -> None:
+        """a: Account settings — or, with no account yet, add the login
+        claude has now (what the empty screen's sentence offers)."""
+        if self._empty():
+            self.app.action_add_current()
+        else:
+            self.dispatch_menu("accounts")
 
     def toggle_auto(self) -> None:
         """Menu → o: automatic switching off (after a confirmation), or

@@ -338,7 +338,7 @@ class TestFleetReadModel:
         assert home.holder_variants(es, sit)[0] == "viewer · service pid 4121 is idle"
         # A paused priming is not news while nothing primes anyway.
         guard = "paused: claude 2.1.3 -> 2.1.4 (cc-swap prime verify)"
-        assert home.attention_parts([], now=NOW, prime_guard=guard, priming=False) is None
+        assert home.attention_notices([], now=NOW, prime_guard=guard, priming=False) == []
 
     def test_now_line_shows_what_it_would_do(self):
         dv = fx.DecisionView("off", "1", None, None, "fleet", at=NOW,
