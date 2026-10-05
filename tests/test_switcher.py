@@ -1793,7 +1793,7 @@ class TestListAccountsUsage:
         assert entry.poll_interval_s == poll_policy.MIN_INTERVAL_S
         assert entry.next_poll_at <= time_mod.time() + poll_policy.MIN_INTERVAL_S + 1
 
-        # An already-eager plan (urgent cadence) is never pushed later.
+        # An already-eager plan (sub-floor cadence) is never pushed later.
         store.set_poll_plan({"1": (time_mod.time() + 60.0, 60.0)}, ident)
         switcher._replan_new_active("1", "a@x.com", "")
         entry = store.entries(ident)["1"]

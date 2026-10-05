@@ -1036,7 +1036,7 @@ class UsageStore:
           plan is also due; that predicate is re-checked under this lock.
         - ``respect_plans=False`` (the auto engine's deliberate schedule):
           poll-due *or* stale — a due entry may be re-fetched inside the
-          serve TTL (that is how the bounded urgent cadence beats the TTL),
+          serve TTL (that is how the 120 s high-usage cadence beats the TTL),
           and an escalation refresh may fetch a not-yet-due candidate. With
           ``repair_overslept``, this becomes the non-escalating scheduler mode:
           due plans and stale impossible plans win, but valid future plans do
