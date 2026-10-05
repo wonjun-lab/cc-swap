@@ -573,6 +573,26 @@ def block_real_oauth_profile_fetch(request, monkeypatch):
     yield
 
 
+@pytest.fixture(autouse=True)
+def block_real_credits_fetch(request, monkeypatch):
+    """Safety net: no test reaches the real prepaid-credits / credit-grant
+    endpoints (``credits.request_org_json``) — ``cswap list`` and Fleet fetch
+    them for every slot holding an unexpired token. Refused as a network
+    error, which the credits store records as a failed fetch (no reading, so
+    nothing is displayed). ``@pytest.mark.no_credits_fake`` opts out for
+    tests that mock ``urlopen`` beneath it."""
+    if request.node.get_closest_marker("no_credits_fake"):
+        yield
+        return
+    import urllib.error
+
+    def refuse(*_a, **_k):
+        raise urllib.error.URLError("credits fetch blocked in tests")
+
+    monkeypatch.setattr("claude_swap.credits.request_org_json", refuse)
+    yield
+
+
 @pytest.fixture
 def temp_home(tmp_path: Path):
     """Create a temporary home directory for testing."""

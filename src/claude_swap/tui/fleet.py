@@ -82,6 +82,9 @@ if TYPE_CHECKING:
 
 LEASE_PROBE_S = 5.0
 SERVICE_PROBE_S = 30.0
+#: How often Fleet looks for slots whose credits reading is due (credits.py
+#: paces the actual fetches: hourly per account).
+CREDITS_CHECK_S = 300.0
 FETCH_ON_OPEN_ENV = "CC_SWAP_FETCH_ON_OPEN"
 
 
@@ -607,6 +610,7 @@ class FleetScreen(Screen):
         self._hostname = host_name()
         self._fx_timers: list = []
         self._prime_guard: PausedView | None = None
+        self._credits: dict[str, dict] = {}
 
     # -- composition ------------------------------------------------------------------
 
@@ -627,9 +631,11 @@ class FleetScreen(Screen):
         self._fx_timers = [
             self.set_interval(LEASE_PROBE_S, self._probe_lease),
             self.set_interval(SERVICE_PROBE_S, self._probe_service),
+            self.set_interval(CREDITS_CHECK_S, self._check_credits),
         ]
         self._probe_lease()
         self._probe_service()
+        self._check_credits()
         if self._host is not None:
             self._host.subscribe(self._on_host_event)
 
@@ -783,6 +789,24 @@ class FleetScreen(Screen):
             self._service = status
             self._render_all()
 
+    def _check_credits(self, force: bool = False) -> None:
+        """Prepaid balance / credit grants for the detail panel: due slots
+        (hourly, ``f`` at most once a minute) are fetched off the UI thread —
+        never the usage endpoint, so also while a viewer."""
+        self.run_worker(
+            partial(self._credits_blocking, force), thread=True, group="fleet-credits",
+            exclusive=True, exit_on_error=False, name="fleet-credits",
+        )
+
+    def _credits_blocking(self, force: bool) -> None:
+        readings = self.app.switcher.credits_by_account(force=force)
+        self.app.call_from_thread(self._on_credits, readings)
+
+    def _on_credits(self, readings: dict[str, dict]) -> None:
+        if readings != self._credits:
+            self._credits = readings
+            self._render_all()
+
     def _apply_store_only(self) -> None:
         """Another engine (or ours) fetches: the poller only reads the store."""
         if not self.is_current or self._held_elsewhere is None:
@@ -848,6 +872,7 @@ class FleetScreen(Screen):
             picks=tuple(picks),
             forced=forced,
             live=home.switching_live(sit),
+            credits=self._credits,
         )
         rows = home.ordered_rows(self._rows, picks, now=now, forced=forced)
         self._order = [r.number for r in rows]
@@ -1427,6 +1452,7 @@ class FleetScreen(Screen):
     def action_fetch(self) -> None:
         """One full fetch now — also as a viewer (store-only lane)."""
         self.app._start_normal_refresh(full=True)
+        self._check_credits(force=True)
         self.notify("Fetching latest usage…", timeout=2)
 
     def action_classic(self) -> None:

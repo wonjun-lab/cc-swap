@@ -463,6 +463,18 @@ A Claude Code login has a fixed deadline. The token endpoint sets it at `/login`
 - **Re-login.** Every message about one slot gives the same fix, `re-login NAME: cc-swap login NAME, or Fleet → select → r` (see above; the slot number, not its email, so the line is safe in logs and notifications); messages that are not about one slot say `re-login: cc-swap login, or Fleet → select → r`. A bare `cc-swap login` renews whichever account you sign in as. By hand, run `claude`, `/login` as that account, then `cc-swap add`. The Fleet guide stores the login only once the live refresh token has changed, so pressing `enter` before logging in stores nothing.
 - **Refresh audit.** Every refresh POST cc-swap makes logs one INFO line to the engine log (`refresh POST caller=… slot=… active=… source=live|backup|profile rt=<8 hex>-><8 hex> accessExp=… login=… result=… latency=…`). It holds fingerprint prefixes only, never tokens or emails, so it is safe to paste into an issue when you need to know which machine spent a token.
 
+### Credits and credit grants
+
+When an account has a prepaid credit balance or a credit grant, Fleet's detail panel and `cc-swap list` show one line for it: `credits balance $20.00 · $10.00 expires Nov 1 · grant $25.00 expires Oct 20` (`list` prints it as `credits: …`). The parts are:
+
+- **balance**: the prepaid credit balance.
+- **`$X expires <date>`**: the part of that balance that is promotional and expires, soonest first (`(+N more)` when there are several).
+- **grant**: a one-off extra-usage credit grant, either already granted (with its expiry) or `available` to claim. cc-swap never claims it; Claude Code offers the claim.
+
+Accounts with none of these show no line. Pay-as-you-go extra usage, when it is turned on, keeps its own `$$` usage bar.
+
+The data comes from two read-only organization endpoints that Claude Code also calls (`prepaid/credits` and `overage_credit_grant`). The usage endpoint is not involved, so this never spends the 5h/7d polling budget, and nothing here changes a switch decision. Each account is read at most once an hour. Fleet's `f` refreshes it as well, at most once a minute. A failed read keeps the last reading and backs off on its own (5 minutes, doubling, up to 6 hours, or longer when the server asks). An account whose access token has expired is skipped until the usage polling has refreshed the token. Readings are stored in `cache/credits.json` in the backup root.
+
 ## Classic dashboard and watch view
 
 With a strategy other than `maximize`, `cc-swap` on its own (or `cc-swap tui`) opens upstream's full-screen dashboard: live usage for every account, switching, and the auto-switcher, all keyboard-driven. Under `maximize` it is in Fleet's menu (`m` → `c`). `cc-swap watch` opens it straight on the live monitor. It works on macOS, Linux and Windows. From the classic dashboard, `g` opens the auto screen.
@@ -692,6 +704,8 @@ Every payload carries a `schemaVersion` (currently `1`); on a handled error stdo
 Usage is served from a per-account cache: when the usage API is briefly unreachable, the last-known numbers are shown instead of nothing (the human view marks them with their age, for example `· 2m ago`). Rows with decision-trusted usage carry additive `usageFetchedAt`/`usageAgeSeconds` fields telling you how old the measurement is. Whenever `usage` is null but a last-known measurement exists (data too old to drive a decision, where `usageStatus` stays `unavailable`, or a row in a non-`ok` state such as `token_expired`), additive `lastGoodUsage`/`lastGoodFetchedAt`/`lastGoodAgeSeconds` fields preserve the human display without making the account actionable. When `usage` is null and nothing else explains it (`usageStatus` is `unavailable`), an additive `usageError` names the last fetch failure by kind (for example `http-429`, `timeout`) and, while the cache is backing off from it, `usageRetryAt` gives the time of the next attempt. These fields apply to list rows and the managed active row from `status --json`. An account held out of rotation with `cc-swap disable` carries an additive `"disabled": true` on its row (absent otherwise).
 
 A row carries an additive `loginExpiresAt` (ISO-8601 UTC) when the stored login records when its refresh token expires, which is the moment the slot will need a fresh `/login` and `cc-swap add --slot N`; a script can warn a few days ahead instead of discovering `relogin_required`. It is absent when Claude Code recorded no such date for that login. Once that moment has passed the row also carries `"loginExpired": true` (derived from the stored date, so it can flip a few hours before the server refuses the next refresh).
+
+Once an account has a credits reading (see [Credits and credit grants](#credits-and-credit-grants)), its `list --json` row carries an additive `credits` object: `balance` and `currency`, `expiring` (a list of `{amount, currency, name, expiresAt}`), `grant` (`{state: "granted"|"available", amount, currency, expiresAt}` or null) and `fetchedAt`. Amounts are in currency units, like `spend`. The object is present even when everything in it is zero.
 
 An account row also carries an additive `alias` field once one is set with `cc-swap alias` (for example `"alias": "dev"`); accounts without one omit the key.
 

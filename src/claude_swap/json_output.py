@@ -335,6 +335,7 @@ def account_row(
     login_expires_at: str | None = None,
     login_expired: bool = False,
     name: str = "",
+    credits: dict | None = None,
 ) -> dict:
     """A full account row for ``--list``. ``backoff_until`` is the live
     backoff only; a lapsed one is the caller's to withhold. ``name``
@@ -371,6 +372,10 @@ def account_row(
     # refresh will be refused, so a script should treat it as due now.
     if login_expired:
         row["loginExpired"] = True
+    # Additive: prepaid balance / credit grant (``credits.to_json``), present
+    # once the slot has a reading.
+    if credits is not None:
+        row["credits"] = credits
     if usage is not None:
         row.update(usage_freshness_fields(usage_fetched_at, usage_age_s))
     else:
