@@ -142,12 +142,32 @@ def test_slot_is_honoured_for_a_new_account(temp_home):
     assert s._get_sequence_data()["sequence"] == [1, 3, 4, 5]
 
 
-def test_a_taken_slot_is_refused_before_the_browser(temp_home):
+def test_a_malformed_slot_is_refused_before_the_browser(temp_home):
     s = _switcher(temp_home)
     login = _new_login()
-    with pytest.raises(Exception, match="slot 4 is taken"):
-        _run(s, login, rl.NewAccount(slot="4"))
+    with pytest.raises(Exception, match="slot number"):
+        _run(s, login, rl.NewAccount(slot="zero"))
     assert not login.calls and not _leftover_profiles(s)
+
+
+def test_a_taken_slot_does_not_block_a_renew_of_that_account(temp_home):
+    """`cc-swap login --slot 4` signing in as #4 itself: a renew, not refused."""
+    s = _switcher(temp_home)
+    outcome = _run(s, FakeLogin(), rl.NewAccount(slot="4"))
+    assert outcome.ok and outcome.number == "4" and _slot_rt(s) == "rt-four-new"
+    assert "--slot" not in outcome.message  # the slot asked for IS the account's
+
+
+def test_adding_to_a_taken_slot_is_refused_when_storing_and_kept(temp_home):
+    s = _switcher(temp_home)
+    before = _sequence(s)
+    login = _new_login()
+    outcome = _run(s, login, rl.NewAccount(slot="4"))
+    assert login.calls  # the slot's use was known only after the sign-in
+    assert outcome.status == rl.FAILED and "slot 4 is taken" in outcome.message
+    assert "cc-swap unclaimed" in outcome.message and _stashed_rts(s) == ["rt-new"]
+    assert _sequence(s) == before and _slot_rt(s) == "rt-four-dead"
+    assert not _leftover_profiles(s)
 
 
 def test_the_email_only_pre_fills(temp_home):
@@ -223,6 +243,22 @@ def test_an_api_key_slot_under_that_email_is_not_guessed(temp_home):
     assert _sequence(s) == before
 
 
+def test_a_slot_without_an_organization_is_offered_a_replacement_not_login_n(temp_home):
+    """A setup-token / add-token slot stores no organization: `cc-swap login 4`
+    compares it strictly and could never succeed, so it is not suggested."""
+    s = _switcher(temp_home)
+    data = s._get_sequence_data()
+    data["accounts"]["4"]["organizationUuid"] = ""
+    s._write_json(s.sequence_file, data)
+    outcome = _run(s, FakeLogin())  # four@example.com in org-4
+    assert outcome.status == rl.AMBIGUOUS
+    assert "cc-swap remove 4; cc-swap login" in outcome.message
+    assert "stored without an organization" in outcome.message
+    assert "cc-swap login 4 " not in outcome.message + " "
+    assert "cc-swap login --new" in outcome.message
+    assert _slot_rt(s) == "rt-four-dead"
+
+
 def test_match_login_rules():
     data = {"accounts": {
         "4": {"email": FOUR, "organizationUuid": ORG4, "uuid": "uuid-4"},
@@ -259,6 +295,73 @@ def test_cancel_or_failure_stores_nothing_and_cleans_up(temp_home, code, status)
     assert outcome.status == status and "nothing stored" in outcome.message
     assert _sequence(s) == before and _live_files(temp_home, s) == live_before
     assert not login.profile.exists() and not _leftover_profiles(s)
+
+
+def test_a_login_that_names_no_account_is_kept_and_says_sign_in_again(temp_home):
+    s = _switcher(temp_home)
+    before = _sequence(s)
+    login = FakeLogin()
+
+    def no_account(argv, env, cwd):
+        code = login(argv, env, cwd)
+        (Path(cwd) / ".claude.json").write_text("{}")
+        return code
+
+    outcome = _run(s, no_account)
+    assert outcome.status == rl.FAILED and "names no account" in outcome.message
+    assert "cc-swap unclaimed" in outcome.message and _stashed_rts(s) == ["rt-four-new"]
+    assert outcome.message.endswith("Sign in again: cc-swap login")
+    assert _sequence(s) == before and not _leftover_profiles(s)
+
+
+def test_an_unreadable_login_is_salvaged_best_effort(temp_home, monkeypatch):
+    s = _switcher(temp_home)
+
+    def unreadable(self):
+        raise OSError("profile torn")
+
+    monkeypatch.setattr(rl.SignInAttempt, "read_login", unreadable)
+    outcome = _run(s, FakeLogin())
+    assert outcome.status == rl.FAILED and "could not read the new login" in outcome.message
+    assert _stashed_rts(s) == ["rt-four-new"]  # the credential itself was readable
+    assert "Sign in again: cc-swap login" in outcome.message
+    assert not _leftover_profiles(s)
+
+
+def test_a_login_claude_did_not_save_says_sign_in_again(temp_home):
+    s = _switcher(temp_home)
+    outcome = _run(s, FakeLogin(write=False))  # exit 0, nothing written
+    assert outcome.status == rl.FAILED and "claude saved no login" in outcome.message
+    assert "Sign in again: cc-swap login" in outcome.message and _stashed_rts(s) == []
+
+
+@pytest.mark.parametrize("make, retry", [
+    (lambda: rl.relogin, "cc-swap login 4"),
+    (lambda: rl.login_new, "cc-swap login --new"),
+])
+def test_the_explicit_forms_say_how_to_retry_too(temp_home, make, retry):
+    s = _switcher(temp_home)
+    fn = make()
+    first = "4" if fn is rl.relogin else rl.NewAccount()
+    outcome = fn(s, first, claude=CLAUDE, run=FakeLogin(write=False), announce=None)
+    assert outcome.status == rl.FAILED and "nothing stored" in outcome.message
+    assert outcome.message.endswith(f"Sign in again: {retry}")
+
+
+def test_failure_warnings_name_the_type_and_slot_not_the_email(temp_home, monkeypatch, caplog):
+    s = _switcher(temp_home)
+
+    def stash(*a, **k):
+        raise OSError(f"cannot write .creds-4-{FOUR}.enc")
+
+    monkeypatch.setattr(s, "stash_relogin_credential", stash)
+    with caplog.at_level("WARNING", logger="claude-swap"):
+        outcome = _run(s, FakeLogin(email="renamed@example.com"))
+    assert outcome.status == rl.AMBIGUOUS
+    warnings = [r.getMessage() for r in caplog.records if r.levelname == "WARNING"]
+    assert any("OSError" in w and "#4" in w for w in warnings)
+    assert not any(FOUR in w or "renamed@example.com" in w for w in warnings)
+    assert not any(r.exc_info for r in caplog.records if r.levelname == "WARNING")
 
 
 def test_a_store_failure_keeps_the_login(temp_home, monkeypatch):
@@ -355,11 +458,34 @@ def test_cli_bare_partial_match_exits_one_and_names_the_commands(temp_home, monk
     assert _sequence(s) == before
 
 
-def test_cli_bare_taken_slot_exits_one_before_the_browser(temp_home, monkeypatch, capsys,
+def test_cli_bare_slot_of_the_signed_in_account_renews(temp_home, monkeypatch, capsys,
+                                                       cli_sign_in):
+    s = _switcher(temp_home)
+    cli_sign_in["login"] = FakeLogin()
+    assert _cli(monkeypatch, ["--slot", "4"]) == 0
+    assert "updated #4 four" in capsys.readouterr().out
+    assert _slot_rt(s) == "rt-four-new"
+
+
+def test_cli_bare_taken_slot_for_a_new_account_exits_one(temp_home, monkeypatch, capsys,
                                                           cli_sign_in):
-    _switcher(temp_home)
-    cli_sign_in["login"] = login = _new_login()
+    s = _switcher(temp_home)
+    cli_sign_in["login"] = _new_login()
     assert _cli(monkeypatch, ["--slot", "4"]) == 1
+    err = capsys.readouterr().err
+    assert "slot 4 is taken" in err and "cc-swap unclaimed" in err
+    assert _slot_rt(s) == "rt-four-dead"
+
+
+def test_cli_explicit_new_still_refuses_a_taken_slot_before_the_browser(
+    temp_home, monkeypatch, capsys
+):
+    _switcher(temp_home)
+    login = _new_login()
+    real_new = rl.login_new
+    monkeypatch.setattr(rl, "login_new", lambda sw, new, *, claude, **kw: real_new(
+        sw, new, claude=claude, **{**kw, "run": login}))
+    assert _cli(monkeypatch, ["--new", "--slot", "4"]) == 1
     assert "slot 4 is taken" in capsys.readouterr().err
     assert not login.calls
 

@@ -292,7 +292,7 @@ To renew (early, or once it has expired), run `cc-swap login` — no slot number
 
 `cc-swap login --email you@example.com` pre-fills the browser. In Fleet, `m` → `a` → `s` (Sign in) does the same; selecting an account and pressing `r` renews that one with its email pre-filled. Ctrl-C cancels and stores nothing.
 
-For scripts, the explicit forms remain: `cc-swap login 4` (or an email or alias) renews that account only and refuses a login as anyone else; `cc-swap login --new` only adds, and refuses an account cc-swap already has.
+For scripts, the explicit forms remain: `cc-swap login 4` (or an email or alias) renews that account only and refuses a login as anyone else; `cc-swap login --new` only adds, and refuses an account cc-swap already has. Behaviour change: a bare `cc-swap login` used to exit with "name the account to re-login"; it now opens the browser sign-in, so a script that called it without arguments now starts an interactive login.
 
 When claude can't be launched (not found, or too old for `claude auth login`), cc-swap shows the manual steps instead: run `claude`, `/login` as that account, then `cc-swap add`. cc-swap recognises the account and updates its slot instead of adding a duplicate.
 

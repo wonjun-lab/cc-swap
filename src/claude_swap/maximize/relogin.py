@@ -312,9 +312,10 @@ def sweep_stale_profiles(root: Path, *, max_age_s: float = STALE_PROFILE_S,
                 continue
             if _remove_profile(path):
                 removed.append(path)
-        except Exception:
-            _logger.warning("Could not remove the leftover re-login profile %s", path,
-                            exc_info=True)
+        except Exception as e:  # the type only: the text is not ours to log at WARNING
+            _logger.warning("Could not remove the leftover re-login profile %s: %s", path,
+                            type(e).__name__)
+            _logger.debug("Removing %s failed", path, exc_info=True)
     if removed:
         _logger.info("Removed %d leftover re-login profile(s)", len(removed))
     return removed
@@ -446,14 +447,12 @@ class LoginAttempt:
         try:
             creds, account = self.read_login()
         except Exception as e:
-            return Outcome(FAILED, t.number, f"could not read the new login: {e}")
+            return self.salvage(switcher, t.number, f"could not read the new login: {e}")
         pair = _full_pair(creds)
         if pair is None:
-            return Outcome(FAILED, t.number, "claude saved no login; nothing stored")
+            return self.salvage(switcher, t.number, "claude saved no login")
         if account is None:
-            return Outcome(
-                FAILED, t.number, "the new login names no account; nothing stored"
-            )
+            return self.salvage(switcher, t.number, "the new login names no account")
         problem = identity_problem(t, account)
         if problem is None:
             problem = _oracle_problem(switcher, t, pair)
@@ -469,8 +468,7 @@ class LoginAttempt:
         except Exception as e:
             if not committed:
                 return Outcome(FAILED, t.number, _not_stored(switcher, t, creds, e))
-            _logger.warning("re-login #%s: stored, then %s: %s", t.number,
-                            type(e).__name__, e)
+            _log_failure("re-login: stored, then the after-work failed", t.number, e)
             result = committed[0]  # stored; only the after-work failed
         except BaseException as e:  # Ctrl-C / SIGTERM mid-store: keep it, then unwind
             if not committed:  # once stored, a stash would only duplicate it
@@ -481,6 +479,35 @@ class LoginAttempt:
             return Outcome(STORED, t.number, f"{stored}; the live login now uses it",
                            activated=True)
         return Outcome(STORED, t.number, stored)
+
+    def retry(self) -> str:
+        """The command that runs this sign-in again."""
+        return f"cc-swap login {self.target.number}"
+
+    def salvage(self, switcher, number: str, why: str) -> Outcome:
+        """The browser step finished but its login cannot be checked or
+        stored (unreadable, incomplete, names no account): keep whatever
+        credential the profile still yields as an unclaimed entry (best
+        effort, before the cleanup deletes it) and never end silently —
+        the message always says to sign in again."""
+        from claude_swap.session import read_config_dir_credentials
+
+        creds = None
+        try:
+            creds = read_config_dir_credentials(str(self.profile), strict_keychain=True)
+        except Exception as e:
+            _log_failure("reading the new login", number, e)
+        message = f"{why}; nothing stored"
+        if _full_pair(creds) is not None:
+            try:
+                entry = switcher.stash_relogin_credential(
+                    number or "new", creds, "login-unreadable",
+                )
+            except Exception as e:
+                _log_failure("keeping the unreadable login", number, e)
+            else:
+                message += f". The new login was kept as {entry} (cc-swap unclaimed)"
+        return Outcome(FAILED, number, f"{message}. Sign in again: {self.retry()}")
 
     def cleanup(self) -> None:
         """Delete the profile's Keychain item and the directory. Idempotent."""
@@ -506,11 +533,18 @@ def _not_stored(switcher, target: Target, creds: str, error: Exception) -> str:
     message = f"not stored ({why}); the slot and the live login are unchanged"
     try:
         entry = switcher.stash_relogin_credential(target.number, creds, "relogin-unstored")
-    except Exception:
-        _logger.warning("Could not keep the unstored login of #%s", target.number,
-                        exc_info=True)
+    except Exception as e:
+        _log_failure("keeping the unstored login", target.number, e)
         return message
     return f"{message}. The new login was kept as {entry} (cc-swap unclaimed); retry cc-swap login {target.number}"
+
+
+def _log_failure(what: str, number: str, error: BaseException) -> None:
+    """Log a failure by its exception type and slot number only: the text
+    can carry a config or credential filename, which holds the account's
+    email. The full text (and traceback) goes to DEBUG."""
+    _logger.warning("%s (#%s): %s", what, number or "new", type(error).__name__)
+    _logger.debug("%s (#%s): %s", what, number or "new", error, exc_info=True)
 
 
 def _oracle_problem(switcher, target: Target, pair: Mapping) -> str | None:
@@ -546,6 +580,9 @@ class NewLoginAttempt(LoginAttempt):
     def what(self) -> str:
         return "sign-in of a new account"
 
+    def retry(self) -> str:
+        return "cc-swap login --new"
+
     def banner(self) -> str:
         who = f" as {self.target.email}" if self.target.email else ""
         return (
@@ -570,12 +607,11 @@ class NewLoginAttempt(LoginAttempt):
         try:
             creds, account = self.read_login()
         except Exception as e:
-            return Outcome(FAILED, "", f"could not read the new login: {e}")
-        pair = _full_pair(creds)
-        if pair is None:
-            return Outcome(FAILED, "", "claude saved no login; nothing stored")
+            return self.salvage(switcher, "", f"could not read the new login: {e}")
+        if _full_pair(creds) is None:
+            return self.salvage(switcher, "", "claude saved no login")
         if account is None:
-            return Outcome(FAILED, "", "the new login names no account; nothing stored")
+            return self.salvage(switcher, "", "the new login names no account")
         try:
             return self._place(switcher, creds, account, adopt_existing)
         except Exception as e:  # e.g. a torn sequence.json: keep the login
@@ -611,8 +647,8 @@ class NewLoginAttempt(LoginAttempt):
                 existing = e.number  # added meanwhile: same answer as below
             except Exception as e:
                 if committed:  # stored; only the after-work failed
-                    _logger.warning("new account #%s: stored, then %s: %s",
-                                    committed[0], type(e).__name__, e)
+                    _log_failure("new account: stored, then the after-work failed",
+                                 committed[0], e)
                     return self._stored(committed[0], email, account, creds)
                 return Outcome(FAILED, "", _new_not_stored(switcher, creds, e))
             except BaseException as e:  # Ctrl-C / SIGTERM mid-store: keep it, then unwind
@@ -665,8 +701,8 @@ def _kept(switcher, number: str, creds: str, message: str) -> str:
     never simply thrown away."""
     try:
         entry = switcher.stash_relogin_credential(number, creds, "login-new-not-stored")
-    except Exception:
-        _logger.warning("Could not keep the unstored new login", exc_info=True)
+    except Exception as e:
+        _log_failure("keeping the unstored new login", number, e)
         return message
     return f"{message}. This login was kept as {entry} (cc-swap unclaimed)"
 
@@ -681,8 +717,8 @@ def _new_not_stored(switcher, creds: str, error: BaseException) -> str:
     message = f"not stored ({why}); the live login is unchanged"
     try:
         entry = switcher.stash_relogin_credential("new", creds, "login-new-unstored")
-    except Exception:
-        _logger.warning("Could not keep the unstored new login", exc_info=True)
+    except Exception as e:
+        _log_failure("keeping the unstored new login", "", e)
         return message
     return f"{message}. The new login was kept as {entry} (cc-swap unclaimed)"
 
@@ -755,7 +791,15 @@ def match_login(data: Mapping | None, account: Mapping) -> LoginMatch:
             if there == here:  # two organizations under one name: tell them apart
                 there, ours = _org_label("", rec_org), _org_label("", org)
             partial.append(f"#{num} is {rec_email} in {there}; you signed in to {ours}")
-            fixes.append((f"cc-swap login {num}", f"renew #{num}: sign in to {there} this time"))
+            if rec_org:
+                fixes.append((f"cc-swap login {num}",
+                              f"renew #{num}: sign in to {there} this time"))
+            else:
+                # Stored without an organization (a setup-token / add-token
+                # slot): `cc-swap login N` compares the org strictly and can
+                # never match a browser login, so replacing it is the way.
+                fixes.append((f"cc-swap remove {num}; cc-swap login",
+                              f"replace #{num} (stored without an organization) with this login"))
         elif same_email:
             partial.append(f"#{num} is {rec_email} in {there}, but another account id")
             fixes.append((f"cc-swap remove {num}; cc-swap login",
@@ -808,6 +852,9 @@ class SignInAttempt(NewLoginAttempt):
     def what(self) -> str:
         return "sign-in"
 
+    def retry(self) -> str:
+        return "cc-swap login"
+
     def banner(self) -> str:
         who = f" as {self.target.email}" if self.target.email else ""
         return (
@@ -826,11 +873,11 @@ class SignInAttempt(NewLoginAttempt):
         try:
             creds, account = self.read_login()
         except Exception as e:
-            return Outcome(FAILED, "", f"could not read the new login: {e}")
+            return self.salvage(switcher, "", f"could not read the new login: {e}")
         if _full_pair(creds) is None:
-            return Outcome(FAILED, "", "claude saved no login; nothing stored")
+            return self.salvage(switcher, "", "claude saved no login")
         if account is None:
-            return Outcome(FAILED, "", "the new login names no account; nothing stored")
+            return self.salvage(switcher, "", "the new login names no account")
         try:
             return self._decide(switcher, creds, account)
         except Exception as e:  # e.g. a torn sequence.json: keep the login
@@ -857,8 +904,7 @@ class SignInAttempt(NewLoginAttempt):
             raise
         except Exception as e:
             if committed:  # stored; only the after-work failed
-                _logger.warning("sign-in: added #%s, then %s: %s",
-                                committed[0], type(e).__name__, e)
+                _log_failure("sign-in: added, then the after-work failed", committed[0], e)
                 number = committed[0]
             else:
                 return Outcome(FAILED, "", _new_not_stored(switcher, creds, e))
@@ -915,8 +961,8 @@ class SignInAttempt(NewLoginAttempt):
             entry = switcher.stash_relogin_credential(
                 match.number or "new", creds, "login-ambiguous",
             )
-        except Exception:
-            _logger.warning("Could not keep the unstored sign-in", exc_info=True)
+        except Exception as e:
+            _log_failure("keeping the unstored sign-in", match.number, e)
             lines.append("The slots and the live login are unchanged.")
         else:
             lines.append(
@@ -937,8 +983,10 @@ def sign_in(
 ) -> Outcome:
     """The whole bare ``cc-swap login`` (Fleet runs the same steps around
     ``App.suspend``). ``new.email`` only pre-fills; ``new.slot`` is where a
-    new account goes (a taken one is refused before the browser)."""
-    check_new_slot(switcher, new.slot)
+    new account goes. Only its number is checked before the browser: a
+    renew does not use it, and adding to a taken one is refused when
+    storing (the login is then kept unclaimed)."""
+    check_new_slot(switcher, new.slot, free=False)
     refuse = getattr(switcher, "_refuse_session_shell", None)
     if refuse is not None:
         refuse()  # before the browser: storing would refuse anyway
@@ -987,12 +1035,17 @@ def login_new(
         return attempt.finish(switcher, adopt_existing=adopt_existing)
 
 
-def check_new_slot(switcher, slot: str | None) -> None:
-    """``ValidationError`` when ``slot`` is not a free slot number."""
+def check_new_slot(switcher, slot: str | None, *, free: bool = True) -> None:
+    """``ValidationError`` when ``slot`` is not a slot number or, with
+    ``free``, is taken. The bare ``cc-swap login`` checks only the number
+    before the browser: whether the slot must be free depends on who signs
+    in (a renew does not use it; ``store_new_login`` re-checks an add)."""
     if slot is None:
         return
     if not str(slot).isdigit() or int(str(slot)) < 1:
         raise ValidationError(f"--slot takes a slot number >= 1, not {slot}")
+    if not free:
+        return
     accounts = (switcher._get_sequence_data() or {}).get("accounts") or {}
     if str(int(str(slot))) in accounts:
         raise ValidationError(

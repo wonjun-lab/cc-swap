@@ -1552,7 +1552,9 @@ new deadline. Other machines keep their own logins: run this there too.
             if args.email is not None and not switcher._validate_email(args.email):
                 raise ValidationError(f"Invalid email format: {args.email}")
             new = rl.NewAccount(slot=args.slot, email=(args.email or "").strip())
-            rl.check_new_slot(switcher, new.slot)  # before anything is launched
+            # Before anything is launched. Bare: the number only — a renew
+            # ignores --slot, an add re-checks it is free when storing.
+            rl.check_new_slot(switcher, new.slot, free=not bare)
         else:
             num, email, _ = switcher.resolve_account(args.account)
             rl.target_for(switcher, num)  # an API-key slot has no login to renew
