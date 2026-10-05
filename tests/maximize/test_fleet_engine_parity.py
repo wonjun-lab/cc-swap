@@ -66,6 +66,7 @@ def _engine_snapshot(snap, mx, state):
             a.number: a.login_expires_at / 1000.0
             for a in snap.accounts if a.login_expires_at is not None
         },
+        ages=engine_hook.reading_ages(entries),
     )
     return esnap
 

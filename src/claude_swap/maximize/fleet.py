@@ -383,6 +383,7 @@ def fleet_rows(
                     not active
                     and landable(tv, mx, drain_room=drain_room)
                     and not policy.login_guarded(tv, now, mx)
+                    and not policy.stale_reading(tv)
                 ),
                 land=land_note(
                     tv, mx, active=active, login=login, now=now, drain_room=drain_room

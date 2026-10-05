@@ -51,7 +51,17 @@ from typing import Any, Protocol
 from claude_swap import autoswitch as aw
 from claude_swap import oauth, poll_policy, shared_login
 from claude_swap.exceptions import ConfigError
-from claude_swap.maximize import drain, history, idle, ledger, notify, pause, policy
+from claude_swap.maximize import (
+    active_watch,
+    drain,
+    history,
+    idle,
+    ledger,
+    notify,
+    pause,
+    policy,
+)
+from claude_swap.maximize import estimate as est
 from claude_swap.maximize import hold as account_hold
 from claude_swap.maximize import ride as learned_ride
 from claude_swap.maximize.model import (
@@ -183,6 +193,68 @@ def _apply_poll_inputs(engine: aw.AutoSwitchEngine, s: MaximizeSettings) -> None
     # apply_threshold sets settings.threshold (escalation, PollEvent label)
     # and switcher.set_poll_policy_inputs (urgent mode) in one call.
     engine.apply_threshold(poll_threshold(s))
+    # Each window's urgency keys on its own hard cap (poll_policy), not on
+    # min(hard): a 7d in the 80s is far from a 98% cap.
+    setter = getattr(engine.switcher, "set_poll_window_caps", None)
+    if callable(setter):
+        setter({"5h": float(s.hard_5h), "7d": float(s.hard_7d)})
+
+
+#: A switch is near enough for the engine to refetch every candidate when a
+#: window's pace reaches its hard cap within this many minutes.
+ESCALATE_ETA_MIN = 30.0
+
+
+def escalation_wanted(
+    engine: aw.AutoSwitchEngine,
+    current: str,
+    value: object,
+    now: float,
+    estimate: est.Estimate | None = None,
+) -> bool:
+    """Whether the engine should refetch every candidate before deciding
+    (``AutoSwitchEngine._collect_scheduled_usage``'s escalation).
+
+    Upstream escalates whenever the binding window is within
+    ``ESCALATION_MARGIN_PCT`` of the threshold, min(hard): under maximize a
+    7d in the 80s did that for days, every machine refetching every
+    candidate every 3 minutes — the shared budget then 429s for everyone.
+    A switch is near only when a window is at its hard cap, or its pace
+    (the samples' velocity, the projection's, or the learned/default one)
+    reaches the cap within :data:`ESCALATE_ETA_MIN`. With no pace known,
+    the upstream band below each window's own cap. Unknown usage escalates
+    (the caller's rule)."""
+    rt = runtime_for(engine)
+    s = rt.settings
+    pct5, _r5, pct7, _r7 = usage_windows(value, now)
+    if pct5 is None or pct7 is None:
+        return True
+    mark5, mark7 = s.hard_5h, s.hard_7d
+    if pct5 >= mark5 or pct7 >= mark7:
+        return True
+    source = rt.dry_samples if engine.dry_run else engine._read_state()
+    samples = idle.trim_samples(_stored_samples(source, current), now)
+    rates: tuple[float | None, float | None] = (None, None)
+    if samples and now - samples[-1].ts <= s.idle_window_min * 60.0:
+        rates = idle.velocity(samples, s)
+    elif estimate is not None and estimate.kind == "projected":
+        rates = tuple(  # type: ignore[assignment]
+            estimate.rates[w] / 60.0 if w in estimate.rates else None for w in ("5h", "7d")
+        )
+    if rates == (None, None):
+        # The pace the policy falls back to (learned, else the plan's).
+        learned, _sources = active_watch.fallback_rates(engine, current)
+        if learned:
+            rates = tuple(  # type: ignore[assignment]
+                learned[w] / 60.0 if w in learned else None for w in ("5h", "7d")
+            )
+    if rates == (None, None):
+        margin = poll_policy.ESCALATION_MARGIN_PCT
+        return pct5 >= mark5 - margin or pct7 >= mark7 - margin
+    for pct, cap, rate in ((pct5, mark5, rates[0]), (pct7, mark7, rates[1])):
+        if rate is not None and rate > 0 and (cap - pct) / rate <= ESCALATE_ETA_MIN:
+            return True
+    return False
 
 
 def _settings_mtime(engine: aw.AutoSwitchEngine) -> int | None:
@@ -375,9 +447,42 @@ def reload_if_changed(engine: aw.AutoSwitchEngine, rt: MaximizeRuntime) -> bool:
         ))
     if not maximize_ok:
         return False
+    changed = settings_diff(rt.settings, effective)
     rt.settings = effective
     _apply_poll_inputs(engine, effective)
+    if changed:
+        # One line per change, so a `config set` shows up in the engine
+        # log the tick it takes effect: "settings changed: hard5h 97 → 90".
+        engine._emit(aw.SettingsChangedEvent(changes=changed))
     return True
+
+
+def settings_diff(old: MaximizeSettings, new: MaximizeSettings) -> list[str]:
+    """``["hard5h 97 → 90", ...]``: the ``maximize`` keys whose value
+    differs, by their settings.json names, in registry order."""
+    from claude_swap.settings import SETTING_SPECS, format_setting_value
+
+    out: list[str] = []
+    for spec in SETTING_SPECS.values():
+        if spec.section != "maximize":
+            continue
+        before, after = getattr(old, spec.field, None), getattr(new, spec.field, None)
+        if before != after:
+            out.append(
+                f"{spec.json_key} {format_setting_value(before)} → {format_setting_value(after)}"
+            )
+    return out
+
+
+def reload_at_tick_start(engine: aw.AutoSwitchEngine) -> None:
+    """Pick up a settings.json change before this tick polls and decides,
+    so the poll line, the escalation threshold and the decision all run on
+    the new values (``cc-swap config set`` takes effect on the next tick,
+    no restart). Never raises."""
+    try:
+        reload_if_changed(engine, runtime_for(engine))
+    except Exception as e:
+        _logger.debug("settings reload failed: %s", type(e).__name__)
 
 
 # -- snapshot inputs -------------------------------------------------------------
@@ -702,6 +807,33 @@ def _history_inputs(
     except Exception as e:  # a planning aid must never break a tick
         _logger.debug("usage history unavailable: %s", type(e).__name__)
         return None, {}, {}
+
+
+#: Where ``AutoSwitchEngine`` keeps this tick's active-usage estimate
+#: (maximize/active_watch.py, ``_collect_scheduled_usage``).
+ESTIMATE_ATTR = "_active_estimate"
+
+
+def active_estimate(engine: aw.AutoSwitchEngine, current: str) -> est.Estimate | None:
+    """This tick's estimate of ``current``'s usage, or None (decide on its
+    reading)."""
+    found = getattr(engine, ESTIMATE_ATTR, None)
+    if isinstance(found, est.Estimate) and found.number == current:
+        return found
+    return None
+
+
+def reading_ages(entries: Mapping) -> dict[str, float | None]:
+    """How old each account's stored reading is (``UsageEntry.age_s``)."""
+    out: dict[str, float | None] = {}
+    for number, entry in entries.items():
+        age = getattr(entry, "age_s", None)
+        out[str(number)] = (
+            float(age)
+            if isinstance(age, (int, float)) and not isinstance(age, bool)
+            else None
+        )
+    return out
 
 
 def _recent_429(entry, now: float) -> bool:
@@ -1037,6 +1169,7 @@ def _publish_decision(
     tiers: Mapping[str, str | None],
     *,
     shared: set[str] | frozenset[str] = frozenset(),
+    estimate: est.Estimate | None = None,
 ) -> None:
     """Write this tick's decision to the state file for TUI viewers.
 
@@ -1069,6 +1202,10 @@ def _publish_decision(
         record["code"] = decision.code
     if shared:
         record["shared"] = sorted(shared, key=lambda n: (len(n), n))
+    if estimate is not None:
+        # The active usage was projected (or reported at its limit by Claude
+        # Code): ``cc-swap why`` says so, and why.
+        record["estimate"] = estimate.to_json()
     if isinstance(decision, Hold) and decision.ride_until is not None:
         # A ride's switch time, so a viewer counts its minutes down live.
         record["rideUntil"] = decision.ride_until
@@ -1519,11 +1656,17 @@ def run_maximize_tick(
     )
     last = state.get("lastSwitchAt")
     tiers = _rate_limit_tiers(engine, rt, records, now)
+    # The active account's usage as the engine decides on it when its
+    # reading is too old, or Claude Code reported its limit
+    # (maximize/active_watch.py). Samples, the ride and the history above
+    # keep running on the readings themselves.
+    estimate = active_estimate(engine, current)
+    decided = dict(usage) if estimate is None else {**usage, current: estimate.value}
     snap, shared = policy_snapshot(
         now=now,
         current=current,
         entries=entries,
-        usage=usage,
+        usage=decided,
         records=records,
         quarantined=quarantined,
         switchable=set(engine.switcher.switchable_account_numbers()),
@@ -1545,11 +1688,20 @@ def run_maximize_tick(
         ride_point_s=ride_tick.point_s,
         ride_q=ride_tick.q,
         k7=k7,
+        ages=reading_ages(entries),
+        estimate=estimate.for_snapshot() if estimate is not None else None,
+        local_idle=(
+            active_watch.local_idle(engine, now, rt.settings.idle_window_min)
+            if estimate is not None and estimate.kind == "projected"
+            else None
+        ),
     )
     decision = policy.decide(snap)
     rt.last_snapshot, rt.last_decision = snap, decision
     engine._emit(_decision_event(snap, decision, engine.dry_run))
-    _publish_decision(engine, snap, decision, state, tiers, shared=shared)
+    _publish_decision(
+        engine, snap, decision, state, tiers, shared=shared, estimate=estimate
+    )
     # `cc-swap auto off`: the decision is shown and published, but nothing
     # acts on it — no switch, no failover, no prime.
     held = pause.auto_off_hold(engine, state)
@@ -1570,7 +1722,7 @@ def run_maximize_tick(
     ok: tuple[str, ...] = ()
     if isinstance(decision, Switch):
         outcome, landed = _switch(
-            engine, rt, snap, decision, usage, headroom, current, entries.get(current)
+            engine, rt, snap, decision, decided, headroom, current, entries.get(current)
         )
         if landed:
             _end_hold_after_switch(engine, held_until, current, landed)
