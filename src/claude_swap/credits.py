@@ -31,6 +31,7 @@ import urllib.request
 from collections.abc import Callable, Iterable
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
+from functools import partial
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -60,14 +61,22 @@ BACKOFF_CAP_S = 6 * 3600.0
 
 Identity = tuple[str, str]  # (email, organizationUuid), as in usage_store
 
-_SYMBOLS = {"USD": "$", "EUR": "€", "GBP": "£"}
-_ZERO_DECIMAL = {"JPY", "KRW", "VND", "CLP", "ISK", "HUF", "TWD", "IDR"}
+# Claude Code 2.1.289's own formatter (the same API's reference consumer):
+# these symbols, and only JPY/KRW/VND read as zero-decimal minor units.
+_SYMBOLS = {"USD": "$", "EUR": "€", "GBP": "£", "JPY": "¥", "BRL": "R$",
+            "CAD": "CA$", "AUD": "A$", "NZD": "NZ$", "SGD": "S$"}
+_ZERO_DECIMAL = {"JPY", "KRW", "VND"}
+#: Statuses that mean "this org has no such resource" — an empty reading,
+#: not a failure to back off from.
+_ABSENT = (403, 404)
 
 
 # -- HTTP ----------------------------------------------------------------------------
 
 
-def request_org_json(access_token: str, org_uuid: str, path: str) -> dict:
+def request_org_json(
+    access_token: str, org_uuid: str, path: str, timeout: float = 5.0
+) -> dict:
     """GET one organization-scoped OAuth endpoint and decode its JSON."""
     url = API_BASE + path.format(org=org_uuid)
     req = urllib.request.Request(
@@ -81,15 +90,14 @@ def request_org_json(access_token: str, org_uuid: str, path: str) -> dict:
             "User-Agent": "claude-swap/1.0",
         },
     )
-    with urllib.request.urlopen(req, timeout=5) as resp:
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
         data = json.loads(resp.read().decode())
     return data if isinstance(data, dict) else {}
 
 
 def _int_or_none(value: object) -> int | None:
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
-        return None
-    return int(value)
+    number = oauth._finite(value)
+    return None if number is None else int(number)
 
 
 def _str_or_none(value: object) -> str | None:
@@ -151,30 +159,52 @@ class CreditsOutcome:
     grant_failed: bool = False
 
 
-def fetch_credits(access_token: str, org_uuid: str) -> CreditsOutcome:
-    """Both reads for one account. The balance is the primary read: its
-    failure fails the fetch (a 404 means "no prepaid credits here", not an
-    error). A failed grant read only leaves the grant as it was."""
-    try:
-        prepaid = parse_prepaid(request_org_json(access_token, org_uuid, PREPAID_PATH))
-    except urllib.error.HTTPError as e:
-        if e.code != 404:
+def fetch_credits(
+    access_token: str, org_uuid: str, timeout: float = 5.0
+) -> CreditsOutcome:
+    """Both reads for one account, concurrently. The balance is the primary
+    read: its failure fails the fetch. A 403/404 means the org has no such
+    resource — an empty reading, not an error. A failed grant read only
+    leaves the grant as it was. A body that does not parse reads as empty."""
+
+    def get(path: str) -> dict:
+        return request_org_json(access_token, org_uuid, path, timeout)
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        prepaid_f = pool.submit(get, PREPAID_PATH)
+        grant_f = pool.submit(get, GRANT_PATH)
+        try:
+            prepaid = _parse_safely(parse_prepaid, prepaid_f.result())
+        except urllib.error.HTTPError as e:
+            if e.code not in _ABSENT:
+                kind, retry_after = oauth._classify_usage_error(e)
+                return CreditsOutcome(error=kind, retry_after_s=retry_after)
+            prepaid = None
+        except Exception as e:
             kind, retry_after = oauth._classify_usage_error(e)
             return CreditsOutcome(error=kind, retry_after_s=retry_after)
-        prepaid = None
-    except Exception as e:
-        kind, retry_after = oauth._classify_usage_error(e)
-        return CreditsOutcome(error=kind, retry_after_s=retry_after)
-    credits: dict = dict(prepaid) if prepaid else {}
-    grant_failed = False
-    try:
-        grant = parse_grant(request_org_json(access_token, org_uuid, GRANT_PATH))
-        if grant is not None:
-            credits["grant"] = grant
-    except Exception as e:
-        grant_failed = True
-        _logger.debug("Credit grant fetch failed: %r", e)
+        credits: dict = dict(prepaid) if prepaid else {}
+        grant_failed = False
+        try:
+            grant = _parse_safely(parse_grant, grant_f.result())
+            if grant is not None:
+                credits["grant"] = grant
+        except urllib.error.HTTPError as e:
+            if e.code not in _ABSENT:
+                grant_failed = True
+                _logger.debug("Credit grant fetch failed: http-%s", e.code)
+        except Exception as e:
+            grant_failed = True
+            _logger.debug("Credit grant fetch failed: %r", e)
     return CreditsOutcome(credits=credits, grant_failed=grant_failed)
+
+
+def _parse_safely(parse: Callable[[object], dict | None], data: object) -> dict | None:
+    try:
+        return parse(data)
+    except Exception as e:  # display-only: a body we cannot read is "nothing"
+        _logger.debug("Credits response parse failed: %r", e)
+        return None
 
 
 # -- store ---------------------------------------------------------------------------
@@ -287,7 +317,10 @@ class CreditsStore:
 
     def record(
         self, identities: dict[str, Identity], outcomes: dict[str, CreditsOutcome]
-    ) -> None:
+    ) -> dict[str, int]:
+        """Merge outcomes; returns each failed slot's consecutive-failure count."""
+        failed: dict[str, int] = {}
+
         def apply(num: str, row: dict, now: float) -> None:
             outcome = outcomes[num]
             row.pop("leaseUntil", None)
@@ -309,6 +342,7 @@ class CreditsStore:
                 return
             failures = int(row.get("consecutiveFailures") or 0) + 1
             row["consecutiveFailures"] = failures
+            failed[num] = failures
             row["lastError"] = outcome.error
             wait = min(BACKOFF_CAP_S, BACKOFF_BASE_S * 2 ** min(failures - 1, 16))
             if outcome.retry_after_s is not None:
@@ -318,6 +352,7 @@ class CreditsStore:
         nums = [n for n in outcomes if n in identities]
         if nums:
             self._mutate(identities, nums, apply)
+        return failed
 
 
 def refresh(
@@ -327,15 +362,20 @@ def refresh(
     *,
     force: bool = False,
     fetcher: Callable[[str, str], CreditsOutcome] | None = None,
+    timeout: float = 5.0,
 ) -> dict[str, dict]:
     """Fetch the due slots, record the outcomes, return every slot's reading.
 
-    ``read_credentials(num)`` is called only for due slots. A slot without a
-    usable (present, unexpired) access token or an organization is skipped
-    and deferred (``CreditsStore.defer``) — no failure is recorded for it.
+    Slots without an organization are never fetched (nor their credentials
+    read). ``read_credentials(num)`` is called only for due slots, at fetch
+    time — so a token the usage pass just rotated is the one used. A slot
+    without a usable (present, unexpired) access token is skipped and
+    deferred (``CreditsStore.defer``) — no failure is recorded for it.
+    ``timeout`` bounds each request (``cswap list`` passes a short one).
     """
-    fetcher = fetcher or fetch_credits
-    due = store.reserve(identities, force=force)
+    fetcher = fetcher or partial(fetch_credits, timeout=timeout)
+    with_org = {num: ident for num, ident in identities.items() if ident[1]}
+    due = store.reserve(with_org, force=force) if with_org else []
     jobs: dict[str, tuple[str, str]] = {}
     skipped: list[str] = []
     for num in due:
@@ -347,24 +387,26 @@ def refresh(
         data = oauth.extract_oauth_data(creds) if creds else None
         token = data.get("accessToken") if data else None
         org = identities[num][1]
-        if not token or not org or oauth.is_oauth_token_expired(data.get("expiresAt")):
+        if not token or oauth.is_oauth_token_expired(data.get("expiresAt")):
             skipped.append(num)
             continue
         jobs[num] = (token, org)
     outcomes: dict[str, CreditsOutcome] = {}
     if jobs:
-        with ThreadPoolExecutor(max_workers=min(4, len(jobs))) as pool:
+        with ThreadPoolExecutor(max_workers=min(8, len(jobs))) as pool:
             futures = {num: pool.submit(fetcher, *job) for num, job in jobs.items()}
             for num, future in futures.items():
                 try:
                     outcomes[num] = future.result()
                 except Exception as e:  # a fetcher must not take the pass down
                     outcomes[num] = CreditsOutcome(error=type(e).__name__)
-        for num, outcome in outcomes.items():
-            if outcome.error is not None:
-                # No email: the line is paste-safe for public issues.
-                _logger.warning("Credits fetch failed for account %s: %s", num, outcome.error)
-        store.record(identities, outcomes)
+        failed = store.record(identities, outcomes)
+        for num, failures in failed.items():
+            # First failure of a streak at WARNING, the repeats at DEBUG. No
+            # email: the line is paste-safe for public issues.
+            level = logging.WARNING if failures == 1 else logging.DEBUG
+            _logger.log(level, "Credits fetch failed for account %s: %s (%d in a row)",
+                        num, outcomes[num].error, failures)
     store.defer(identities, skipped)
     return store.readings(identities)
 

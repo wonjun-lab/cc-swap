@@ -110,7 +110,12 @@ def test_grants_granted_and_claimable():
 def test_money():
     assert credits.money(123456, "USD") == "$1,234.56"
     assert credits.money(500, "EUR") == "€5.00"
-    assert credits.money(500, "JPY") == "JPY 500"
+    assert credits.money(500, "JPY") == "¥500"
+    assert credits.money(500, "KRW") == "KRW 500"
+    # Two-decimal minor units for everything else, as Claude Code formats
+    # them (HUF/TWD/IDR included).
+    assert credits.money(123456, "HUF") == "HUF 1,234.56"
+    assert credits.money(500, "TWD") == "TWD 5.00"
     assert credits.money(500, None) == "$5.00"
 
 
@@ -152,6 +157,7 @@ def test_fetch_sends_get_with_org_header(monkeypatch):
 
     def fake_urlopen(req, timeout):
         seen.append(req)
+        assert timeout == 5.0
         body = prepaid(2000) if "prepaid/credits" in req.full_url else {
             **GRANT_NONE, "available": True, "eligible": True,
             "amount_minor_units": 500, "currency": "USD"}
@@ -162,11 +168,11 @@ def test_fetch_sends_get_with_org_header(monkeypatch):
     assert outcome.error is None and not outcome.grant_failed
     assert outcome.credits["balance"] == 2000
     assert outcome.credits["grant"]["state"] == "available"
-    assert [r.full_url for r in seen] == [
+    assert sorted(r.full_url for r in seen) == sorted([
         "https://example.com/api/oauth/organizations/org-1/prepaid/credits",
         "https://example.com/api/oauth/organizations/org-1/overage_credit_grant"
         "?campaign=feature_of_the_week",
-    ]
+    ])
     for req in seen:
         assert req.get_method() == "GET"
         assert req.get_header("X-organization-uuid") == "org-1"
@@ -328,7 +334,7 @@ def _seeded_switcher(sample_sequence_data: dict) -> ClaudeAccountSwitcher:
     return switcher
 
 
-def _fake_fetch(token, org):
+def _fake_fetch(token, org, timeout=5.0):
     return credits.CreditsOutcome(credits={
         "balance": 2000, "currency": "USD",
         "expiring": [{"amount": 1000, "currency": "USD", "name": None,
@@ -409,3 +415,90 @@ def test_fleet_detail_panel_shows_the_credits_line():
     lines = render.render_detail(_by(rows)["1"], by_n["1"], 117, ctx).plain.splitlines()
     assert any(line.strip() == "credits balance $12.30" for line in lines)
     assert render.detail_height(_by(rows)["1"], by_n["1"], ctx) == len(lines)
+
+
+# -- review fixes --------------------------------------------------------------------
+
+
+@pytest.mark.no_credits_fake
+def test_403_reads_as_empty_not_as_a_failure(monkeypatch):
+    def fake(token, org, path, timeout=5.0):
+        raise _http_error(path, 403)
+
+    monkeypatch.setattr(credits, "request_org_json", fake)
+    assert credits.fetch_credits("t", "o") == credits.CreditsOutcome(credits={})
+
+
+def test_nan_and_infinity_never_raise():
+    body = json.loads('{"amount": NaN, "promo_tranches": [{"remaining_amount_minor_units": '
+                      'Infinity, "expires_at": "2030-01-01T00:00:00Z"}]}')
+    assert credits.parse_prepaid(body) is None
+    body = json.loads('{"amount": 100, "promo_tranches": [{"remaining_amount_minor_units": '
+                      '1e400, "expires_at": "2030-01-01T00:00:00Z"}]}')
+    assert credits.parse_prepaid(body)["expiring"] == []
+    grant = json.loads('{"granted": true, "amount_minor_units": NaN}')
+    assert credits.parse_grant(grant)["amount"] is None
+
+
+def test_repeat_failures_log_at_debug(tmp_path: Path, caplog):
+    import logging
+
+    clock = Clock()
+    store = credits.CreditsStore(tmp_path, clock=clock)
+
+    def fail(token, org):
+        return credits.CreditsOutcome(error="http-500")
+
+    ids = {"1": IDS["1"]}
+    with caplog.at_level(logging.DEBUG, logger="claude-swap"):
+        _refresh(store, fail, ids=ids)
+        clock.t += credits.BACKOFF_CAP_S
+        _refresh(store, fail, ids=ids)
+    levels = [r.levelno for r in caplog.records if "Credits fetch failed" in r.getMessage()]
+    assert levels == [logging.WARNING, logging.DEBUG]
+
+
+def test_a_slot_without_an_org_is_never_read(tmp_path: Path):
+    store = credits.CreditsStore(tmp_path, clock=Clock())
+    read: list[str] = []
+
+    def creds(num):
+        read.append(num)
+        return _token()
+
+    ids = {"1": ("a@example.com", ""), "2": IDS["2"]}
+    credits.refresh(store, ids, creds, fetcher=lambda t, o: credits.CreditsOutcome(credits={}))
+    assert read == ["2"]
+
+
+def test_list_rereads_credentials_and_uses_the_short_timeout(
+    temp_home: Path, mock_org_claude_config: Path, sample_sequence_data: dict, monkeypatch,
+):
+    from claude_swap import oauth
+    from claude_swap.switcher import LIST_CREDITS_TIMEOUT_S
+
+    switcher = _seeded_switcher(sample_sequence_data)
+    stale = json.dumps({"claudeAiOauth": {"accessToken": "old"}})
+    fresh = json.dumps({"claudeAiOauth": {"accessToken": "new"}})
+    phase = {"credits": False}
+    sent: list[tuple[str, float]] = []
+
+    def read(*_a):
+        return fresh if phase["credits"] else stale
+
+    def usage(*_a, **_k):
+        phase["credits"] = True  # the usage pass rotated the stored tokens
+        return oauth.UsageOutcome({"five_hour": {"pct": 1.0}})
+
+    def fake(token, org, path, timeout=5.0):
+        sent.append((token, timeout))
+        return {}
+
+    monkeypatch.setattr(credits, "request_org_json", fake)
+    with patch.object(switcher, "_read_active_credentials",
+                      side_effect=lambda: ActiveCredentials(read(), False)), \
+         patch.object(switcher, "_read_account_credentials", side_effect=read), \
+         patch("claude_swap.oauth.try_fetch_usage_for_account", side_effect=usage):
+        switcher.list_accounts(json_output=True)
+    assert len(sent) == 4 and set(sent) == {("new", LIST_CREDITS_TIMEOUT_S)}
+    assert LIST_CREDITS_TIMEOUT_S <= 3.0

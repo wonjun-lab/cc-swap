@@ -123,6 +123,10 @@ _FETCH_STAGGER_S = 0.25
 # an age note there would be permanent noise.
 _USAGE_AGE_NOTE_S = poll_policy.SERVE_TTL_S
 
+# Per-request timeout for the credits reads ``cswap list`` makes (both reads
+# of every due account run concurrently, so this bounds the added latency).
+LIST_CREDITS_TIMEOUT_S = 3.0
+
 
 def _pace_marker(window: dict, fetched_at: float | None) -> str:
     """"  (ahead of pace)" when a weekly window is meaningfully ahead of pace, else ""."""
@@ -1939,6 +1943,7 @@ class ClaudeAccountSwitcher:
         *,
         force: bool = False,
         fetch: bool = True,
+        timeout: float = 5.0,
     ) -> dict[str, dict]:
         """Slot → prepaid balance / credit grant reading (see credits.py).
 
@@ -1946,10 +1951,11 @@ class ClaudeAccountSwitcher:
         refresh, at most once a minute) unless ``fetch`` is False, then
         returns every slot's last reading. Display only — nothing here feeds
         a switch decision, and it never raises: a failure just leaves the
-        previous reading (or none) in place. Given ``accounts_info`` (the
-        ``list`` pass), credentials come from it; otherwise they are read
-        only for due slots — the live store for the active one, the backup
-        for the rest.
+        previous reading (or none) in place. ``accounts_info`` (the ``list``
+        pass) supplies the slots and the active one; credentials are always
+        re-read at fetch time, only for due slots — the live store for the
+        active one, the backup for the rest — so a token the usage pass just
+        rotated is the one sent. ``timeout`` bounds each request.
         """
         try:
             if accounts_info is not None:
@@ -1957,8 +1963,9 @@ class ClaudeAccountSwitcher:
                     str(num): (email, org_uuid or "")
                     for num, email, _n, org_uuid, _a, _c, _al in accounts_info
                 }
-                creds = {str(info[0]): info[5] for info in accounts_info}
-                read = creds.__getitem__
+                active = next(
+                    (str(info[0]) for info in accounts_info if info[4]), None
+                )
             else:
                 data = self._get_sequence_data_migrated() or {}
                 accounts = data.get("accounts", {})
@@ -1974,15 +1981,15 @@ class ClaudeAccountSwitcher:
                     self._find_account_slot(data, *current) if current else None
                 )
 
-                def read(num: str) -> str:
-                    if num == active:
-                        return self._read_active_credentials().value or ""
-                    return self._read_account_credentials(num, identities[num][0])
+            def read(num: str) -> str:
+                if num == active:
+                    return self._read_active_credentials().value or ""
+                return self._read_account_credentials(num, identities[num][0])
 
             if not fetch:
                 return self._credits_store.readings(identities)
             return credits_mod.refresh(
-                self._credits_store, identities, read, force=force
+                self._credits_store, identities, read, force=force, timeout=timeout
             )
         except Exception as e:
             self._logger.debug(f"Credits pass failed: {e!r}")
@@ -6837,7 +6844,12 @@ class ClaudeAccountSwitcher:
 
         accounts_info = self._build_accounts_info()
         entries = self._collect_usage_entries(accounts_info, fetch=fetch)
-        credits = self.credits_by_account(accounts_info, fetch=fetch is None)
+        # After the usage pass (credentials re-read, so a just-rotated token
+        # is used), with a short per-request timeout: once credits are due
+        # this adds at most ~LIST_CREDITS_TIMEOUT_S to the command.
+        credits = self.credits_by_account(
+            accounts_info, fetch=fetch is None, timeout=LIST_CREDITS_TIMEOUT_S
+        )
 
         if json_output:
             return self._build_list_payload(accounts_info, entries, credits)

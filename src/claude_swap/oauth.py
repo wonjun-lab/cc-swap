@@ -5,8 +5,10 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import math
 import sys
 import threading
+import time
 import urllib.error
 import urllib.request
 from collections.abc import Callable, Sequence
@@ -621,8 +623,43 @@ def request_usage_data(access_token: str) -> dict:
     ``extra_usage``/``spend``/``iguana_necktie``, as Claude Code's plain one.
     ``skip_spend`` (which Claude Code pairs with it) is deliberately absent:
     it nulls ``extra_usage``, which the spend line reads.
+
+    The flag is display-only, so it must never cost a usage reading: a
+    400/404/422 on the flagged URL is retried once, immediately, without
+    it, and the flag is dropped for this process for
+    ``COUPON_FLAG_REPROBE_S``. A 5xx is retried the same way; if the
+    flag-less retry succeeds the flag is dropped too, else the original
+    error propagates to the normal backoff. Every other error (401, 429,
+    network) propagates untouched — no retry spends the budget.
     """
-    url = "https://api.anthropic.com/api/oauth/usage?cedar_ember=1"
+    global _coupon_flag_off_until
+    if time.time() < _coupon_flag_off_until:
+        return _get_usage(_USAGE_URL, access_token)
+    try:
+        return _get_usage(_USAGE_URL + "?cedar_ember=1", access_token)
+    except urllib.error.HTTPError as e:
+        if e.code in (400, 404, 422):
+            _coupon_flag_off_until = time.time() + COUPON_FLAG_REPROBE_S
+            _logger.info("Usage request refused the coupon flag (http-%s); dropping it", e.code)
+            return _get_usage(_USAGE_URL, access_token)
+        if 500 <= e.code < 600:
+            try:
+                data = _get_usage(_USAGE_URL, access_token)
+            except Exception:
+                raise e from None
+            _coupon_flag_off_until = time.time() + COUPON_FLAG_REPROBE_S
+            _logger.info("Usage request failed only with the coupon flag (http-%s); dropping it", e.code)
+            return data
+        raise
+
+
+_USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
+#: How long the coupon flag stays off after the server refused it.
+COUPON_FLAG_REPROBE_S = 3 * 3600.0
+_coupon_flag_off_until = 0.0
+
+
+def _get_usage(url: str, access_token: str) -> dict:
     headers = {
         "Authorization": f"Bearer {access_token}",
         "anthropic-beta": OAUTH_BETA_HEADER,
@@ -762,13 +799,32 @@ def build_usage_result(data: dict) -> dict | None:
         return None
     # Display only, added after the emptiness check so a response with no
     # windows still reads as "no usage" to every decision path.
-    cloud = parse_cloud_credit(data.get("iguana_necktie"))
-    if cloud is not None:
-        result["cloud_credit"] = cloud
-    coupons = parse_reset_coupons(data.get("cedar_ember"))
-    if coupons is not None:
-        result["reset_coupons"] = coupons
+    # Display-only blocks: a parse failure drops the block, never the
+    # decision-grade reading above.
+    for key, field, parse in (
+        ("cloud_credit", "iguana_necktie", parse_cloud_credit),
+        ("reset_coupons", "cedar_ember", parse_reset_coupons),
+    ):
+        try:
+            block = parse(data.get(field))
+        except Exception as e:
+            _logger.debug("%s parse failed: %r", field, e)
+            block = None
+        if block is not None:
+            result[key] = block
     return result
+
+
+def _finite(value: object) -> float | None:
+    """A JSON number as a finite float, else None (bool, NaN, ±Infinity and
+    ints too large for a float all read as None)."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    try:
+        out = float(value)
+    except OverflowError:
+        return None
+    return out if math.isfinite(out) else None
 
 
 #: Limits a reset coupon can clear, in the words the usage lines use.
@@ -797,9 +853,8 @@ def parse_reset_coupons(block: object) -> dict | None:
         return value if isinstance(value, str) and value else None
 
     def count(value: object) -> int | None:
-        if isinstance(value, bool) or not isinstance(value, (int, float)):
-            return None
-        return max(0, int(value))
+        number = _finite(value)
+        return None if number is None else max(0, int(number))
 
     def limits(value: object) -> list[str]:
         if not isinstance(value, list):
@@ -846,10 +901,7 @@ def parse_cloud_credit(block: object) -> dict | None:
         return None
 
     def num(key: str) -> float | None:
-        value = block.get(key)
-        if isinstance(value, bool) or not isinstance(value, (int, float)):
-            return None
-        return float(value)
+        return _finite(block.get(key))
 
     limit = num("limit_dollars")
     if limit is None:

@@ -593,6 +593,13 @@ def block_real_credits_fetch(request, monkeypatch):
     yield
 
 
+@pytest.fixture(autouse=True)
+def _coupon_flag_on(monkeypatch):
+    """The usage request's coupon flag is process state (dropped after the
+    server refuses it); every test starts with it on."""
+    monkeypatch.setattr("claude_swap.oauth._coupon_flag_off_until", 0.0)
+
+
 @pytest.fixture
 def temp_home(tmp_path: Path):
     """Create a temporary home directory for testing."""
