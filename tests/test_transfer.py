@@ -212,6 +212,32 @@ class TestAliasTransfer:
                 )
                 assert "alias" not in seq["accounts"][imported_num]
 
+    def test_import_alias_reading_like_a_local_name_is_dropped(self, temp_home: Path):
+        """An imported alias that reads like a local account's display name
+        (case and ·/./: aside; maximize/names.py) would make a command mean
+        two accounts: it is dropped like a duplicate alias."""
+        dst_home = temp_home.parent / "dst"
+        dst_home.mkdir()
+        src = _linux_switcher(temp_home)
+        _seed_account(src, 1, "alice@example.com", alias="Dev.Shared")
+        out_file = temp_home / "backup.cswap"
+        export_accounts(src, str(out_file))
+
+        with patch("pathlib.Path.home", return_value=dst_home):
+            with patch.dict(os.environ, {"HOME": str(dst_home)}):
+                dst = _linux_switcher(dst_home)
+                _seed_account(dst, 9, "dev.shared@example.com")  # named dev.shared
+
+                import_accounts(dst, str(out_file))
+
+                seq = dst._get_sequence_data()
+                imported = next(
+                    acc for acc in seq["accounts"].values()
+                    if acc["email"] == "alice@example.com"
+                )
+                assert "alias" not in imported
+                assert dst._resolve_account_identifier("dev.shared") == "9"
+
     def test_import_reexport_of_same_account_keeps_own_alias(self, temp_home: Path):
         """Re-importing a backup of an account that already carries the same
         alias locally must not be treated as a collision with itself."""

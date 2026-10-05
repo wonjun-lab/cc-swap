@@ -8975,6 +8975,32 @@ class TestSwitchRemoveGatesAcceptAlias:
         accounts = switcher._get_sequence_data()["accounts"]
         assert "3" not in accounts and "2" in accounts
 
+    def test_a_name_that_reads_like_two_is_never_guessed(self, temp_home: Path, monkeypatch):
+        """jo@x in two organizations and jo.personal@y: ``jo·personal`` and
+        ``jo.personal`` would be one name typed two ways, so both say their
+        slot, and ``remove jo.personal`` removes nothing."""
+        data = {
+            "activeAccountNumber": 1, "sequence": [1, 2, 3],
+            "accounts": {
+                "1": {"email": "jo@example.com", "uuid": "u1"},
+                "2": {"email": "jo@example.com", "uuid": "u2", "organizationUuid": "o",
+                      "organizationName": "Acme"},
+                "3": {"email": "jo.personal@example.org", "uuid": "u3"},
+            },
+        }
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        switcher._write_json(switcher.sequence_file, data)
+        assert switcher.account_names() == {
+            "1": "jo·personal·1", "2": "jo·Acme", "3": "jo.personal·3"}
+        monkeypatch.setattr("builtins.input", lambda *a, **k: "y")
+        with patch.object(switcher, "_delete_account_files"):
+            with pytest.raises((AccountNotFoundError, ValidationError)):
+                switcher.remove_account("jo.personal")
+            assert set(switcher._get_sequence_data()["accounts"]) == {"1", "2", "3"}
+            switcher.remove_account("jo.personal·3")
+        assert set(switcher._get_sequence_data()["accounts"]) == {"1", "2"}
+
     def test_a_folded_match_of_two_names_is_refused_never_guessed(self, temp_home: Path):
         from claude_swap.exceptions import ConfigError
         from claude_swap.maximize.names import match_names

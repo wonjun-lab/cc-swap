@@ -517,9 +517,10 @@ def table_plan(
     (:data:`TIGHT_GAP`); the reset clocks go (the countdowns stay); the plan
     column goes; the status column takes its shorter wording
     (:func:`short_status`, ``login 1d`` for ``login 1d left``); then the
-    bars go, leaving the percentages. The name is never cut: ``order``, the
-    whole name, the resets and the status columns never go, so a terminal
-    too narrow even for that clips the row's end.
+    bars go, leaving the percentages; then the 7d resets go, then the 5h
+    ones. The name is never cut and the status never goes: ``order``, the
+    whole name, the percentages and the status stay, so only a terminal too
+    narrow even for those clips the row's end.
 
     Height: ``attention`` is how many lines the attention notes would like
     (:func:`attention_want`; True: one). The first always shows; the others
@@ -566,6 +567,18 @@ def table_plan(
             fit, status = fit_at(bar)
         short = status is not None
         columns = _columns(needs, bar=bar, clock=clock, plan=plan, name=name, status=status)
+        # A row that still does not fit loses its end, and the status is
+        # last: before that, the resets go (7d, then 5h; the percentages
+        # stay), so the status is never what is cut away.
+        for gone in ("reset7", "reset5"):
+            if _span(columns, gap) <= room:
+                break
+            columns = [c for c in columns if c[0] != gone]
+        if status is not None:  # room again for the status's own wording?
+            whole = [(k, max(needs.status, cells(HEADERS["status"])) if k == "status" else w)
+                     for k, w in columns]
+            if _span(whole, gap) <= room:
+                columns, short = whole, False
     blanks = height >= BLANKS_MIN_ROWS
     want = int(attention)
     fixed_lines = 1 + 1 + 1 + min(want, 1) + 2 * int(blanks)  # status, header, footer
@@ -1300,8 +1313,10 @@ def seg_len(segs: Sequence[Seg]) -> int:
 
 
 def fit_variant(variants: Sequence[Sequence[Seg]], width: int) -> list[Seg]:
-    """The first (longest) variant that fits ``width``; the last one, cut,
-    when none does."""
+    """The first (longest) variant that fits ``width``; when none does, the
+    last one up to its first segment that does not fit — only a first
+    segment (``Auto ON``, ``Holding``: never a name) is ever cut, so an
+    account's name shows whole or not at all."""
     for variant in variants:
         if seg_len(variant) <= width:
             return list(variant)
@@ -1310,10 +1325,12 @@ def fit_variant(variants: Sequence[Sequence[Seg]], width: int) -> list[Seg]:
     for text, tone in variants[-1]:
         if room <= 0:
             break
-        if len(text) > room:
-            text = fx.clip(text, room)
+        if cells(text) > room:
+            if not out:
+                out.append((fx.clip(text, room), tone))
+            break
         out.append((text, tone))
-        room -= len(text)
+        room -= cells(text)
     return out
 
 
@@ -1349,6 +1366,7 @@ class Notice:
     tone: Tone = "warn"            # "crit" (red) or "warn" (amber)
     alarm: bool = True             # "! " in front: something for you to do
     tail: tuple[str, ...] = ()     # the words after another note on its line
+    name: str = ""                 # the account it names (never cut)
 
     @property
     def tails(self) -> tuple[str, ...]:
@@ -1457,6 +1475,7 @@ def attention_notices(
         words = f"{r.name} needs re-login{more}"
         out.append(Notice(
             tuple(words + p for p in press) + (words,), tone="crit", tail=(words,),
+            name=r.name,
         ))
     shared = [r for r in rows if r.shared and r.login != "relogin"]
     if shared:  # cc-swap: shared_login.py — not refreshed until re-logged
@@ -1466,7 +1485,7 @@ def attention_notices(
         short = f"{r.name} shares its login{more}"
         out.append(Notice(
             tuple(words + p for p in press) + (words, short + " (cc-swap doctor)", short),
-            tone="crit", tail=(words, short),
+            tone="crit", tail=(words, short), name=r.name,
         ))
     if prime_guard and priming:
         out.append(guard_notice(prime_guard, now))
@@ -1477,6 +1496,7 @@ def attention_notices(
         out.append(Notice(
             tuple(words + p for p in press) + (words,),
             tone="crit" if left < fx.LOGIN_URGENT_S else "warn", tail=(words,),
+            name=r.name,
         ))
     locked = [r for r in rows if r.login == "keychain"]
     if locked:
@@ -1488,7 +1508,7 @@ def attention_notices(
         )
         out.append(Notice(
             (f"{r.name} keychain locked{more} — unlock it, press f", *short),
-            tail=short,
+            tail=short, name=r.name,
         ))
     if linger_off:
         out.append(Notice((
@@ -1505,6 +1525,18 @@ def _first_fit(options: Sequence[str], room: int) -> str | None:
     return next((o for o in options if cells(o) <= room), None)
 
 
+def _cut(notice: Notice, room: int) -> str:
+    """``notice``'s shortest wording cut to ``room`` — the account name it
+    starts with kept whole (only the words after it are cut, or dropped);
+    the row's end is clipped before a name is."""
+    last = notice.variants[-1]
+    if notice.name and last.startswith(notice.name):
+        left = room - cells(notice.name)
+        rest = last[len(notice.name):]
+        return notice.name + (fx.clip(rest, left) if left > 1 else "")
+    return fx.clip(last, max(room, 1))
+
+
 def _attention_line(group: Sequence[Notice], width: int) -> tuple[str, Tone]:
     """One line: the first note (its longest wording that fits, else its
     shortest cut to fit), then as many of the others as fit after it, and
@@ -1514,7 +1546,7 @@ def _attention_line(group: Sequence[Notice], width: int) -> tuple[str, Tone]:
     head, *rest = group
 
     def pack(room: int) -> tuple[str, list[Notice]]:
-        text = _first_fit(head.variants, room) or fx.clip(head.variants[-1], max(room, 1))
+        text = _first_fit(head.variants, room) or _cut(head, room)
         shown = [head]
         for notice in rest:
             extra = _first_fit(notice.tails, room - cells(text) - 3)

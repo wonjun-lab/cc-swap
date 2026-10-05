@@ -64,7 +64,7 @@ def _plain(segs) -> str:
 #: 02:18`` resets (``not started`` without the clock), ``login 1d left``.
 NEEDS = home.TableNeeds(rows=6, name=26, plan=4, reset5=13, reset5_short=11,
                         reset7=19, reset7_short=5, status=13, detail=6)
-ALWAYS = ("order", "account", "5h", "reset5", "7d", "reset7", "status")
+ALWAYS = ("order", "account", "5h", "7d", "status")
 ORDER = tuple(k for k, _h in home.COLUMNS)
 
 
@@ -90,7 +90,7 @@ def _shape(plan: home.TablePlan) -> tuple:
     # 4. then the bars go, the percentages stay; the name is never cut …
     (90, (0, False, False, 1, 26)),
     (81, (0, False, False, 1, 26)),
-    # … so past that the row's end is clipped, the name whole.
+    # … then the 7d resets go, then the 5h ones (the status never does).
     (80, (0, False, False, 1, 26)),
     (66, (0, False, False, 1, 26)),
 ])
@@ -98,25 +98,33 @@ def test_table_plan_gives_way_in_order(width, shape):
     plan = home.table_plan(width, 40, NEEDS)
     assert _shape(plan) == shape
     assert plan.room == width - home.MARGIN
-    assert plan.total <= plan.room or (plan.bar == 0 and width < 81)
+    assert plan.total <= plan.room
     assert plan.keys == tuple(k for k in ORDER if k in plan.keys)
     assert (plan.width("5h"), plan.width("7d")) == ((plan.bar + 5 if plan.bar else 4),) * 2
-    assert plan.width("reset5") == max(NEEDS.reset5 if plan.clock else NEEDS.reset5_short, 9)
+    assert ("reset7" in plan.keys) is (width >= 81) and ("reset5" in plan.keys) is (width >= 71)
+    if "reset5" in plan.keys:
+        assert plan.width("reset5") == max(
+            NEEDS.reset5 if plan.clock else NEEDS.reset5_short, 9)
 
 
 @pytest.mark.parametrize("width", range(60, 221, 3))
 @pytest.mark.parametrize("height", [8, 16, 24, 36, 45])
-def test_table_plan_never_drops_order_resets_or_status(width, height):
+def test_table_plan_never_drops_order_names_or_status(width, height):
     plan = home.table_plan(width, height, NEEDS, attention=True)
     assert set(ALWAYS) <= set(plan.keys)
     assert plan.keys == tuple(k for k in ORDER if k in plan.keys)
-    # The status column starts right after 7d resets: never pushed to the edge.
-    assert plan.x("status") == plan.x("reset7") + plan.width("reset7") + plan.gap
+    # The status column is the last, right after the column before it.
+    before = plan.keys[plan.keys.index("status") - 1]
+    assert plan.x("status") == plan.x(before) + plan.width(before) + plan.gap
     assert plan.x("status") + plan.width("status") == plan.total
-    # The name is never cut: when nothing else gives, the row's end clips.
+    # The name is never cut, and the status is never what a clipped row
+    # loses: the resets go first (7d, then 5h).
     assert plan.width("account") == NEEDS.name
-    if plan.total > plan.room:
+    assert plan.total <= plan.room
+    if "reset7" not in plan.keys:
         assert plan.bar == 0 and not plan.plan and not plan.clock
+    if "reset5" not in plan.keys:
+        assert "reset7" not in plan.keys
     assert plan.bar == 0 or home.MIN_BAR <= plan.bar <= home.MAX_BAR
     # The order the details give way in.
     if plan.gap == home.GAP:
@@ -126,6 +134,7 @@ def test_table_plan_never_drops_order_resets_or_status(width, height):
     # Wider never shows less.
     wider = home.table_plan(width + 1, height, NEEDS, attention=True)
     assert (wider.clock, wider.plan) >= (plan.clock, plan.plan)
+    assert set(plan.keys) <= set(wider.keys)
 
 
 def test_table_is_narrower_than_a_wide_terminal():

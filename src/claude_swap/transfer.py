@@ -421,11 +421,22 @@ def import_accounts(
 
         alias = raw.get("alias") or None
         if alias:
+            from claude_swap.maximize.names import fold
+
             alias_key = normalize_alias(alias)  # already validated in pass-1 above
-            if alias_key in seen_aliases:
+            if fold(alias_key) in seen_aliases:
                 raise TransferError(f"duplicate alias in export: {alias_key}")
-            seen_aliases.add(alias_key)
+            seen_aliases.add(fold(alias_key))
             owner = local_aliases.get(alias_key)
+            # cc-swap: nor may it read like another local account's name
+            # (alias or display name, case and ·/./: aside; maximize/names.py).
+            own_slot = switcher._find_account_slot(local_data, email, org_uuid)
+            taken = switcher._alias_in_use(alias_key, exclude_num=own_slot)
+            if taken is not None:
+                rec = (local_data.get("accounts") or {}).get(taken) or {}
+                taken_by = (rec.get("email", ""), rec.get("organizationUuid", "") or "")
+                if taken_by != (email, org_uuid):
+                    owner = taken_by
             if owner is not None and owner != (email, org_uuid):
                 _eprint(
                     f"Warning: alias '{alias_key}' for {email} already used by an "

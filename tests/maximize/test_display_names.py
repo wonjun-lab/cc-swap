@@ -26,14 +26,34 @@ def test_same_address_in_two_organizations_says_the_org():
     assert got == {"1": "same·personal", "4": "same·Acme-Labs"}
 
 
-def test_org_named_after_an_address_shows_no_address():
+def test_the_org_claude_names_after_its_owner_is_personal():
+    # claude.ai names a personal account's organization after its address.
     got = names.record_names({
         "1": {"email": "same@example.com", "organizationUuid": "o-1",
               "organizationName": "same@example.com's Organization"},
-        "2": {"email": "same@example.com"},
+        "2": {"email": "same@example.com", "organizationUuid": "o-2",
+              "organizationName": "Acme Labs"},
     })
-    assert got["1"] == "same·sames-Organization"  # typeable: no quote, no space, no @
-    assert got["2"] == "same·personal"
+    assert got == {"1": "same·personal", "2": "same·Acme-Labs"}
+    for org in ("same's Organization", "SAME@example.com’s organisation", "same@example.com"):
+        assert names.org_tag(org, "same@example.com") == "personal"
+    # Another's organization stays its own, typeable: no quote, space or @.
+    assert names.org_tag("x@example.com's Organization") == "personal"
+    assert names.org_tag("Jordan's Organization", "same@example.com") == "Jordans-Organization"
+
+
+def test_a_name_from_one_group_never_reads_like_one_from_another():
+    roster = {
+        "1": {"email": "jo@example.com"},
+        "2": {"email": "jo@example.com", "organizationUuid": "o", "organizationName": "Acme"},
+        "3": {"email": "jo.personal@example.org"},
+    }
+    got = names.record_names(roster)
+    folded = [names.fold(n) for n in got.values()]
+    assert len(set(folded)) == len(folded), got
+    assert got == {"1": "jo·personal·1", "2": "jo·Acme", "3": "jo.personal·3"}
+    assert names.match_name(got, "jo.personal") is None  # nothing to guess at
+    assert names.match_name(got, "jo.personal·3") == "3"
 
 
 def test_org_name_without_uuid_is_personal():

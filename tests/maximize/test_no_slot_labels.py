@@ -111,6 +111,43 @@ def test_the_table_attention_summary_and_panel_use_names():
                                 return_to=rows[0], now=NOW))
 
 
+@pytest.mark.parametrize("width", [100, 80, 70])
+def test_a_long_name_at_80_columns_keeps_every_status_and_the_name_whole(width):
+    long = "wonjun.chois-Organization-account-x"  # 37 cells with the order mark's gap
+    snap, mx, state = mockup()
+    rows = fx.fleet_rows(snap, mx, PRIME, state, now=NOW)
+    rows = [replace(r, name=long) if r.number == "4" else r for r in rows]
+    ctx = render.Ctx(Palette.DARK, window_ticks(mx), NOW)
+    statuses = {r.number: ctx.status(r) for r in rows}
+    plan = home.table_plan(width, 24, home.table_needs(rows, statuses, now=NOW))
+    lines = render.render_table(rows, plan, ctx, selected=None, selected_bg="").text.plain
+    lines = lines.splitlines()
+    for row, line in zip(rows, lines):
+        status = statuses[row.number]
+        if status:
+            assert line.rstrip().endswith(plan.status_text(status[0])), (width, line)
+        assert row.name in line and "…" not in line.split(row.name)[0]
+    header = render.table_header(plan, Palette.DARK).plain
+    assert header.rstrip().endswith("status") and "…" not in header
+
+
+def test_the_sentence_and_attention_lines_never_cut_a_name():
+    snap, mx, state = mockup()
+    rows = fx.fleet_rows(snap, mx, PRIME, state, now=NOW)
+    rows = [replace(r, name="a-rather-long-account-name") if r.number in ("1", "3") else r
+            for r in rows]
+    dv = fx.DecisionView("hold", "1", None, None, "x", at=NOW - 5, source="engine", code="hold")
+    hold = account_hold.AccountHold("1", NOW + 2 * H)
+    variants = home.status_variants(SERVICE, dv, rows, MX, "live", now=NOW, hold=hold,
+                                    hold_read=True)
+    notes = home.attention_notices(rows, now=NOW)
+    for width in range(8, 120):
+        text = _plain(home.fit_variant(variants, width))
+        assert "a-rather-long-account-name" in text or "a-rather" not in text, (width, text)
+        for line, _tone in home.attention_lines(notes, width, 1):
+            assert "a-rather-long-account-name" in line or "a-rath" not in line, (width, line)
+
+
 def test_engine_log_lines_use_names():
     names = {"1": "main", "2": "side"}
 

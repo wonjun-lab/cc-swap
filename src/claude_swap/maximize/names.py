@@ -65,12 +65,27 @@ def _domain_labels(email: str) -> list[str]:
     return labels[:-1] if len(labels) > 1 else labels  # never the top-level label
 
 
-def org_tag(org: str) -> str:
+#: The organization claude.ai makes for a personal account:
+#: ``x@example.com's Organization`` (or ``x's Organization``).
+_PERSONAL_ORG_RE = re.compile(r"\s*(\S+)\s*['’]s\s+organi[sz]ation\s*", re.IGNORECASE)
+
+
+def org_tag(org: str, email: str = "") -> str:
     """An organization name fit for a display name, typeable as it is:
-    ``personal`` for none, any address inside it cut to its local part,
-    spaces as ``-``, nothing that needs quoting (``Acme Labs`` →
-    ``Acme-Labs``). Never shortened."""
-    text = _EMAIL_RE.sub(r"\1", str(org or "")).replace("'", "").replace("’", "")
+    ``personal`` for none, and for the organization claude.ai names after
+    its owner (``x@example.com's Organization``, or one named after
+    ``email`` or its local part); else any address inside it cut to its
+    local part, spaces as ``-``, nothing that needs quoting (``Acme Labs``
+    → ``Acme-Labs``). Never shortened."""
+    raw = str(org or "").strip()
+    owner = _PERSONAL_ORG_RE.fullmatch(raw)
+    if owner is not None:
+        who = owner.group(1).lower()
+        if "@" in who or not email or who in (email.lower(), short_name(email).lower()):
+            return "personal"
+    if email and raw.lower() in (email.lower(), short_name(email).lower()):
+        return "personal"
+    text = _EMAIL_RE.sub(r"\1", raw).replace("'", "").replace("’", "")
     text = "-".join(p for p in _ORG_DROP_RE.sub(" ", text).split() if p)
     return text or ("personal" if not str(org or "").strip() else "org")
 
@@ -141,7 +156,7 @@ def display_names(accounts: Iterable[tuple]) -> dict[str, str]:
                 named[members[0][0]] = base[address]
                 continue
             # The very same address in two slots: the organization tells.
-            tags = [org_tag(org) for _s, _e, org in members]
+            tags = [org_tag(org, email) for _s, email, org in members]
             unique = len({fold(t) for t in tags}) == len(tags)
             for (slot, _email, _org), tag in zip(members, tags):
                 named[slot] = f"{base[address]}·{tag if unique else slot}"
@@ -152,6 +167,25 @@ def display_names(accounts: Iterable[tuple]) -> dict[str, str]:
         for slot, name in named.items():
             clash = seen[fold(name)] > 1 or fold(name) in aliases or fold(name).isdigit()
             out[slot] = f"{name}·{slot}" if clash and not name.endswith(f"·{slot}") else name
+    # One pass over every name: a name made above may still read like one
+    # from another group (``jo·personal`` for jo@x in two organizations and
+    # ``jo.personal`` for jo.personal@y). Each such name that is not an
+    # alias says its slot; the alias keeps its name. Repeated until no two
+    # names read alike, so the outcome never depends on order.
+    alias_slots = {slot for slot, _e, alias, _o in rows if alias}
+    for _round in range(len(rows) + 1):
+        counts: dict[str, int] = {}
+        for name in out.values():
+            counts[fold(name)] = counts.get(fold(name), 0) + 1
+        clashing = [
+            slot for slot, name in out.items()
+            if counts[fold(name)] > 1 and slot not in alias_slots
+            and not name.startswith("#")
+        ]
+        if not clashing:
+            break
+        for slot in clashing:
+            out[slot] = f"{out[slot]}·{slot}"
     return {slot: out[slot] for slot, _e, _a, _o in rows}
 
 

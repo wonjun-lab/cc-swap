@@ -110,12 +110,12 @@ def _fit(variants: Sequence[str], width: int) -> str:
 
 def table_header(plan: home.TablePlan, palette: Palette) -> Text:
     """The dim column headers, each over its column."""
-    line = Text(style=palette.muted, no_wrap=True, overflow="ellipsis")
+    line = Text(style=palette.muted, no_wrap=True, overflow="crop")
     for i, (key, width) in enumerate(plan.columns):
         if i:
             line.append(" " * plan.gap)
         line.append(pad_to(Text(home.HEADERS[key]), width))
-    return pad_to(line, plan.room)
+    return pad_to(line, plan.room, overflow="crop")  # clipped as the rows are
 
 
 def _order_cell(mark: str, width: int, ctx: Ctx) -> Text:
