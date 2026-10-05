@@ -2676,6 +2676,7 @@ class ClaudeAccountSwitcher:
             if on_commit is not None:
                 on_commit(num)
         self._usage_store.clear_dead_token([num], {num: (email, org)})
+        self._forget_ride_learning(num)
         self._recheck_shared_logins()
         self._logger.info(
             "stored a new login as %s (rt %s); the live login untouched",
@@ -5159,6 +5160,16 @@ class ClaudeAccountSwitcher:
 
         self._prune_mappings(email, account_info.get("organizationUuid", ""))
         self._prune_last_resort(accounts_before, account_num)
+        self._forget_ride_learning(account_num)
+
+    def _forget_ride_learning(self, account_num: str) -> None:
+        """cc-swap fork: the learned ride's per-slot k, t and q (and the
+        usage points k is read from) described the login the slot held
+        before; a new login in it, or none, must not inherit them
+        (maximize/ride_slots.py). Never raises."""
+        from claude_swap.maximize.ride_slots import forget_slots
+
+        forget_slots(self.backup_dir, [str(account_num)])
 
     def _prune_last_resort(self, accounts_before: dict, account_num: str) -> None:
         """Drop the ``maximize.lastResort`` entries that named only the removed

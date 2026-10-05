@@ -68,6 +68,16 @@ class Sample:
 
 
 @dataclass(frozen=True)
+class RideFiveH:
+    """A 7d ride measured on the 5h (``ride.fraction_5h``): what the engine
+    folded in from the readings since the arm time."""
+
+    rise: float               # 5h points risen since the arm time (across a 5h reset)
+    phase_armed: float        # the 5h's phase at the 7d's estimated crossing
+    point_s: float | None     # the 5h's seconds per point, frozen at the arm time
+
+
+@dataclass(frozen=True)
 class QuietWindow:
     """A predicted quiet stretch (maximize/history.py): epochs plus local
     ``HH:MM`` labels for reasons."""
@@ -131,10 +141,20 @@ class Snapshot:
     ride_armed_at: Mapping[str, float] = field(default_factory=dict)
     ride_point_s: Mapping[str, float] = field(default_factory=dict)
     ride_q: Mapping[str, float] = field(default_factory=dict)
+    # The 7d ride measured on the 5h (absent = the time rule above), and
+    # the learned share of the last point it switches at (absent =
+    # ``ride.T_START``).
+    ride_5h: Mapping[str, RideFiveH] = field(default_factory=dict)
+    ride_t: Mapping[str, float] = field(default_factory=dict)
     # The near-reset drain (maximize/drain.py): each account's learned
     # 7d-per-5h ratio k (7d points one 5h point costs; ``drain.learn_k``
-    # over the usage history). Absent = not learned: the plan's default.
+    # over the usage history). Absent = not learned: the plan's default for
+    # the drain.
     k7: Mapping[str, float] = field(default_factory=dict)
+    # The k the 7d ride may read its last point by (``drain.ride_k``: more
+    # windows, a bounded spread; ``policy.ride_k`` adds the plan check).
+    # Absent = the time rule for the learned ride.
+    ride_k7: Mapping[str, float] = field(default_factory=dict)
     # The active account's pct5/pct7 are an estimate (None: its reading).
     estimate: UsageEstimate | None = None
     # While the active account's usage is projected, the usage samples stop
@@ -164,6 +184,13 @@ class Switch:
     # A ``due`` ride that ``maximize.rideMaxMin`` ended before its learned
     # share: it says nothing about q, so nothing is learned from it.
     ride_capped: bool = False
+    # The ride window(s) measured on the 5h (they teach ``t``, not q).
+    ride_by_5h: tuple[str, ...] = ()
+    # The ride window(s) that reached their learned share (due, and not
+    # capped by ``rideMaxMin``): only they learn from a ``due`` switch. With
+    # ``rideWindows = "5h,7d"`` one window can end the ride while the other
+    # was neither due nor capped, or due only by the cap.
+    ride_ok: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -179,6 +206,7 @@ class Hold:
     # comes first (epoch s), and the window(s) it rides.
     ride_until: float | None = None
     ride_windows: tuple[str, ...] = ()
+    ride_by_5h: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)

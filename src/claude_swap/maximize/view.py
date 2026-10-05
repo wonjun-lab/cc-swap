@@ -24,9 +24,17 @@ from typing import Literal, get_args
 from claude_swap.maximize import drain
 from claude_swap.maximize import history as usage_history
 from claude_swap.maximize import hold as account_hold
+from claude_swap.maximize import policy
 from claude_swap.maximize import ride as learned_ride
 from claude_swap.maximize.auto_off_flag import read_flag
-from claude_swap.maximize.model import AccountView, Forecast, HoldCode, Sample, Snapshot
+from claude_swap.maximize.model import (
+    AccountView,
+    Forecast,
+    HoldCode,
+    RideFiveH,
+    Sample,
+    Snapshot,
+)
 from claude_swap.maximize.score import landable, rank, score
 from claude_swap.maximize.snapshot import build_snapshot
 from claude_swap.models import AccountsSnapshot
@@ -108,10 +116,15 @@ class MaximizeState:
     hold: account_hold.AccountHold | None = None
     # The learned ride (maximize/ride.py): q per window, and each account's
     # armed windows (``maximizeRide``: slot -> window -> arm time, and
-    # seconds per point) so Fleet decides a ride as the engine does.
+    # seconds per point) so Fleet decides a ride as the engine does. The
+    # ``rideLearning`` record as read: the active account's own q and t
+    # (``ride.learned_for``) come from it.
+    ride_learning: object = None
     ride_q: Mapping[str, float] = field(default_factory=dict)
     ride_armed_at: Mapping[str, Mapping[str, float]] = field(default_factory=dict)
     ride_point_s: Mapping[str, Mapping[str, float]] = field(default_factory=dict)
+    ride_t: Mapping[str, float] = field(default_factory=dict)
+    ride_5h: Mapping[str, Mapping[str, RideFiveH]] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -145,12 +158,17 @@ def _text(value) -> str | None:
     return str(value) if isinstance(value, (str, int)) and not isinstance(value, bool) else None
 
 
-def _ride_armed(raw: object) -> tuple[dict[str, dict[str, float]], dict[str, dict[str, float]]]:
-    """``(armed_at, point_s)``, each slot -> window -> value, from
+def _ride_armed(
+    raw: object,
+) -> tuple[
+    dict[str, dict[str, float]], dict[str, dict[str, float]], dict[str, dict[str, RideFiveH]]
+]:
+    """``(armed_at, point_s, five_h)``, each slot -> window -> value, from
     ``maximizeRide``'s ``accounts``, leniently."""
     accounts = raw.get("accounts") if isinstance(raw, dict) else None
     at: dict[str, dict[str, float]] = {}
     point: dict[str, dict[str, float]] = {}
+    five_h: dict[str, dict[str, RideFiveH]] = {}
     for number, windows in (accounts.items() if isinstance(accounts, dict) else ()):
         for w in learned_ride.WINDOWS:
             item = windows.get(w) if isinstance(windows, dict) else None
@@ -161,7 +179,15 @@ def _ride_armed(raw: object) -> tuple[dict[str, dict[str, float]], dict[str, dic
             seconds = _num(item.get("pointS"))
             if seconds is not None and seconds > 0:
                 point.setdefault(str(number), {})[w] = seconds
-    return at, point
+            five = item.get("fiveH")
+            if isinstance(five, dict):
+                rise, phase = _num(five.get("rise")), _num(five.get("phase"))
+                p5s = _num(five.get("pointS"))
+                if rise is not None and phase is not None:
+                    five_h.setdefault(str(number), {})[w] = RideFiveH(
+                        rise, phase, p5s if p5s is not None and p5s > 0 else None
+                    )
+    return at, point, five_h
 
 
 def _published(raw: object) -> tuple[PublishedDecision | None, dict[str, str | None]]:
@@ -247,11 +273,14 @@ def read_state(backup_root: Path) -> MaximizeState:
     off_set = flag_off or (AUTO_OFF_KEY in raw and off is not None and off is not False)
     off_map = flag_map if flag_off and flag_map else (off if isinstance(off, dict) else {})
     off_by = off_map.get("by")
-    ride_armed_at, ride_point_s = _ride_armed(raw.get("maximizeRide"))
+    ride_armed_at, ride_point_s, ride_5h = _ride_armed(raw.get("maximizeRide"))
     return MaximizeState(
+        ride_learning=raw.get(learned_ride.LEARN_KEY),
         ride_q=learned_ride.q_values(raw.get(learned_ride.LEARN_KEY)),
+        ride_t=learned_ride.t_values(raw.get(learned_ride.LEARN_KEY)),
         ride_armed_at=ride_armed_at,
         ride_point_s=ride_point_s,
+        ride_5h=ride_5h,
         auto_off=off_set,
         auto_off_since=_num(off_map.get("since")) if off_set else None,
         auto_off_by=off_by if off_set and isinstance(off_by, str) and off_by else None,
@@ -324,14 +353,37 @@ def history_inputs(
 def drain_k7(
     h: usage_history.History | None, settings: MaximizeSettings, now: float
 ) -> dict[str, float]:
-    """Each account's learned 7d-per-5h ratio for the near-reset drain, the
-    way the engine derives it (``engine_hook._history_inputs``:
-    ``drain.learn_k`` while ``drainHours`` is on). No history, or any
-    failure, is nothing learned."""
-    if h is None or settings.drain_hours <= 0:
+    """Each account's learned 7d-per-5h ratio for the near-reset drain and
+    the 7d ride's 5h measure, the way the engine derives it
+    (``engine_hook._history_inputs``: ``drain.learn_k`` while ``drainHours``
+    or the 7d ride is on). No history, or any failure, is nothing learned."""
+    if h is None or (settings.drain_hours <= 0 and "7d" not in policy.ride_windows(settings)):
         return {}
     try:
         return drain.learn_k(h.points, now)
+    except Exception:
+        return {}
+
+
+def _own(state: MaximizeState, number: str | None, key: str) -> dict[str, float]:
+    """The active account's own learned ``q`` or ``t`` per window, where it
+    has one (``ride.learned_accounts``); the window's stands otherwise."""
+    if number is None:
+        return {}
+    mine = learned_ride.learned_accounts(state.ride_learning).get(str(number), {})
+    return {w: item[key] for w, item in mine.items()}
+
+
+def ride_k7(
+    h: usage_history.History | None, settings: MaximizeSettings, now: float
+) -> dict[str, float]:
+    """Each account's k the 7d ride may read its last point by, the way the
+    engine derives it (``engine_hook._history_inputs``: ``drain.ride_k``
+    while the 7d ride is on). No history, or any failure, is none."""
+    if h is None or "7d" not in policy.ride_windows(settings):
+        return {}
+    try:
+        return drain.ride_k(h.points, now)
     except Exception:
         return {}
 
@@ -408,10 +460,13 @@ def snapshot_from_accounts(
         forecast=forecast,
         rates7=rates7,
         hold_until=pinned.until if pinned is not None else None,
-        ride_q=state.ride_q,
+        ride_q={**state.ride_q, **_own(state, snap.active_number, "q")},
         ride_armed_at=state.ride_armed_at.get(snap.active_number or "", {}),
         ride_point_s=state.ride_point_s.get(snap.active_number or "", {}),
+        ride_5h=state.ride_5h.get(snap.active_number or "", {}),
+        ride_t={**state.ride_t, **_own(state, snap.active_number, "t")},
         k7=drain_k7(history, settings, now),
+        ride_k7=ride_k7(history, settings, now),
         # How old each reading is: the policy's stale landing rule, as the
         # engine applies it (engine_hook.reading_ages).
         ages={

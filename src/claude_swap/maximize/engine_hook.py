@@ -25,11 +25,14 @@ switch the engine makes ends the hold on the account it leaves.
 The learned ride (maximize/ride.py) keeps three state-file records: the
 whole-point steps of each account while active (``rideSteps``, T1), the
 rides (``maximizeRide``: each account's arm time and T1 per window at its
-mark, kept until that window resets, and which windows the active
-account's last acted-on decision rode), and what was learned
-(``rideLearning``, q per window). A ride the engine ended with its
-hard switch before 100% raises q; 100% read while it rode halves q; an
-idle switch, a dry run, ``auto off`` and an unreadable tick teach nothing.
+mark, kept until that window resets, on 7d the 5h measure folded in from
+each reading since, and which windows the active account's last acted-on
+decision rode and which of them on the 5h), and what was learned
+(``rideLearning``, q and t per window). A ride the engine ended with its
+hard switch before 100% raises q (t when measured on the 5h); 100% while
+it rode — read, or a limit refusal Claude Code reported
+(maximize/limit_watch.py) — lowers it (``ride.learn``); an idle switch, a dry run, ``auto off`` and an
+unreadable tick teach nothing.
 A ride polls the active account at the 120 s high-usage cadence over its last
 ``RESET_WAIT_URGENT_S``, at ``pendingPollS`` before that.
 
@@ -60,6 +63,7 @@ from claude_swap.maximize import (
     notify,
     pause,
     policy,
+    ride_slots,
 )
 from claude_swap.maximize import estimate as est
 from claude_swap.maximize import hold as account_hold
@@ -71,6 +75,7 @@ from claude_swap.maximize.model import (
     Forecast,
     Hold,
     Indeterminate,
+    RideFiveH,
     Sample,
     Snapshot,
     Switch,
@@ -765,21 +770,25 @@ def _history_inputs(
     current: str,
     samples: tuple[Sample, ...],
     now: float,
-) -> tuple[Forecast | None, dict[str, float], dict[str, float]]:
-    """Record this tick in the usage history; ``(forecast, rates7, k7)`` for
-    the Snapshot.
+) -> tuple[Forecast | None, dict[str, float], dict[str, float], dict[str, float]]:
+    """Record this tick in the usage history; ``(forecast, rates7, k7,
+    ride_k7)`` for the Snapshot.
 
     Only readings the tick already has are recorded (no poll, no refresh):
-    usage points while ``preempt`` or the near-reset drain
-    (``drainHours``) is on, slot observations while ``learnIdlePattern``
-    is. The drain's k per account (``drain.learn_k``) comes from those
-    points. Dry runs record in memory only. History is a planning aid: any
+    usage points while ``preempt``, the near-reset drain (``drainHours``)
+    or the 7d learned ride is on, slot observations while
+    ``learnIdlePattern`` is. The k per account (``drain.learn_k``, the
+    drain's; ``drain.ride_k``, the stricter one the 7d ride's 5h measure
+    takes) comes from those points. Dry runs record in memory only. History is a planning aid: any
     failure here is logged and decides as if it had none.
     """
     s = rt.settings
     drain_on = s.drain_hours > 0
-    if not (s.preempt or s.learn_idle_pattern or drain_on):
-        return None, {}, {}
+    # The 7d ride reads its last point on the 5h at the account's own k.
+    need_k = drain_on or "7d" in policy.ride_windows(s)
+    ride_on = "7d" in policy.ride_windows(s)
+    if not (s.preempt or s.learn_idle_pattern or need_k):
+        return None, {}, {}, {}
     try:
         root = engine.switcher.backup_dir
         if rt.history is None or rt.history.root != root:
@@ -794,17 +803,18 @@ def _history_inputs(
                 readings[str(number)] = (float(fetched_at), pct5, pct7)
         rt.history.observe(
             now, current, readings, samples,
-            points=s.preempt or drain_on, slots=s.learn_idle_pattern,
+            points=s.preempt or need_k, slots=s.learn_idle_pattern,
             write=not engine.dry_run,
         )
         kept = rt.history.history
         forecast = history.forecast(kept.slots, now) if s.learn_idle_pattern else None
         rates = history.burn_rates(kept.points, now) if s.preempt else {}
-        k7 = drain.learn_k(kept.points, now) if drain_on else {}
-        return forecast, rates, k7
+        k7 = drain.learn_k(kept.points, now) if need_k else {}
+        ride_k7 = drain.ride_k(kept.points, now) if ride_on else {}
+        return forecast, rates, k7, ride_k7
     except Exception as e:  # a planning aid must never break a tick
         _logger.debug("usage history unavailable: %s", type(e).__name__)
-        return None, {}, {}
+        return None, {}, {}, {}
 
 
 #: Where ``AutoSwitchEngine`` keeps this tick's active-usage estimate
@@ -886,7 +896,28 @@ def _armed_windows(raw: object) -> dict:
             "pointS": point if point and point > 0 else None,
             "reset": _finite(item.get("reset")),
         }
+        five = _five_h(item.get("fiveH"))
+        if five is not None:
+            out[w]["fiveH"] = five
     return out
+
+
+def _five_h(raw: object) -> dict | None:
+    """An armed 7d window's 5h measure, leniently: ``{"p5", "readAt",
+    "rise", "phase", "pointS", "r5"}`` (the last 5h reading folded in and
+    when it was read, the 5h points risen since the arm time, the 5h's phase
+    at the 7d's estimated crossing, the 5h's seconds per point, the 5h's
+    ``resets_at`` as last read), or None."""
+    if not isinstance(raw, Mapping):
+        return None
+    values = {k: _finite(raw.get(k)) for k in ("p5", "readAt", "rise", "phase")}
+    if any(v is None for v in values.values()):
+        return None
+    point = _finite(raw.get("pointS"))
+    return {
+        **values, "pointS": point if point and point > 0 else None,
+        "r5": _finite(raw.get("r5")),
+    }
 
 
 def _ride_record(raw: object, current: str) -> dict:
@@ -898,7 +929,7 @@ def _ride_record(raw: object, current: str) -> dict:
     window's entry ends with that window's reset, :func:`_ride_track`).
     ``riding`` belongs to the account the record names: another active
     account starts it empty (a switch ends the ride under way)."""
-    out: dict = {"account": current, "riding": [], "accounts": {}}
+    out: dict = {"account": current, "riding": [], "by5h": [], "accounts": {}}
     if not isinstance(raw, Mapping):
         return out
     accounts = raw.get("accounts")
@@ -910,6 +941,9 @@ def _ride_record(raw: object, current: str) -> dict:
     mine = out["accounts"].get(current, {})
     if str(raw.get("account")) == current and isinstance(riding, list):
         out["riding"] = [w for w in learned_ride.WINDOWS if w in riding and w in mine]
+        by_5h = raw.get("by5h")
+        if isinstance(by_5h, list):
+            out["by5h"] = [w for w in out["riding"] if w in by_5h]
     return out
 
 
@@ -938,13 +972,80 @@ def _disarm_parked(
 
 def _velocity_point_s(
     samples: tuple[Sample, ...], s: MaximizeSettings, now: float, window: str
-) -> float | None:
-    """Seconds per point at the recent velocity (fresh samples only)."""
+) -> tuple[float | None, float]:
+    """``(seconds per point, points risen)`` at the recent velocity over
+    ``idleWindowMin`` (fresh samples only; ``idle.point_pace``)."""
     if not samples or now - samples[-1].ts > s.idle_window_min * 60.0:
+        return None, 0.0
+    return idle.point_pace(samples, s, window)
+
+
+def _arm_five_h(
+    steps: Mapping,
+    samples: tuple[Sample, ...],
+    s: MaximizeSettings,
+    current: str,
+    at: float,
+    read_at: float,
+    previous: float | None,
+    now: float,
+    reset5: float | None = None,
+) -> dict | None:
+    """The 5h measure of a 7d ride armed at ``at`` (the reading before the
+    first one at the mark, ``previous``; that first one read at
+    ``read_at``), or None without that reading: the 5h it read, the 5h's
+    pace (``ride.point_estimate`` on the 5h), and its phase at the 7d's
+    estimated crossing: the middle of the two readings (the 7d crossed
+    somewhere between them) when they are at most
+    ``ride.MIDPOINT_MAX_GAP_S`` apart, else the arm time itself (across a
+    longer gap other use may have carried the 7d over early in it: half
+    the gap credited as unused would ride into 100%)."""
+    before = next((x for x in samples if x.ts == previous), None) if previous == at else None
+    if before is None:
         return None
-    v5, v7 = idle.velocity(samples, s)
-    rate = v5 if window == "5h" else v7
-    return 60.0 / rate if rate is not None and rate > 0 else None
+    point = learned_ride.point_estimate(
+        learned_ride.point_seconds(steps, current, "5h", now),
+        *_velocity_point_s(samples, s, now, "5h"),
+    )
+    phase = learned_ride.phase_5h(samples, at, point)
+    if point is not None and read_at - at <= learned_ride.MIDPOINT_MAX_GAP_S:
+        phase += (read_at - at) / 2.0 / point
+    return {
+        "p5": before.pct5, "readAt": at, "rise": 0.0, "phase": phase, "pointS": point,
+        "r5": reset5 if reset5 is not None and reset5 > read_at else None,
+    }
+
+
+def _fold_five_h(
+    five: dict, samples: tuple[Sample, ...], reset5: float | None = None
+) -> None:
+    """Fold the readings since the last one counted into a 7d ride's 5h
+    measure (``ride.rise_5h``). A 5h reset is a reading taken at or after
+    the 5h's ``resets_at`` as last read (``five["r5"]``), or a drop: a
+    window at 0-1% that resets into one reading as much shows no drop.
+    Across it the old window's phase at the reset (its ``resets_at`` when
+    known, else the middle of the two readings) is carried. ``reset5``: the
+    5h's ``resets_at`` in this tick's reading, kept for the next fold."""
+    seen = list(samples)
+    for i, x in enumerate(seen):
+        if x.ts <= five["readAt"]:
+            continue
+        old = five.get("r5")
+        reset = x.pct5 < five["p5"] or (old is not None and x.ts >= old)
+        carry = 0.0
+        if reset:
+            at = (
+                old if old is not None and five["readAt"] < old <= x.ts
+                else (five["readAt"] + x.ts) / 2.0
+            )
+            carry = learned_ride.phase_5h(seen[:i], at, five["pointS"], limit=None)
+            five["r5"] = None  # the new window's comes with its reading
+        five["rise"] = learned_ride.rise_5h(
+            five["rise"], five["p5"], x.pct5, carry, reset=reset
+        )
+        five["p5"], five["readAt"] = x.pct5, x.ts
+    if reset5 is not None and seen and reset5 > seen[-1].ts:
+        five["r5"] = reset5
 
 
 @dataclass
@@ -954,9 +1055,11 @@ class RideTick:
     steps: dict
     record: dict
     hits: tuple[str, ...]
+    hits_5h: tuple[str, ...]
     stored_steps: object
     stored_record: object
     q: dict[str, float]
+    t: dict[str, float] = field(default_factory=dict)
 
     @property
     def _mine(self) -> dict:
@@ -972,6 +1075,14 @@ class RideTick:
             w: item["pointS"] for w, item in self._mine.items() if item["pointS"] is not None
         }
 
+    @property
+    def five_h(self) -> dict[str, RideFiveH]:
+        return {
+            w: RideFiveH(f["rise"], f["phase"], f["pointS"])
+            for w, item in self._mine.items()
+            if (f := item.get("fiveH")) is not None
+        }
+
 
 def _ride_track(
     engine: aw.AutoSwitchEngine,
@@ -984,15 +1095,19 @@ def _ride_track(
     new: Sample | None,
     prev_ts: float | None,
     now: float,
+    refused: tuple[str, ...] = (),
 ) -> RideTick:
     """Record this tick's whole-point steps, arm or disarm each window that
-    may ride, and note a hit: a window that reads 100% while the last
-    acted-on decision rode it. Writes nothing (:func:`_ride_commit` does).
+    may ride, and note a hit: a window at 100% while the last acted-on
+    decision rode it — read so, or in ``refused``, the windows Claude Code
+    reported a limit refusal for (the ``reported`` estimate). Writes
+    nothing (:func:`_ride_commit` does).
 
     A window is armed when it first reads its hard mark under 100% (at the
-    reading's fetch time) with its T1 frozen then: the shorter of the timed
-    steps' and the recent velocity's, else unknown until one is known. Under the mark again
-    (a reset) or at 100% disarms it."""
+    reading's fetch time) with its T1 frozen then (``ride.point_estimate``:
+    the timed steps' pace, the recent velocity only when no step was timed
+    or it shows a burst), else unknown until one is known. Under the mark
+    again (a reset) or at 100% disarms it."""
     s = rt.settings
     source = rt.dry_ride if engine.dry_run else state
     stored_steps = source.get(learned_ride.STEPS_KEY)
@@ -1013,14 +1128,19 @@ def _ride_track(
     pct5, reset5, pct7, reset7 = usage_windows(usage.get(current), now)
     fetched_at = getattr(entry, "fetched_at", None)
     hits: list[str] = []
+    hits_5h: list[str] = []
     for w, pct, cap, reset in (
         ("5h", pct5, s.hard_5h, reset5), ("7d", pct7, s.hard_7d, reset7)
     ):
+        if w in refused:
+            pct = policy.LIMIT_PCT  # Claude Code was refused for it: 100%
         if pct is None:
             continue  # unreadable this tick: keep what we had
         if pct >= policy.LIMIT_PCT:
             if w in record["riding"]:
                 hits.append(w)
+                if w in record["by5h"]:
+                    hits_5h.append(w)
             armed.pop(w, None)
         elif w in rides and cap >= policy.RIDE_FLOOR_PCT and pct >= cap:
             item = armed.get(w)
@@ -1032,6 +1152,12 @@ def _ride_track(
                 previous = max((x.ts for x in samples if x.ts < read_at), default=None)
                 at = learned_ride.arm_time(read_at, previous)
                 item = armed[w] = {"at": at, "pointS": None, "reset": None}
+                if w == "7d":
+                    five = _arm_five_h(
+                        steps, samples, s, current, at, read_at, previous, now, reset5
+                    )
+                    if five is not None:
+                        item["fiveH"] = five
             # When this window resets (it drops the arm time even while
             # the account is parked and unread).
             item["reset"] = reset if reset is not None and reset > now else None
@@ -1039,29 +1165,80 @@ def _ride_track(
             # now and kept there: clamped only when deciding, the ride
             # would count from "now" on every tick and never end.
             item["at"] = min(item["at"], now)
+            if item.get("fiveH") is not None:
+                _fold_five_h(item["fiveH"], samples, reset5)
             if item["pointS"] is None:
-                # The shorter of the measured steps and the recent velocity:
-                # a T1 too long rides into 100%.
-                known = [
-                    x for x in (
-                        learned_ride.point_seconds(steps, current, w, now),
-                        _velocity_point_s(samples, s, now, w),
-                    ) if x is not None
-                ]
-                item["pointS"] = min(known) if known else None
+                item["pointS"] = learned_ride.point_estimate(
+                    learned_ride.point_seconds(steps, current, w, now),
+                    *_velocity_point_s(samples, s, now, w),
+                )
         else:
             armed.pop(w, None)
     record["riding"] = [w for w in record["riding"] if w in armed]
+    record["by5h"] = [w for w in record["by5h"] if w in record["riding"]]
     if not armed:
         del record["accounts"][current]
     return RideTick(
         steps=steps,
         record=record,
         hits=tuple(hits),
+        hits_5h=tuple(hits_5h),
         stored_steps=stored_steps,
         stored_record=stored_record,
-        q=learned_ride.q_values(source.get(learned_ride.LEARN_KEY)),
+        q=learned_ride.q_values(source.get(learned_ride.LEARN_KEY), current),
+        t=learned_ride.t_values(source.get(learned_ride.LEARN_KEY), current),
     )
+
+
+def _reconcile_ride_slots(
+    engine: aw.AutoSwitchEngine,
+    rt: MaximizeRuntime,
+    state: dict,
+    records: Mapping[str, Mapping],
+    tiers: Mapping[str, str | None],
+) -> None:
+    """Drop the learned ride of a slot whose login or plan changed, or that
+    is gone (maximize/ride_slots.py): its own q/t/pace in the state file
+    (and ``state``, this tick's copy) and its usage-history points, on disk
+    and in the recorder's memory, so a previous login's k, t and q never
+    carry over. Writes only when something changed; a dry run writes
+    nothing. Never raises."""
+    if engine.dry_run or not records:
+        return
+    slots = {n: (ride_slots.fingerprint(r), tiers.get(n)) for n, r in records.items()}
+    keys = (learned_ride.LEARN_KEY, learned_ride.STEPS_KEY, ride_slots.IDS_KEY)
+    probe = {k: state[k] for k in keys if k in state}
+    if ride_slots.reconcile(probe, slots) == (set(), set()) and probe.get(
+        ride_slots.IDS_KEY
+    ) == state.get(ride_slots.IDS_KEY):
+        return
+    result: dict[str, tuple[set[str], set[str]]] = {}
+
+    def mutate(st: dict) -> None:
+        result["v"] = ride_slots.reconcile(st, slots)
+
+    try:
+        written = engine._mutate_state(mutate)
+        changed, gone = result["v"]
+        for k in keys:
+            if k in written:
+                state[k] = written[k]
+            else:
+                state.pop(k, None)
+        forgotten = changed | gone
+        if not forgotten:
+            return
+        ride_slots.forget_points(engine.switcher.backup_dir, forgotten)
+        if rt.history is not None and rt.history.loaded:
+            rt.history.history = ride_slots.drop_points(rt.history.history, forgotten)
+    except Exception as e:
+        _logger.debug("could not reconcile the learned ride's slots: %s", type(e).__name__)
+        return
+    if changed:
+        _logger.info(
+            "learned ride: forgot %s (another login or plan)",
+            ", ".join(engine._name(n) for n in sorted(changed)),
+        )
 
 
 def _ride_commit(
@@ -1071,25 +1248,32 @@ def _ride_commit(
     now: float,
     *,
     riding: tuple[str, ...] | None = None,
+    by_5h: tuple[str, ...] = (),
     ok: tuple[str, ...] = (),
+    ok_5h: tuple[str, ...] = (),
 ) -> None:
     """Persist this tick's ride records and learn from how a ride ended.
 
     ``riding``: the windows the decision the engine acted on rides (None
-    keeps the previous ones: nothing was acted on this tick). ``ok``: the
-    windows whose ride the engine ended with its hard switch, before 100%.
-    A hit (:func:`_ride_track`) halves q, an ok raises it, both under the
+    keeps the previous ones: nothing was acted on this tick), ``by_5h``
+    those of them measured on the 5h. ``ok``: the windows whose ride the
+    engine ended with its hard switch, before 100%; ``ok_5h`` those of them
+    measured on the 5h (they, and a hit while measured so, teach ``t``).
+    A hit (:func:`_ride_track`) lowers q, an ok raises it, both under the
     state lock. A dry run keeps its records in memory and learns nothing.
     Never raises: bookkeeping must not break a tick."""
     record = dict(tick.record)
     if riding is not None:
         record["riding"] = [w for w in learned_ride.WINDOWS if w in riding]
+        record["by5h"] = [w for w in record["riding"] if w in by_5h]
     if engine.dry_run:
         rt.dry_ride = {
             **rt.dry_ride, learned_ride.STEPS_KEY: tick.steps, RIDE_KEY: record,
         }
         return
-    outcomes = [(w, "hit") for w in tick.hits] + [(w, "ok") for w in ok]
+    outcomes = [(w, "hit", w in tick.hits_5h) for w in tick.hits] + [
+        (w, "ok", w in ok_5h) for w in ok
+    ]
     if tick.steps == tick.stored_steps and record == tick.stored_record and not outcomes:
         return
 
@@ -1098,8 +1282,10 @@ def _ride_commit(
         st[RIDE_KEY] = record
         if outcomes:
             data: object = st.get(learned_ride.LEARN_KEY)
-            for w, outcome in outcomes:
-                data = learned_ride.learn(data, w, outcome, now)  # type: ignore[arg-type]
+            for w, outcome, five in outcomes:
+                data = learned_ride.learn(  # type: ignore[arg-type]
+                    data, w, outcome, now, by_5h=five, account=record["account"]
+                )
             st[learned_ride.LEARN_KEY] = data
 
     try:
@@ -1107,10 +1293,12 @@ def _ride_commit(
     except Exception as e:
         _logger.debug("could not record the learned ride: %s", type(e).__name__)
         return
-    for w, outcome in outcomes:
+    for w, outcome, five in outcomes:
         _logger.info(
-            "learned ride: %s %s", w,
-            "switched before 100%" if outcome == "ok" else "reached 100% while riding",
+            "learned ride: %s %s%s", w,
+            "switched before 100%" if outcome == "ok"
+            else "reached 100% (read or refused) while riding",
+            " (measured on the 5h)" if five else "",
         )
 
 
@@ -1657,20 +1845,23 @@ def run_maximize_tick(
         engine, rt, state, current, entries.get(current), usage.get(current), now
     )
     new_sample, prev_ts = _new_sample(before, samples)
+    # The active account's usage as the engine decides on it when its
+    # reading is too old, or Claude Code reported its limit
+    # (maximize/active_watch.py). Samples, the ride and the history below
+    # keep running on the readings themselves; a reported limit is a ride's
+    # hit all the same.
+    estimate = active_estimate(engine, current)
+    tiers = _rate_limit_tiers(engine, rt, records, now)
+    _reconcile_ride_slots(engine, rt, state, records, tiers)
     ride_tick = _ride_track(
         engine, rt, state, current, entries.get(current), usage,
         samples, new_sample, prev_ts, now,
+        refused=estimate.refused if estimate is not None else (),
     )
-    forecast, rates7, k7 = _history_inputs(
+    forecast, rates7, k7, ride_k7 = _history_inputs(
         engine, rt, entries, usage, current, samples, now
     )
     last = state.get("lastSwitchAt")
-    tiers = _rate_limit_tiers(engine, rt, records, now)
-    # The active account's usage as the engine decides on it when its
-    # reading is too old, or Claude Code reported its limit
-    # (maximize/active_watch.py). Samples, the ride and the history above
-    # keep running on the readings themselves.
-    estimate = active_estimate(engine, current)
     decided = dict(usage) if estimate is None else {**usage, current: estimate.value}
     snap, shared = policy_snapshot(
         now=now,
@@ -1697,7 +1888,10 @@ def run_maximize_tick(
         ride_armed_at=ride_tick.armed_at,
         ride_point_s=ride_tick.point_s,
         ride_q=ride_tick.q,
+        ride_5h=ride_tick.five_h,
+        ride_t=ride_tick.t,
         k7=k7,
+        ride_k7=ride_k7,
         ages=reading_ages(entries),
         estimate=estimate.for_snapshot() if estimate is not None else None,
         local_idle=(
@@ -1729,21 +1923,26 @@ def run_maximize_tick(
     engine._idle_hold_since = None
     landed: str | None = None
     riding: tuple[str, ...] = ()
+    by_5h: tuple[str, ...] = ()
     ok: tuple[str, ...] = ()
+    ok_5h: tuple[str, ...] = ()
     if isinstance(decision, Switch):
         outcome, landed = _switch(
             engine, rt, snap, decision, decided, headroom, current, entries.get(current)
         )
         if landed:
             _end_hold_after_switch(engine, held_until, current, landed)
-            if decision.ride == "due" and not decision.ride_capped:
-                ok = decision.ride_windows
+            if decision.ride == "due":
+                ok = decision.ride_ok
+                ok_5h = tuple(w for w in ok if w in decision.ride_by_5h)
     elif isinstance(decision, Hold):
         outcome = _hold(engine, rt, decision, current, entries.get(current), now)
         if decision.code == "ride":
-            riding = decision.ride_windows
+            riding, by_5h = decision.ride_windows, decision.ride_by_5h
     else:
         outcome = _exhausted(engine, snap, decision, current)
-    _ride_commit(engine, rt, ride_tick, now, riding=riding, ok=ok)
+    _ride_commit(
+        engine, rt, ride_tick, now, riding=riding, by_5h=by_5h, ok=ok, ok_5h=ok_5h
+    )
     _run_primer(engine, rt, replace(snap, active=landed) if landed else snap)
     return outcome

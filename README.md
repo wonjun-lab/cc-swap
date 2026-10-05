@@ -245,7 +245,7 @@ If the window that crossed its threshold resets within 15 minutes and your pace 
 
 An account near its weekly (7d) reset whose quota would otherwise expire unused is *draining*: within 24 hours of the reset (`maximize.drainHours`; 0 turns it off), cc-swap sets its 7d soft threshold aside and keeps using it up to the 98% hard threshold; while it still has at least a quarter 5h window of room it lands on it up to 93% and tries it first, the soonest reset first. Fleet tags it `drain 18h`, and `cc-swap why` says `main 7d 86% resets in 18h — draining it first`. Hard thresholds, 100% and holds work as always.
 
-If you raise the 7d hard threshold to 99 or more, cc-swap may keep using the account for a few more minutes once it gets there, because the API reports whole percents and up to a point of quota is still left. It learns how long it can safely ride that last point.
+If you raise the 7d hard threshold to 99 or more, cc-swap may keep using the account for a few more minutes once it gets there, because the API reports whole percents and up to a point of quota is still left. It learns how much of that last point it can use, measuring it on the faster-moving 5h window once it has reliably learned how the account's two windows relate. It aims for about 1 hit in 10 rides, and a hit (100% before it switches) stops the turn Claude Code was running, which you then resume on the next account. To never be interrupted, set `maximize.learnedRide` to false or `maximize.rideWindows` to `""`: it switches at the hard threshold instead.
 
 ### Priming (optional, off by default)
 

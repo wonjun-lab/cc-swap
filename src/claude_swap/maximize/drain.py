@@ -87,6 +87,23 @@ K_MIN_WINDOWS = 3
 #: inside it.
 K_MIN = 0.05
 K_MAX = 0.5
+#: The 7d ride reads its last point at ``k`` (``policy.ride_k``), where a k
+#: x% off moves the switch by about x% of the point: it takes a k learned
+#: from at least this many windows ...
+K_RIDE_MIN_WINDOWS = 5
+#: ... whose spread (interquartile range over median) is at most this:
+#: each window's Δ7d is a handful of whole points, so a few windows'
+#: median can be 5-8% off ...
+K_RIDE_MAX_SPREAD = 0.10
+#: ... and within this share above the plan's default (``policy.ride_k``):
+#: a plan change (5x/20x, k ×1.6) or a slot given to another login mixes
+#: two accounts in the 8 days of history ...
+K_RIDE_PLAN_BAND = 0.35
+#: ... and within this share below it. Tighter: a low k under-reads the
+#: last point (``used`` scales with k) and rides into 100%, while a high
+#: one only switches early. A 5x login's k (~0.11) read for a 20x slot
+#: (default 0.165) is a third low; this rejects it.
+K_RIDE_PLAN_BAND_BELOW = 0.20
 
 Rule = Literal["hours", "headroom"]
 
@@ -140,6 +157,26 @@ def learn_k(points: Sequence, now: float | None = None) -> dict[str, float]:
         if len(ratios) >= K_MIN_WINDOWS:
             k = float(statistics.median(ratios))
             out[number] = round(min(K_MAX, max(K_MIN, k)), 4)
+    return out
+
+
+def ride_k(points: Sequence, now: float | None = None) -> dict[str, float]:
+    """``{slot: k}`` the 7d ride may read its last point by: like
+    :func:`learn_k`, but only from at least :data:`K_RIDE_MIN_WINDOWS`
+    counted windows whose interquartile range is at most
+    :data:`K_RIDE_MAX_SPREAD` of their median (the plan check is
+    ``policy.ride_k``'s, which knows the plan)."""
+    if now is not None:
+        points = [p for p in points if p.ts <= now]
+    out: dict[str, float] = {}
+    for number in sorted({p.number for p in points}):
+        ratios = window_ratios(points, number)
+        if len(ratios) < K_RIDE_MIN_WINDOWS:
+            continue
+        k = float(statistics.median(ratios))
+        q1, _, q3 = statistics.quantiles(ratios, n=4, method="inclusive")
+        if k > 0 and (q3 - q1) / k <= K_RIDE_MAX_SPREAD and K_MIN <= k <= K_MAX:
+            out[number] = round(k, 4)
     return out
 
 
