@@ -343,8 +343,13 @@ def snapshot_from_accounts(
     now: float,
     plans: Mapping[str, str | None] | None = None,
     history: usage_history.History | None = None,
+    decision: bool = False,
 ) -> Snapshot:
     """The policy Snapshot for the TUI's store snapshot.
+
+    ``decision``: usage as the engine decides on it
+    (``UsageEntry.decision_value``: a reading too old to trust is unknown);
+    else the last good reading whatever its age (for display).
 
     Plan tiers are not read here (reading ``rateLimitTier`` costs a Keychain
     read per account): ``plans`` — the labels a live engine published — and
@@ -361,7 +366,11 @@ def snapshot_from_accounts(
     return build_snapshot(
         now=now,
         active=snap.active_number,
-        usage={a.number: (a.usage.sentinel or a.usage.last_good) for a in accounts},
+        usage={
+            a.number: (a.usage.decision_value() if decision
+                       else (a.usage.sentinel or a.usage.last_good))
+            for a in accounts
+        },
         records={
             a.number: {"email": a.email, "alias": a.alias, "disabled": a.disabled}
             for a in accounts

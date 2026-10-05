@@ -809,7 +809,11 @@ class FleetScreen(Screen):
         es = self._engine_status()
         msnap = self._msnap(now)
         dv = self._decision(msnap, now)
+        # The engine's own lists, over the readings it trusts (msnap).
         picks = [v.number for v in policy.landing_candidates(msnap)] if msnap else []
+        forced = frozenset(
+            v.number for v in policy.escape_candidates(msnap)
+        ) - set(picks) if msnap else frozenset()
         snap = self.app.snapshot
         published = self._state.decision
         sit = home.situation(
@@ -822,10 +826,15 @@ class FleetScreen(Screen):
             palette=palette,
             ticks=mxview.window_ticks(self._mx),
             now=now,
-            next_no=home.next_number(dv, picks, sit),
+            next_no=home.next_number(
+                dv, picks, sit, untrusted={r.number for r in self._rows if not r.trusted},
+            ),
             priming=self._priming(es, sit),
+            picks=tuple(picks),
+            forced=forced,
+            live=home.switching_live(sit),
         )
-        rows = home.ordered_rows(self._rows, picks, now=now)
+        rows = home.ordered_rows(self._rows, picks, now=now, forced=forced)
         self._order = [r.number for r in rows]
         if self._sel not in self._order:
             self._sel = next((r.number for r in rows if r.active), None) or (

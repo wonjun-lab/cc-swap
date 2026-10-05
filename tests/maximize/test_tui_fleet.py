@@ -1338,3 +1338,47 @@ async def test_with_no_account_the_home_says_how_to_add_one(tmp_path, held_by_se
         await pilot.press("a")
         await pilot.pause()
         assert isinstance(app.screen, ConfirmModal)  # adds the login claude has now
+
+
+# -- the order column follows the engine (audit item 3) ----------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_an_untrusted_reading_is_never_numbered_next_or_counted(tmp_path, held_by_service):
+    """#6's reading is 2h old: the engine counts it as unknown, so Fleet
+    neither numbers it nor tags it next nor counts it in the summary, and
+    says how old it is in amber; a locked keychain is never numbered."""
+    app = make_app(_degraded(tmp_path))
+    async with app.run_test(size=(80, 24)) as pilot:
+        await _open(pilot)
+        screen = app.screen
+        assert _cell(app, "6", "order") == "–" and _cell(app, "2", "order") == "–"
+        assert _cell(app, "6", "status") == "reading 2h old"
+        numbered = [n for n in screen._order if _cell(app, n, "order").isdigit()]
+        assert numbered == ["3", "4"]  # the engine's landing order, nothing else
+        assert "next" not in _block(app, "6")
+        # Usable and trusted: #1, #3, #4 (#2 keychain, #5 dead, #6 untrusted).
+        assert _plain(app, "#fx-summary").startswith("5h free: 2 accounts")
+
+
+@pytest.mark.asyncio
+async def test_the_order_column_dims_while_nothing_switches(tmp_path, monkeypatch):
+    from claude_swap.tui.theme import Palette
+
+    monkeypatch.setattr(
+        "claude_swap.tui.fleet.service_status",
+        lambda: {"platform": "darwin", "installed": True, "running": False,
+                 "state": "not loaded", "pid": None, "logs": []},
+    )
+    app = make_app(_six(tmp_path))
+    async with app.run_test(size=(120, 36)) as pilot:
+        await _open(pilot)
+        assert app.screen._situation == "no-engine"
+        body = app.screen.query_one("#fx-body").layout_map.text
+        muted = Palette.from_theme(app.current_theme).muted
+        first, _count = app.screen.query_one("#fx-body").layout_map.spans["2"]
+        start = sum(len(line) + 1 for line in body.plain.splitlines()[:first])
+        x = app.screen._plan.x("order")
+        styles = [str(s.style) for s in body.spans if s.start <= start + x + 2 < s.end]
+        assert _cell(app, "2", "order") == "1"
+        assert any(muted in s for s in styles) and not any("bold" in s for s in styles)
