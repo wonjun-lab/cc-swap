@@ -33,7 +33,7 @@ def finding_lines(findings: list[dr.Finding]) -> list[Text]:
     order = {"error": 0, "warn": 1, "info": 2, "ok": 3}
     out: list[Text] = []
     for f in sorted(findings, key=lambda f: order[f.severity]):
-        where = f.check if f.scope in ("env", "accounts") else f"{f.scope} {f.check}"
+        where = f.check if f.scope in ("env", "accounts") else f"{f.where} {f.check}"
         tag = {"error": "ERROR", "warn": "WARN", "info": "info", "ok": "ok"}[f.severity]
         line = Text(f"{tag:<5}  ", style=_STYLES[f.severity])
         line.append(f"{where}: {f.detail}")

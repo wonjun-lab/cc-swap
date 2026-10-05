@@ -58,9 +58,9 @@ def test_menu_titles_carry_their_state():
     assert menus.menu_title("fetch", fetching=True) == "Fetch latest usage — fetching…"
     assert menus.menu_title("strategy") == "Swap strategy…"
     pick = menus.Selected("2", "side", excluded=False)
-    assert menus.menu_title("exclude", selected=pick) == "Exclude #2 side"
+    assert menus.menu_title("exclude", selected=pick) == "Exclude side"
     back = menus.Selected("5", "alt", excluded=True)
-    assert menus.menu_title("exclude", selected=back) == "Include #5 alt"
+    assert menus.menu_title("exclude", selected=back) == "Include alt"
 
 
 def test_menu_rows_explain_and_flag():

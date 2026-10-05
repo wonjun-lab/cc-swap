@@ -70,7 +70,7 @@ class AccountsScreen(Screen):
 
     def on_mount(self) -> None:
         table = self.query_one("#fx-ac-table", DataTable)
-        for label in ("#", "account", "login", "tier"):
+        for label in ("account", "login", "tier"):
             table.add_column(label, key=label)
         self.watch(self.app, "snapshot", self._on_snapshot)
         self._render_static()
@@ -118,9 +118,10 @@ class AccountsScreen(Screen):
         for row in rows:
             login, tone = fx.login_text(row)
             table.add_row(
-                Text(row.number, style=tone_style("bold" if row.active else "plain", palette)),
                 Text(f"{row.name}  [{row.org}]" + ("  ● active" if row.active else ""),
-                     style=tone_style("crit" if row.login == "relogin" else "plain", palette)),
+                     style=tone_style(
+                         "crit" if row.login == "relogin"
+                         else "bold" if row.active else "plain", palette)),
                 Text(login, style=tone_style(tone, palette)),
                 Text(fx.TIER_CELLS.get(row.tier, row.tier),
                      style=tone_style("plain" if row.tier == "normal" else "dim", palette)),
@@ -189,7 +190,7 @@ class AccountsScreen(Screen):
             acc = next((a for a in (snap.accounts if snap else ()) if a.number == number), None)
             app.push_screen(
                 TextInputModal(
-                    f"Name #{number}",
+                    f"Name {self._account_name(number)}",
                     "Alias (letters, digits, - _ .); empty removes it",
                     acc.alias if acc else "",
                 ),
@@ -207,9 +208,19 @@ class AccountsScreen(Screen):
             return
         switcher = self.app.switcher
         if alias:
-            self.app._start_action(f"Name #{number}", partial(switcher.set_alias, number, alias))
+            self.app._start_action(
+                f"Name {self._account_name(number)}", partial(switcher.set_alias, number, alias)
+            )
         else:
-            self.app._start_action(f"Unname #{number}", partial(switcher.unset_alias, number))
+            self.app._start_action(
+                f"Unname {self._account_name(number)}", partial(switcher.unset_alias, number)
+            )
+
+    def _account_name(self, number: str) -> str:
+        """Slot ``number``'s display name (maximize/names.py)."""
+        from claude_swap.tui.fleet import _who
+
+        return _who(self.app, number)
 
     def action_back(self) -> None:
         if self._picking:

@@ -107,7 +107,7 @@ def menu_title(
         return f"Mode: {mode_label or 'off'}"
     if action == "exclude" and selected is not None:
         verb = "Include" if selected.excluded else "Exclude"
-        return f"{verb} #{selected.number} {selected.name}"
+        return f"{verb} {selected.name}"
     if action == "accounts" and relogin:
         return f"{entry.title} · {relogin} need{'s' if relogin == 1 else ''} re-login"
     if action == "fetch" and fetching:
@@ -181,7 +181,7 @@ def hold_rows(held_until: float | None, now: float) -> list[MenuRow]:
     return rows
 
 
-HOLD_TITLE = "Hold #{number} {name} — stay on this account"
+HOLD_TITLE = "Hold {name} — stay on this account"
 #: Under the hold picker's title: what a hold does and does not stop.
 HOLD_NOTE = (
     "soft, preempt and rebalance moves wait; a hard mark, 100% and a reset wait "

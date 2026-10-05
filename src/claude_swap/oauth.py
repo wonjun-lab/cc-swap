@@ -253,13 +253,23 @@ def deadline_text(epoch_s: float, now_s: float | None = None) -> str:
 RELOGIN_STEPS = "cc-swap login, or Fleet → select → r"
 
 
-def relogin_fix(number: str | int) -> str:
-    """The one re-login instruction every surface prints for slot ``number``.
+def _local_part(email: str) -> str:
+    """The part of ``email`` before the ``@`` (what a log line may carry)."""
+    from claude_swap.maximize.names import short_name
 
-    Names the slot (``cc-swap login N``: it pre-fills that account's email
-    and refuses any other) rather than the email, so the line is safe in
-    logs and notifications; a bare ``cc-swap login`` renews it too."""
-    return f"re-login #{number}: cc-swap login {number}, or Fleet → select → r"
+    return short_name(email or "")
+
+
+def relogin_fix(name: str) -> str:
+    """The one re-login instruction every surface prints for the account
+    called ``name`` (its display name, maximize/names.py).
+
+    ``cc-swap login NAME`` pre-fills that account's email and refuses any
+    other; the display name, not the email, keeps the line safe in logs and
+    notifications. A bare ``cc-swap login`` renews it too."""
+    from claude_swap.maximize.names import cli_arg
+
+    return f"re-login {name}: cc-swap login {cli_arg(name)}, or Fleet → select → r"
 
 
 def is_oauth_token_expired(expires_at: object) -> bool:
@@ -879,7 +889,9 @@ def try_fetch_usage_for_account(
     never consumes a superseded snapshot. ``persist_credentials`` is then
     unused for the refresh (the gate persists internally).
     """
-    context = f"for account {account_num}"  # no email: paste-safe for public issues
+    # The address's local part, never the whole address: paste-safe for
+    # public issues (cc-swap: a name, not the slot number; maximize/names.py).
+    context = f"for {_local_part(email) or f'account {account_num}'}"
     oauth = extract_oauth_data(credentials)
     access_token = oauth.get("accessToken") if oauth else None
     if not access_token:
@@ -1019,17 +1031,16 @@ def _persist(
         callback(account_num, email, credentials)
     except Exception as e:
         _logger.warning(
-            "Refreshed OAuth token for account %s (%s) but failed to persist it: %r. "
+            "Refreshed OAuth token for %s but failed to persist it: %r. "
             "The refresh token on disk may now be stale; if the next refresh fails "
             "with invalid_grant, re-run `cc-swap add` after logging in.",
-            account_num,
-            email,
+            _local_part(email) or f"account {account_num}",
             e,
         )
         # stderr, not stdout: this runs inside ``cswap list --json`` and the
         # other ``--json`` commands, whose stdout is one machine-readable object.
         print_warning(
-            f"Warning: failed to save refreshed token for account {account_num} ({email}). "
+            f"Warning: failed to save refreshed token for {email or f'account {account_num}'}. "
             f"If the next refresh fails, re-run `cc-swap add` after logging in.",
             file=sys.stderr,
         )

@@ -22,9 +22,11 @@ import sys
 import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
+from pathlib import Path
 
 from claude_swap import paths
 from claude_swap.maximize import doctor as dr
+from claude_swap.maximize.names import name_of
 from claude_swap.printer import bolded, dimmed, muted, reddened, yellowed
 
 SCHEMA_VERSION = 1
@@ -55,7 +57,7 @@ def doctor_lines(findings: list[dr.Finding], *, color: bool = True) -> list[str]
             continue
         out.append(bolded(title) if color else title)
         for f in rows:
-            label = f.check if f.scope in ("env", "accounts") else f"{f.scope} {f.check}"
+            label = f.check if f.scope in ("env", "accounts") else f"{f.where} {f.check}"
             tag = _tag(f.severity) if color else f"{_TAGS[f.severity]:<5}"
             out.append(f"  {tag}  {label:<18} {f.detail}")
             if f.fix and f.severity != "ok":
@@ -179,7 +181,7 @@ def init_steps(probes: dr.Probes) -> list[Step]:
 
     number = dr.live_slot(ctx)
     if number:
-        steps.append(Step("adopted", "ok", "Live login saved in a slot", f"#{number}"))
+        steps.append(Step("adopted", "ok", "Live login saved in a slot", ctx.name(number)))
     else:
         steps.append(Step(
             "adopted", "TODO", "Live login saved in a slot",
@@ -371,7 +373,7 @@ def init_command(argv: list[str]) -> None:
             f"({summary_line(findings)}):"
         )
         for f in doctor_problems:
-            label = f.check if f.scope in ("env", "accounts") else f"{f.scope} {f.check}"
+            label = f.check if f.scope in ("env", "accounts") else f"{f.where} {f.check}"
             print(f"  {_tag(f.severity)}  {label}: {f.detail}")
             if f.fix:
                 print(" " * 9 + muted(f"→ {f.fix}"))
@@ -658,7 +660,7 @@ def drain_status(backup_root, *, now: float, draining: object = None) -> dict:
         "drainHours": s.drain_hours,
         "k7": k7,
         "draining": [{"slot": n, "hoursLeft": round(h, 2)} for n, h in now_draining],
-        "text": drain.describe(s.drain_hours, k7, now_draining),
+        "text": drain.describe(s.drain_hours, k7, now_draining, _names(backup_root)),
     }
 
 
@@ -784,7 +786,7 @@ def _engine_why(backup_root, *, now: float, state: Mapping | None = None) -> dic
     if published.decision == "switch":
         meaning = f"Switching: {TRIGGERS.get(published.trigger or '', published.trigger or 'switch')}."
         action = (
-            f"Nothing; the engine switched (now on #{published.target})."
+            f"Nothing; the engine switched (now on {_name(backup_root, published.target)})."
             if landed
             else "Nothing; the engine is switching (or just switched)."
         )
@@ -807,6 +809,34 @@ def _engine_why(backup_root, *, now: float, state: Mapping | None = None) -> dic
     }
 
 
+def _names(backup_root) -> dict[str, str]:
+    """``{slot: display name}`` (maximize/names.py) from sequence.json; {}
+    when it cannot be read."""
+    from claude_swap.maximize.names import record_names
+
+    try:
+        data = json.loads((Path(backup_root) / "sequence.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError, RecursionError):
+        return {}
+    return record_names(data.get("accounts") if isinstance(data, dict) else None)
+
+
+def _name(backup_root, number: object) -> str:
+    return name_of(_names(backup_root), number)
+
+
+def _add_names(why: dict, names: Mapping[str, str]) -> None:
+    """``activeName``/``targetName`` next to the slot numbers (JSON keeps
+    both; the lines show the names), and ``names`` for the lines."""
+    why["names"] = dict(names)
+    for key in ("active", "target"):
+        if why.get(key):
+            why[f"{key}Name"] = name_of(names, why[key])
+    would = why.get("wouldDecide")
+    if isinstance(would, dict) and would.get("target"):
+        would["targetName"] = name_of(names, would["target"])
+
+
 def _why_lines(why: dict) -> list[str]:
     who = f"engine pid {why['pid']}" if why.get("pid") else "engine"
     if why["source"] == "paused":
@@ -816,10 +846,12 @@ def _why_lines(why: dict) -> list[str]:
     else:
         head = why["decision"].upper()
         if why.get("target"):
-            head += f" → #{why['target']}"
+            head += f" → {why.get('targetName') or name_of({}, why['target'])}"
         if why.get("trigger"):
             head += f" ({why['trigger']})"
-    active = f" on #{why['active']}" if why.get("active") else ""
+    active = (
+        f" on {why.get('activeName') or name_of({}, why['active'])}" if why.get("active") else ""
+    )
     when = "" if why["source"] in ("paused", "auto-off") else f" · {dr.duration(why['ageS'])} ago"
     if why["source"] == "auto-off":
         lines = [bolded(head)]
@@ -842,12 +874,12 @@ def _why_lines(why: dict) -> list[str]:
             n: [tuple(p) for p in places]
             for n, places in (why.get("sharedWith") or {}).items()
         }
-        lines.append(f"  skipped  {skip_text(why['shared'], partners)}")
+        lines.append(f"  skipped  {skip_text(why['shared'], partners, why.get('names'))}")
     would = why.get("wouldDecide")
     if would:
         verdict = would["decision"]
         if would.get("target") and would["decision"] in ("switch", "pending"):
-            verdict += f" → #{would['target']}"
+            verdict += f" → {would.get('targetName') or name_of({}, would['target'])}"
         lines.append(dimmed(f"  if on    the engine would {verdict}: {would['reason']}"))
     if why.get("holdLine"):
         lines.append(f"  hold     {why['holdLine']}")
@@ -927,6 +959,8 @@ def why_command(argv: list[str], *, clock: Callable[[], float] = time.time) -> N
     if why is not None and why.get("shared"):
         why["sharedWith"] = shared_partners(why["shared"])
     if why is not None:
+        _add_names(why, _names(root))
+    if why is not None:
         why["idlePattern"] = idle_pattern(root, now=now)
         why["learnedRide"] = ride_learning(root)
         why["drain"] = drain_status(root, now=now, draining=published_draining(root))
@@ -937,6 +971,7 @@ def why_command(argv: list[str], *, clock: Callable[[], float] = time.time) -> N
         if claude_note is not None:
             payload["claude"] = claude_note
         payload.pop("holdLine", None)
+        payload.pop("names", None)
         if why is None:
             payload["fallback"] = "cc-swap auto --once --dry-run --json"
         if held is not None:

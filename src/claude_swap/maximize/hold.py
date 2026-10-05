@@ -363,10 +363,21 @@ def until_text(hold: AccountHold, now: float) -> str:
     return f"until {clock_text(hold.until, now)} ({left_text(hold.until - now)} left)"
 
 
-def held_message(hold: AccountHold, now: float, *, asked: float | None = None) -> str:
-    """``Holding #1 until 15:30 (2h left)``, saying so when the end that
-    was ``asked`` for lay more than 24h away and the hold was capped."""
-    text = f"Holding #{hold.slot} {until_text(hold, now)}"
+def held_message(
+    hold: AccountHold,
+    now: float,
+    *,
+    asked: float | None = None,
+    name: str | None = None,
+    root: Path | None = None,
+) -> str:
+    """``Holding dev until 15:30 (2h left)``, saying so when the end that
+    was ``asked`` for lay more than 24h away and the hold was capped.
+    ``name``: the held account's display name; without one it is read off
+    ``root``'s sequence.json (no ``root``: ``#slot``)."""
+    if not name:
+        name = _label(hold.slot, _names(root) if root is not None else {})
+    text = f"Holding {name} {until_text(hold, now)}"
     if asked is not None and asked - now > MAX_HOLD_S:
         clock = time.strftime("%H:%M", time.localtime(asked))
         text += f" ({clock} is {left_text(asked - now)} away; a hold is at most 24h)"
@@ -405,14 +416,9 @@ def _names(root: Path) -> dict[str, str]:
 def record_names(accounts: object) -> dict[str, str]:
     """``{slot: display name}`` for ``sequence.json``'s account records
     (maximize/names.py: the alias, else the short name, made unique)."""
-    from claude_swap.maximize.names import display_names
+    from claude_swap.maximize.names import record_names as names_of_records
 
-    if not isinstance(accounts, Mapping):
-        return {}
-    return display_names(
-        (str(n), str(r.get("email") or ""), str(r.get("alias") or ""))
-        for n, r in accounts.items() if isinstance(r, Mapping)
-    )
+    return names_of_records(accounts)
 
 
 def display_name_hook(root: Path):
@@ -429,8 +435,9 @@ def display_name_hook(root: Path):
 
 
 def _label(slot: str, names: Mapping[str, str]) -> str:
-    name = names.get(slot)
-    return f"#{slot} {name}" if name else f"#{slot}"
+    from claude_swap.maximize.names import name_of
+
+    return name_of(names, slot)
 
 
 def _marks(root: Path) -> tuple[float, float]:
@@ -456,7 +463,7 @@ def status_payload(hold: AccountHold | None, now: float) -> dict | None:
 
 
 def status_line(root: Path, now: float, *, state: Mapping | None = None) -> str | None:
-    """``Holding #1 main until 15:30 (2h left) — only hard 98%/100% will
+    """``Holding main until 15:30 (2h left) — only hard 98%/100% will
     move you`` while a hold pins the active account (:func:`live_slot`),
     else None."""
     hold = holding(read_hold(root, now=now, state=state), live_slot(root), now, root=root)

@@ -284,11 +284,27 @@ def format_account_label(
     alias: str | None = None,
     disabled: bool = False,
     fetched_at: float | None = None,
+    name: str | None = None,
 ) -> str:
-    """Build one account row's menu label."""
-    label = f"{alias}  ({email})" if alias else email
+    """Build one account row's menu label. ``num`` is the slot (the row's
+    callback key, never shown); the account goes by its display name."""
     marker = "  (disabled)" if disabled else ""
-    return f"{num}  {label}{marker}  {usage_summary(usage, now, fetched_at)}"
+    return (
+        f"{account_menu_name(num, email, alias, name)}{marker}  "
+        f"{usage_summary(usage, now, fetched_at)}"
+    )
+
+
+def account_menu_name(num, email: str, alias: str | None = None, name: str | None = None) -> str:
+    """cc-swap: how a menu row names an account (maximize/names.py): the
+    address alone when the display name is just its local part, else
+    ``name  (address)``."""
+    from claude_swap.maximize.names import name_of, short_name
+
+    shown = name or alias or name_of({}, num, email)
+    if not email or shown == short_name(email):
+        return email or shown
+    return f"{shown}  ({email})"
 
 
 def _local_part(email: str, limit: int = 12) -> str:
@@ -372,20 +388,28 @@ def _usage_log_key(usage: dict | str | None) -> tuple[float | None, float | None
 _SWITCH_LOG_RE = re.compile(r"Switched from account (\d+) to (\d+)")
 
 
-def parse_switch_history(log_text: str, limit: int = SWITCH_HISTORY_LIMIT) -> list[str]:
+def parse_switch_history(
+    log_text: str, limit: int = SWITCH_HISTORY_LIMIT, names: dict | None = None
+) -> list[str]:
     """Recent account switches from the log, most-recent first.
 
     Reads the ``Switched from account X to Y`` lines the switcher logs and pairs
     each with its timestamp (trimmed to the minute). Returns at most ``limit``
-    entries like ``"3 → 1   2026-06-27 02:06"``. Any unparseable line is skipped.
+    entries like ``"work → side   2026-06-27 02:06"``: each slot by its display
+    name in ``names`` ({slot: name}; maximize/names.py), ``#3`` for a slot it
+    does not name. Any unparseable line is skipped.
     """
+    from claude_swap.maximize.names import name_of
+
     out: list[str] = []
     for line in log_text.splitlines():
         m = _SWITCH_LOG_RE.search(line)
         if not m:
             continue
         stamp = line.split(" - ", 1)[0].strip()[:16]  # "YYYY-MM-DD HH:MM"
-        out.append(f"{m.group(1)} → {m.group(2)}   {stamp}")
+        out.append(
+            f"{name_of(names or {}, m.group(1))} → {name_of(names or {}, m.group(2))}   {stamp}"
+        )
     return out[-limit:][::-1]
 
 
@@ -843,10 +867,12 @@ def run(switcher) -> int:
                 _purge(self.menu._menu)
             self.menu.clear()
             account_items = []
+            names = self._account_names()
             for num, email, is_active, display, _last_good, alias, disabled, fetched_at in self.snapshot["accounts"]:
                 item = rumps.MenuItem(
                     format_account_label(
-                        num, email, display, alias=alias, disabled=disabled, fetched_at=fetched_at
+                        num, email, display, alias=alias, disabled=disabled, fetched_at=fetched_at,
+                        name=names.get(str(num)),
                     ),
                     callback=self._make_switch_to(num),
                 )
@@ -885,9 +911,10 @@ def run(switcher) -> int:
             accounts = self.snapshot["accounts"]
             if not accounts:
                 menu.add(rumps.MenuItem("No managed accounts", callback=None))
+            names = self._account_names()
             for num, email, _is_active, _display, _last_good, alias, _disabled, _fetched_at in accounts:
-                label = f"{num}  {alias}  ({email})" if alias else f"{num}  {email}"
-                menu.add(rumps.MenuItem(label, callback=self._make_remove(num)))
+                label = account_menu_name(num, email, alias, names.get(str(num)))
+                menu.add(rumps.MenuItem(label, callback=self._make_remove(num, label)))
             return menu
 
         def _disable_menu(self, rumps):
@@ -895,10 +922,11 @@ def run(switcher) -> int:
             accounts = self.snapshot["accounts"]
             if not accounts:
                 menu.add(rumps.MenuItem("No managed accounts", callback=None))
+            names = self._account_names()
             for num, email, _is_active, _display, _last_good, alias, disabled, _fetched_at in accounts:
-                name = f"{alias}  ({email})" if alias else email
                 item = rumps.MenuItem(
-                    f"{num}  {name}", callback=self._make_toggle_disabled(num, disabled)
+                    account_menu_name(num, email, alias, names.get(str(num))),
+                    callback=self._make_toggle_disabled(num, disabled),
                 )
                 # A check-mark reads as "held out of rotation" — same glyph the
                 # active row uses, but here it means disabled, not selected.
@@ -912,7 +940,7 @@ def run(switcher) -> int:
                 text = log_path.read_text(encoding="utf-8")
             except OSError:
                 text = ""
-            entries = parse_switch_history(text)
+            entries = parse_switch_history(text, names=self._account_names())
             if entries:
                 for line in entries:
                     menu.add(rumps.MenuItem(line, callback=None))
@@ -1003,11 +1031,19 @@ def run(switcher) -> int:
                     self.refresh_async()
             return cb
 
-        def _make_remove(self, num):
+        def _account_names(self) -> dict:
+            """cc-swap: ``{slot: display name}``; ``{}`` when unknown."""
+            try:
+                names = self.switcher.account_names()
+            except Exception:
+                return {}
+            return names if isinstance(names, dict) else {}
+
+        def _make_remove(self, num, label=None):
             def cb(_sender):
                 if rumps.alert(
                     title="Remove account",
-                    message=f"Remove account {num}?",
+                    message=f"Remove {label or account_menu_name(num, '')}?",
                     ok="Remove",
                     cancel="Cancel",
                 ) == 1:  # 1 == OK

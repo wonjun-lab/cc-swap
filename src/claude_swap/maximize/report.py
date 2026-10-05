@@ -1,6 +1,8 @@
 """Per-account maximize rows for dry-run output, JSON events and the TUI.
 
-No I/O and no emails: rows identify accounts by slot number only.
+No I/O and no emails: rows carry each account's slot number (the JSON
+contract) and its display name (``name``, maximize/names.py), which the
+rendered table shows.
 """
 
 from __future__ import annotations
@@ -10,6 +12,7 @@ from collections.abc import Sequence
 
 from claude_swap.maximize import drain, idle
 from claude_swap.maximize.model import Snapshot
+from claude_swap.maximize.names import name_of, view_name
 from claude_swap.maximize.score import days_left, landable, score
 
 
@@ -35,6 +38,7 @@ def decision_rows(snap: Snapshot) -> list[dict]:
         ]
         rows.append({
             "number": v.number,
+            "name": view_name(v),
             "active": v.number == snap.active,
             "tier": v.tier,
             "plan": "20x" if v.plan_weight >= 4 else "std",
@@ -57,16 +61,18 @@ def _pct(value: float | None) -> str:
 
 def render_rows(rows: Sequence[dict]) -> list[str]:
     """Fixed-width table; ``*`` marks the active account."""
+    names = [str(r.get("name") or name_of({}, r.get("number"))) for r in rows]
+    width = max([len("account"), *(len(n) for n in names)])
     lines = [
-        f"    {'#':>3} {'tier':<11} {'plan':<4} {'5h':>5} {'7d':>5} "
+        f"    {'account':<{width}} {'tier':<11} {'plan':<4} {'5h':>5} {'7d':>5} "
         f"{'7d-in':>6} {'score':>6} {'land':<4} {'idle':<7} flags"
     ]
-    for r in rows:
+    for r, name in zip(rows, names):
         days = "?" if r["days7"] is None else f"{r['days7']:.1f}d"
         sc = "-" if r["score"] is None else f"{r['score']:.2f}"
         lines.append(
             (
-                f"  {'*' if r['active'] else ' '} {r['number']:>3} {r['tier']:<11} "
+                f"  {'*' if r['active'] else ' '} {name:<{width}} {r['tier']:<11} "
                 f"{r['plan']:<4} {_pct(r['pct5']):>5} {_pct(r['pct7']):>5} "
                 f"{days:>6} {sc:>6} {'yes' if r['landable'] else '-':<4} "
                 f"{r['idle'] or '-':<7} {r['flags']}"

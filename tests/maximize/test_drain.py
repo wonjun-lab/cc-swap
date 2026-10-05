@@ -112,7 +112,7 @@ class TestPredicate:
 
     def test_words(self):
         v = hours("1", 0, 86, 18)
-        assert drain.text(v, one(v)) == "#1 7d 86% resets in 18h — draining it first"
+        assert drain.text(v, one(v)) == "1 7d 86% resets in 18h — draining it first"
         assert drain.tag(18.2) == "drain 18h"
         assert drain.left_text(0.4) == "24m" and drain.left_text(72) == "3d"
 
@@ -215,7 +215,7 @@ class TestLanding:
         s = snap("1", acct("1", 96, 40), hours("2", 0, 88, 18), acct("3", 0, 30, reset7_d=5))
         got = decide(s)
         assert isinstance(got, Switch) and got.trigger == "hard" and got.target == "2"
-        assert got.reason.endswith("-> #2 (normal, score 1.12): #2 7d 88% resets in 18h "
+        assert got.reason.endswith("-> 2 (normal, score 1.12): 2 7d 88% resets in 18h "
                                    "— draining it first")
         off = decide(replace(s, settings=MaximizeSettings(drain_hours=0)))
         assert isinstance(off, Switch) and off.target == "3"
@@ -303,7 +303,7 @@ class TestActiveDraining:
         got = decide(s)
         assert isinstance(got, Hold) and not got.pending and got.code is None
         assert got.reason == (
-            "#1 7d 92% resets in 18h — draining it first (7d soft 90% set aside until "
+            "1 7d 92% resets in 18h — draining it first (7d soft 90% set aside until "
             "the reset; hard 98% still switches)"
         )
         off = decide(replace(s, settings=MaximizeSettings(drain_hours=0)))
@@ -370,7 +370,7 @@ class TestActiveDraining:
                          samples="idle"), hold_until=NOW + H)
         got = decide(s)
         assert isinstance(got, Hold) and got.code == "hold"
-        assert "otherwise: #1 7d 92% resets in 18h — draining it first" in got.reason
+        assert "otherwise: 1 7d 92% resets in 18h — draining it first" in got.reason
 
 
 class TestRebalance:
@@ -390,7 +390,7 @@ class TestRebalance:
         s = self.cooled(hours("1", 10, 80, 20), hours("2", 0, 85, 4))
         got = decide(s)
         assert isinstance(got, Switch) and got.trigger == "rebalance" and got.target == "2"
-        assert got.reason.endswith("#2 7d 85% resets in 4h — draining it first; idle")
+        assert got.reason.endswith("2 7d 85% resets in 4h — draining it first; idle")
         # The other way round: #2 resets later, whatever its score.
         back = self.cooled(hours("2", 0, 85, 4), hours("1", 10, 20, 20))
         assert isinstance(decide(back), Hold)
@@ -540,6 +540,11 @@ class TestSurfaces:
             "7d drain: within 24h of a 7d reset · draining #1 (18h) · k learned #2 0.167; "
             "others by plan (20x 0.165, 5x 0.105)"
         )
+        names = {"1": "dev", "2": "ops"}
+        assert drain.describe(24, {"2": 0.167}, [("1", 18.2)], names) == (
+            "7d drain: within 24h of a 7d reset · draining dev (18h) · k learned ops 0.167; "
+            "others by plan (20x 0.165, 5x 0.105)"
+        )
 
     def test_view_drain_k7_follows_the_settings_like_the_engine(self):
         from claude_swap.maximize import view as mxview
@@ -571,13 +576,13 @@ class TestEngine:
         assert of(h, SwitchEvent) == [] and h.active_number() == 1
         record = h.state()[DECISION_KEY]
         assert record["decision"] == "hold"
-        assert record["reason"].startswith("#1 7d 92% resets in 18h — draining it first")
+        assert record["reason"].startswith("a 7d 92% resets in 18h — draining it first")
         assert record["draining"] == {"1": pytest.approx(r7, abs=1)}
         status = doctor_cli.drain_status(
             h.switcher.backup_dir, now=h.clock.now, draining=record["draining"]
         )
         assert status["draining"][0]["slot"] == "1"
-        assert "draining #1 (18h)" in status["text"]
+        assert "draining a (18h)" in status["text"]
 
     def test_drain_off_is_the_soft_switch(self, temp_home):
         from tests.maximize.test_engine_maximize import make, of, win

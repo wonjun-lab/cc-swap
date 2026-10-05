@@ -989,23 +989,27 @@ def _live_prime(switcher, target: str | None) -> Callable[[], tuple[bool, str]]:
     def run() -> tuple[bool, str]:
         from claude_swap.maximize.prime_cli import manual_prime
 
-        plan = manual_prime(
+        from claude_swap.maximize.names import name_of
+
+        dry = manual_prime(
             switcher, None, dry_run=True, emit=lambda _e: None, check_version=False
-        ).plan
+        )
+        plan = dry.plan
         candidates = [num for num, _text, would in plan if would]
         pick = target if target not in (None, "auto") else (candidates[0] if candidates else None)
         if pick is None:
             return False, "no idle account with its 5h window off to prime"
+        name = name_of(dry.names, pick)
         if pick not in candidates:
             reason = next((t for n, t, _w in plan if n == pick), "not an account")
-            return False, f"#{pick} cannot be primed now ({reason})"
+            return False, f"{name} cannot be primed now ({reason})"
         report = manual_prime(
             switcher, {pick}, dry_run=False, emit=lambda _e: None, check_version=False
         )
         outcomes = ", ".join(
             str(getattr(e, "outcome", "?")) for e in report.events if getattr(e, "account", "") == pick
         ) or ("verification pending" if pick in report.pending else "no outcome")
-        return not report.failed, f"#{pick}: {outcomes}"
+        return not report.failed, f"{name}: {outcomes}"
 
     return run
 

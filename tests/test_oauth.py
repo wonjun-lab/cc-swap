@@ -865,8 +865,8 @@ class TestFetchUsageForAccount:
         msg = warning_records[0].getMessage()
         assert "failed to persist" in msg
         assert "cc-swap add" in msg
-        assert "1" in msg
-        assert "test@example.com" in msg
+        assert "for test " in msg  # the local part, never the whole address
+        assert "test@example.com" not in msg
 
         # Also verify the user-visible printed warning, and that stdout stays clean
         captured = capsys.readouterr()
@@ -997,9 +997,9 @@ class TestTryFetchUsageOutcome:
             r.getMessage() for r in caplog.records if r.levelno == logging.WARNING
         ]
         line = next(m for m in warnings if "http-429" in m)
-        # The line users paste into public issues: account number and the
-        # server's Retry-After, never the email.
-        assert "account 1" in line
+        # The line users paste into public issues: the address's local part
+        # and the server's Retry-After, never the email.
+        assert "for a:" in line
         assert "retry-after 42s" in line
         assert "a@b.c" not in line
         # Any 429 = the usage endpoint's own budget, which cumulative polling

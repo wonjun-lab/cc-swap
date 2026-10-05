@@ -266,7 +266,7 @@ def test_sync_active_backup_refuses_when_ownership_is_unverified(mac):
     sw, home, store = mac
     with patch("claude_swap.oauth.fetch_oauth_profile", return_value=None):
         ok, reason = sw.sync_active_backup(skip_number="2")
-    assert not ok and "#1" in reason and "cc-swap add" in reason
+    assert not ok and "a's current login" in reason and "cc-swap add" in reason
     assert "rt-" not in reason and "@" not in reason
     assert sw._read_account_credentials("1", "a@example.com") == OLD1
     # Re-logging the active slot itself needs no backup.

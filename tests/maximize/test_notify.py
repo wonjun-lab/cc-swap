@@ -48,7 +48,7 @@ def fake(monkeypatch) -> Fake:
 
 
 def note(key: str = "relogin:3", event: str = "relogin") -> notify.Note:
-    return notify.Note(event, key, "cc-swap: #3 old needs a re-login", "its refresh token is dead")
+    return notify.Note(event, key, "cc-swap: old needs a re-login", "its refresh token is dead")
 
 
 # -- delivery commands --------------------------------------------------------------------
@@ -230,8 +230,8 @@ def test_a_switch_is_notified_with_its_trigger_and_no_email(temp_home, fake):
     _alias(h, 2, "side")
     assert h.tick_with_usage(HARD) is TickOutcome.SWITCHED
     [(title, body)] = fake.sent
-    assert title == "cc-swap: switched to #2 side"
-    assert body == "from #1 a · hard: #1 5h 96% >= hard 95%"
+    assert title == "cc-swap: switched to side"
+    assert body == "from a · hard: a 5h 96% >= hard 95%"
     assert "@" not in title + body
     state = json.loads((h.switcher.backup_dir / notify.STATE_FILENAME).read_text())
     assert "switch:1>2" in state["sent"]
@@ -270,7 +270,7 @@ def test_relogin_and_expiring_logins_once_a_day(temp_home, fake):
     usage = {"1": win(10, 10), "2": win(0, 10), "3": "re-login needed"}
     h.tick_with_usage(usage)
     titles = sorted(t for t, _b in fake.sent)
-    assert titles == ["cc-swap: #2 b login ends in 5h 0m", "cc-swap: #3 c needs a re-login"]
+    assert titles == ["cc-swap: b login ends in 5h 0m", "cc-swap: c needs a re-login"]
     bodies = " ".join(b for _t, b in fake.sent)
     assert "its refresh token is dead" in bodies and "press r" in bodies and "@" not in bodies
     for _ in range(5):  # the next ticks of the day: nothing new
@@ -293,7 +293,8 @@ def test_a_login_past_its_deadline_needs_a_relogin(temp_home, fake):
     rt.login_deadlines, rt.login_deadlines_at = {"3": NOW - 60}, NOW
     h.tick_with_usage({"1": win(10, 10), "2": win(0, 10), "3": win(0, 10)})
     [(title, body)] = fake.sent
-    assert title == "cc-swap: #3 c needs a re-login" and body.startswith("its login expired")
+    assert title == "cc-swap: c needs a re-login" and body.startswith("its login expired")
+    assert "cc-swap login c, or Fleet" in body
 
 
 def test_priming_paused_is_notified(temp_home, fake, monkeypatch):
@@ -324,7 +325,7 @@ def test_a_keychain_hold_over_15_minutes_is_notified_once(temp_home, fake, monke
         h.clock.advance(300)
     [(title, body)] = fake.sent
     assert title == "cc-swap: Keychain unreadable for 15 min"
-    assert body.startswith("#1's live login cannot be read, so nothing switches")
+    assert body.startswith("a's live login cannot be read, so nothing switches")
     assert h.active_number() == 1
 
 

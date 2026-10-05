@@ -28,8 +28,10 @@ from claude_swap.autoswitch import (
     TickOutcome,
     UnquarantineEvent,
     _recovery_is_useful,
+    account_names,
     pct_label,
 )
+from claude_swap.maximize.hold import display_name_hook
 from claude_swap.json_output import (
     USAGE_FOREIGN_CREDENTIAL,
     USAGE_KEYCHAIN_UNAVAILABLE,
@@ -327,7 +329,7 @@ class TestDecisionTable:
         assert harness.active_number() == 3
         switch = next(e for e in harness.events if isinstance(e, SwitchEvent))
         assert switch.trigger == "proactive"
-        assert switch.to_ref == {"number": 3, "email": "c@example.com"}
+        assert switch.to_ref == {"number": 3, "email": "c@example.com", "name": "c"}
         assert harness.state()["lastSwitchTo"] == "3"
 
     def test_no_active_account(self, temp_home):
@@ -844,7 +846,7 @@ class TestNewLoginOnDeadActiveSlot:
         assert "1" not in harness.state().get("quarantine", {})
         [adopted] = [e for e in harness.events if isinstance(e, LoginAdoptedEvent)]
         assert adopted.number == "1"
-        assert adopted.human().startswith("adopted new login for #1")
+        assert adopted.human().startswith("adopted new login for a")
         assert "@" not in adopted.human() and "rt-new" not in adopted.human()
 
     def test_mismatched_identity_holds_and_warns(self, harness):
@@ -2382,17 +2384,20 @@ class TestEventsShape:
         harness.tick_with_usage({"1": _usage(95), "2": _usage(10), "3": _usage(50)})
         switch = next(e for e in harness.events if isinstance(e, SwitchEvent))
         payload = switch.to_json()
-        assert payload["from"] == {"number": 1, "email": "a@example.com"}
-        assert payload["to"] == {"number": 2, "email": "b@example.com"}
+        assert payload["from"] == {"number": 1, "email": "a@example.com", "name": "a"}
+        assert payload["to"] == {"number": 2, "email": "b@example.com", "name": "b"}
 
     def test_poll_event_human_line(self, harness):
         harness.tick_with_usage({"1": _usage(42), "2": _usage(10), "3": None})
         poll = next(e for e in harness.events if isinstance(e, PollEvent))
-        line = poll.human()
-        assert "Account-1" in line and "42% used" in line
+        # `cc-swap auto` names accounts by their display names (the hook).
+        with account_names(display_name_hook(harness.switcher.backup_dir)):
+            line = poll.human()
+        assert line.startswith("a: 42% used")
+        assert "Account-" not in line and "#" not in line
         # Others show per-window pcts, not just the ambiguous binding pct.
-        assert "#2: 5h 10% · 7d 0%" in line
-        assert "#3: ?" in line
+        assert "others: b 5h 10% · 7d 0%" in line
+        assert ", c ?" in line
 
     def test_poll_event_windows_match_the_decision_set(self, temp_home):
         # Scoped windows appear only when configured: rendering an ignored
@@ -2416,14 +2421,16 @@ class TestEventsShape:
         plain = build()
         plain.tick_with_usage(usage)
         poll = next(e for e in plain.events if isinstance(e, PollEvent))
-        assert "#2: 5h 3% · 7d 89%" in poll.human()
+        with account_names(display_name_hook(plain.switcher.backup_dir)):
+            assert "b 5h 3% · 7d 89%" in poll.human()
         assert "Fable" not in poll.human()
         assert poll.to_json()["windowsPct"]["2"] == {"5h": 3.0, "7d": 89.0}
 
         modeled = build(model="Fable")
         modeled.tick_with_usage(usage)
         poll = next(e for e in modeled.events if isinstance(e, PollEvent))
-        assert "#2: 5h 3% · 7d 89% · Fable 21%" in poll.human()
+        with account_names(display_name_hook(modeled.switcher.backup_dir)):
+            assert "b 5h 3% · 7d 89% · Fable 21%" in poll.human()
         assert poll.to_json()["windowsPct"]["2"] == {
             "5h": 3.0, "7d": 89.0, "Fable": 21.0,
         }
@@ -2967,7 +2974,7 @@ class TestModelAwareSwitch:
         assert outcome is TickOutcome.SWITCHED
         assert h.active_number() == 2  # most Fable headroom
         switch = next(e for e in h.events if isinstance(e, SwitchEvent))
-        assert switch.to_ref == {"number": 2, "email": "b@example.com"}
+        assert switch.to_ref == {"number": 2, "email": "b@example.com", "name": "b"}
 
     def test_without_model_setting_the_same_usage_holds(self, temp_home):
         # Default engine ignores scoped windows → #1 reads 5% used, no switch.
@@ -3228,7 +3235,7 @@ class TestConsumeFirstStrategy:
         assert h.active_number() == 2
         sw = next(e for e in h.events if isinstance(e, SwitchEvent))
         assert sw.trigger == "consume-first"
-        assert sw.to_ref == {"number": 2, "email": "b@example.com"}
+        assert sw.to_ref == {"number": 2, "email": "b@example.com", "name": "b"}
 
     def test_stays_when_active_already_resets_soonest(self, temp_home):
         h = self._harness(temp_home)
@@ -3477,7 +3484,7 @@ class TestConsumeFirstStrategy:
         assert outcome is TickOutcome.SWITCHED
         assert h.active_number() == 3
         sw = next(e for e in h.events if isinstance(e, SwitchEvent))
-        assert sw.to_ref == {"number": 3, "email": "c@example.com"}
+        assert sw.to_ref == {"number": 3, "email": "c@example.com", "name": "c"}
 
     def test_active_past_reset_holds_reset_unknown(self, temp_home):
         # The active account's own reset can be stale too: past == unknown,

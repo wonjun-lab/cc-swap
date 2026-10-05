@@ -95,7 +95,9 @@ def test_rows_and_table_carry_no_email():
     assert rows[0]["active"] and rows[0]["idle"] == "idle" and not rows[0]["landable"]
     assert rows[1]["landable"] and rows[1]["score"] == pytest.approx(0.9)
     table = render_rows(rows)
-    assert table[0].split()[:3] == ["#", "tier", "plan"]
-    assert table[1].split()[:3] == ["*", "1", "normal"]
-    assert table[2].split()[:2] == ["2", "normal"]
+    assert [r["number"] for r in rows] == ["1", "2"]  # the JSON keeps the slot
+    assert [r["name"] for r in rows] == ["a", "b"]
+    assert table[0].split()[:3] == ["account", "tier", "plan"]
+    assert table[1].split()[:3] == ["*", "a", "normal"]
+    assert table[2].split()[:2] == ["b", "normal"]
     assert "@" not in "\n".join(table)

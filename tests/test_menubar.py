@@ -229,18 +229,27 @@ def test_usage_summary_scoped_no_pace_marker_on_window_rolled_to_zero():
 
 
 def test_format_account_label():
+    # The slot number is the row's callback key, never shown.
     label = menubar.format_account_label(2, "loc@papaya.asia", _USAGE)
-    assert label == "2  loc@papaya.asia  5h 42% · 7d 18% · $ 30%"
+    assert label == "loc@papaya.asia  5h 42% · 7d 18% · $ 30%"
 
 
 def test_format_account_label_with_alias():
     label = menubar.format_account_label(2, "loc@papaya.asia", _USAGE, alias="dev")
-    assert label == "2  dev  (loc@papaya.asia)  5h 42% · 7d 18% · $ 30%"
+    assert label == "dev  (loc@papaya.asia)  5h 42% · 7d 18% · $ 30%"
+
+
+def test_format_account_label_with_display_name():
+    # A name that is not just the address's local part leads, address after.
+    label = menubar.format_account_label(
+        2, "loc@papaya.asia", _USAGE, name="loc@papaya"
+    )
+    assert label == "loc@papaya  (loc@papaya.asia)  5h 42% · 7d 18% · $ 30%"
 
 
 def test_format_account_label_disabled_marker():
     label = menubar.format_account_label(2, "loc@papaya.asia", _USAGE, disabled=True)
-    assert label == "2  loc@papaya.asia  (disabled)  5h 42% · 7d 18% · $ 30%"
+    assert label == "loc@papaya.asia  (disabled)  5h 42% · 7d 18% · $ 30%"
 
 
 # --- usage logging -------------------------------------------------------------
@@ -423,10 +432,15 @@ _SWITCH_LOG = (
 
 
 def test_parse_switch_history_most_recent_first():
-    assert menubar.parse_switch_history(_SWITCH_LOG) == [
-        "3 → 1   2026-06-27 02:10",
-        "1 → 3   2026-06-27 00:57",
+    names = {"1": "work", "3": "side"}
+    assert menubar.parse_switch_history(_SWITCH_LOG, names=names) == [
+        "side → work   2026-06-27 02:10",
+        "work → side   2026-06-27 00:57",
     ]
+
+
+def test_parse_switch_history_unnamed_slot_reads_as_its_number():
+    assert menubar.parse_switch_history(_SWITCH_LOG)[0] == "#3 → #1   2026-06-27 02:10"
 
 
 def test_parse_switch_history_respects_limit():
@@ -436,7 +450,7 @@ def test_parse_switch_history_respects_limit():
     )
     out = menubar.parse_switch_history(lines, limit=2)
     assert len(out) == 2
-    assert out[0] == "1 → 2   2026-06-27 05:00"  # newest first
+    assert out[0] == "#1 → #2   2026-06-27 05:00"  # newest first
 
 
 def test_parse_switch_history_empty_or_no_matches():

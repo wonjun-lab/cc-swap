@@ -135,6 +135,19 @@ class FakeSwitcher:
     def current_account_number(self) -> str | None:
         return self.active
 
+    def account_names(self, data: dict | None = None) -> dict[str, str]:
+        from claude_swap.maximize.names import display_names
+
+        return display_names(
+            (a.number, a.email, a.alias, a.org_name if a.org_uuid else "")
+            for a in self._accounts
+        )
+
+    def account_name(self, num: object, email: object = "", *, data: dict | None = None) -> str:
+        from claude_swap.maximize.names import name_of
+
+        return name_of(self.account_names(), num, email)
+
     def switch_to(
         self, identifier: str, json_output: bool = False, force: bool = False
     ) -> dict:

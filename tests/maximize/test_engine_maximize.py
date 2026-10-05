@@ -20,8 +20,10 @@ from claude_swap.autoswitch import (
     QuarantineEvent,
     SwitchEvent,
     TickOutcome,
+    account_names,
 )
 from claude_swap.maximize import pause
+from claude_swap.maximize.hold import display_name_hook
 from claude_swap.maximize.engine_hook import (
     DECISION_KEY,
     SAMPLES_KEY,
@@ -117,7 +119,9 @@ class TestHook:
         assert [r["number"] for r in event.rows] == ["1", "2", "3"]
         payload = json.dumps(event.to_json())
         assert "@" not in payload and "sk-" not in payload
-        assert event.human().startswith("maximize: hold on Account-1: ")
+        assert [r["name"] for r in event.rows] == ["a", "b", "c"]
+        with account_names(display_name_hook(h.switcher.backup_dir)):
+            assert event.human().startswith("maximize: hold on a: ")
 
 
 class TestSoftAndHard:
@@ -228,9 +232,9 @@ class TestResetWait:
         assert not of(h, SwitchEvent) and h.active_number() == 1
         decisions = of(h, MaximizeDecisionEvent)
         assert decisions[0].reason == (
-            "#1 5h 93% — resets in 13m, waiting it out (switches at once if it hits 100%)"
+            "a 5h 93% — resets in 13m, waiting it out (switches at once if it hits 100%)"
         )
-        assert decisions[3].reason.startswith("#1 5h 96% — resets in 4m")
+        assert decisions[3].reason.startswith("a 5h 96% — resets in 4m")
 
     def test_the_wait_is_published_for_why(self, temp_home):
         h = make(temp_home)
@@ -423,11 +427,12 @@ class TestSamples:
         assert of(h, SwitchEvent)[0].dry_run is True
         assert h.active_number() == 1
         assert h.state() == {}
-        text = of(h, MaximizeDecisionEvent)[-1].human()
+        with account_names(display_name_hook(h.switcher.backup_dir)):
+            text = of(h, MaximizeDecisionEvent)[-1].human()
         lines = text.splitlines()
-        assert lines[0].startswith("maximize: switch (soft) on Account-1")
-        assert lines[1].split()[:3] == ["#", "tier", "plan"]
-        assert lines[2].split()[:6] == ["*", "1", "normal", "std", "62%", "40%"]
+        assert lines[0].startswith("maximize: switch (soft): a 5h 62% >= soft 50%")
+        assert lines[1].split()[:3] == ["account", "tier", "plan"]
+        assert lines[2].split()[:6] == ["*", "a", "normal", "std", "62%", "40%"]
         assert lines[2].split()[-1] == "idle"
         assert "@" not in text
 
@@ -613,8 +618,8 @@ class TestUpstreamPaths:
         assert not of(h, ErrorEvent)
         [event] = of(h, NoSwitchEvent)
         assert event.reason == "hard-stay"  # a hold of the hard trigger's own
-        assert "no account under the hard caps has more 5h room than #1" in event.detail
-        assert f"set aside #2 ({status})" in event.detail
+        assert "no account under the hard caps has more 5h room than a" in event.detail
+        assert f"set aside b ({status})" in event.detail
         assert h.active_number() == 1
 
     def test_failed_preparation_then_hold_keeps_systemic_errors(self, temp_home):
@@ -670,7 +675,7 @@ class TestPublishDecision:
             "reason": record["reason"], "pending": True,
             "plans": {"1": None, "2": None, "3": "20x"},
         }
-        assert record["reason"].startswith("#1 5h 62% >= soft 50")
+        assert record["reason"].startswith("a 5h 62% >= soft 50")
         text = json.dumps(h.state()[DECISION_KEY])
         assert "@" not in text and "sk-" not in text
 
@@ -837,8 +842,8 @@ class TestLoginExpiryWarning:
         usage = {"1": win(10, 30), "2": win(0, 10), "3": win(0, 50)}
         h.tick_with_usage(usage)
         [line] = login_warnings(h)
-        assert line.startswith("Account-2 login expires ") and " (in 2d 0h)" in line
-        assert line.endswith("before then, re-login #2: cc-swap login 2, or Fleet → "
+        assert line.startswith("b login expires ") and " (in 2d 0h)" in line
+        assert line.endswith("before then, re-login b: cc-swap login b, or Fleet → "
                              "select → r")
         assert "@" not in line and "rt-2" not in line and "sk-2" not in line
         h.clock.advance(3600)
@@ -857,7 +862,7 @@ class TestLoginExpiryWarning:
         )
         h.tick_with_usage({"1": win(10, 30), "2": win(0, 10), "3": win(0, 50)})
         [line] = login_warnings(h)
-        assert line.startswith("Account-1 login expired ")
+        assert line.startswith("a login expired ")
 
 
 class TestActiveCredentialUnreadableMaximize:
@@ -1011,15 +1016,17 @@ class TestSharedLogin:
         assert h.state()[DECISION_KEY]["target"] == "3"
 
     def test_why_names_the_skip(self, temp_home):
-        from claude_swap.maximize.doctor_cli import _why_lines, published_why
+        from claude_swap.maximize.doctor_cli import _add_names, _names, _why_lines, published_why
 
         h = make(temp_home)
         usage = {"1": win(62, 40), "2": win(0, 10), "3": win(0, 50)}
         h.tick_with_entries(self._entries(h, usage, {"2"}))
         why = published_why(h.switcher.backup_dir, now=h.clock.now)
         assert why is not None and why["shared"] == ["2"] and why["target"] == "3"
+        _add_names(why, _names(h.switcher.backup_dir))
         lines = "\n".join(_why_lines(why))
-        assert "skipped  #2 shares its login — re-login one of them (cc-swap login 2)" in lines
+        assert "skipped  b shares its login — re-login one of them (cc-swap login b)" in lines
+        assert "PENDING → c on a" in lines
 
     def test_the_tick_decides_on_policy_snapshot(self, temp_home):
         """The assembly Fleet's parity test calls is the one the tick uses."""

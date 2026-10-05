@@ -77,7 +77,7 @@ class TestAWeekOfUse:
         decision = h.state()[DECISION_KEY]
         assert decision["decision"] == "switch" and decision["trigger"] == "preempt"
         assert "before your usual quiet time (18:00)" in decision["reason"]
-        assert decision["reason"].endswith("— moving to #2 now while you're idle")
+        assert decision["reason"].endswith("— moving to b now while you're idle")
 
         reasons = no_switch_reasons(h)
         # Mon-Thu: nothing but ordinary holds (one per tick); Friday's burst

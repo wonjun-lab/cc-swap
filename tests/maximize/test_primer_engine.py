@@ -307,7 +307,7 @@ class TestPrimer:
         rig.primer(runner=runner).run_due(rig.snap(nums=("1", "2")))
         assert runner.calls == []
         assert rig.primes() == {}  # no attempt recorded
-        assert "account 2 not primed this pass: switching paused (relogin)" in caplog.text
+        assert "prime: b not primed this pass: switching paused (relogin)" in caplog.text
 
     def test_refused_precheck_fetch_defers_to_the_next_tick(self, rig, caplog):
         """Same branch that made `cc-swap prime` a silent no-op: the engine
@@ -327,7 +327,7 @@ class TestPrimer:
         assert runner.calls == []
         assert rig.primes() == {}  # nothing spent, nothing to wait for
         assert (
-            "account 2 not primed this pass: no usage reading from the last 60s: "
+            "prime: b not primed this pass: no usage reading from the last 60s: "
             "the last usage fetch failed (http-429); fetches back off for 30s more"
         ) in caplog.text
         rig.usage.server["2"] = value  # the throttle lifts

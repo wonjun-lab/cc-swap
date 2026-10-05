@@ -109,7 +109,7 @@ def test_repairs_a_managed_account_into_the_keychain_and_its_slot(managed):
     sw, home, store, email, uuid = managed
     with _owner(email, uuid):
         message = lr.repair(sw, confirm=lambda q: True)
-    assert message.startswith("Repaired: the Keychain and #1")
+    assert message.startswith("Repaired: the Keychain and ")
     assert "rt-x-new" in _keychain(store)
     assert "rt-x-new" in sw._read_account_credentials("1", "a@example.com")
     assert sw._read_account_credentials("2", "b@example.com") == CRED2

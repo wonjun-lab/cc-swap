@@ -66,6 +66,7 @@ from claude_swap.json_output import (
     USAGE_RELOGIN_REQUIRED,
 )
 from claude_swap.maximize.hold import record_names
+from claude_swap.maximize.names import cli_arg, name_of
 
 _logger = logging.getLogger("claude-swap")
 
@@ -163,10 +164,9 @@ def scrub(text: str) -> str:
 
 
 def label(number: object, names: Mapping[str, str]) -> str:
-    """``#3 old`` (the short name), or ``#3``."""
-    slot = str(number)
-    name = names.get(slot, "")
-    return f"#{slot} {name}" if name else f"#{slot}"
+    """The account's display name (``old``); ``#3`` only for an account
+    nothing else names."""
+    return name_of(names, number)
 
 
 def switch_note(src: object, dst: object, trigger: str, why: str | None,
@@ -181,7 +181,7 @@ def relogin_note(slot: str, cause: str, names: Mapping[str, str]) -> Note:
     return Note(
         "relogin", f"relogin:{slot}",
         f"cc-swap: {label(slot, names)} needs a re-login",
-        f"{cause} — cc-swap login {slot}, or Fleet: select it, press r",
+        f"{cause} — cc-swap login {cli_arg(label(slot, names))}, or Fleet: select it, press r",
     )
 
 
@@ -217,8 +217,10 @@ def prime_verify_failed_note(paused: str | None, detail: str) -> Note:
     )
 
 
-def keychain_note(slot: str | None, minutes: int) -> Note:
-    who = f"#{slot}'s live login" if slot else "the live login"
+def keychain_note(
+    slot: str | None, minutes: int, names: Mapping[str, str] | None = None
+) -> Note:
+    who = f"{label(slot, names or {})}'s live login" if slot else "the live login"
     return Note(
         "keychain", "keychain", f"cc-swap: Keychain unreadable for {minutes} min",
         f"{who} cannot be read, so nothing switches. Unlock the login keychain, "
@@ -461,7 +463,7 @@ class EngineNotifier:
                     slot = self.engine.switcher.current_account_number()
                 except Exception:
                     slot = None
-                return [keychain_note(slot, int((now - since) // 60))]
+                return [keychain_note(slot, int((now - since) // 60), self._names())]
         return []
 
     def _switch_why(self, dst: object) -> str | None:

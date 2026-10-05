@@ -17,6 +17,7 @@ from claude_swap.maximize.model import (
     Snapshot,
     UsageEstimate,
 )
+from claude_swap.maximize.names import record_names
 from claude_swap.maximize.plan import plan_name, plan_weight
 from claude_swap.maximize.tiers import parse_account_list, tier_for
 from claude_swap.poll_policy import parse_reset_ts
@@ -96,6 +97,7 @@ def build_snapshot(
     landing rule; ``estimate``/``local_idle``: the active account's usage is
     an estimate (``Snapshot.estimate``)."""
     last_resort = parse_account_list(settings.last_resort)
+    shown = record_names(records)
     views: list[AccountView] = []
     for number, record in records.items():
         number = str(number)
@@ -120,6 +122,7 @@ def build_snapshot(
                     rate_limit_tiers.get(number), email, settings.plan_override
                 ),
                 age_s=(ages or {}).get(number),
+                name=shown.get(number, ""),
             )
         )
     return Snapshot(

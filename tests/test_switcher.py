@@ -1334,9 +1334,9 @@ class TestListAccountsUsage:
             switcher.list_accounts()
 
         output = capsys.readouterr().out
-        assert "  1: dev (test@example.com) [personal] (active)" in output
+        assert "  dev (test@example.com) [personal] (active) #1" in output
         # unaliased account keeps rendering plain email, no spurious parens
-        assert "  2: account2@example.com" in output
+        assert "  account2@example.com [personal] #2" in output
         assert "(account2@example.com)" not in output
 
     def test_list_shows_usage_null_reset(
@@ -2024,7 +2024,7 @@ class TestActiveAccountRefresh:
         [post] = [m for m in messages if "refresh POST" in m]
         assert "caller=_fetch_active_usage" in post and "slot=1" in post
         assert "active=yes" in post and "source=live" in post and "result=ok" in post
-        assert any("persisted" in m and "account 1" in m for m in messages)
+        assert any("persisted" in m and "refresh: test active" in m for m in messages)
         for secret in ("rt-orig", "rt-new", "sk-active", "sk-new", "test@example.com"):
             assert secret not in caplog.text
 
@@ -4069,8 +4069,8 @@ class TestSwitchToSelfSlotAndForce:
         assert creds[("1", "test@example.com")] == self.IMPORTED_1
         assert live["creds"] == self.LIVE_1
         out = capsys.readouterr().out
-        assert "Already on" in out and "Account-1" in out
-        assert "cc-swap switch 1 --force" in out
+        assert "Already on" in out and "Already on test" in out
+        assert "cc-swap switch test --force" in out
 
     def test_force_self_activation_restores_imported_creds(
         self,
@@ -4697,7 +4697,7 @@ class TestUpgradeMigration:
         switcher.status()
 
         out = capsys.readouterr().out
-        assert "Account-1" in out
+        assert "Status: user (user@example.com" in out
         assert "not managed" not in out
 
     def test_list_after_upgrade_marks_active(
@@ -5124,7 +5124,7 @@ class TestAddAccountFromToken:
         assert 1 in data["sequence"]
         out = capsys.readouterr().out
         assert "Added" in out
-        assert "user@example.com" in out
+        assert "Added user [personal]" in out
 
     def test_credentials_blob_format(self, temp_home):
         """Stored credentials must wrap the token in claudeAiOauth and seed default scopes."""
@@ -5312,7 +5312,7 @@ class TestAddAccountFromToken:
         data = switcher._get_sequence_data()
         assert data["accounts"]["1"]["email"] == "setup-token-1@token.local"
         out = capsys.readouterr().out
-        assert "setup-token-1@token.local" in out
+        assert "Added setup-token-1 [personal]" in out
 
     def test_default_email_with_explicit_slot(self, temp_home):
         """Default email should derive from explicit --slot when one is given."""
@@ -5516,7 +5516,7 @@ class TestSwitchSkipsBrokenSlots:
             s.switch()
 
         out = capsys.readouterr().out
-        assert "Skipping Account-2" in out
+        assert "Skipping b" in out
 
         data = s._get_sequence_data()
         assert data["activeAccountNumber"] == 3
@@ -5546,7 +5546,7 @@ class TestSwitchSkipsBrokenSlots:
         s.switch()  # must not raise
 
         out = capsys.readouterr().out
-        assert "Skipping Account-2" in out
+        assert "Skipping b" in out
         assert "No other accounts have valid" in out
 
         # Active account unchanged.
@@ -5620,7 +5620,7 @@ class TestSwitchSkipsBrokenSlots:
             s.switch()
 
         out = capsys.readouterr().out
-        assert "Skipping Account-1" in out
+        assert "Skipping a" in out
 
         data = s._get_sequence_data()
         assert data["activeAccountNumber"] == 2
@@ -5638,7 +5638,7 @@ class TestSwitchSkipsBrokenSlots:
         with patch.object(s, "list_accounts"):
             s.switch()
 
-        assert "Skipping Account-1 (disabled)" in capsys.readouterr().out
+        assert "Skipping a (disabled)" in capsys.readouterr().out
         assert s._get_sequence_data()["activeAccountNumber"] == 2
 
     def test_fresh_machine_all_broken_raises(self, temp_home: Path):
@@ -5766,7 +5766,7 @@ class TestUsageAwareSwitch:
 
         out = capsys.readouterr().out
         assert "All accounts are at their 5h/7d limit" in out
-        assert "staying on Account-1" in out
+        assert "staying on a" in out
         assert s._get_sequence_data()["activeAccountNumber"] == 1  # unchanged
 
     def test_best_current_usage_unavailable_stays(self, temp_home: Path, capsys):
@@ -5866,7 +5866,7 @@ class TestUsageAwareSwitch:
             s.switch(strategy="next-available")
 
         out = capsys.readouterr().out
-        assert "Skipping Account-2 (at 5h/7d limit)" in out
+        assert "Skipping b (at 5h/7d limit)" in out
         assert s._get_sequence_data()["activeAccountNumber"] == 3
 
     @staticmethod
@@ -5903,7 +5903,7 @@ class TestUsageAwareSwitch:
 
         out = capsys.readouterr().out
         assert "Using configured model limits: Fable (from autoswitch.model)" in out
-        assert "Skipping Account-2 (at Fable limit)" in out
+        assert "Skipping b (at Fable limit)" in out
         assert s._get_sequence_data()["activeAccountNumber"] == 3
 
     def test_next_available_without_models_ignores_scoped(
@@ -6017,7 +6017,7 @@ class TestUsageAwareSwitch:
             s.switch(strategy="next-available")
 
         out = capsys.readouterr().out
-        assert "staying on Account-1" in out
+        assert "staying on a" in out
         # No switch onto an exhausted account; stays on the current one.
         assert s._get_sequence_data()["activeAccountNumber"] == 1
         mock_list.assert_not_called()
@@ -6153,8 +6153,8 @@ class TestSwitchSkipsDeadLogins:
             s.switch(strategy=strategy)
         assert s._get_sequence_data()["activeAccountNumber"] == 3
         out = capsys.readouterr().out
-        assert "Skipping Account-2 (login expired" in out
-        assert "re-login #2: cc-swap login 2, or Fleet → select → r" in out
+        assert "Skipping b (login expired" in out
+        assert "re-login b: cc-swap login b, or Fleet → select → r" in out
 
     def test_rotation_json_names_the_skip(self, temp_home):
         s = self._three(temp_home, s2=-3600)
@@ -6162,7 +6162,7 @@ class TestSwitchSkipsDeadLogins:
             result = s.switch(json_output=True)
         assert result["to"]["number"] == 3
         assert any(
-            w.startswith("Skipped Account-2 (login expired") for w in result["warnings"]
+            w.startswith("Skipped b (login expired") for w in result["warnings"]
         )
 
     def test_switch_to_a_dead_login_is_refused(self, temp_home):
@@ -6170,8 +6170,8 @@ class TestSwitchSkipsDeadLogins:
         with pytest.raises(SwitchRefusedError) as exc:
             s.switch_to("2")
         message = str(exc.value)
-        assert "Account-2" in message and "login expired" in message
-        assert "--allow-dead-login" in message and "re-login #2" in message
+        assert "Not switching to b:" in message and "login expired" in message
+        assert "--allow-dead-login" in message and "re-login b" in message
         assert exc.value.reason == "login-dead"
         assert s._get_sequence_data()["activeAccountNumber"] == 1
 
@@ -6207,10 +6207,10 @@ class TestSwitchSkipsDeadLogins:
         s = self._three(temp_home, s2=-3600)
         with pytest.raises(SwitchRefusedError) as exc:
             s.switch_to("2")
-        assert "cc-swap switch 2 --allow-dead-login" in str(exc.value)
+        assert "cc-swap switch b --allow-dead-login" in str(exc.value)
         assert "--force" not in str(exc.value)
         payload = s.switch_to("2", json_output=True)
-        assert payload["override"] == "cc-swap switch 2 --allow-dead-login"
+        assert payload["override"] == "cc-swap switch b --allow-dead-login"
         assert "--force" not in payload["message"]
 
     def test_all_others_disabled_says_so_and_refuses(self, temp_home):
@@ -6238,8 +6238,8 @@ class TestSwitchSkipsDeadLogins:
         with pytest.raises(SwitchRefusedError) as exc:
             s.switch()
         message = str(exc.value)
-        assert "Account-2 is disabled" in message
-        assert "Account-3" in message and "login expired" in message
+        assert "b is disabled" in message
+        assert "c cannot be used" in message and "login expired" in message
 
 
 class TestSwitchRefusalExitCodes:
@@ -7200,7 +7200,7 @@ class TestProvenanceGuard:
         assert _read_safety_copy(switcher, entry_id) == foreign
         assert entries[entry_id]["resolvedIdentity"]["uuid"] == "uuid-2"
         assert any(
-            "ownership mismatch" in w and "Account-2" in w
+            "ownership mismatch" in w and "account2" in w
             for w in op["warnings"]
         )
         # The switch itself proceeded, onto the stored backup.
@@ -7231,7 +7231,7 @@ class TestProvenanceGuard:
         assert creds_store[("1", "test@example.com")] == self._A1_BACKUP
         assert creds_store[("2", "account2@example.com")] == a2_backup
         assert switcher.list_unclaimed_credentials() == {}
-        assert any("already matches Account-2" in w for w in op["warnings"])
+        assert any("already matches account2's" in w for w in op["warnings"])
 
     def test_alien_credential_preserved_and_skipped(
         self, temp_home, mock_claude_config, sample_sequence_data,
@@ -7413,7 +7413,7 @@ class TestProvenanceGuard:
         assert creds_store[("1", "test@example.com")] == self._A1_BACKUP
         assert creds_store[("2", "account2@example.com")] == a2_backup
         assert len(switcher.list_unclaimed_credentials()) == 1
-        assert any("Account-2" in w for w in op["warnings"])
+        assert any("account2" in w for w in op["warnings"])
 
     def test_unresolvable_mismatch_backs_up_pre_fix(
         self, temp_home, mock_claude_config, sample_sequence_data,
@@ -7769,7 +7769,7 @@ class TestDuplicateAccountDetection:
         ]
         warnings = switcher._duplicate_account_warnings(info)
         assert len(warnings) == 1
-        assert "Account-1 and Account-2" in warnings[0]
+        assert "account1 and account2" in warnings[0]
 
     def test_same_uuid_across_slots_flagged(
         self, temp_home, sample_sequence_data,
@@ -7851,7 +7851,7 @@ class TestLockstepUsageDetection:
         }
         warnings = switcher._lockstep_usage_warnings(self._info(), entries)
         assert len(warnings) == 1
-        assert "Account-1 and Account-2" in warnings[0]
+        assert "account1 and account2" in warnings[0]
         assert "may be the same account" in warnings[0]
 
     def test_differing_resets_not_flagged(self, temp_home, sample_sequence_data):
@@ -9098,7 +9098,7 @@ class TestDisableEnableAccount:
         assert s.switchable_account_numbers() == ["1", "3"]
         data = s._get_sequence_data()
         assert data["accounts"]["2"]["disabled"] is True
-        assert "Disabled Account-2" in capsys.readouterr().out
+        assert "Disabled b." in capsys.readouterr().out
 
     def test_enable_clears_flag_and_restores_position(self, temp_home, capsys):
         s = self._setup(temp_home)
@@ -9116,7 +9116,7 @@ class TestDisableEnableAccount:
         assert s.switchable_account_numbers() == ["1", "2", "3"]
         data = s._get_sequence_data()
         assert "disabled" not in data["accounts"]["2"]
-        assert "Enabled Account-2" in capsys.readouterr().out
+        assert "Enabled b." in capsys.readouterr().out
 
     def test_disable_by_email(self, temp_home):
         s = self._setup(temp_home)
@@ -9186,7 +9186,7 @@ class TestDisableEnableAccount:
             s.switch()
 
         out = capsys.readouterr().out
-        assert "Skipping Account-2 (disabled)" in out
+        assert "Skipping b (disabled)" in out
         assert s._get_sequence_data()["activeAccountNumber"] == 3
 
     def test_best_strategy_ignores_disabled_candidate(self, temp_home):
@@ -9270,7 +9270,7 @@ class TestDisableEnableAccount:
         out = capsys.readouterr().out
         assert "(disabled)" in out
         # Marker attaches to the disabled row, not the enabled one.
-        disabled_line = next(ln for ln in out.splitlines() if ln.strip().startswith("2:"))
+        disabled_line = next(ln for ln in out.splitlines() if ln.rstrip().endswith("#2"))
         assert "(disabled)" in disabled_line
 
     def test_json_list_carries_disabled_field(self, temp_home):
@@ -11825,7 +11825,7 @@ class TestGateUltraReviewFixes:
                 "location under it can land"
             )
             assert any(
-                r.levelno >= logging.ERROR and "1" in r.getMessage()
+                r.levelno >= logging.ERROR and "test" in r.getMessage()
                 for r in caplog.records
             ), (
                 "DEFECT: the profile keeps serving the superseded generation "
@@ -12997,3 +12997,57 @@ class TestLoginExpiry:
         by_num = {a.number: a for a in snap.accounts}
         assert by_num["1"].login_expires_at is None
         assert by_num["2"].login_expires_at == deadline
+
+
+class TestNamesNotNumbers:
+    """cc-swap fork: the upstream CLI surfaces name an account by its display
+    name (maximize/names.py); the slot number survives only dimmed at the end
+    of a `list` row (and in --json, alongside a ``name``)."""
+
+    def _two(self, temp_home: Path) -> ClaudeAccountSwitcher:
+        helper = TestDisableEnableAccount()
+        s = helper._setup(temp_home)
+        helper._seed(s, 1, "dev.shared@example.com")
+        helper._seed(s, 2, "side@example.com")
+        s.set_alias("2", "work")
+        return s
+
+    def test_list_leads_with_the_name_and_ends_with_the_slot(self, temp_home, capsys):
+        s = self._two(temp_home)
+        capsys.readouterr()
+        with patch.object(s, "_read_credentials", return_value=""), \
+             patch.object(s, "_read_account_credentials", return_value=""):
+            s.list_accounts()
+        rows = [
+            ln for ln in capsys.readouterr().out.splitlines()
+            if ln.startswith("  ") and not ln.startswith("    ")
+        ]
+        assert rows[0] == "  dev.shared@example.com [personal] #1"
+        assert rows[1] == "  work (side@example.com) [personal] #2"
+
+    def test_disable_names_the_account_and_logs_no_address(self, temp_home, capsys, caplog):
+        import logging
+
+        s = self._two(temp_home)
+        capsys.readouterr()
+        with caplog.at_level(logging.INFO, logger="claude-swap"):
+            s.set_account_disabled("work", True)
+        assert "Disabled work." in capsys.readouterr().out
+        assert "side@example.com" not in caplog.text
+
+    def test_ambiguous_email_prompt_takes_a_name(self, temp_home, capsys):
+        s = self._two(temp_home)
+        data = s._get_sequence_data()
+        # The same address in two organizations: the names say which.
+        data["accounts"]["2"] = dict(
+            data["accounts"]["1"], organizationUuid="org-a", organizationName="Acme",
+        )
+        s._write_json(s.sequence_file, data)
+        names = s.account_names()
+        assert set(names.values()) == {"dev.shared·personal", "dev.shared·Acme"}
+        with patch("builtins.input", side_effect=["dev.shared.acme", "y"]), \
+             patch.object(s, "_delete_account_files"):
+            s.remove_account("dev.shared@example.com")
+        out = capsys.readouterr().out
+        assert "dev.shared·Acme [Acme]" in out and "#2" not in out
+        assert list((s._get_sequence_data() or {})["accounts"]) == ["1"]

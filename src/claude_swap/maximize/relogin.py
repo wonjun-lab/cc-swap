@@ -69,6 +69,7 @@ from pathlib import Path
 from claude_swap import oauth
 from claude_swap.credentials import looks_like_api_key
 from claude_swap.exceptions import AccountNotFoundError, ValidationError
+from claude_swap.maximize.names import cli_arg, name_of, record_names
 
 _logger = logging.getLogger("claude-swap")
 
@@ -96,6 +97,12 @@ class Target:
     email: str
     org: str
     uuid: str
+    # The display name (maximize/names.py) every message calls it by.
+    name: str = ""
+
+    @property
+    def label(self) -> str:
+        return self.name or name_of({}, self.number, self.email)
 
 
 @dataclass(frozen=True)
@@ -114,16 +121,19 @@ def target_for(switcher, number: str) -> Target:
     """Slot ``number``'s stored identity. ``AccountNotFoundError`` for no
     such slot; ``ValidationError`` for an API-key slot (nothing to log in)."""
     num = str(number)
-    record = ((switcher._get_sequence_data() or {}).get("accounts") or {}).get(num)
+    accounts = (switcher._get_sequence_data() or {}).get("accounts") or {}
+    record = accounts.get(num)
     if not isinstance(record, Mapping) or not record.get("email"):
-        raise AccountNotFoundError(f"Account-{num} does not exist")
+        raise AccountNotFoundError(f"No account {num}")
+    name = name_of(record_names(accounts), num, record.get("email"))
     if record.get("kind") == "api_key":
-        raise ValidationError(f"Account-{num} is an API key: there is no login to renew")
+        raise ValidationError(f"{name} is an API key: there is no login to renew")
     return Target(
         num,
         str(record.get("email") or ""),
         str(record.get("organizationUuid") or ""),
         str(record.get("uuid") or "").strip(),
+        name,
     )
 
 
@@ -389,7 +399,7 @@ class LoginAttempt:
     def banner(self) -> str:
         t = self.target
         return (
-            f"\ncc-swap: signing in #{t.number} as {t.email} with `claude auth login`.\n"
+            f"\ncc-swap: signing in {t.label} as {t.email} with `claude auth login`.\n"
             "Finish in the browser; over SSH open the printed URL on any device "
             "and paste the code here.\n"
             "Ctrl-C cancels. Nothing is stored unless the login is this account.\n"
@@ -423,7 +433,7 @@ class LoginAttempt:
 
     def what(self) -> str:
         """The attempt, as messages name it."""
-        return f"re-login #{self.target.number}"
+        return f"re-login {self.target.label}"
 
     def _saved_a_login(self) -> bool:
         try:
@@ -458,7 +468,7 @@ class LoginAttempt:
             problem = _oracle_problem(switcher, t, pair)
         if problem is not None:
             return Outcome(
-                MISMATCH, t.number, f"not #{t.number}'s account: {problem}; nothing stored"
+                MISMATCH, t.number, f"not {t.label}'s account: {problem}; nothing stored"
             )
         committed: list[dict] = []
         try:
@@ -474,7 +484,7 @@ class LoginAttempt:
             if not committed:  # once stored, a stash would only duplicate it
                 _not_stored(switcher, t, creds, e)
             raise
-        stored = f"#{t.number} login stored ({t.email})"
+        stored = f"{t.label} login stored ({t.email})"
         if result.get("activated"):
             return Outcome(STORED, t.number, f"{stored}; the live login now uses it",
                            activated=True)
@@ -482,7 +492,7 @@ class LoginAttempt:
 
     def retry(self) -> str:
         """The command that runs this sign-in again."""
-        return f"cc-swap login {self.target.number}"
+        return f"cc-swap login {cli_arg(self.target.label)}"
 
     def salvage(self, switcher, number: str, why: str) -> Outcome:
         """The browser step finished but its login cannot be checked or
@@ -536,13 +546,17 @@ def _not_stored(switcher, target: Target, creds: str, error: Exception) -> str:
     except Exception as e:
         _log_failure("keeping the unstored login", target.number, e)
         return message
-    return f"{message}. The new login was kept as {entry} (cc-swap unclaimed); retry cc-swap login {target.number}"
+    return (
+        f"{message}. The new login was kept as {entry} (cc-swap unclaimed); "
+        f"retry cc-swap login {cli_arg(target.label)}"
+    )
 
 
 def _log_failure(what: str, number: str, error: BaseException) -> None:
-    """Log a failure by its exception type and slot number only: the text
-    can carry a config or credential filename, which holds the account's
-    email. The full text (and traceback) goes to DEBUG."""
+    """Log a failure by its exception type and slot number only (an
+    internal log, read with the code): the text can carry a config or
+    credential filename, which holds the account's email. The full text
+    (and traceback) goes to DEBUG."""
     _logger.warning("%s (#%s): %s", what, number or "new", type(error).__name__)
     _logger.debug("%s (#%s): %s", what, number or "new", error, exc_info=True)
 
@@ -672,8 +686,8 @@ class NewLoginAttempt(LoginAttempt):
             return outcome
         return Outcome(DUPLICATE, existing, _kept(
             switcher, existing, creds,
-            f"{email} is already #{existing}; not stored as a new account. To "
-            f"renew that login: cc-swap login {existing}",
+            f"{email} is already {_nm(switcher, existing, email)}; not stored as a new "
+            f"account. To renew that login: cc-swap login {cli_arg(_nm(switcher, existing, email))}",
         ))
 
     @staticmethod
@@ -681,7 +695,7 @@ class NewLoginAttempt(LoginAttempt):
         """The success message: the account, its organization and the plan
         its credential names (``rateLimitTier``, as every slot's plan)."""
         tag = _plan_tag(account, creds)
-        return Outcome(STORED, number, f"new account #{number} stored ({email} [{tag}])")
+        return Outcome(STORED, number, f"new account {email} stored [{tag}]")
 
 
 def _plan_tag(account: Mapping, creds: str) -> str:
@@ -764,10 +778,13 @@ def match_login(data: Mapping | None, account: Mapping) -> LoginMatch:
     fixes: list[tuple[str, str]] = []
     first = ""
     accounts = (data or {}).get("accounts") or {}
+    names = record_names(accounts)
     for raw_num, rec in accounts.items():
         if not isinstance(rec, Mapping) or not rec.get("email"):
             continue
         num = str(raw_num)
+        nm = name_of(names, num, rec.get("email"))
+        arg = cli_arg(nm)
         rec_email = str(rec.get("email") or "").strip()
         rec_org = str(rec.get("organizationUuid") or "")
         rec_uuid = str(rec.get("uuid") or "").strip()
@@ -783,38 +800,39 @@ def match_login(data: Mapping | None, account: Mapping) -> LoginMatch:
             continue
         first = first or num
         if api_key:
-            partial.append(f"#{num} is an API key under {rec_email}")
-            fixes.append((f"cc-swap remove {num}; cc-swap login",
-                          f"replace the API key #{num} with this login"))
+            partial.append(f"{nm} is an API key under {rec_email}")
+            fixes.append((f"cc-swap remove {arg}; cc-swap login",
+                          f"replace the API key {nm} with this login"))
         elif same_email and rec_org != org:
             ours = here
             if there == here:  # two organizations under one name: tell them apart
                 there, ours = _org_label("", rec_org), _org_label("", org)
-            partial.append(f"#{num} is {rec_email} in {there}; you signed in to {ours}")
+            partial.append(f"{nm} is {rec_email} in {there}; you signed in to {ours}")
             if rec_org:
-                fixes.append((f"cc-swap login {num}",
-                              f"renew #{num}: sign in to {there} this time"))
+                fixes.append((f"cc-swap login {arg}",
+                              f"renew {nm}: sign in to {there} this time"))
             else:
                 # Stored without an organization (a setup-token / add-token
                 # slot): `cc-swap login N` compares the org strictly and can
                 # never match a browser login, so replacing it is the way.
-                fixes.append((f"cc-swap remove {num}; cc-swap login",
-                              f"replace #{num} (stored without an organization) with this login"))
+                fixes.append((f"cc-swap remove {arg}; cc-swap login",
+                              f"replace {nm} (stored without an organization) with this login"))
         elif same_email:
-            partial.append(f"#{num} is {rec_email} in {there}, but another account id")
-            fixes.append((f"cc-swap remove {num}; cc-swap login",
-                          f"replace #{num} with the account you signed in as"))
+            partial.append(f"{nm} is {rec_email} in {there}, but another account id")
+            fixes.append((f"cc-swap remove {arg}; cc-swap login",
+                          f"replace {nm} with the account you signed in as"))
         else:
-            partial.append(f"#{num} is this account id under another email, {rec_email}")
-            fixes.append((f"cc-swap remove {num}; cc-swap login",
-                          f"replace #{num} (its email changed)"))
+            partial.append(f"{nm} is this account id under another email, {rec_email}")
+            fixes.append((f"cc-swap remove {arg}; cc-swap login",
+                          f"replace {nm} (its email changed)"))
     if len(exact) == 1:
         return LoginMatch(RENEW, exact[0][0])
     if exact:  # two slots claim one account (a hand-edited sequence.json)
         first = exact[0][0]
         for num, there in exact:
-            partial.insert(0, f"#{num} is {email} in {there} too")
-            fixes.insert(0, (f"cc-swap login {num}", f"renew #{num}"))
+            nm = name_of(names, num, email)
+            partial.insert(0, f"{nm} is {email} in {there} too")
+            fixes.insert(0, (f"cc-swap login {cli_arg(nm)}", f"renew {nm}"))
     if not partial:
         return LoginMatch(ADD)
     from claude_swap.switcher import ClaudeAccountSwitcher
@@ -833,16 +851,30 @@ def _day(deadline_ms: int) -> str:
 
 
 def _slot_name(data: Mapping, number: str) -> str:
-    """Slot ``number``'s short name (its alias, else its email's local part),
-    as Fleet and the fork's CLI lines name it."""
-    from claude_swap.maximize.names import display_names
-
+    """Slot ``number``'s display name (maximize/names.py), as every surface
+    names it."""
     accounts = (data or {}).get("accounts") or {}
-    names = display_names(
-        (str(n), str(r.get("email") or ""), str(r.get("alias") or ""))
-        for n, r in accounts.items() if isinstance(r, Mapping)
-    )
-    return names.get(str(number), f"#{number}")
+    record = accounts.get(str(number)) if isinstance(accounts, Mapping) else None
+    email = record.get("email") if isinstance(record, Mapping) else ""
+    return name_of(record_names(accounts), number, email)
+
+
+def _with_email(name: str, email: str) -> str:
+    """``new@example.com`` when the name is its local part, else ``name
+    (email)``: a terminal line, the address says which account."""
+    from claude_swap.maximize.names import short_name
+
+    if not email or name.lower() == short_name(email).lower():
+        return email or name
+    return f"{name} ({email})"
+
+
+def _nm(switcher, number: object, email: object = "") -> str:
+    """Slot ``number``'s display name, read off ``switcher``."""
+    try:
+        return switcher.account_name(number, email)
+    except Exception:
+        return name_of({}, number, email)
 
 
 class SignInAttempt(NewLoginAttempt):
@@ -913,7 +945,8 @@ class SignInAttempt(NewLoginAttempt):
                 _new_not_stored(switcher, creds, e)
             raise
         return Outcome(STORED, number,
-                       f"added #{number} {email} [{_plan_tag(account, creds)}]")
+                       f"added {_with_email(_nm(switcher, number, email), email)} "
+                       f"[{_plan_tag(account, creds)}]")
 
     def _renew(self, switcher, number: str, creds: str, data: Mapping) -> Outcome:
         """Exactly ``cc-swap login N``'s checks and store (``store_relogin``,
@@ -931,14 +964,15 @@ class SignInAttempt(NewLoginAttempt):
             return outcome
         deadline = oauth.login_expires_at_ms(creds)
         ends = f"; login now ends {_day(deadline)}" if deadline else ""
-        lines = [f"updated #{number} {_slot_name(data, number)} (token renewed{ends})"]
+        name = _slot_name(data, number)
+        lines = [f"updated {name} (token renewed{ends})"]
         if outcome.activated:
             lines.append(
-                f"#{number} is the account Claude Code is logged in as: the live "
+                f"{name} is the account Claude Code is logged in as: the live "
                 "login now uses the new token too (same account, nothing switched)"
             )
         if asked is not None and str(int(str(asked))) != number:
-            lines.append(f"--slot {asked} not used: this account is already #{number}")
+            lines.append(f"--slot {asked} not used: this account is already {name}")
         return Outcome(STORED, number, "\n".join(lines), activated=outcome.activated)
 
     @staticmethod
@@ -1049,7 +1083,8 @@ def check_new_slot(switcher, slot: str | None, *, free: bool = True) -> None:
     accounts = (switcher._get_sequence_data() or {}).get("accounts") or {}
     if str(int(str(slot))) in accounts:
         raise ValidationError(
-            f"slot {int(str(slot))} is taken (Account-{int(str(slot))}); "
+            f"slot {int(str(slot))} is taken (by "
+            f"{name_of(record_names(accounts), str(int(str(slot))))}); "
             "pick a free one, or omit --slot"
         )
 
@@ -1064,12 +1099,15 @@ def guided_new_steps(claude: str | None) -> list[str]:
     ]
 
 
-def guided_steps(number: str, email: str, claude: str | None) -> list[str]:
+def guided_steps(
+    number: str, email: str, claude: str | None, name: str | None = None
+) -> list[str]:
     """The manual re-login, for when claude cannot be launched here."""
+    who = name or name_of({}, number, email)
     return [
-        f"Re-login #{number} by hand ({email}):",
+        f"Re-login {who} by hand ({email}):",
         f"  1. run  {claude or 'claude'}  and type /login, sign in as {email}",
-        f"  2. run  cc-swap add  (it refreshes #{number} in place)",
+        f"  2. run  cc-swap add  (it refreshes {who} in place)",
         "  3. switch back to the account you were on",
     ]
 

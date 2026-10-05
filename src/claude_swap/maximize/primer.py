@@ -43,6 +43,7 @@ from claude_swap.autoswitch import (
     PrimeEvent,
 )
 from claude_swap.maximize.model import AccountView, Snapshot
+from claude_swap.maximize.names import name_of, view_name
 from claude_swap.maximize.pause import active_pause
 from claude_swap.maximize.snapshot import build_snapshot
 from claude_swap.poll_policy import parse_reset_ts
@@ -433,9 +434,14 @@ def plan_text(row: PlanRow, max_attempts: int) -> str:
     return f"would prime now (window {window}, attempt {row.attempt}/{max_attempts})"
 
 
-def plan_lines(rows: Sequence[PlanRow], max_attempts: int) -> list[str]:
-    """``cc-swap prime --dry-run`` lines: slot numbers and reasons, no emails."""
-    return [f"#{row.number}  {plan_text(row, max_attempts)}" for row in rows]
+def plan_lines(
+    rows: Sequence[PlanRow], max_attempts: int, names: Mapping[str, str] | None = None
+) -> list[str]:
+    """``cc-swap prime --dry-run`` lines: display names (``names``, ``{slot:
+    name}``) and reasons, no emails."""
+    return [
+        f"{name_of(names or {}, row.number)}  {plan_text(row, max_attempts)}" for row in rows
+    ]
 
 
 def _scrubbed(name: str) -> bool:
@@ -705,7 +711,14 @@ def request_fetch(switcher, number: str, at: float) -> None:
         interval = entry.poll_interval_s if entry is not None else None
         store.set_poll_plan({number: (at, interval)}, identities)
     except Exception:
-        _logger.debug("prime: could not pull account %s's poll plan", number, exc_info=True)
+        try:
+            name = switcher.account_name(number)
+        except Exception:
+            name = None
+        _logger.debug(
+            "prime: could not pull %s's poll plan",
+            name if isinstance(name, str) and name else name_of({}, number), exc_info=True,
+        )
 
 
 def _no_reading_reason(entry, now: float) -> str:
@@ -871,8 +884,9 @@ class Primer:
         return events
 
     def plan_lines(self, snap: Snapshot, numbers: set[str] | None = None) -> list[str]:
-        """``cc-swap prime --dry-run`` rows: slot numbers and reasons, no emails."""
-        return [f"#{num}  {text}" for num, text, _ in self.plan(snap, numbers)]
+        """``cc-swap prime --dry-run`` rows: display names and reasons, no emails."""
+        names = {v.number: view_name(v) for v in snap.accounts}
+        return [f"{name_of(names, num)}  {text}" for num, text, _ in self.plan(snap, numbers)]
 
     def plan_rows(self, snap: Snapshot, numbers: set[str] | None = None) -> list[PlanRow]:
         """:func:`plan_rows` plus the live ``cswap run`` session check."""
@@ -1128,7 +1142,7 @@ class Primer:
                 # does not count against the account, which is eligible again.
                 self._record(email, lastOutcome="unverified", attempts=0)
                 _logger.info(
-                    "prime: account %s's launch went unverified for 5h; dropped", view.number
+                    "prime: %s's launch went unverified for 5h; dropped", view_name(view)
                 )
                 continue
             if now < prime_at + VERIFY_DELAY_S:
@@ -1267,9 +1281,17 @@ class Primer:
                 return "claude changed since the version check; re-checked next tick"
         return None
 
-    @staticmethod
-    def _held_back(num: str, why: str) -> tuple[list[PrimeEvent], bool, str]:
-        _logger.info("prime: account %s not primed this pass: %s", num, why)
+    def _name(self, num: str) -> str:
+        """What the log calls slot ``num``: the engine's name for it."""
+        named = getattr(self.engine, "_name", None)
+        try:
+            found = named(num) if callable(named) else None
+        except Exception:
+            found = None
+        return found if isinstance(found, str) and found else name_of({}, num)
+
+    def _held_back(self, num: str, why: str) -> tuple[list[PrimeEvent], bool, str]:
+        _logger.info("prime: %s not primed this pass: %s", self._name(num), why)
         return [], False, why
 
     def _access_token(
@@ -1341,8 +1363,8 @@ class Primer:
                 and self.settings.model != FALLBACK_MODEL
             ):
                 _logger.warning(
-                    "prime: model %s not found; retrying account %s with %s",
-                    self.settings.model, target.number, FALLBACK_MODEL,
+                    "prime: model %s not found; retrying %s with %s",
+                    self.settings.model, self._name(target.number), FALLBACK_MODEL,
                 )
                 # Same attempt (already claimed), new launch instant: guard it
                 # and make it the prime time verification measures against.
@@ -1372,7 +1394,9 @@ class Primer:
                 num, "failed", None, "could not start claude: " + result.stderr_tail[-200:]
             )]
         if result.returncode == 0 and result.is_error is not True:
-            _logger.info("prime: account %s request sent; verifying after %.0fs", num, VERIFY_DELAY_S)
+            _logger.info(
+                "prime: %s request sent; verifying after %.0fs", self._name(num), VERIFY_DELAY_S
+            )
             return []  # stays "launched" until a later reading verifies it
         kind = classify_failure(result)
         if kind == "auth":
@@ -1388,8 +1412,8 @@ class Primer:
             # The request may still have reached the API: verify like a timeout.
             self._record(email, lastOutcome="exit-error")
             _logger.warning(
-                "prime: account %s claude exited %s: %s",
-                num, result.returncode, result.stderr_tail[-200:],
+                "prime: %s claude exited %s: %s",
+                self._name(num), result.returncode, result.stderr_tail[-200:],
             )
             return []
         return [PrimeEvent(num, "failed", None, detail)]

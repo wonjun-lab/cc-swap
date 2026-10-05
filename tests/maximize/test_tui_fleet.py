@@ -293,7 +293,7 @@ class TestFleetScreen:
         async with app.run_test(size=(140, 40)) as pilot:
             await _open(pilot)
             assert _plain(app, "#fx-attention") == (
-                "! #3 old needs re-login — select it, press r"
+                "! old needs re-login — select it, press r"
             )
             await pilot.press("m")
             await pilot.pause()
@@ -316,7 +316,7 @@ class TestFleetScreen:
                 status = _status(app)
                 # No decision published yet: nothing is claimed.
                 assert status.startswith(
-                    "Auto ON · using #1 main · waiting for the engine's next check"
+                    "Auto ON · using main · waiting for the engine's next check"
                 )
                 assert status.endswith(f"viewer · pid {os.getpid()} is switching")
                 assert app._store_only is True
@@ -362,7 +362,7 @@ class TestFleetScreen:
         async with app.run_test(size=(160, 40)) as pilot:
             await _open(pilot)
             assert _status(app).startswith(
-                "Auto ON · switching #1 main → #2 user2 now (soft)"
+                "Auto ON · switching main → user2 now (soft)"
             )
             assert _cell(app, "1", "plan") == "20x"
             assert _cell(app, "2", "plan") == "—"  # nothing says
@@ -486,14 +486,14 @@ class TestFleetScreen:
         async with app.run_test(size=(160, 40)) as pilot:
             await _open(pilot)
             assert _status(app).startswith(
-                "Auto ON · using #1 main · 5h 96% — resets in 8m, waiting it out "
+                "Auto ON · using main · 5h 96% — resets in 8m, waiting it out "
                 "(switches at once if it hits 100%)"
             )
         async with make_app(fake).run_test(size=(90, 28)) as pilot:
             await _open(pilot)
             # Narrower: the policy's own words, without the account's name.
             assert _status(pilot.app).startswith(
-                "Auto ON · #1 5h 96% — resets in 8m, waiting it out"
+                "Auto ON · main 5h 96% — resets in 8m, waiting it out"
             )
 
     async def test_help_names_the_learned_idle_pattern(self, tmp_path):
@@ -593,9 +593,9 @@ async def test_every_size_shows_the_table_with_headers_and_both_resets(
         assert scroll.region.y == head.region.y + 1
         assert keys.region.y == height - 1 and scroll.region.bottom <= keys.region.y
         assert _status(app).startswith("Auto ON · ")
-        assert "#2" in _status(app) and "when you pause" in _status(app)
+        assert NAMES[1] in _status(app) and "when you pause" in _status(app)
         assert _plain(app, "#fx-attention").startswith(
-            f"! #5 {NAMES[4]} needs re-login — select it, press r"
+            f"! {NAMES[4]} needs re-login — select it, press r"
         )
         assert _plain(app, "#fx-keys") == FOOTER
         # The headers, each over its column (plan only when it fits).
@@ -611,7 +611,7 @@ async def test_every_size_shows_the_table_with_headers_and_both_resets(
         assert orders == {"1": "●", "2": "1", "6": "2", "3": "3", "4": "4", "5": "–"}
         for number, line in _rows(app).items():
             assert len(line) <= width - 3
-            assert _cell(app, number, "account").endswith(f"#{number}")
+            assert "#" not in _cell(app, number, "account"), number
             assert _cell(app, number, "reset5"), number
             assert _cell(app, number, "reset7"), number
         assert _cell(app, "2", "reset5") == "not started"
@@ -627,13 +627,13 @@ async def test_every_size_shows_the_table_with_headers_and_both_resets(
             assert all(len(line.rstrip()) < width - 3 for line in _rows(app).values())
         if width >= 160:
             assert all(len(line.rstrip()) <= plan.total for line in _rows(app).values())
-            assert _cell(app, "1", "account") == f"{NAMES[0]} #1"  # whole short names
+            assert _cell(app, "1", "account") == f"{NAMES[0]}"  # whole short names
         # The selected account in full under the table, when it fits.
         assert detail.display
         assert detail.region.y == scroll.region.bottom
         assert detail.region.bottom <= keys.region.y
         panel = _plain(app, "#fx-detail")
-        assert f"{EMAILS[0]} #1  personal · 20x  ● active" in panel
+        assert f"{EMAILS[0]}  personal · 20x  ● active" in panel
         assert "Fable" in panel and "Fable" not in header  # per-model: the panel only
         assert "login ends " in panel
 
@@ -687,10 +687,10 @@ async def test_short_names_everywhere_but_the_panel(tmp_path, held_by_service):
     async with app.run_test(size=(160, 45)) as pilot:
         await _open(pilot)
         screen = app.screen
-        # The account column is as wide as the longest short name plus " #N".
-        assert screen._plan.width("account") == max(len(n) for n in NAMES) + 3
+        # The account column is as wide as the longest short name.
+        assert screen._plan.width("account") == max(len(n) for n in NAMES)
         assert {n: _cell(app, n, "account") for n in SIX_ORDER} == {
-            str(i + 1): f"{name} #{i + 1}" for i, name in enumerate(NAMES)
+            str(i + 1): name for i, name in enumerate(NAMES)
             if str(i + 1) in SIX_ORDER
         }
         for selector in ("#fx-status", "#fx-attention", "#fx-body"):
@@ -969,7 +969,7 @@ class TestNameKey:
             await pilot.press(*"side", "enter")  # typing replaces it
             await _open(pilot)
             assert ("set_alias", "2", "side") in fake.calls
-            assert _cell(app, "2", "account") == "side #2"
+            assert _cell(app, "2", "account") == "side"
 
     async def test_an_empty_name_brings_the_short_name_back(self, tmp_path, held_by_service):
         import dataclasses
@@ -983,14 +983,14 @@ class TestNameKey:
             await pilot.press("down", "n", "backspace", "enter")  # clear it, save
             await _open(pilot)
             assert ("unset_alias", "2") in fake.calls
-            assert _cell(app, "2", "account") == f"{NAMES[1]} #2"
+            assert _cell(app, "2", "account") == f"{NAMES[1]}"
 
     async def test_esc_and_an_unchanged_name_change_nothing(self, tmp_path, held_by_service):
         fake = _six_aliasable(tmp_path)
         app = make_app(fake)
         async with app.run_test(size=(160, 45)) as pilot:
             await _open(pilot)
-            await pilot.press("down", "down", "down", "down", "n")  # #4 jordan.lee@uni
+            await pilot.press("down", "down", "down", "down", "n")  # jordan.lee@uni
             await _open(pilot)
             await pilot.press("escape")
             await _open(pilot)
@@ -1031,7 +1031,7 @@ class TestHoldKey:
             await pilot.press("h")
             await _open(pilot)
             assert isinstance(app.screen, MenuModal)
-            assert app.screen._title == f"Hold #1 {NAMES[0]} — stay on this account"
+            assert app.screen._title == f"Hold {NAMES[0]} — stay on this account"
             started = time.time()
             await pilot.press("t")  # two hours
             await _open(pilot)
@@ -1040,7 +1040,7 @@ class TestHoldKey:
             assert held.slot == "1" and held.by == "fleet"
             assert started + 7200 - 5 <= held.until <= time.time() + 7200
             status = _status(app)
-            assert status.startswith(f"Holding #1 {NAMES[0]} until ")
+            assert status.startswith(f"Holding {NAMES[0]} until ")
             assert "(2h left) — only hard 98%/100% will move you (h to change)" in status
             # h → o lifts it; the sentence goes back to the engine's word.
             await pilot.press("h", "o")
@@ -1141,14 +1141,14 @@ async def test_the_capacity_summary_sits_over_the_headers(tmp_path, held_by_serv
         # on its 5h (the active one is never named back). Countdowns, as
         # the table's resets count.
         assert summary == (
-            "5h free: 4 accounts · 7d left this week ≈ 3.5 accounts · next 7d in 2d04h (#2)"
+            f"5h free: 4 accounts · 7d left this week ≈ 3.5 accounts · next 7d in 2d04h ({NAMES[1]})"
         )
         assert screen.query_one("#fx-head").region.y == screen.query_one(
             "#fx-summary").region.y + 1
         await pilot.resize_terminal(80, 24)
         await _open(pilot)
         # 80 columns: the 7d room goes first.
-        assert _plain(app, "#fx-summary") == "5h free: 4 accounts · next 7d in 2d04h (#2)"
+        assert _plain(app, "#fx-summary") == f"5h free: 4 accounts · next 7d in 2d04h ({NAMES[1]})"
         await pilot.resize_terminal(80, 10)
         await _open(pilot)
         assert not screen.query_one("#fx-summary").display
@@ -1157,7 +1157,7 @@ async def test_the_capacity_summary_sits_over_the_headers(tmp_path, held_by_serv
 @pytest.mark.asyncio
 async def test_the_summary_names_the_account_that_comes_back(tmp_path, held_by_service):
     """#6 at 5h 70%: not free, back when its 5h resets; both countdowns fit
-    at 80 columns."""
+    at 100 columns (80 keep the 5h one: the names take more room than slots did)."""
     from dataclasses import replace
 
     fake = _six(tmp_path)
@@ -1170,10 +1170,10 @@ async def test_the_summary_names_the_account_that_comes_back(tmp_path, held_by_s
         accounts.append(a)
     fake._accounts = accounts
     app = make_app(fake)
-    async with app.run_test(size=(80, 24)) as pilot:
+    async with app.run_test(size=(100, 30)) as pilot:
         await _open(pilot)
         assert _plain(app, "#fx-summary") == (
-            "5h free: 3 accounts · next back in 3h17m (#6) · next 7d in 2d04h (#2)"
+            f"5h free: 3 accounts · next back in 3h17m ({NAMES[5]}) · next 7d in 2d04h ({NAMES[1]})"
         )
 
 
@@ -1213,10 +1213,10 @@ async def test_a_killed_claude_shows_beside_a_dead_login(tmp_path, held_by_servi
     async with app.run_test(size=size) as pilot:
         await _open(pilot)
         lines = _attention(app)
-        assert lines[0] == f"! #5 {NAMES[4]} needs re-login — select it, press r"
+        assert lines[0] == f"! {NAMES[4]} needs re-login — select it, press r"
         assert lines[1].startswith("! claude 2.1.4 killed by ")
         assert "cc-swap doctor" in lines[1] and "priming paused" in lines[1]
-        assert lines[2] == f"! #3 {NAMES[2]} login ends in 1d 4h — select it, press r"
+        assert lines[2] == f"! {NAMES[2]} login ends in 1d 4h — select it, press r"
         assert app.screen._plan.attention == 3
         # Every row still shows, and the selected account's panel.
         assert app.screen._order == SIX_ORDER and app.screen._plan.detail
@@ -1235,7 +1235,7 @@ async def test_a_killed_claude_on_a_short_terminal_shares_the_line(tmp_path, hel
         # The kill rides along in its shortest wording, remedy first; the
         # login due that did not fit is counted.
         assert _attention(app) == [
-            f"! #5 {NAMES[4]} needs re-login — select it, press r · cc-swap doctor: "
+            f"! {NAMES[4]} needs re-login — select it, press r · cc-swap doctor: "
             "claude killed, priming paused (+1 more)"
         ]
         assert app.screen.query_one("#fx-scroll").region.height == 6  # every row
@@ -1266,16 +1266,15 @@ async def test_a_locked_keychain_and_an_old_reading_say_so(tmp_path, held_by_ser
     app = make_app(_degraded(tmp_path))
     async with app.run_test(size=size) as pilot:
         await _open(pilot)
-        # At 80 columns the status column gives room to the names: the
-        # tag too wide for it takes its shorter wording.
+                # tag too wide for it takes its shorter wording.
         assert _cell(app, "2", "status") == (
-            "keychain (f)" if size == (80, 24) else "keychain locked (f)"
+            "keychain locked (f)"
         )
         assert _cell(app, "6", "status") == "reading 2h old"
-        assert f"! #2 {NAMES[1]} keychain locked — unlock it, press f" in _attention(app)
+        assert f"! {NAMES[1]} keychain locked — unlock it, press f" in _attention(app)
         # No name is cut.
         for number, name in zip(("1", "2", "3", "4", "5", "6"), NAMES):
-            assert _cell(app, number, "account") == f"{name} #{number}"
+            assert _cell(app, number, "account") == name
 
 
 @pytest.mark.asyncio
@@ -1290,7 +1289,7 @@ async def test_prime_times_never_cut_a_name_at_80_columns(tmp_path, held_by_serv
     async with app.run_test(size=(80, 24)) as pilot:
         await _open(pilot)
         for number, name in zip(("1", "2", "3", "4", "5", "6"), NAMES):
-            assert _cell(app, number, "account") == f"{name} #{number}"
+            assert _cell(app, number, "account") == name
         assert _cell(app, "2", "status").startswith("prime ")
 
 
@@ -1320,7 +1319,7 @@ async def test_a_relogin_pause_counts_down_and_asks_for_no_relogin(tmp_path, hel
         await _open(pilot)
         assert _status(app).startswith("Paused · re-login in progress — nothing switches for 8m")
         assert "press r" not in _plain(app, "#fx-attention")
-        assert f"#5 {NAMES[4]} needs re-login" in _plain(app, "#fx-attention")
+        assert f"{NAMES[4]} needs re-login" in _plain(app, "#fx-attention")
 
 
 @pytest.mark.asyncio

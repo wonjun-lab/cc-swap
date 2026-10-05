@@ -160,10 +160,10 @@ def test_fleet_words_a_ride_and_counts_it_down():
     assert dv.eta_hard_min is None  # past its hard mark already
     said = _says(dv, rows)
     assert said[0] == (
-        "Auto ON · using #5 side · 7d 99% — riding to the limit, switching in ~2m "
+        "Auto ON · using side · 7d 99% — riding to the limit, switching in ~2m "
         "(learned) or at your next pause"
     )
-    assert said[1].startswith("Auto ON · #5 7d 99% — riding to the limit")
+    assert said[1].startswith("Auto ON · side 7d 99% — riding to the limit")
     assert said[-1] == "Auto ON"
     # A minute later, from the same published decision: ~1m, then now.
     assert "switching in ~1m (learned)" in _says(dv, rows, NOW + 60)[0]

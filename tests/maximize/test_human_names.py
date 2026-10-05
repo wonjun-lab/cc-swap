@@ -1,7 +1,8 @@
-"""Under the maximize strategy the engine's human event lines name an account
-by its short display name (alias, else the part before the ``@``), not its
-address (``auto.log`` is read over shoulders and pasted into issues). JSON
-output keeps the address."""
+"""The engine's human event lines name an account by its display name (alias,
+else the part before the ``@``, maximize/names.py) — never its slot number
+(an internal id that differs per machine) nor its address (``auto.log`` is
+read over shoulders and pasted into issues). ``cc-swap auto`` installs the
+name hook under every strategy. JSON output keeps the number and address."""
 
 from __future__ import annotations
 
@@ -14,7 +15,10 @@ import pytest
 from claude_swap import autoswitch as aw
 from claude_swap import cli
 from claude_swap.autoswitch import (
+    LoginAdoptedEvent,
+    MaximizeDecisionEvent,
     PollEvent,
+    PrimeEvent,
     QuarantineEvent,
     SwitchEvent,
     TickOutcome,
@@ -47,23 +51,65 @@ def _name(number: str, email: str) -> str:
     return {"1": "main", "2": "work"}.get(number, email.split("@")[0])
 
 
-def test_default_human_lines_still_print_the_address():
-    assert f"Account-2 ({SIDE}): 13% used" in _poll().human()
-    assert f"Account-1 -> Account-2 ({SIDE})" in _switch().human()
+def test_without_a_hook_a_line_says_the_local_part():
+    line = _poll().human()
+    assert line.startswith("side.user: 13% used")
+    assert "Account-" not in line and "@" not in line
+    assert "Switched main.user -> side.user (soft5h)" in _switch().human()
 
 
-def test_hook_names_the_poll_switch_and_quarantine_lines():
+def test_hook_names_every_line():
     with aw.account_names(_name):
-        assert "Account-2 (work): 13% used" in _poll().human()
-        assert "Switched Account-1 -> Account-2 (work) (soft5h)" in _switch().human()
-        assert "Account-3 (carol) quarantined" in QuarantineEvent(
+        poll = _poll().human()
+        assert poll.startswith("work: 13% used")
+        assert poll.endswith("| others: main 20%")
+        assert "Switched main -> work (soft5h)" in _switch().human()
+        quarantined = QuarantineEvent(
             number="3", email="carol@example.com", reason="dead"
         ).human()
-        assert "Account-3 (carol) back in rotation" in UnquarantineEvent(
+        assert quarantined.startswith("carol quarantined: dead.")
+        assert "re-login carol: cc-swap login carol" in quarantined
+        assert "carol back in rotation" in UnquarantineEvent(
             number="3", email="carol@example.com"
         ).human()
-    # The hook is scoped: afterwards the address is back.
-    assert SIDE in _poll().human()
+        assert LoginAdoptedEvent(number="1").human() == "adopted new login for main"
+        assert PrimeEvent("2", "primed", None).human() == "work: 5h window primed"
+    # The hook is scoped: afterwards the local part is back.
+    assert _poll().human().startswith("side.user:")
+
+
+def test_no_line_names_a_slot_number():
+    with aw.account_names(_name):
+        lines = [
+            _poll().human(),
+            _switch().human(),
+            LoginAdoptedEvent(number="2").human(),
+            MaximizeDecisionEvent(
+                active="2", decision="hold", trigger=None, reason="work under soft",
+            ).human(),
+        ]
+    for line in lines:
+        assert "Account-" not in line and "#1" not in line and "#2" not in line
+
+
+def test_a_decision_line_names_the_active_account_once():
+    with aw.account_names(_name):
+        line = MaximizeDecisionEvent(
+            active="2", decision="switch", trigger="soft",
+            reason="work 5h 91% >= soft 90%; idle; -> main (normal, score 1.20)",
+        ).human()
+        assert line == (
+            "maximize: switch (soft): work 5h 91% >= soft 90%; idle; "
+            "-> main (normal, score 1.20)"
+        )
+        other = MaximizeDecisionEvent(
+            active="2", decision="hold", trigger=None, reason="switching paused",
+        ).human()
+        assert other == "maximize: hold on work: switching paused"
+
+
+def test_an_account_with_neither_alias_nor_address_is_its_slot():
+    assert LoginAdoptedEvent(number="7").human() == "adopted new login for #7"
 
 
 def test_hook_leaves_json_alone():
@@ -74,14 +120,15 @@ def test_hook_leaves_json_alone():
         a.pop("ts"), b.pop("ts")
         assert a == b
     assert hooked[0]["active"]["email"] == SIDE
+    assert hooked[0]["active"]["number"] == 2
 
 
-def test_a_failing_hook_falls_back_to_the_address():
+def test_a_failing_hook_falls_back_to_the_local_part():
     def boom(number, email):
         raise RuntimeError("no")
 
     with aw.account_names(boom):
-        assert SIDE in _poll().human()
+        assert _poll().human().startswith("side.user: 13% used")
 
 
 class FakeEngine:
@@ -126,15 +173,16 @@ def _fleet(root, side_alias: str = "") -> None:
     }}))
 
 
-def test_cli_maximize_prints_short_names(temp_home, capsys):
+def test_cli_maximize_prints_display_names(temp_home, capsys):
     root = ClaudeAccountSwitcher().backup_dir
     _fleet(root, side_alias="work")
     set_setting(root, "autoswitch.strategy", "maximize")
     assert _auto(["--once"]) == 2
     out = capsys.readouterr().out
-    assert "Account-2 (work): 13% used" in out
-    assert "Switched Account-1 -> Account-2 (work)" in out
+    assert "work: 13% used" in out
+    assert "Switched main.user -> work" in out
     assert "@example.com" not in out
+    assert "Account-" not in out
 
 
 def test_cli_maximize_falls_back_to_the_local_part(temp_home, capsys):
@@ -142,14 +190,17 @@ def test_cli_maximize_falls_back_to_the_local_part(temp_home, capsys):
     _fleet(root)
     set_setting(root, "autoswitch.strategy", "maximize")
     assert _auto(["--once"]) == 2
-    assert "Account-2 (side.user): 13% used" in capsys.readouterr().out
+    assert "side.user: 13% used" in capsys.readouterr().out
 
 
-def test_cli_other_strategies_keep_the_address(temp_home, capsys):
+def test_cli_other_strategies_name_accounts_too(temp_home, capsys):
     root = ClaudeAccountSwitcher().backup_dir
     _fleet(root, side_alias="work")
     assert _auto(["--once"]) == 2
-    assert f"Account-2 ({SIDE}): 13% used" in capsys.readouterr().out
+    out = capsys.readouterr().out
+    assert "work: 13% used" in out
+    assert "@example.com" not in out
+    assert "Account-" not in out
 
 
 def test_cli_json_keeps_the_address_under_maximize(temp_home, capsys):

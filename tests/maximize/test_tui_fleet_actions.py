@@ -189,7 +189,7 @@ class TestRowKeys:
             await pilot.press("r")
             await pilot.pause()
             assert isinstance(app.screen, FleetScreen)
-            assert ("#2 login works — nothing to fix", "information") in toasts
+            assert ("user2's login works — nothing to fix", "information") in toasts
 
 
 @pytest.mark.asyncio
@@ -221,8 +221,8 @@ class TestPrime:
             options = app.screen.query_one("#fx-prime-list", SelectionList)
             labels = [str(options.get_option_at_index(i).prompt)
                       for i in range(options.option_count)]
-            assert any(lbl.startswith("#1 main") and "skip (active)" in lbl for lbl in labels)
-            assert any(lbl.startswith("#2") and "would prime now" in lbl for lbl in labels)
+            assert any(lbl.startswith("main") and "skip (active)" in lbl for lbl in labels)
+            assert any(lbl.startswith("user2") and "would prime now" in lbl for lbl in labels)
             assert any("skip (window-on)" in lbl for lbl in labels)
             assert options.selected == ["2"]
             await pilot.press("enter")
@@ -417,7 +417,7 @@ class TestRelogin:
         async with app.run_test(size=(160, 40)) as pilot:
             await _open(pilot)
             attention = app.screen.query_one("#fx-attention", Static).render().plain
-            assert "#2 user2 login ends in 2d 0h" in attention
+            assert "user2 login ends in 2d 0h" in attention
             assert "@" not in attention  # the short name, never the address
             assert _tag(app, "2") == "login 2d left"
             await _to_row(pilot, "2")
@@ -504,7 +504,7 @@ class TestRelogin:
             await _open(pilot)
             assert isinstance(app.screen, FleetScreen)
             assert ("add", None, True) in fake.calls
-            assert ("#4 login stored; back on #1", "information") in toasts
+            assert ("old login stored; back on main", "information") in toasts
 
     async def test_relogin_modal_stores_the_right_login_and_switches_back(self, tmp_path):
         from claude_swap.tui.fleet import FleetScreen
@@ -523,7 +523,7 @@ class TestRelogin:
             assert isinstance(app.screen, FleetScreen)
             assert ("add", None, True) in fake.calls
             assert ("switch_to", "1") in fake.calls
-            assert ("#4 login stored; back on #1", "information") in toasts
+            assert ("old login stored; back on main", "information") in toasts
             state = json.loads((tmp_path / "autoswitch_state.json").read_text())
             assert "pausedUntil" not in state
 
@@ -550,7 +550,7 @@ def test_relogin_store_refuses_when_live_login_is_another_slot(tmp_path):
     result = relogin_store(fake, "4", return_to="1")
     assert result == {
         "stored": False, "number": "4",
-        "reason": "the live login is #2, not #4; nothing stored",
+        "reason": "the live login is user2, not old; nothing stored",
     }
     assert fake.calls == []
     # Same email, other account uuid (a different person's org seat): refused too.
@@ -724,7 +724,7 @@ class TestLaunchedRelogin:
             assert suspended == [True]
             assert isinstance(app.screen, FleetScreen)  # no guide modal
             assert fake.stored == [("4", "user4@example.com", "rt-new")]
-            assert ("#4 login stored (user4@example.com)", "information") in toasts
+            assert ("old login stored (user4@example.com)", "information") in toasts
             assert not app.busy
         argv, profile = seen[0]
         assert argv[1:] == ["auth", "login", "--claudeai", "--email", "user4@example.com"]
@@ -742,7 +742,7 @@ class TestLaunchedRelogin:
             toasts = _toasts(app)
             await _press_r_on(pilot, "4")
             assert fake.stored == []
-            [(message, severity)] = [t for t in toasts if "not #4's account" in t[0]]
+            [(message, severity)] = [t for t in toasts if "not old's account" in t[0]]
             assert severity == "error"
             assert "user2@example.com" in message and "user4@example.com" in message
         assert not list(tmp_path.glob("relogin-*"))
@@ -852,7 +852,7 @@ class TestSignIn:
             assert suspended == [True]
             assert fake.added == [("brand@example.com", "None")]
             assert fake.stored == []  # not a re-login
-            assert ("added #5 brand@example.com [personal]", "information") in toasts
+            assert ("added brand@example.com [personal]", "information") in toasts
             assert not app.busy
         argv, profile = seen[0]
         assert argv[1:] == ["auth", "login", "--claudeai"]
@@ -869,7 +869,7 @@ class TestSignIn:
             await _press_s_in_account_settings(pilot)
             assert fake.added == []
             assert fake.stored == [("3", "user3@example.com", "rt-new")]
-            [(message, severity)] = [t for t in toasts if t[0].startswith("updated #3 ")]
+            [(message, severity)] = [t for t in toasts if t[0].startswith("updated user3 ")]
             assert severity == "information" and "token renewed" in message
         assert not list(tmp_path.glob("relogin-*"))
         assert not any(c[0] == "switch_to" for c in fake.calls)
@@ -886,7 +886,7 @@ class TestSignIn:
             await _press_s_in_account_settings(pilot)
             assert fake.added == [] and fake.stored == []
             [(message, severity)] = [t for t in toasts if "only in part" in t[0]]
-            assert severity == "warning" and "cc-swap remove 3; cc-swap login" in message
+            assert severity == "warning" and "cc-swap remove user3; cc-swap login" in message
         assert not list(tmp_path.glob("relogin-*"))
 
     async def test_without_auth_login_it_says_how_by_hand(self, tmp_path, monkeypatch):

@@ -54,6 +54,10 @@ class AccountView:
     # non-active account read longer ago than ``policy.STALE_LANDING_S`` is
     # no landing target unless nothing else can take you.
     age_s: float | None = None
+    # The account's display name (maximize/names.py: alias, else short name,
+    # made unique) — what every reason names it by. "" = not computed: the
+    # reasons fall back to the local part of ``email`` (``names.view_name``).
+    name: str = ""
 
 
 @dataclass(frozen=True)

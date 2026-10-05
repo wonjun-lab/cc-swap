@@ -2,7 +2,8 @@
 
 Manual counterpart of the engine's automatic priming (spec §8.1 CLI): same
 target rules and safety checks, no jitter, and it works with
-``prime.enabled`` off. Prints slot numbers only.
+``prime.enabled`` off. Names accounts by their display names (never an
+email).
 """
 
 from __future__ import annotations
@@ -14,8 +15,9 @@ import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
 
-from claude_swap.autoswitch import AutoSwitchEngine, AutoSwitchEvent
+from claude_swap.autoswitch import AutoSwitchEngine, AutoSwitchEvent, account_names
 from claude_swap.exceptions import ClaudeSwitchError
+from claude_swap.maximize.names import name_of
 from claude_swap.maximize.primer import Primer, _slot_order, prime_snapshot
 from claude_swap.printer import dimmed, error
 from claude_swap.settings import load_prime_settings, load_settings
@@ -42,7 +44,8 @@ _DIM_SUFFIXES = (_PENDING_NOTE, _NOTHING)
 
 @dataclass(frozen=True)
 class PrimeReport:
-    """What one manual priming pass did, by slot number only (no emails).
+    """What one manual priming pass did, keyed by slot number (no emails);
+    its lines name each account by ``names`` (``{slot: display name}``).
 
     ``plan`` is ``Primer.plan``: ``(slot, text, would_prime)`` in slot order.
     Every account the plan would prime ends up in ``events``, ``pending`` or
@@ -58,6 +61,10 @@ class PrimeReport:
     blocked: str | None = None
     blocked_all: bool = False
     notes: list[str] = field(default_factory=list)
+    names: dict[str, str] = field(default_factory=dict)
+
+    def _name(self, num: str) -> str:
+        return name_of(self.names, num)
 
     @property
     def failed(self) -> bool:
@@ -72,9 +79,9 @@ class PrimeReport:
 
     def tail_lines(self) -> list[str]:
         """The lines after the events: pending, not primed, or nothing to do."""
-        lines = [f"#{num}  {_PENDING_NOTE}" for num in self.pending]
+        lines = [f"{self._name(num)}  {_PENDING_NOTE}" for num in self.pending]
         lines += [
-            f"#{num}  not primed ({self.not_primed[num]})"
+            f"{self._name(num)}  not primed ({self.not_primed[num]})"
             for num in sorted(self.not_primed, key=_slot_order)
         ]
         if not self.events and not self.pending and not self.not_primed:
@@ -88,21 +95,42 @@ class PrimeReport:
             head = [f"Priming is paused: {self.blocked}"] if self.blocked_all else []
             held = "priming is paused, see above" if self.blocked_all else self.blocked
             rows = [
-                f"#{num}  not primed ({held})"
+                f"{self._name(num)}  not primed ({held})"
                 if would and self.blocked is not None
-                else f"#{num}  {text}"
+                else f"{self._name(num)}  {text}"
                 for num, text, would in self.plan
             ] or ["No accounts."]
             return head + rows + list(self.notes)
-        out = [f"#{num}  {text}" for num, text, would in self.plan if not would]
-        out += [event.human() for event in self.events]
+        out = [f"{self._name(num)}  {text}" for num, text, would in self.plan if not would]
+        with account_names(self._hook()):
+            out += [event.human() for event in self.events]
         return out + self.tail_lines()
 
+    def _hook(self):
+        """An ``autoswitch.account_names`` hook naming events by ``names``
+        (None, leaving any installed one, when there are none)."""
+        if not self.names:
+            from claude_swap import autoswitch
 
-def _print_skips(plan: list[tuple[str, str, bool]]) -> None:
+            return autoswitch._name_hook
+        return lambda num, email: name_of(self.names, num, email)
+
+
+def _print_skips(
+    plan: list[tuple[str, str, bool]], names: dict[str, str] | None = None
+) -> None:
     for num, text, would_prime in plan:
         if not would_prime:
-            print(dimmed(f"#{num}  {text}"))
+            print(dimmed(f"{name_of(names or {}, num)}  {text}"))
+
+
+def _account_names(switcher) -> dict[str, str]:
+    """``{slot: display name}`` from the switcher (``{}`` when it has none)."""
+    try:
+        found = switcher.account_names()
+    except Exception:
+        return {}
+    return dict(found) if isinstance(found, dict) else {}
 
 
 def _auto_off_notes(backup_root) -> list[str]:
@@ -164,12 +192,13 @@ def manual_prime(
     usage = {num: entry.decision_value() for num, entry in entries.items()}
     snap = prime_snapshot(engine, usage, clock())
     plan = primer.plan(snap, numbers)
+    names = _account_names(switcher)
     if dry_run:
         # Same blockers as the real run below, so the two never disagree.
         blocked, blocked_all = primer.preflight()
         return PrimeReport(
             True, plan, blocked=blocked, blocked_all=blocked_all,
-            notes=_auto_off_notes(switcher.backup_dir),
+            notes=_auto_off_notes(switcher.backup_dir), names=names,
         )
     if on_plan is not None:
         on_plan(plan)
@@ -184,7 +213,7 @@ def manual_prime(
     for num, _text, would_prime in plan:
         if would_prime and not disabled and num not in reported and num not in not_primed:
             not_primed[num] = "no longer a priming target"
-    return PrimeReport(False, plan, list(events), pending, not_primed)
+    return PrimeReport(False, plan, list(events), pending, not_primed, names=names)
 
 
 def _warn(message: str) -> None:
@@ -241,24 +270,26 @@ def prime_command(argv: list[str]) -> None:
         )
         from claude_swap.maximize import claude_exec
 
-        with claude_exec.manual("cc-swap prime", warn=_warn):
-            report = manual_prime(
-                switcher,
-                numbers,
-                dry_run=args.dry_run,
-                emit=_print_event,
-                sleep=_sleep,
-                clock=_clock,
-                on_plan=_print_skips,
-            )
-        if args.dry_run:
-            for line in report.lines():
-                print(line)
-            if report.failed:
-                sys.exit(1)
-            return
-        for event in report.events:
-            _print_event(event)
+        names = _account_names(switcher)
+        with account_names(lambda num, email: name_of(names, num, email)):
+            with claude_exec.manual("cc-swap prime", warn=_warn):
+                report = manual_prime(
+                    switcher,
+                    numbers,
+                    dry_run=args.dry_run,
+                    emit=_print_event,
+                    sleep=_sleep,
+                    clock=_clock,
+                    on_plan=lambda plan: _print_skips(plan, names),
+                )
+            if args.dry_run:
+                for line in report.lines():
+                    print(line)
+                if report.failed:
+                    sys.exit(1)
+                return
+            for event in report.events:
+                _print_event(event)
         for line in report.tail_lines():
             print(dimmed(line) if line.endswith(_DIM_SUFFIXES) else line)
         sys.exit(1 if report.failed else 0)

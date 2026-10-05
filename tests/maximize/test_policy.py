@@ -207,7 +207,7 @@ CASES = [
     # -- 3. soft: waits for idle -------------------------------------------
     Case("soft-busy-holds-pending",
          snap("1", acct("1", 62, 40), acct("2"), samples="busy"),
-         Hold, pending=True, reason_has="waiting for idle to move to #2"),
+         Hold, pending=True, reason_has="waiting for idle to move to 2"),
     Case("soft-idle-switches",
          snap("1", acct("1", 62, 40), acct("2"), samples="idle"),
          Switch, target="2", trigger="soft"),
@@ -333,7 +333,7 @@ CASES = [
          snap("1", resets(acct("1", 96, 40), m5=8), acct("2", 10, 10),
               samples=rows((600, 94, 40), (0, 96, 40))),
          Hold, pending=False,
-         reason_has="#1 5h 96% — resets in 8m, waiting it out "
+         reason_has="1 5h 96% — resets in 8m, waiting it out "
                     "(switches at once if it hits 100%)"),
     Case("reset-wait-switches-when-100-comes-within-2-min-of-the-reset",
          # 95.5% at 0.5 pt/min: 100% in 9 min, the reset in 8 (< 8 + 2).
@@ -354,7 +354,7 @@ CASES = [
          Switch, target="2", trigger="hard"),
     Case("reset-wait-soft-skips-the-idle-switch",
          snap("1", resets(acct("1", 62, 40), m5=5), acct("2"), samples="idle"),
-         Hold, pending=False, reason_has="#1 5h 62% — resets in 5m, waiting it out"),
+         Hold, pending=False, reason_has="1 5h 62% — resets in 5m, waiting it out"),
     Case("reset-wait-soft-while-busy-is-not-pending",
          snap("1", resets(acct("1", 62, 40), m5=5), acct("2"), samples="busy"),
          Hold, pending=False, reason_has="resets in 5m"),
@@ -362,12 +362,12 @@ CASES = [
          # 7d at 98.5% (hard 98), 0.05 pt/min: 100% in 30 min, reset in 10.
          snap("1", resets(acct("1", 30, 98.5), m7=10), acct("2", 10, 10),
               samples=rows((600, 30, 98), (0, 30, 98.5))),
-         Hold, pending=False, reason_has="#1 7d 98.5% — resets in 10m"),
+         Hold, pending=False, reason_has="1 7d 98.5% — resets in 10m"),
     Case("reset-wait-other-window-over-hard-switches",
          # 5h could wait out its reset, but 7d 99% (reset in 3 days) cannot.
          snap("1", resets(acct("1", 96, 99), m5=8), acct("2", 10, 10),
               samples=rows((600, 94, 99), (0, 96, 99))),
-         Switch, target="2", trigger="hard", reason_has="#1 7d 99% >= hard 98%"),
+         Switch, target="2", trigger="hard", reason_has="1 7d 99% >= hard 98%"),
     Case("reset-wait-other-window-eta-forced-switches",
          # 5h waits; 7d is 3 pts under hard at 0.5 pt/min (6 min <= forceEtaMin).
          snap("1", resets(acct("1", 96, 95), m5=8), acct("2", 10, 10),
@@ -376,11 +376,11 @@ CASES = [
     Case("reset-wait-other-window-soft-still-waits-for-idle",
          snap("1", resets(acct("1", 96, 92), m5=8), acct("2", 10, 10),
               samples=rows((600, 94, 92), (0, 96, 92))),
-         Hold, pending=True, reason_has="#1 7d 92% >= soft 90%; waiting for idle"),
+         Hold, pending=True, reason_has="1 7d 92% >= soft 90%; waiting for idle"),
     Case("reset-wait-other-window-soft-switches-at-idle",
          # 5h 94% (soft, under hard, idle) waits; the 7d soft mark does not.
          snap("1", resets(acct("1", 94, 92), m5=8), acct("2", 10, 10), samples="idle"),
-         Switch, target="2", trigger="soft", reason_has="#1 7d 92% >= soft 90%"),
+         Switch, target="2", trigger="soft", reason_has="1 7d 92% >= soft 90%"),
     Case("reset-wait-unknown-pace-over-hard-switches",
          snap("1", resets(acct("1", 96, 40), m5=8), acct("2", 10, 10)),
          Switch, target="2", trigger="hard"),
@@ -394,7 +394,7 @@ CASES = [
          # 90% at 0.5 pt/min: hard 95 in 10 min (forced), 100% in 20; reset in 8.
          snap("1", resets(acct("1", 90, 40), m5=8), acct("2", 10, 10),
               samples=rows((600, 85, 40), (0, 90, 40))),
-         Hold, pending=False, reason_has="#1 5h 90% — resets in 8m"),
+         Hold, pending=False, reason_has="1 5h 90% — resets in 8m"),
     Case("reset-wait-on-stale-samples-is-an-unknown-pace",
          snap("1", resets(acct("1", 96, 40), m5=8), acct("2", 10, 10),
               samples=rows((1500, 94, 40), (900, 96, 40))),
@@ -403,7 +403,7 @@ CASES = [
          snap("1", resets(acct("1", 96, 98.5), m5=8, m7=12), acct("2", 10, 10),
               samples=rows((600, 94, 98), (0, 96, 98.5))),
          Hold, pending=False,
-         reason_has="#1 5h 96% — resets in 8m, 7d 98.5% — resets in 12m, waiting it out"),
+         reason_has="1 5h 96% — resets in 8m, 7d 98.5% — resets in 12m, waiting it out"),
     Case("reset-wait-leaves-rebalance-alone",
          snap("1", resets(acct("1", 10, 10, reset7_d=6), m5=5),
               acct("2", 0, 70, reset7_d=0.5), samples="idle"),
@@ -665,14 +665,14 @@ class TestPreempt:
         got = decide(preempt_snap())
         assert isinstance(got, Switch) and got.trigger == "preempt" and got.target == "2"
         assert got.reason == (
-            "#1 7d 84% would pass 90% in ~3h, before your usual quiet time (23:00) "
-            "— moving to #2 now while you're idle"
+            "1 7d 84% would pass 90% in ~3h, before your usual quiet time (23:00) "
+            "— moving to 2 now while you're idle"
         )
 
     def test_not_idle_holds_with_the_preempt_code(self):
         got = decide(preempt_snap(samples=BUSY5))
         assert isinstance(got, Hold) and got.code == "preempt" and not got.pending
-        assert "will move to #2 at the next idle moment" in got.reason
+        assert "will move to 2 at the next idle moment" in got.reason
 
     def test_a_candidate_that_would_cross_too_is_no_target(self):
         # #2 at 81% is landable but climbs at the active's pace: 90% in 4.5 h,
@@ -726,7 +726,7 @@ class TestPreempt:
     def test_the_rebalance_cooldown_applies(self):
         got = decide(preempt_snap(last_switch_min=10))
         assert isinstance(got, Hold) and got.code == "preempt"
-        assert got.reason.startswith("preempt cooldown (20 min left): #1 7d 84%")
+        assert got.reason.startswith("preempt cooldown (20 min left): 1 7d 84%")
 
     def test_never_onto_a_worse_tier(self):
         got = decide(preempt_snap(candidate=acct("2", 10, 10, reset7_d=6, tier="last_resort")))
@@ -772,7 +772,7 @@ class TestRebalanceDeferral:
     def test_a_small_gain_in_a_busy_time_waits_for_the_quiet_window(self):
         got = self.decide(next=quiet(3, 11))
         assert isinstance(got, Hold) and got.code == "rebalance-deferred"
-        assert got.reason.startswith("rebalance deferred to your quiet time (23:00): #2 score")
+        assert got.reason.startswith("rebalance deferred to your quiet time (23:00): 2 score")
 
     def test_a_big_gain_rebalances_now(self):
         got = self.decide(BIG, next=quiet(3, 11))
@@ -844,7 +844,7 @@ class TestNoPreemptRebalancePingPong:
         assert not isinstance(on_2, Switch), on_2
         assert isinstance(on_2, Hold) and on_2.code is None and not on_2.pending
         assert on_2.reason == (
-            "#2 under soft (5h 0% / 7d 30%); #1 scores better (1.40) but its 7d would "
+            "2 under soft (5h 0% / 7d 30%); 1 scores better (1.40) but its 7d would "
             "pass 90% in ~3h, within the next 4h — staying"
         )
 
@@ -964,7 +964,7 @@ def test_a_hold_sets_aside_soft_preempt_and_rebalance_but_never_safety(case: Hol
         assert got.code == case.code, got
         assert not got.pending
     if case.code == "hold":
-        assert got.reason.startswith(f"#{case.snap.active} held until ")
+        assert got.reason.startswith(f"{case.snap.active} held until ")
         assert "(2h left)" in got.reason
         assert "only a hard mark (5h 95%, 7d 98%) or 100% will move you" in got.reason
 
@@ -972,8 +972,8 @@ def test_a_hold_sets_aside_soft_preempt_and_rebalance_but_never_safety(case: Hol
 def test_a_hard_mark_with_nowhere_roomier_to_go_has_its_own_code():
     got = decide(snap("1", acct("1", 96, 40), acct("2", 97, 10), acct("3", 10, 99)))
     assert isinstance(got, Hold) and got.code == "hard-stay" and not got.pending
-    assert got.reason.startswith("#1 5h 96% >= hard 95%; nothing landable")
-    assert got.reason.endswith("than #1; staying")
+    assert got.reason.startswith("1 5h 96% >= hard 95%; nothing landable")
+    assert got.reason.endswith("than 1; staying")
 
 
 def test_a_held_reason_says_what_would_have_happened():
@@ -1019,3 +1019,17 @@ def test_an_ended_hold_is_no_hold():
     plain = snap("1", acct("1", 62, 40), acct("2", 10, 10), samples="idle")
     assert decide(held(plain, hours=0)) == decide(plain)
     assert decide(held(plain, hours=-1)) == decide(plain)
+
+
+def test_reasons_name_accounts_by_their_display_names():
+    from dataclasses import replace
+
+    s = snap(
+        "1",
+        replace(acct("1", 96, 40), name="betlab.master"),
+        replace(acct("2", 10, 10), name="lesthesia"),
+    )
+    got = decide(s)
+    assert isinstance(got, Switch) and got.target == "2"
+    assert got.reason.startswith("betlab.master 5h 96% >= hard 95%; -> lesthesia (normal, ")
+    assert "#1" not in got.reason and "#2" not in got.reason

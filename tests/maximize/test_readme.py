@@ -125,9 +125,9 @@ def test_readme_trigger_table_lists_every_policy_trigger():
     # The home sentence for each hold code and a preempt switch (maximize/home.py).
     "5h 96% — resets in 8m, waiting it out (switches at once if it hits 100%)",
     "7d 84% would pass 90% in ~3h, before your usual quiet time (23:00) — will move to "
-    "#2 side when you pause",
+    "side when you pause",
     "rebalance deferred to your quiet time (23:00)",
-    "switching #1 main → #2 side now while you're idle",
+    "switching main → side now while you're idle",
     # The learned idle pattern: in help (?) and Swap strategy, not on the home screen.
     "idle pattern: 9 days learned · next quiet window 23:00–07:30",
 ])
@@ -180,9 +180,11 @@ def test_readme_quotes_the_hold_sentence_and_the_summary_line_fleet_prints():
     now = time.mktime((2026, 10, 3, 5, 0, 0, 0, 0, -1))
     mx = replace(MaximizeSettings(), hard_5h=98.0, hard_7d=98.0)
 
+    NAMES5 = ("main", "side", "old", "work", "spare")
+
     def row(n, pct5, pct7, *, reset5=None, reset7=None, active=False):
         return fx.FleetRow(
-            number=str(n), name=f"acct{n}", email=f"acct{n}@example.com", org="personal",
+            number=str(n), name=NAMES5[n - 1], email=f"acct{n}@example.com", org="personal",
             active=active, rank=1, plan="20x", tier="normal", pct5=pct5, pct7=pct7,
             days7=3.0, score=1.0, landable=True, land="yes", state5="running", reset5=reset5,
             prime=fx.PrimeCell("active", None, None, "—"), login="ok", stale=False,
@@ -209,7 +211,7 @@ def test_readme_quotes_the_hold_sentence_and_the_summary_line_fleet_prints():
         hold=AccountHold("1", until), hold_read=True,
     )
     held = "".join(t for t, _ in variants[1])
-    assert held == "Holding #1 until 15:30 (2h left) — only hard 98%/100% will move you"
+    assert held == "Holding main until 15:30 (2h left) — only hard 98%/100% will move you"
     assert f"`{held}`" in text
 
 

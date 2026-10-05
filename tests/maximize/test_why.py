@@ -31,7 +31,10 @@ def _docs_text() -> str:
 @pytest.fixture
 def root(tmp_path, monkeypatch):
     monkeypatch.setattr(doctor_cli.paths, "get_backup_root", lambda: tmp_path)
-    (tmp_path / "sequence.json").write_text(json.dumps({"activeAccountNumber": 1, "accounts": {}}))
+    (tmp_path / "sequence.json").write_text(json.dumps({
+        "activeAccountNumber": 1,
+        "accounts": {"1": {"email": "main@example.com"}, "2": {"email": "side@example.com"}},
+    }))
     return tmp_path
 
 
@@ -70,7 +73,7 @@ def test_fresh_pending_decision_is_explained(root, monkeypatch, capsys, dry_runs
     publish(root)
     code, out = why(monkeypatch, capsys)
     assert code == 0 and dry_runs == []
-    assert "PENDING → #2" in out and "on #1" in out and "engine pid 4121" in out
+    assert "PENDING → side" in out and "on main" in out and "engine pid 4121" in out
     assert "code     maximize-pending" in out
     assert doctor_cli.REASONS["maximize-pending"][0] in out
     assert "#1 5h 62% >= soft 50%" in out
@@ -110,7 +113,7 @@ def test_a_code_from_another_record_or_on_a_switch_is_ignored(root, monkeypatch,
 def test_switch_names_its_trigger(root, monkeypatch, capsys):
     publish(root, decision="switch", trigger="soft", pending=False)
     _, out = why(monkeypatch, capsys)
-    assert "SWITCH → #2 (soft)" in out
+    assert "SWITCH → side (soft)" in out
     assert doctor_cli.TRIGGERS["soft"] in out
 
 
@@ -184,13 +187,14 @@ def test_auto_off_without_a_fresh_decision_still_says_off(root, monkeypatch, cap
 
 def test_a_switch_that_just_landed_is_explained(root, monkeypatch, capsys, dry_runs):
     # Published on #1 targeting #2; the switch landed so sequence.json says #2.
-    (root / "sequence.json").write_text(json.dumps({"activeAccountNumber": 2, "accounts": {}}))
+    (root / "sequence.json").write_text(json.dumps({"activeAccountNumber": 2, "accounts": {
+        "1": {"email": "main@example.com"}, "2": {"email": "side@example.com"}}}))
     publish(root, active="1", target="2", decision="switch", trigger="hard", pending=False)
     code, out = why(monkeypatch, capsys, "--no-fallback")
     assert code == 0 and dry_runs == []
-    assert "SWITCH → #2 (hard)" in out
+    assert "SWITCH → side (hard)" in out
     assert "No engine published" not in out
-    assert "switched" in out
+    assert "switched" in out and "now on side" in out
 
 
 def test_a_switch_to_a_third_account_is_still_history(root, monkeypatch, capsys, dry_runs):

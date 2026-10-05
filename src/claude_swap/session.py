@@ -588,6 +588,21 @@ class SessionManager:
         self.sessions_dir = switcher.backup_dir / "sessions"
         self._logger = switcher._logger
 
+    def _names(self) -> dict[str, str]:
+        """cc-swap: ``{slot: display name}`` (maximize/names.py), ``{}``
+        when the switcher cannot say."""
+        try:
+            names = self.switcher.account_names()
+        except Exception:
+            return {}
+        return names if isinstance(names, dict) else {}
+
+    def _name(self, account_num: object, email: object = "") -> str:
+        """cc-swap: the display name a message calls slot ``account_num`` by."""
+        from claude_swap.maximize.names import name_of
+
+        return name_of(self._names(), account_num, email)
+
     # -- launch ----------------------------------------------------------
 
     def run(
@@ -641,7 +656,7 @@ class SessionManager:
             if current is not None and current == (email, org_uuid):
                 if require_session:
                     raise SessionError(
-                        f"Account-{account_num} ({email}) is the active default "
+                        f"{self._name(account_num, email)} is the active default "
                         "login, so this launch would run plain claude on the "
                         "default login rather than in a session profile (a "
                         "second copy of the active credential would drift). "
@@ -650,7 +665,7 @@ class SessionManager:
                     )
                 print(
                     dimmed(
-                        f"Account-{account_num} ({email}) is already the active "
+                        f"{self._name(account_num, email)} is already the active "
                         "default login — launching claude directly."
                     )
                 )
@@ -668,7 +683,7 @@ class SessionManager:
         )
 
         print(
-            f"{accent('Launching')} Account-{account_num} ({email}) "
+            f"{accent('Launching')} {self._name(account_num, email)} "
             f"{muted('[session mode]')}"
         )
         env = {
@@ -741,18 +756,19 @@ class SessionManager:
             # consume gate defers on (it may be a switch's moment). Explain;
             # a re-login is not the remedy for a moment.
             raise SessionError(
-                f"Not starting a session for Account-{account_num} right now: "
+                f"Not starting a session for {self._name(account_num)} right now: "
                 "the live login holds its login too (a switch may be in "
                 "progress), and a session would refresh it out from under "
                 "Claude Code. Retry in a moment; if it persists, cc-swap "
                 "doctor explains the live login."
             )
         where = ", ".join(label for label, _slot in places) or "another place"
+        names = self._names()
         raise SessionError(
-            f"Not starting a session for Account-{account_num}: its login is "
+            f"Not starting a session for {self._name(account_num)}: its login is "
             f"also held by {where}. {shared_login.NOTE[0].upper()}"
             f"{shared_login.NOTE[1:]}. Fix: "
-            f"{shared_login.fix([str(account_num), *(s for _l, s in places if s)])}"
+            f"{shared_login.fix([str(account_num), *(s for _l, s in places if s)], names)}"
         )
 
     def _ensure_not_api_key(self, account_num: str, email: str) -> None:
@@ -764,7 +780,7 @@ class SessionManager:
         """
         if self.switcher._account_kind(account_num) == "api_key":
             raise SessionError(
-                f"Account-{account_num} ({email}) is an API-key account; "
+                f"{self._name(account_num, email)} is an API-key account; "
                 "'cswap run' (session mode) does not support API-key accounts yet. "
                 "Use 'cc-swap switch' to make it your default login instead."
             )
@@ -848,13 +864,13 @@ class SessionManager:
                 # credentials is correct because nothing was spent.
                 if outcome.stashed:
                     raise SessionError(
-                        f"Account-{account_num}'s refreshed credential could "
+                        f"{self._name(account_num, email)}'s refreshed credential could "
                         f"not be stored, so the backup still holds a spent "
                         f"grant. The successor is stashed — please retry, and "
                         f"the next run adopts it automatically."
                     )
                 raise SessionError(
-                    f"Account-{account_num}'s refreshed credential could "
+                    f"{self._name(account_num, email)}'s refreshed credential could "
                     f"neither be stored nor stashed, so the backup holds a "
                     f"spent grant and the successor is gone. Fix the storage "
                     f"failure first; retrying before that spends nothing but "
@@ -863,7 +879,7 @@ class SessionManager:
                 )
             if outcome.error is not None:
                 warning(
-                    f"Could not refresh the token for Account-{account_num}; "
+                    f"Could not refresh the token for {self._name(account_num, email)}; "
                     "continuing with the stored credentials."
                 )
 
@@ -923,7 +939,7 @@ class SessionManager:
                 verdict = "valid"
             if verdict in ("unknown", "unreachable"):
                 raise SessionError(
-                    f"Session profile for Account-{account_num} ({email}) could "
+                    f"Session profile for {self._name(account_num, email)} could "
                     f"not be verified: `claude auth status` did not run or did "
                     f"not answer. The profile is left in place — check that "
                     f"`claude` is on PATH, then retry."
@@ -931,7 +947,7 @@ class SessionManager:
             if verdict != "valid":
                 self._cleanup_failed_session(session_dir)
                 raise SessionError(
-                    f"Session profile for Account-{account_num} ({email}) failed "
+                    f"Session profile for {self._name(account_num, email)} failed "
                     f"validation. Log in with that account and re-add it: "
                     f"cc-swap add --slot {account_num}"
                 )
@@ -978,12 +994,12 @@ class SessionManager:
                 # Third copy of the switch path's message; same reason not to
                 # send the user to a re-add over a locked Keychain.
                 raise SessionError(
-                    f"Account-{account_num}'s backup is in the macOS Keychain "
+                    f"{self._name(account_num, email)}'s backup is in the macOS Keychain "
                     f"but it is unreadable right now (locked or no GUI "
                     f"session). Retry from a GUI terminal; do not re-add."
                 )
             raise SessionError(
-                f"Account-{account_num} has no stored credentials. "
+                f"{self._name(account_num, email)} has no stored credentials. "
                 f"Re-add with: cc-swap add --slot {account_num}"
             )
 
@@ -1000,7 +1016,7 @@ class SessionManager:
         oauth_account = config_data.get("oauthAccount")
         if not oauth_account:
             raise SessionError(
-                f"Account-{account_num} has no stored config backup. "
+                f"{self._name(account_num, email)} has no stored config backup. "
                 f"Re-add with: cc-swap add --slot {account_num}"
             )
 
@@ -1032,7 +1048,8 @@ class SessionManager:
             os.chmod(config_path, 0o600)
 
         self._logger.info(
-            f"Bootstrapped session profile for account {account_num} at {session_dir}"
+            f"Bootstrapped session profile for {self._name(account_num, email)} "
+            f"(under {session_dir.parent})"
         )
         self._recheck_shared_logins()  # its old copy may have been shared
 

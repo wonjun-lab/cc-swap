@@ -28,6 +28,7 @@ from claude_swap.exceptions import (
     ValidationError,
 )
 from claude_swap import oauth, pace, shared_login
+from claude_swap.maximize.names import cli_arg, labeled, name_of
 from claude_swap.claude_locks import claude_config_lock, claude_credentials_lock
 from claude_swap.json_output import (
     SCHEMA_VERSION,
@@ -878,10 +879,10 @@ class ClaudeAccountSwitcher:
 
             if not mark_session_stale(self._session_dir(account_num, email)):
                 self._logger.error(
-                    "Account %s's backup credentials changed but its live "
+                    "%s's backup credentials changed but its live "
                     "session profile could not be marked stale; it may keep "
                     "serving the superseded generation once it exits.",
-                    account_num,
+                    self.account_name(account_num),
                 )
         else:
             self._invalidate_session_credentials(account_num, email)
@@ -931,9 +932,9 @@ class ClaudeAccountSwitcher:
 
             if mark_session_stale(self._session_dir(account_num, email)):
                 self._logger.warning(
-                    "Stored account %s's credential but could not invalidate "
+                    "Stored %s's credential but could not invalidate "
                     "its session profile; marked it stale so the next run "
-                    "re-bootstraps.", account_num, exc_info=True,
+                    "re-bootstraps.", self.account_name(account_num), exc_info=True,
                 )
             else:
                 # Nothing recorded the superseded profile: the marker is what
@@ -941,10 +942,10 @@ class ClaudeAccountSwitcher:
                 # see a revoked-but-unexpired token. Say so at ERROR rather
                 # than let a silent warning imply the fallback worked.
                 self._logger.error(
-                    "Stored account %s's credential but could NOT invalidate "
+                    "Stored %s's credential but could NOT invalidate "
                     "its session profile OR mark it stale; the profile may "
                     "keep serving the superseded generation until its token "
-                    "expires.", account_num, exc_info=True,
+                    "expires.", self.account_name(account_num), exc_info=True,
                 )
 
     def _delete_account_credentials(self, account_num: str, email: str) -> None:
@@ -1099,7 +1100,7 @@ class ClaudeAccountSwitcher:
         data = self._get_sequence_data() or {}
         record = data.get("accounts", {}).get(account_num)
         if not record:
-            raise AccountNotFoundError(f"Account-{account_num} does not exist")
+            raise AccountNotFoundError(f"No account found with identifier: {identifier}")
         return (
             account_num,
             record.get("email", ""),
@@ -1133,11 +1134,13 @@ class ClaudeAccountSwitcher:
         data = self._get_sequence_data() or {}
         record = data.get("accounts", {}).get(account_num)
         if not record:
-            raise AccountNotFoundError(f"Account-{account_num} does not exist")
+            raise AccountNotFoundError(f"No account found with identifier: {identifier}")
 
         conflict = self._alias_in_use(normalized, exclude_num=account_num)
         if conflict is not None:
-            raise ConfigError(f"Alias '{normalized}' is already used by account {conflict}")
+            raise ConfigError(
+                f"Alias '{normalized}' is already used by {self._alias_owner(conflict, data)}"
+            )
 
         record["alias"] = normalized
         data["lastUpdated"] = get_timestamp()
@@ -1164,7 +1167,7 @@ class ClaudeAccountSwitcher:
         data = self._get_sequence_data() or {}
         record = data.get("accounts", {}).get(account_num)
         if not record:
-            raise AccountNotFoundError(f"Account-{account_num} does not exist")
+            raise AccountNotFoundError(f"No account found with identifier: {identifier}")
 
         if "alias" in record:
             del record["alias"]
@@ -1230,7 +1233,7 @@ class ClaudeAccountSwitcher:
         creds, unreadable = self._read_account_credentials_ex(account_num, email)
         if unreadable:
             raise ConfigError(
-                f"Account-{account_num}'s stored credential could not be "
+                f"{self.account_name(account_num, email)}'s stored credential could not be "
                 "read (keychain unavailable?); nothing was changed. Retry "
                 "once it is readable again."
             )
@@ -1259,9 +1262,9 @@ class ClaudeAccountSwitcher:
         record_a = data.get("accounts", {}).get(num_a)
         record_b = data.get("accounts", {}).get(num_b)
         if not record_a:
-            raise AccountNotFoundError(f"Account-{num_a} does not exist")
+            raise AccountNotFoundError(f"No account found with identifier: {first}")
         if not record_b:
-            raise AccountNotFoundError(f"Account-{num_b} does not exist")
+            raise AccountNotFoundError(f"No account found with identifier: {second}")
 
         email_a = record_a.get("email", "")
         email_b = record_b.get("email", "")
@@ -1637,7 +1640,7 @@ class ClaudeAccountSwitcher:
 
             data = self._get_sequence_data() or {}
             if not data.get("accounts", {}).get(num_src):
-                raise AccountNotFoundError(f"Account-{num_src} does not exist")
+                raise AccountNotFoundError(f"No account found with identifier: {account}")
 
             # `add` numbers new accounts from the highest slot, so a stray huge
             # target would inflate every future account number.
@@ -1680,7 +1683,7 @@ class ClaudeAccountSwitcher:
         data = self._get_sequence_data() or {}
         record = data.get("accounts", {}).get(num_src)
         if not record:
-            raise AccountNotFoundError(f"Account-{num_src} does not exist")
+            raise AccountNotFoundError(f"No account in slot {num_src}")
         if data.get("accounts", {}).get(target):
             raise ValidationError(
                 f"Slot {target} is already occupied — retry the move"
@@ -1804,9 +1807,10 @@ class ClaudeAccountSwitcher:
         mappings = MappingStore(self.backup_dir).all()
         if not mappings:
             print(dimmed("No directory mappings yet."))
-            print(muted("Map one with: cswap map <NUM|EMAIL> [PATH]"))
+            print(muted("Map one with: cswap map <NAME|EMAIL> [PATH]"))
             return
         seq = self._get_sequence_data_migrated() or {}
+        names = self.account_names(seq)
         print(bolded("Directory mappings:"))
         for path in sorted(mappings):
             entry = mappings[path]
@@ -1818,7 +1822,8 @@ class ClaudeAccountSwitcher:
                 tag = self._get_display_tag(
                     email, account.get("organizationName", ""), org_uuid
                 )
-                print(f"  {path} {dimmed('→')} {slot}: {email} {muted(f'[{tag}]')}")
+                shown = labeled(name_of(names, slot, email), email)
+                print(f"  {path} {dimmed('→')} {shown} {muted(f'[{tag}]')}")
             else:
                 print(f"  {path} {dimmed('→')} {email} {muted('(account removed)')}")
 
@@ -2017,11 +2022,12 @@ class ClaudeAccountSwitcher:
         data = self._get_sequence_data() or {}
         record = data.get("accounts", {}).get(account_num)
         if not record:
-            raise AccountNotFoundError(f"Account-{account_num} does not exist")
+            raise AccountNotFoundError(f"No account found with identifier: {identifier}")
 
+        name = self.account_name(account_num, email, data=data)
         verb = "disabled" if disabled else "enabled"
         if bool(record.get("disabled")) == disabled:
-            print(dimmed(f"Account-{account_num} ({email}) is already {verb}."))
+            print(dimmed(f"{name} is already {verb}."))
             return
 
         if disabled:
@@ -2030,9 +2036,9 @@ class ClaudeAccountSwitcher:
             record.pop("disabled", None)
         data["lastUpdated"] = get_timestamp()
         self._write_json(self.sequence_file, data)
-        self._logger.info(f"{verb.capitalize()} account {account_num}: {email}")
+        self._logger.info(f"{verb.capitalize()} {name}")
 
-        print(f"{accent(verb.capitalize())} Account-{account_num} ({email}).")
+        print(f"{accent(verb.capitalize())} {name}.")
 
         if disabled:
             active = data.get("activeAccountNumber")
@@ -2045,7 +2051,7 @@ class ClaudeAccountSwitcher:
                 warning(
                     "  No accounts remain in rotation — auto-switch and bare "
                     "switch have nothing to pick. Re-enable one with "
-                    "cc-swap enable <num|email>."
+                    "cc-swap enable <name>."
                 )
         else:
             print(dimmed("  It is back in the rotation."))
@@ -2131,7 +2137,7 @@ class ClaudeAccountSwitcher:
             if verdict is not None and (verdict.degraded or verdict.keychain_unavailable):
                 return False, f"{KEYCHAIN_REFUSAL}; retry in a GUI terminal"
             if live is None:
-                return False, f"#{num}'s live login could not be read"
+                return False, f"{self.account_name(num, email)}'s live login could not be read"
             if not live or looks_like_api_key(live) or holds_only_shared_fields(live):
                 # cc-swap: no login to back up (an MCP-only live credential
                 # included — Claude Code's Keychain-unavailable fallback).
@@ -2143,10 +2149,11 @@ class ClaudeAccountSwitcher:
                 backup = self._read_account_credentials(num, email)
             if oauth.credential_fingerprint(backup) == live_fp:
                 return True, ""
+            name = self.account_name(num, email)
             return False, (
-                f"#{num}'s current login could not be backed up (its owner "
+                f"{name}'s current login could not be backed up (its owner "
                 f"could not be verified); run `cc-swap add` while logged in "
-                f"as #{num}, then retry"
+                f"as {name}, then retry"
             )
         except Exception as e:
             return False, f"backing up the active login failed ({type(e).__name__})"
@@ -2231,16 +2238,17 @@ class ClaudeAccountSwitcher:
             self._usage_store.clear_dead_token([num], {num: (rec_email, rec_org)})
             self._recheck_shared_logins()
             self._logger.info(
-                "adopted new login for #%s (rt %s -> %s)",
-                num, oauth.fingerprint8(backup), oauth.fingerprint8(live),
+                "adopted new login for %s (rt %s -> %s)",
+                self.account_name(num, rec_email), oauth.fingerprint8(backup),
+                oauth.fingerprint8(live),
             )
             return "adopted"
         except LockError:
             return "busy"
         except Exception:
             self._logger.warning(
-                "Adopting the new live login for account %s failed; holding "
-                "and retrying next pass.", num, exc_info=True,
+                "Adopting the new live login for %s failed; holding "
+                "and retrying next pass.", self.account_name(num), exc_info=True,
             )
             return "error"
 
@@ -2322,7 +2330,9 @@ class ClaudeAccountSwitcher:
             data = self._get_sequence_data() or {}
             record = data.get("accounts", {}).get(num)
             if not isinstance(record, dict):
-                raise AccountNotFoundError(f"Account-{num} does not exist")
+                raise AccountNotFoundError(
+                    "the account was removed or moved meanwhile; nothing stored"
+                )
             rec_email = str(record.get("email") or "")
             rec_org = str(record.get("organizationUuid") or "")
             rec_uuid = str(record.get("uuid") or "").strip()
@@ -2332,8 +2342,8 @@ class ClaudeAccountSwitcher:
                 or (rec_uuid and uuid and uuid != rec_uuid)
             ):
                 raise ConfigError(
-                    f"the new login is {email or 'unknown'}, not Account-{num}'s "
-                    f"account; nothing stored"
+                    f"the new login is {email or 'unknown'}, not "
+                    f"{self.account_name(num, rec_email, data=data)}'s account; nothing stored"
                 )
             if precheck is not None:
                 precheck()
@@ -2342,7 +2352,8 @@ class ClaudeAccountSwitcher:
             backup_before, unreadable = self._read_account_credentials_ex(num, rec_email)
             if unreadable:
                 raise CredentialReadError(
-                    f"Account-{num}'s stored login is unreadable (Keychain locked?)"
+                    f"{self.account_name(num, rec_email, data=data)}'s stored login "
+                    "is unreadable (Keychain locked?)"
                 )
             config_file = self.configs_dir / f".claude-config-{num}-{rec_email}.json"
             config_before = (
@@ -2415,7 +2426,8 @@ class ClaudeAccountSwitcher:
         self._usage_store.clear_dead_token([num], {num: (rec_email, rec_org)})
         self._recheck_shared_logins()
         self._logger.info(
-            "stored a new login for #%s (rt %s%s)", num, oauth.fingerprint8(credentials),
+            "stored a new login for %s (rt %s%s)", self.account_name(num, rec_email),
+            oauth.fingerprint8(credentials),
             "; live login rewritten" if live_now else "",
         )
         return {"activated": bool(live_now)}
@@ -2453,8 +2465,8 @@ class ClaudeAccountSwitcher:
                 step()
             except Exception:
                 self._logger.error(
-                    "Rolling back the failed re-login of account %s: a restore "
-                    "step failed.", num, exc_info=True,
+                    "Rolling back the failed re-login of %s: a restore "
+                    "step failed.", self.account_name(num, email), exc_info=True,
                 )
             except BaseException as e:  # finish the rollback, then honour it
                 interrupted = interrupted or e
@@ -2547,7 +2559,8 @@ class ClaudeAccountSwitcher:
             existing = self.slot_for_login(data, email, org, uuid)
             if existing is not None:
                 raise DuplicateAccountError(
-                    f"{email} is already Account-{existing}", number=existing,
+                    f"{email} is already added as "
+                    f"{self.account_name(existing, email, data=data)}", number=existing,
                 )
             if slot is None:
                 num = str(self._get_next_account_number())
@@ -2555,7 +2568,8 @@ class ClaudeAccountSwitcher:
                 num = str(wanted)
                 if num in data["accounts"]:
                     raise ValidationError(
-                        f"slot {num} is taken (Account-{num}); pick a free one"
+                        f"slot {num} is taken (by {self.account_name(num, data=data)}); "
+                        "pick a free one"
                     )
             config_file = self.configs_dir / f".claude-config-{num}-{email}.json"
             # A `.prev` left on this key by an account removed from it must
@@ -2590,7 +2604,7 @@ class ClaudeAccountSwitcher:
                     except Exception:
                         self._logger.error(
                             "Undoing the failed new account %s: a cleanup step "
-                            "failed.", num, exc_info=True,
+                            "failed.", self.account_name(num, email), exc_info=True,
                         )
                 raise
             if on_commit is not None:
@@ -2598,8 +2612,8 @@ class ClaudeAccountSwitcher:
         self._usage_store.clear_dead_token([num], {num: (email, org)})
         self._recheck_shared_logins()
         self._logger.info(
-            "stored a new login as #%s (rt %s); the live login untouched",
-            num, oauth.fingerprint8(credentials),
+            "stored a new login as %s (rt %s); the live login untouched",
+            self.account_name(num, email), oauth.fingerprint8(credentials),
         )
         return num
 
@@ -2679,8 +2693,8 @@ class ClaudeAccountSwitcher:
             if data is None:
                 self._write_json(self.sequence_file, seq)
         except Exception:
-            self._logger.debug("could not drop account %s's re-login pin", account_num,
-                               exc_info=True)
+            self._logger.debug("could not drop %s's re-login pin",
+                               self.account_name(account_num), exc_info=True)
 
     def backfill_account_uuid(
         self,
@@ -2734,8 +2748,11 @@ class ClaudeAccountSwitcher:
             session_dir_for,
         )
 
+        from claude_swap.maximize.names import name_of, record_names
+
         num = str(account_num)
         accounts = (self._get_sequence_data() or {}).get("accounts") or {}
+        names = record_names(accounts)
         holders: dict[str, list[tuple[str, str | None]]] = {}
 
         def note(credentials: str | None, label: str, slot: str | None) -> None:
@@ -2752,7 +2769,7 @@ class ClaudeAccountSwitcher:
                 own_profile = session_dir_for(self.backup_dir, num, email)
                 continue
             note(self._store.peek_account_credentials(str(other), email),
-                 f"#{other}", str(other))
+                 name_of(names, other, email), str(other))
         for owner, path in shared_login.session_profiles(self.backup_dir):
             if (own_profile is not None and path == own_profile) or is_session_stale(path):
                 continue
@@ -2762,8 +2779,9 @@ class ClaudeAccountSwitcher:
             )
             note(
                 read_session_credentials(path),
-                *((shared_login.profile_label(owner), owner) if current
-                  else (f"a leftover cswap run profile made for #{owner}", None)),
+                *((shared_login.profile_label(owner, names), owner) if current
+                  else (f"a leftover cswap run profile made for {name_of(names, owner)}",
+                        None)),
             )
         return holders
 
@@ -2815,21 +2833,24 @@ class ClaudeAccountSwitcher:
             places = list(self._shared_holders(account_num).get(fp, []))
             return places, self._live_shares(account_num, fp) is not None
         except Exception:
-            self._logger.debug("shared-login check for account %s failed",
-                               account_num, exc_info=True)
+            self._logger.debug("shared-login check for %s failed",
+                               self.account_name(account_num), exc_info=True)
             return [], False
 
     def _log_shared_refusal(
         self, account_num: str, credentials: str, places, *, deferred: bool = False
     ) -> None:
-        """One line per refusal: slot numbers and a fingerprint prefix only."""
+        """One line per refusal: display names and a fingerprint prefix only."""
+        names = self.account_names()
         self._logger.warning(
-            "Not refreshing account %s: its refresh token (rt %s) is also held "
+            "Not refreshing %s: its refresh token (rt %s) is also held "
             "by %s; refreshing would log the other copy out. %s",
-            account_num, oauth.fingerprint8(credentials),
+            self.account_name(account_num), oauth.fingerprint8(credentials),
             ", ".join(label for label, _slot in places),
             "Deferred (cc-swap doctor checks the live login)." if deferred
-            else "Re-login one of them (cc-swap login N); cc-swap doctor names them.",
+            else "R" + shared_login.fix(
+                [str(account_num), *(slot for _label, slot in places if slot)], names
+            )[1:] + "; cc-swap doctor names them.",
         )
 
     def _audited_refresh(
@@ -2917,9 +2938,9 @@ class ClaudeAccountSwitcher:
             self._logger.warning(
                 "CLAUDE_SECURESTORAGE_CONFIG_DIR is set; cswap mirrors it "
                 "when capturing a credential but not when consuming one, "
-                "so refusing to consume account %s's refresh token "
+                "so refusing to consume %s's refresh token "
                 "(unset the variable or run from a normal shell).",
-                account_num,
+                self.account_name(account_num),
             )
             # Distinct kind: deterministic and self-inflicted (an env var),
             # so it must SURFACE — a transient would fall through to a
@@ -2940,8 +2961,8 @@ class ClaudeAccountSwitcher:
         )
         if not consume_lock.acquire():
             self._logger.info(
-                "Another consume is in flight for account %s; deferring to "
-                "the next pass.", account_num,
+                "Another consume is in flight for %s; deferring to "
+                "the next pass.", self.account_name(account_num),
             )
             # Distinct from "transient": nothing failed and nothing is remote.
             # Another gate holds the slot and will finish; this pass simply
@@ -2979,8 +3000,8 @@ class ClaudeAccountSwitcher:
                     # possibly-superseded copy this gate exists to never
                     # consume. Defer; nothing consumed.
                     self._logger.info(
-                        "Backup for account %s unreadable (keychain); "
-                        "deferring the refresh.", account_num,
+                        "Backup for %s unreadable (keychain); "
+                        "deferring the refresh.", self.account_name(account_num),
                     )
                     return oauth.RefreshOutcome(None, "transient")
                 # Adopt a stashed successor from a prior gate whose persist
@@ -3007,8 +3028,8 @@ class ClaudeAccountSwitcher:
                     # mode, remount the volume) or drop
                     # (`cswap unclaimed --purge`).
                     self._logger.info(
-                        "Account %s's stashed successor is unreadable; "
-                        "deferring the refresh.", account_num, exc_info=True,
+                        "%s's stashed successor is unreadable; "
+                        "deferring the refresh.", self.account_name(account_num), exc_info=True,
                     )
                     return oauth.RefreshOutcome(None, "stash-unreadable")
                 if adopted_creds is not None:
@@ -3027,9 +3048,9 @@ class ClaudeAccountSwitcher:
                     # after. Every production caller reads its snapshot from
                     # the backup store, so absent here really does mean gone.
                     self._logger.info(
-                        "Account %s's stored credential is gone; deferring "
+                        "%s's stored credential is gone; deferring "
                         "the refresh rather than consuming a grant for a "
-                        "slot that no longer exists.", account_num,
+                        "slot that no longer exists.", self.account_name(account_num),
                     )
                     return oauth.RefreshOutcome(None, "transient")
                 refresh_input = current
@@ -3092,8 +3113,8 @@ class ClaudeAccountSwitcher:
             # "Nothing consumed" is about the POST, not the store -- see
             # the generic handler below.
             self._logger.info(
-                "Slot lock held elsewhere; deferring account %s's backup "
-                "refresh to the next pass.", account_num,
+                "Slot lock held elsewhere; deferring %s's backup "
+                "refresh to the next pass.", self.account_name(account_num),
             )
             return oauth.RefreshOutcome(None, "transient")
         except Exception:
@@ -3119,8 +3140,8 @@ class ClaudeAccountSwitcher:
             # nothing. The cost of the advanced case is only that the next
             # pass re-reads a slot that is already fresh.
             self._logger.warning(
-                "Pre-consume window failed for account %s; deferring.",
-                account_num, exc_info=True,
+                "Pre-consume window failed for %s; deferring.",
+                self.account_name(account_num), exc_info=True,
             )
             return oauth.RefreshOutcome(None, "transient")
 
@@ -3141,8 +3162,8 @@ class ClaudeAccountSwitcher:
             # shape: the server just rejected these exact bytes), this
             # never fires and the POST proceeds.
             self._logger.info(
-                "refresh: account %s already rotated past the caller's copy "
-                "(rt %s); adopted without a POST", account_num,
+                "refresh: %s already rotated past the caller's copy "
+                "(rt %s); adopted without a POST", self.account_name(account_num),
                 oauth.fingerprint8(refresh_input),
             )
             return oauth.RefreshOutcome(refresh_input, None, None, consumed_fp)
@@ -3197,7 +3218,7 @@ class ClaudeAccountSwitcher:
             )
             nonlocal stashed_reason
             stashed_reason = reason
-            self._logger.warning(note, account_num)
+            self._logger.warning(note, self.account_name(account_num, email))
 
         outcome_creds = result.credentials
         try:
@@ -3217,7 +3238,7 @@ class ClaudeAccountSwitcher:
                         # it, so this must stash AND demote.
                         stash_successor(
                             "consume-gate-store-unreadable",
-                            "Account %s's stored credential was unreadable "
+                            "%s's stored credential was unreadable "
                             "(keychain) after a refresh POST; successor "
                             "stashed, nothing rewritten.",
                         )
@@ -3228,7 +3249,7 @@ class ClaudeAccountSwitcher:
                         # instead.
                         stash_successor(
                             "consume-gate-slot-removed",
-                            "Account %s's stored credential disappeared "
+                            "%s's stored credential disappeared "
                             "during a refresh POST; successor stashed, "
                             "nothing rewritten.",
                         )
@@ -3240,7 +3261,7 @@ class ClaudeAccountSwitcher:
                         # newer credential.
                         stash_successor(
                             "consume-gate-cas-conflict",
-                            "Backup lineage for account %s moved during a "
+                            "Backup lineage for %s moved during a "
                             "refresh POST; successor stashed, adopting the "
                             "newer store credential.",
                         )
@@ -3255,7 +3276,7 @@ class ClaudeAccountSwitcher:
                 # the next gate pass adopts from the stash.
                 stash_successor(
                     "consume-gate-persist-lock-failed",
-                    "Slot lock unavailable after consuming account %s's "
+                    "Slot lock unavailable after consuming %s's "
                     "grant; successor stashed for the next pass.",
                 )
         except Exception:
@@ -3265,13 +3286,13 @@ class ClaudeAccountSwitcher:
             # (same-dir I/O error, e.g. disk full), the successor survives
             # only in this return value — say so loudly.
             self._logger.warning(
-                "Persisting account %s's refreshed credential failed; "
-                "stashing instead.", account_num, exc_info=True,
+                "Persisting %s's refreshed credential failed; "
+                "stashing instead.", self.account_name(account_num), exc_info=True,
             )
             try:
                 stash_successor(
                     "consume-gate-persist-failed",
-                    "Persist failed after consuming account %s's grant; "
+                    "Persist failed after consuming %s's grant; "
                     "successor stashed for the next pass.",
                 )
             except Exception:
@@ -3281,10 +3302,10 @@ class ClaudeAccountSwitcher:
                 # with nothing stashed.
                 stashed_reason = "consume-gate-unpersisted"
                 self._logger.error(
-                    "Account %s's consumed successor could not be persisted "
+                    "%s's consumed successor could not be persisted "
                     "or stashed — it survives only for this pass. Fix the "
                     "storage failure, then re-login and `cc-swap add` if the "
-                    "slot strikes.", account_num, exc_info=True,
+                    "slot strikes.", self.account_name(account_num), exc_info=True,
                 )
         if stashed_reason in _DEMOTING_STASH_REASONS:
             # The successor is parked, not persisted: the slot still holds the
@@ -3342,9 +3363,9 @@ class ClaudeAccountSwitcher:
             self._store._remove_unclaimed_credential(entry_id)
         except Exception:
             self._logger.warning(
-                "Could not retire account %s's stash entry %s; leaving it for "
+                "Could not retire %s's stash entry %s; leaving it for "
                 "the next pass (`cswap unclaimed --purge` drops it by hand).",
-                account_num, entry_id, exc_info=True,
+                self.account_name(account_num), entry_id, exc_info=True,
             )
 
     def _adopt_stashed_successor(
@@ -3395,7 +3416,7 @@ class ClaudeAccountSwitcher:
             # id and `--purge` drops them even with the manifest unreadable.
             raise CredentialReadError(
                 f"the unclaimed manifest is {manifest_verdict} and stashed "
-                f"entry files exist; deferring account {account_num}'s "
+                f"entry files exist; deferring {self.account_name(account_num, email)}'s "
                 "adoption rather than POSTing a generation a stashed "
                 "successor may already have superseded (`cswap unclaimed` "
                 "lists them, `--purge` drops one)"
@@ -3420,9 +3441,9 @@ class ClaudeAccountSwitcher:
                     # not the pending persist it looks like.
                     self._retire_stash_entry(entry_id, account_num)
                     self._logger.info(
-                        "Retired account %s's CAS-conflict stash entry: its "
+                        "Retired %s's CAS-conflict stash entry: its "
                         "generation was superseded by the writer that won the "
-                        "race, so no pass can ever adopt it.", account_num,
+                        "race, so no pass can ever adopt it.", self.account_name(account_num),
                     )
                 elif not any(self._store._read_unclaimed_credential(entry_id)):
                     # No bytes and no matching generation: nothing can ever
@@ -3442,9 +3463,9 @@ class ClaudeAccountSwitcher:
                     # operator's call (`cswap unclaimed --purge`).
                     self._retire_stash_entry(entry_id, account_num)
                     self._logger.info(
-                        "Retired account %s's byte-less stash entry: its "
+                        "Retired %s's byte-less stash entry: its "
                         "credential is gone and its generation has passed, "
-                        "so no pass could ever adopt it.", account_num,
+                        "so no pass could ever adopt it.", self.account_name(account_num),
                     )
                 continue
             creds, unreadable = self._store._read_unclaimed_credential(entry_id)
@@ -3470,9 +3491,9 @@ class ClaudeAccountSwitcher:
                 # CAS-conflict branch above already retires on sight.
                 self._retire_stash_entry(entry_id, account_num)
                 self._logger.info(
-                    "Retired account %s's unreadable-bytes stash entry: its "
+                    "Retired %s's unreadable-bytes stash entry: its "
                     "generation is gone, so no pass could ever adopt it.",
-                    account_num,
+                    self.account_name(account_num),
                 )
                 continue
             # The WRAPPER, not the store method plus a private repeat of its
@@ -3488,9 +3509,9 @@ class ClaudeAccountSwitcher:
             # dropped with `cswap unclaimed --purge`.
             self._retire_stash_entry(entry_id, account_num)
             self._logger.info(
-                "Adopted account %s's stashed successor (%s): the stored "
+                "Adopted %s's stashed successor (%s): the stored "
                 "generation was already consumed by the gate pass that "
-                "stashed it.", account_num, meta.get("reason", "unknown"),
+                "stashed it.", self.account_name(account_num), meta.get("reason", "unknown"),
             )
             return creds
         if deferred_entry_id is not None:
@@ -3500,7 +3521,7 @@ class ClaudeAccountSwitcher:
             # which already degrades to "transient" and defers to the next
             # pass rather than discarding that generation.
             raise CredentialReadError(
-                f"stash entry {deferred_entry_id} for account {account_num} "
+                f"stash entry {deferred_entry_id} for {self.account_name(account_num, email)} "
                 "is unreadable; deferring adoption rather than discarding "
                 "its generation"
             )
@@ -3632,10 +3653,11 @@ class ClaudeAccountSwitcher:
         """
         from claude_swap.session import scan_live_sessions
 
+        shown = labeled(self.account_name(account_num, email), email)
         pids = self._live_session_pids(account_num, email)
         if pids:
             raise SessionError(
-                f"Account-{account_num} ({email}) has a live session-mode Claude "
+                f"{shown} has a live session-mode Claude "
                 f"instance (PID {', '.join(map(str, pids))}). "
                 f"Exit it first, then retry {action}."
             )
@@ -3643,7 +3665,7 @@ class ClaudeAccountSwitcher:
         _, unreadable = scan_live_sessions(session_dir)
         if unreadable:
             raise SessionError(
-                f"Account-{account_num} ({email}) has {unreadable} session "
+                f"{shown} has {unreadable} session "
                 f"record(s) that could not be read, so whether a Claude "
                 f"instance is live cannot be determined. Inspect "
                 f"{session_dir / 'sessions'} and remove or repair them, then "
@@ -3671,7 +3693,7 @@ class ClaudeAccountSwitcher:
         clear_session_stale(session_dir)
         self._recheck_shared_logins()
         self._logger.info(
-            f"Invalidated session credentials for account {account_num}"
+            f"Invalidated session credentials for {self.account_name(account_num, email)}"
         )
 
     def _session_profile_ahead(
@@ -3758,7 +3780,7 @@ class ClaudeAccountSwitcher:
                 return False
             self._store._write_account_credentials(account_num, email, profile)
         self._logger.info(
-            f"Adopted account {account_num}'s session profile credential "
+            f"Adopted {self.account_name(account_num, email)}'s session profile credential "
             "into its backup"
         )
         return True
@@ -3776,8 +3798,11 @@ class ClaudeAccountSwitcher:
             self._logger.debug("shared-login recheck failed: %s", type(e).__name__)
             return
         if cleared:
+            from claude_swap.maximize.names import names_list
+
             self._logger.info(
-                "shared-login: re-checking #%s after a login change", ", #".join(cleared)
+                "shared-login: re-checking %s after a login change",
+                names_list(self.account_names(), cleared),
             )
 
     def _delete_session_profile(self, account_num: str, email: str) -> None:
@@ -3816,14 +3841,15 @@ class ClaudeAccountSwitcher:
             # it is wrong. The surviving stale marker also makes the next
             # run's stale arm re-fire on this slot forever.
             self._logger.warning(
-                "Could not fully remove account %s's session profile at %s; "
+                "Could not fully remove %s's session profile (under %s; its directory name carries the address); "
                 "credentials are gone but the profile dir and/or its stale "
                 "marker survive (check permissions on it and its parent).",
-                account_num, session_dir,
+                self.account_name(account_num), session_dir.parent,
             )
             return
         self._logger.info(
-            f"Removed session profile for account {account_num} at {session_dir}"
+            f"Removed session profile for {self.account_name(account_num, email)} "
+            f"(under {session_dir.parent})"
         )
 
     def _init_sequence_file(self) -> None:
@@ -3857,6 +3883,26 @@ class ClaudeAccountSwitcher:
         Guarding each caller was the alternative and it is 27 edits that the
         28th forgets. This is the reader; the distinction belongs here."""
         return self._read_json(self.sequence_file, strict=True)
+
+    def account_names(self, data: dict | None = None) -> dict[str, str]:
+        """cc-swap: ``{slot: display name}`` for every managed account
+        (maximize/names.py: alias, else short name, made unique). ``{}``
+        when the roster is missing or unreadable — never raises."""
+        from claude_swap.maximize.names import record_names
+
+        if data is None:
+            try:
+                data = self._get_sequence_data()
+            except Exception:
+                data = None
+        return record_names((data or {}).get("accounts"))
+
+    def account_name(self, num: object, email: object = "", *, data: dict | None = None) -> str:
+        """cc-swap: the name a message calls slot ``num`` by — its display
+        name, else the local part of ``email``, else ``#num``."""
+        from claude_swap.maximize.names import name_of
+
+        return name_of(self.account_names(data), num, email)
 
     def _get_next_account_number(self) -> int:
         """Get next account number."""
@@ -4276,7 +4322,8 @@ class ClaudeAccountSwitcher:
             new_label = "API-key" if is_api_key else "OAuth"
             raise ValidationError(
                 f"'{email}' already exists as an {existing_label} account "
-                f"(slot {slot}); cannot add it as an {new_label} account. "
+                f"({self.account_name(slot, email, data=data)}); cannot add it as "
+                f"an {new_label} account. "
                 f"Pass a distinct --email."
             )
 
@@ -4302,6 +4349,14 @@ class ClaudeAccountSwitcher:
             if (account.get("alias") or "").lower() == alias_key:
                 return num
         return None
+
+    def _alias_owner(self, num: str, data: dict | None = None) -> str:
+        """cc-swap: the account holding an alias, for a CLI error — its
+        name (the alias itself) with its address."""
+        if data is None:
+            data = self._get_sequence_data() or {}
+        email = ((data.get("accounts") or {}).get(num) or {}).get("email", "")
+        return labeled(self.account_name(num, email, data=data), email)
 
     def _alias_in_use(self, alias: str, *, exclude_num: str | None = None) -> str | None:
         """Return the account number already using ``alias`` (other than ``exclude_num``), if any."""
@@ -4335,17 +4390,24 @@ class ClaudeAccountSwitcher:
         ]
 
         if len(matches) == 0:
-            return None
+            # cc-swap: the display name every surface shows (alias, else the
+            # short name, made unique; maximize/names.py), case-insensitively.
+            # ``·`` in a name may be typed as ``.`` or ``:``.
+            from claude_swap.maximize.names import match_name
+
+            return match_name(self.account_names(data), identifier)
         if len(matches) == 1:
             return matches[0]
 
+        names = self.account_names(data)
         details = ", ".join(
-            f"{num} [{data['accounts'][num].get('organizationName') or 'personal'}]"
+            f"{names.get(num, num)} [{data['accounts'][num].get('organizationName') or 'personal'}]"
             for num in matches
         )
+        example = names.get(matches[0], matches[0])
         raise ConfigError(
             f"Email '{identifier}' is ambiguous — matches accounts: {details}. "
-            f"Use account number instead (e.g., cc-swap switch 1)."
+            f"Use the account's name instead (e.g., cc-swap switch {example})."
         )
 
     def _get_sequence_data_migrated(self) -> dict | None:
@@ -4467,7 +4529,7 @@ class ClaudeAccountSwitcher:
                 conflict = self._alias_in_use(alias, exclude_num=account_num)
                 if conflict is not None:
                     raise ValidationError(
-                        f"Alias '{alias}' is already used by account {conflict}"
+                        f"Alias '{alias}' is already used by {self._alias_owner(conflict, seq)}"
                     )
 
             current_creds = self._read_capture_credentials()
@@ -4518,10 +4580,11 @@ class ClaudeAccountSwitcher:
             self._write_json(self.sequence_file, seq)
 
             tag = self._get_display_tag(current_email, matched_org_name, current_org_uuid)
-            self._logger.info(f"Updated credentials for account {account_num}: {current_email}")
+            name = self.account_name(account_num, current_email, data=seq)
+            self._logger.info(f"Updated credentials for {name}")
             print(
-                f"{accent('Updated credentials')} for Account {account_num} "
-                f"({current_email} {muted(f'[{tag}]')})."
+                f"{accent('Updated credentials')} for {labeled(name, current_email)} "
+                f"{muted(f'[{tag}]')}."
             )
             return
 
@@ -4594,7 +4657,7 @@ class ClaudeAccountSwitcher:
             conflict = self._alias_in_use(alias, exclude_num=account_num)
             if conflict is not None:
                 raise ValidationError(
-                    f"Alias '{alias}' is already used by account {conflict}"
+                    f"Alias '{alias}' is already used by {self._alias_owner(conflict)}"
                 )
 
         # Read new account credentials BEFORE any destructive operations
@@ -4674,10 +4737,11 @@ class ClaudeAccountSwitcher:
 
         self._write_json(self.sequence_file, data)
         tag = self._get_display_tag(current_email, organization_name, organization_uuid)
-        self._logger.info(f"Added account {account_num}: {current_email} (org: {organization_uuid or 'personal'})")
+        name = self.account_name(account_num, current_email, data=data)
+        self._logger.info(f"Added {name} (org: {organization_uuid or 'personal'})")
         if migrate_from:
             print(f"{dimmed(f'Moved from slot {migrate_from} → {slot}')}")
-        print(f"{accent('Added')} Account {account_num}: {current_email} {muted(f'[{tag}]')}")
+        print(f"{accent('Added')} {labeled(name, current_email)} {muted(f'[{tag}]')}")
 
     def add_account_from_token(
         self,
@@ -4782,10 +4846,11 @@ class ClaudeAccountSwitcher:
             seq["lastUpdated"] = get_timestamp()
             self._write_json(self.sequence_file, seq)
             kind_label = "API key" if is_api_key else "token"
-            self._logger.info(f"Updated {kind_label} for account {account_num}: {email}")
+            name = self.account_name(account_num, email, data=seq)
+            self._logger.info(f"Updated {kind_label} for {name}")
             print(
-                f"{accent(f'Updated {kind_label}')} for Account {account_num} "
-                f"({email} {muted('[personal]')})."
+                f"{accent(f'Updated {kind_label}')} for {labeled(name, email)} "
+                f"{muted('[personal]')}."
             )
             return
 
@@ -4881,11 +4946,12 @@ class ClaudeAccountSwitcher:
 
         self._write_json(self.sequence_file, data)
         source_label = "API key" if is_api_key else "token"
-        self._logger.info(f"Added account {account_num} from {source_label}: {email}")
+        name = self.account_name(account_num, email, data=data)
+        self._logger.info(f"Added {name} from {source_label}")
         if migrate_from:
             print(f"{dimmed(f'Moved from slot {migrate_from} → {slot}')}")
         print(
-            f"{accent('Added')} Account {account_num}: {email} "
+            f"{accent('Added')} {labeled(name, email)} "
             f"{muted('[personal]')} {muted(f'(from {source_label})')}"
         )
 
@@ -4917,6 +4983,9 @@ class ClaudeAccountSwitcher:
                     if acc.get("email") == identifier
                 ]
                 if len(matches) > 1:
+                    from claude_swap.maximize.names import match_name
+
+                    names = self.account_names(data)
                     print(f"Multiple accounts found for '{identifier}':")
                     for num in matches:
                         acc = data["accounts"][num]
@@ -4925,9 +4994,13 @@ class ClaudeAccountSwitcher:
                             acc.get("organizationName", ""),
                             acc.get("organizationUuid", ""),
                         )
-                        print(f"  {num}: {identifier} {muted(f'[{tag}]')}")
-                    choice = input("Enter account number to remove: ").strip()
-                    if not choice.isdigit() or choice not in matches:
+                        print(f"  {name_of(names, num)} {muted(f'[{tag}]')}")
+                    choice = input("Enter the name of the account to remove: ").strip()
+                    if not (choice.isdigit() and choice in matches):
+                        choice = match_name(
+                            {n: names[n] for n in matches if n in names}, choice
+                        ) or ""
+                    if choice not in matches:
                         print(dimmed("Cancelled"))
                         return
                     identifier = choice
@@ -4942,22 +5015,24 @@ class ClaudeAccountSwitcher:
         account_info = data.get("accounts", {}).get(account_num)
 
         if not account_info:
-            raise AccountNotFoundError(f"Account-{account_num} does not exist")
+            raise AccountNotFoundError(f"No account found with identifier: {identifier}")
 
         email = account_info.get("email")
         active_account = data.get("activeAccountNumber")
+        name = self.account_name(account_num, email, data=data)
+        shown = labeled(name, email)
 
         # Check before the confirmation prompt (better UX); the chokepoint in
         # _delete_account_files re-checks as a safety net for all paths.
         self._ensure_no_live_session(account_num, email, "--remove-account")
 
         if str(active_account) == account_num:
-            warning(f"Warning: Account-{account_num} ({email}) is currently active")
+            warning(f"Warning: {shown} is currently active")
 
         if not assume_yes:
             confirm = input(
                 f"Are you sure you want to permanently remove "
-                f"Account-{account_num} ({email})? [y/N] "
+                f"{shown}? [y/N] "
             )
             if confirm.lower() != "y":
                 print(dimmed("Cancelled"))
@@ -4973,15 +5048,15 @@ class ClaudeAccountSwitcher:
         data["lastUpdated"] = get_timestamp()
 
         self._write_json(self.sequence_file, data)
-        self._logger.info(f"Removed account {account_num}: {email}")
-        print(f"{accent('Removed')} Account-{account_num} ({email})")
+        self._logger.info(f"Removed {name}")
+        print(f"{accent('Removed')} {shown}")
 
         self._prune_mappings(email, account_info.get("organizationUuid", ""))
         self._prune_last_resort(accounts_before, account_num)
 
     def _prune_last_resort(self, accounts_before: dict, account_num: str) -> None:
         """Drop the ``maximize.lastResort`` entries that named only the removed
-        Account-``account_num`` (its email or alias). Left behind, such an
+        account in slot ``account_num`` (its email or alias). Left behind, such an
         entry no longer resolves (``last-resort remove`` cannot clear it) and
         silently marks the same login last-resort again once it is re-added.
         An entry that still names another account (a shared email) stays."""
@@ -5205,9 +5280,9 @@ class ClaudeAccountSwitcher:
             self._logger.warning(
                 "CLAUDE_SECURESTORAGE_CONFIG_DIR is set; cswap mirrors it "
                 "when capturing a credential but not when refreshing one, "
-                "so refusing to refresh account %s's active credential "
+                "so refusing to refresh %s's active credential "
                 "(unset the variable or run from a normal shell).",
-                account_num,
+                self.account_name(account_num),
             )
             return FetchRecord(error="store-unmirrored")
 
@@ -5219,8 +5294,8 @@ class ClaudeAccountSwitcher:
         try:
             shared_holders = self._shared_holders(account_num)
         except Exception:
-            self._logger.debug("shared-login check for account %s failed",
-                               account_num, exc_info=True)
+            self._logger.debug("shared-login check for %s failed",
+                               self.account_name(account_num), exc_info=True)
             shared_holders = {}
 
         # Attribution against the slot's
@@ -5245,10 +5320,10 @@ class ClaudeAccountSwitcher:
             if (account_num, email, "unattributable") not in self._provenance_warned:
                 self._provenance_warned.add((account_num, email, "unattributable"))
                 self._logger.warning(
-                    "Active credential does not match Account-%s's stored "
+                    "Active credential does not match %s's stored "
                     "backup and the backup is unusable; cannot refresh "
                     "(provenance unknown).",
-                    account_num,
+                    self.account_name(account_num),
                 )
             return _defer(force_refresh)
         self._provenance_warned.discard((account_num, email, "unattributable"))
@@ -5375,9 +5450,9 @@ class ClaudeAccountSwitcher:
                             )
                             self._write_credentials(working)
                         self._logger.info(
-                            "refresh: account %s's live login was the one a "
+                            "refresh: %s's live login was the one a "
                             "re-login replaced; restored the new login "
-                            "(rt %s)", account_num, oauth.fingerprint8(pinned),
+                            "(rt %s)", self.account_name(account_num), oauth.fingerprint8(pinned),
                         )
                     elif live_verdict or (
                         oauth.credential_fingerprint(live) == backup_fp
@@ -5388,17 +5463,17 @@ class ClaudeAccountSwitcher:
                             )
                             self._logger.info(
                                 "refresh: adopted Claude Code's rotated "
-                                "credential for account %s into its backup "
-                                "(rt %s -> %s)", account_num,
+                                "credential for %s into its backup "
+                                "(rt %s -> %s)", self.account_name(account_num),
                                 oauth.fingerprint8(backup),
                                 oauth.fingerprint8(live),
                             )
                         except Exception:
                             self._logger.warning(
                                 "Backup resync after adopting a rotated "
-                                "credential failed for account %s; the next "
+                                "credential failed for %s; the next "
                                 "expiry may refuse to refresh until a "
-                                "switch resyncs it.", account_num,
+                                "switch resyncs it.", self.account_name(account_num),
                             )
                     else:
                         self._logger.debug(
@@ -5504,10 +5579,10 @@ class ClaudeAccountSwitcher:
                                     self._provenance_warned.add(key)
                                     self._logger.warning(
                                         "Live credential is newer than "
-                                        "Account-%s's backup but its "
+                                        "%s's backup but its "
                                         "ownership is unverified; refresh "
                                         "deferred to Claude Code's next "
-                                        "use.", account_num,
+                                        "use.", self.account_name(account_num),
                                     )
                                 return _defer(force_refresh)
                         else:
@@ -5658,9 +5733,9 @@ class ClaudeAccountSwitcher:
                             backup_ok = False
                             self._logger.warning(
                                 "Backup write failed after a consumed "
-                                "refresh for account %s; attempting the "
+                                "refresh for %s; attempting the "
                                 "active store.",
-                                account_num,
+                                self.account_name(account_num),
                             )
                     try:
                         # _write_credentials can touch ~/.claude.json (via
@@ -5673,18 +5748,18 @@ class ClaudeAccountSwitcher:
                         live_ok = False
                         self._logger.warning(
                             "Active-store write failed after a %s for "
-                            "account %s%s.",
+                            "%s%s.",
                             "backup restore" if restore_source is not None
                             else "consumed refresh",
-                            account_num,
+                            self.account_name(account_num),
                             "" if backup_ok
                             else "; the rotated credential was NOT persisted "
                                  "anywhere — re-login may be required",
                         )
                     self._logger.info(
-                        "refresh: account %s active %s persisted "
+                        "refresh: %s active %s persisted "
                         "(rt %s; backup %s, live %s)",
-                        account_num,
+                        self.account_name(account_num),
                         "restore" if restore_source is not None else "refresh",
                         oauth.fingerprint8(working),
                         "kept" if restore_source is not None
@@ -5703,8 +5778,8 @@ class ClaudeAccountSwitcher:
             # fetch contract.
             self._logger.info(
                 "Credential locks held elsewhere; deferring the "
-                "active-token refresh for account %s to the next pass.",
-                account_num,
+                "active-token refresh for %s to the next pass.",
+                self.account_name(account_num),
             )
             return _defer(force_refresh)
         except Exception:
@@ -5712,8 +5787,8 @@ class ClaudeAccountSwitcher:
             # pass (a raising worker would kill the whole pass for every
             # account). Config/lock-file I/O errors land here.
             self._logger.warning(
-                "Active-token refresh for account %s failed unexpectedly; "
-                "deferring to the next pass.", account_num, exc_info=True,
+                "Active-token refresh for %s failed unexpectedly; "
+                "deferring to the next pass.", self.account_name(account_num), exc_info=True,
             )
             return _defer(force_refresh)
 
@@ -5782,9 +5857,9 @@ class ClaudeAccountSwitcher:
                 )
                 if resolved is None:
                     self._logger.debug(
-                        "Ownership probe for account %s's drifted live "
+                        "Ownership probe for %s's drifted live "
                         "credential failed; resync skipped this pass.",
-                        account_num,
+                        self.account_name(account_num),
                     )
                     return
                 match = self._resolved_matches_slot_identity(
@@ -5792,10 +5867,10 @@ class ClaudeAccountSwitcher:
                 )
                 if match is None:
                     self._logger.debug(
-                        "Ownership of account %s's drifted live credential "
+                        "Ownership of %s's drifted live credential "
                         "is unverifiable (no stored uuid, partial profile); "
                         "resync skipped this pass.",
-                        account_num,
+                        self.account_name(account_num),
                     )
                     return
                 # Key built AFTER the match: an email-path affirmation just
@@ -5810,10 +5885,10 @@ class ClaudeAccountSwitcher:
                         self._provenance_warned.add(key)
                         self._logger.warning(
                             "Live credential resolves to a different "
-                            "account than Account-%s's identity; backup "
+                            "account than %s's identity; backup "
                             "left untouched (foreign credential under a "
                             "stale config).",
-                            account_num,
+                            self.account_name(account_num),
                         )
                     return
                 self._provenance_warned.discard((account_num, email, "resync"))
@@ -5859,17 +5934,17 @@ class ClaudeAccountSwitcher:
                     return
                 self._write_account_credentials(account_num, email, live)
                 self._logger.info(
-                    "Resynced account %s's backup to the rotated live "
+                    "Resynced %s's backup to the rotated live "
                     "credential (rotation completed outside a collect pass).",
-                    account_num,
+                    self.account_name(account_num),
                 )
         except LockError:
             return  # holder is mid-operation; the next pass retries
         except Exception:
             self._logger.warning(
-                "Backup resync for account %s failed; the recovery branch's "
+                "Backup resync for %s failed; the recovery branch's "
                 "newer-generation check still guards the next expiry.",
-                account_num, exc_info=True,
+                self.account_name(account_num), exc_info=True,
             )
 
     def _static_usage_sentinel(
@@ -5952,7 +6027,7 @@ class ClaudeAccountSwitcher:
             # right identity and safe to refresh — treat the slot as not
             # session-owned for this fetch.
             self._logger.debug(
-                f"Session profile for account {num} is logged in as a "
+                f"Session profile for {self.account_name(num, email)} is logged in as a "
                 f"different account; fetching usage from the backup credential"
             )
             session_creds = None
@@ -6488,6 +6563,7 @@ class ClaudeAccountSwitcher:
         whenever the identity oracle answers.
         """
         data = self._get_sequence_data() or {}
+        names = self.account_names(data)
         by_fp: dict[str, str] = {}
         by_identity: dict[tuple[str, str], str] = {}
         out: list[str] = []
@@ -6498,7 +6574,7 @@ class ClaudeAccountSwitcher:
                 other = by_fp.get(fp)
                 if other:
                     out.append(
-                        f"Account-{other} and Account-{snum} hold the same "
+                        f"{name_of(names, other)} and {name_of(names, snum)} hold the same "
                         f"credential ({email}) — one slot's backup was "
                         "overwritten. Log in with the missing account and "
                         "re-add it: cc-swap add --slot N"
@@ -6511,7 +6587,7 @@ class ClaudeAccountSwitcher:
                 other = by_identity.get(key)
                 if other and other != snum:
                     out.append(
-                        f"Account-{other} and Account-{snum} both authenticate "
+                        f"{name_of(names, other)} and {name_of(names, snum)} both authenticate "
                         f"as {email} — remove or re-login one of them."
                     )
                 elif not other:
@@ -6544,6 +6620,7 @@ class ClaudeAccountSwitcher:
         report that account's usage — same lockstep signature, different
         cause.
         """
+        names = self.account_names()
         seen: dict[tuple, str] = {}
         out: list[str] = []
         for num, _email, _org_name, _org_uuid, _is_active, _creds, _alias in accounts_info:
@@ -6565,7 +6642,7 @@ class ClaudeAccountSwitcher:
             other = seen.get(key)
             if other:
                 out.append(
-                    f"Account-{other} and Account-{snum} report identical "
+                    f"{name_of(names, other)} and {name_of(names, snum)} report identical "
                     "usage and reset times — they may be the same account "
                     "(issue #117). If it persists, log in with the missing "
                     "account and re-add it: cc-swap add --slot N"
@@ -6583,6 +6660,7 @@ class ClaudeAccountSwitcher:
         active_num: int | None = None
         accounts = []
         seq_data = self._get_sequence_data() or {}
+        names = self.account_names(seq_data)
         now = self._usage_store.clock()
         for num, email, org_name, org_uuid, is_active, creds, alias in accounts_info:
             if is_active:
@@ -6607,6 +6685,7 @@ class ClaudeAccountSwitcher:
                     disabled=self._disabled_from_data(seq_data, str(num)),
                     login_expires_at=oauth.login_expires_at_iso(creds),
                     login_expired=oauth.is_login_expired(creds),
+                    name=name_of(names, num, email),
                 )
             )
         payload = {
@@ -6661,19 +6740,29 @@ class ClaudeAccountSwitcher:
         if json_output:
             return self._build_list_payload(accounts_info, entries)
 
+        from claude_swap.maximize.names import short_name
+
         seq_data = self._get_sequence_data() or {}
+        names = self.account_names(seq_data)
         print(bolded("Accounts:"))
         for i, (num, email, org_name, org_uuid, is_active, _, alias) in enumerate(accounts_info):
             tag = self._get_display_tag(email, org_name, org_uuid)
-            label = f"{accent(alias)} ({email})" if alias else email
+            # cc-swap: the display name leads (maximize/names.py); the address
+            # alone says it when the name is just its local part. The slot
+            # number trails, dimmed, for anyone who types numbers.
+            name = name_of(names, num, email)
+            label = (
+                email if email and name == short_name(email)
+                else f"{accent(name)} ({email})" if email else accent(name)
+            )
             markers = ""
             if is_active:
                 markers += f" {bold_accent('(active)')}"
             if self._disabled_from_data(seq_data, str(num)):
                 markers += f" {muted('(disabled)')}"
-            print(f"  {num}: {label} {muted(f'[{tag}]')}{markers}")
+            print(f"  {label} {muted(f'[{tag}]')}{markers} {muted(f'#{num}')}")
             for line in _usage_entry_lines(entries[str(num)]):
-                print(f"     {line}")
+                print(f"    {line}")
             expiry_line = login_expiry_warning_line(
                 accounts_info[i][5], entries[str(num)]
             )
@@ -6683,11 +6772,11 @@ class ClaudeAccountSwitcher:
                     accounts_info[i][5], within_ms=86_400_000
                 )
                 paint = reddened if urgent else yellowed
-                print(f"     {paint(expiry_line)}")
+                print(f"    {paint(expiry_line)}")
 
             if show_token_status:
                 for line in self._token_status_lines(accounts_info[i]):
-                    print(f"     {dimmed('•')} {muted(line)}")
+                    print(f"    {dimmed('•')} {muted(line)}")
             if i < len(accounts_info) - 1:
                 print()
 
@@ -6784,6 +6873,7 @@ class ClaudeAccountSwitcher:
         status, usage = usage_fields(entry.decision_value(), entry.fetched_at)
         active: dict = {
             "number": int(account_num),
+            "name": self.account_name(account_num, current_email, data=data),
             "email": current_email,
             "organizationName": org_name,
             "organizationUuid": org_uuid,
@@ -6837,8 +6927,9 @@ class ClaudeAccountSwitcher:
         if account_num:
             tag = self._get_display_tag(current_email, org_name, current_org_uuid)
             total = len(data.get("accounts", {}))
+            name = self.account_name(account_num, current_email, data=data)
             print(
-                f"{bolded('Status:')} {accent(f'Account-{account_num}')} "
+                f"{bolded('Status:')} {accent(name)} "
                 f"({current_email} {muted(f'[{tag}]')})"
             )
             print(f"  {dimmed(f'Total managed accounts: {total}')}")
@@ -6884,10 +6975,10 @@ class ClaudeAccountSwitcher:
         switched = from_ref != to_ref
         if switched:
             reason = "switched"
-            message = f"Switched to Account-{to_ref['number']} ({to_ref['email']})"
+            message = f"Switched to {to_ref['name']}"
         else:
             reason = "already-active"
-            message = f"Already on Account-{to_ref['number']} ({to_ref['email']})"
+            message = f"Already on {to_ref['name']}"
         return {
             "schemaVersion": SCHEMA_VERSION,
             "switched": switched,
@@ -6898,6 +6989,10 @@ class ClaudeAccountSwitcher:
             "message": message,
             "warnings": (extra_warnings or []) + op["warnings"],
         }
+
+    def _account_ref(self, number: int | None, email: str) -> dict:
+        """``json_output.account_ref`` carrying the account's display name."""
+        return account_ref(number, email, self.account_name(number, email))
 
     def _switch_noop(
         self,
@@ -6993,6 +7088,7 @@ class ClaudeAccountSwitcher:
             if not preferred:
                 raise ConfigError("No accounts are managed yet")
 
+            names = self.account_names(data)
             target = str(preferred)
             target_disabled = self._disabled_from_data(data, target)
             if target_disabled or not self._account_is_switchable(target):
@@ -7005,9 +7101,9 @@ class ClaudeAccountSwitcher:
                         f"cc-swap add --slot {target})"
                     )
                 if json_output:
-                    warnings.append(f"Skipped Account-{target} {reason}")
+                    warnings.append(f"Skipped {name_of(names, target)} {reason}")
                 else:
-                    print(f"{accent('Skipping')} Account-{target} {console_reason}")
+                    print(f"{accent('Skipping')} {name_of(names, target)} {console_reason}")
                 fallback = next(
                     (str(num) for num in sequence
                      if str(num) != target
@@ -7021,7 +7117,7 @@ class ClaudeAccountSwitcher:
                     ):
                         raise ConfigError(
                             "No accounts remain in rotation. Re-enable one with: "
-                            "cc-swap enable <num|email>"
+                            "cc-swap enable <name>"
                         )
                     raise ConfigError(
                         "No managed accounts have valid stored credentials/config. "
@@ -7041,7 +7137,7 @@ class ClaudeAccountSwitcher:
             # In JSON mode, don't silently auto-add (a surprising side effect in
             # automation) — report it as a structured no-op instead.
             if json_output:
-                ref = account_ref(None, current_email)
+                ref = self._account_ref(None, current_email)
                 return self._switch_noop(
                     strategy=strategy_label,
                     reason="unmanaged-account",
@@ -7053,11 +7149,15 @@ class ClaudeAccountSwitcher:
             self.add_account()
             data = self._get_sequence_data()
             account_num = data.get("activeAccountNumber")
-            print(f"It has been automatically added as Account-{account_num}.")
+            print(
+                "It has been automatically added as "
+                f"{self.account_name(account_num, current_email, data=data)}."
+            )
             print(dimmed("Please run the switch command again to switch to the next account."))
             return None
 
         data = self._get_sequence_data()
+        names = self.account_names(data)
         sequence = data.get("sequence", [])
 
         if len(sequence) < 2:
@@ -7066,7 +7166,7 @@ class ClaudeAccountSwitcher:
                 return self._switch_noop(
                     strategy=strategy_label,
                     reason="only-one-account",
-                    to_ref=account_ref(int(num), current_email) if num else None,
+                    to_ref=self._account_ref(int(num), current_email) if num else None,
                     message="Only one account is managed. Add more accounts to switch between.",
                 )
             print(dimmed("Only one account is managed. Add more accounts to switch between."))
@@ -7081,7 +7181,7 @@ class ClaudeAccountSwitcher:
             current_num = str(active_account) if active_account is not None else None
 
         current_ref = (
-            account_ref(int(current_num), current_email) if current_num else None
+            self._account_ref(int(current_num), current_email) if current_num else None
         )
 
         # Usage-aware "jump to most headroom". Only switches when another
@@ -7106,12 +7206,12 @@ class ClaudeAccountSwitcher:
                         to_ref=current_ref, warnings=warnings,
                         message=(
                             f"Current account usage is unavailable — staying on "
-                            f"Account-{current_num}."
+                            f"{name_of(names, current_num)}."
                         ),
                     )
                 print(dimmed(
                     f"Current account usage is unavailable — staying on "
-                    f"Account-{current_num}. Run cc-swap switch to rotate."
+                    f"{name_of(names, current_num)}. Run cc-swap switch to rotate."
                 ))
                 return None
             if note == "no-comparison":
@@ -7121,12 +7221,12 @@ class ClaudeAccountSwitcher:
                         to_ref=current_ref, warnings=warnings,
                         message=(
                             f"No other account has usage data to compare — staying "
-                            f"on Account-{current_num}."
+                            f"on {name_of(names, current_num)}."
                         ),
                     )
                 print(dimmed(
                     f"No other account has usage data to compare — staying on "
-                    f"Account-{current_num}. Run cc-swap switch to rotate."
+                    f"{name_of(names, current_num)}. Run cc-swap switch to rotate."
                 ))
                 return None
             if note == "incomplete-comparison":
@@ -7136,12 +7236,12 @@ class ClaudeAccountSwitcher:
                         to_ref=current_ref, warnings=warnings,
                         message=(
                             f"No account with known usage has more remaining quota; "
-                            f"some usage is unavailable — staying on Account-{current_num}."
+                            f"some usage is unavailable — staying on {name_of(names, current_num)}."
                         ),
                     )
                 print(dimmed(
                     f"No account with known usage has more remaining quota; some "
-                    f"usage is unavailable — staying on Account-{current_num}."
+                    f"usage is unavailable — staying on {name_of(names, current_num)}."
                 ))
                 return None
             if note == "stay":
@@ -7151,12 +7251,12 @@ class ClaudeAccountSwitcher:
                         to_ref=current_ref, warnings=warnings,
                         message=(
                             f"Already on the account with the most remaining quota "
-                            f"(Account-{current_num})."
+                            f"({name_of(names, current_num)})."
                         ),
                     )
                 print(
                     f"{accent('Already on the account with the most remaining quota')} "
-                    f"(Account-{current_num})."
+                    f"({name_of(names, current_num)})."
                 )
                 return None
             if note == "exhausted":
@@ -7168,12 +7268,12 @@ class ClaudeAccountSwitcher:
                         to_ref=current_ref, warnings=warnings,
                         message=(
                             f"All accounts are at their {limits_label} — staying on "
-                            f"Account-{current_num}."
+                            f"{name_of(names, current_num)}."
                         ),
                     )
                 warning(
                     f"All accounts are at their {limits_label} — staying on "
-                    f"Account-{current_num}."
+                    f"{name_of(names, current_num)}."
                 )
                 return None
             # note == "none": fall through; rotation reports the lack of targets.
@@ -7212,36 +7312,37 @@ class ClaudeAccountSwitcher:
         for offset in range(1, len(sequence)):
             candidate = str(sequence[(current_index + offset) % len(sequence)])
             if self._disabled_from_data(data, candidate):
-                skipped_out[candidate] = f"Account-{candidate} is disabled"
+                skipped_out[candidate] = f"{name_of(names, candidate)} is disabled"
                 if json_output:
-                    warnings.append(f"Skipped Account-{candidate} (disabled)")
+                    warnings.append(f"Skipped {name_of(names, candidate)} (disabled)")
                 else:
-                    print(f"{accent('Skipping')} Account-{candidate} (disabled)")
+                    print(f"{accent('Skipping')} {name_of(names, candidate)} (disabled)")
                 continue
             if not self._account_is_switchable(candidate):
                 skipped_unusable = True
                 if json_output:
                     warnings.append(
-                        f"Skipped Account-{candidate} (no stored credentials/config)"
+                        f"Skipped {name_of(names, candidate)} (no stored credentials/config)"
                     )
                 else:
                     print(
-                        f"{accent('Skipping')} Account-{candidate} "
+                        f"{accent('Skipping')} {name_of(names, candidate)} "
                         f"(no stored credentials/config, re-add with "
                         f"cc-swap add --slot {candidate})"
                     )
                 continue
             dead = self.dead_login_reason(candidate)
             if dead is not None and candidate != str(current_num):
-                skipped_out[candidate] = f"Account-{candidate} cannot be used ({dead})"
+                cname = name_of(names, candidate)
+                skipped_out[candidate] = f"{cname} cannot be used ({dead})"
                 if json_output:
                     warnings.append(
-                        f"Skipped Account-{candidate} ({dead}; {oauth.relogin_fix(candidate)})"
+                        f"Skipped {cname} ({dead}; {oauth.relogin_fix(cname)})"
                     )
                 else:
                     print(
-                        f"{accent('Skipping')} Account-{candidate} "
-                        f"({dead}; {oauth.relogin_fix(candidate)})"
+                        f"{accent('Skipping')} {cname} "
+                        f"({dead}; {oauth.relogin_fix(cname)})"
                     )
                 continue
             if strategy == "next-available":
@@ -7263,10 +7364,10 @@ class ClaudeAccountSwitcher:
                             label = "/".join(at)
                     if json_output:
                         warnings.append(
-                            f"Skipped Account-{candidate} (at {label} limit)"
+                            f"Skipped {name_of(names, candidate)} (at {label} limit)"
                         )
                     else:
-                        print(f"{accent('Skipping')} Account-{candidate} (at {label} limit)")
+                        print(f"{accent('Skipping')} {name_of(names, candidate)} (at {label} limit)")
                     continue
             next_account = candidate
             break
@@ -7283,12 +7384,12 @@ class ClaudeAccountSwitcher:
                     to_ref=current_ref, warnings=warnings,
                     message=(
                         f"All other accounts are at their {limits_label} — staying on "
-                        f"Account-{current_num}."
+                        f"{name_of(names, current_num)}."
                     ),
                 )
             warning(
                 f"All other accounts are at their {limits_label} — staying on "
-                f"Account-{current_num}."
+                f"{name_of(names, current_num)}."
             )
             return None
 
@@ -7297,16 +7398,16 @@ class ClaudeAccountSwitcher:
             # has a dead login: say which, and that nothing switched (exit 1).
             fixes = []
             if any(why.endswith("is disabled") for why in skipped_out.values()):
-                fixes.append("re-enable one with: cc-swap enable <num|email>")
+                fixes.append("re-enable one with: cc-swap enable <name>")
             fixes += [
-                oauth.relogin_fix(num)
+                oauth.relogin_fix(name_of(names, num))
                 for num, why in skipped_out.items()
                 if not why.endswith("is disabled")
             ]
             message = (
                 "No other account is in rotation: "
                 + ", ".join(skipped_out.values())
-                + f". Staying on Account-{current_num}; "
+                + f". Staying on {name_of(names, current_num)}; "
                 + "; or ".join(fixes) + "."
             )
             if json_output:
@@ -7349,10 +7450,10 @@ class ClaudeAccountSwitcher:
                         from_ref=current_ref,
                         to_ref=current_ref,
                         warnings=warnings,
-                        message=f"Already on Account-{next_account} ({current_email})",
+                        message=f"Already on {name_of(names, next_account, current_email)}",
                     )
                 print(
-                    f"{accent('Already on')} Account-{next_account} ({current_email})"
+                    f"{accent('Already on')} {name_of(names, next_account, current_email)}"
                 )
                 return None
 
@@ -7405,6 +7506,9 @@ class ClaudeAccountSwitcher:
                     if acc.get("email") == identifier
                 ]
                 if len(matches) > 1:
+                    from claude_swap.maximize.names import match_name
+
+                    names = self.account_names(data)
                     print(f"Multiple accounts found for '{identifier}':")
                     for num in matches:
                         acc = data["accounts"][num]
@@ -7413,9 +7517,13 @@ class ClaudeAccountSwitcher:
                             acc.get("organizationName", ""),
                             acc.get("organizationUuid", ""),
                         )
-                        print(f"  {num}: {identifier} {muted(f'[{tag}]')}")
-                    choice = input("Enter account number to switch to: ").strip()
-                    if not choice.isdigit() or choice not in matches:
+                        print(f"  {name_of(names, num)} {muted(f'[{tag}]')}")
+                    choice = input("Enter the name of the account to switch to: ").strip()
+                    if not (choice.isdigit() and choice in matches):
+                        choice = match_name(
+                            {n: names[n] for n in matches if n in names}, choice
+                        ) or ""
+                    if choice not in matches:
                         print(dimmed("Cancelled"))
                         return None
                     identifier = choice
@@ -7428,7 +7536,7 @@ class ClaudeAccountSwitcher:
 
         data = self._get_sequence_data()
         if target_account not in data.get("accounts", {}):
-            raise AccountNotFoundError(f"Account-{target_account} does not exist")
+            raise AccountNotFoundError(f"No account found with identifier: {identifier}")
 
         # Short-circuit a no-op before mutating (issue #79). A self-switch
         # would first back up the live credentials into the target slot —
@@ -7455,15 +7563,13 @@ class ClaudeAccountSwitcher:
                     email = (
                         data.get("accounts", {}).get(target_account, {}).get("email", "")
                     )
-                    ref = account_ref(int(target_account), email)
+                    ref = self._account_ref(int(target_account), email)
                     if not json_output:
-                        print(
-                            f"{accent('Already on')} Account-{target_account} ({email})"
-                        )
+                        print(f"{accent('Already on')} {ref['name']}")
                         print(dimmed(
                             "To rewrite the live login from the stored backup "
                             "(e.g. after --import), run: "
-                            f"cc-swap switch {target_account} --force"
+                            f"cc-swap switch {cli_arg(ref['name'])} --force"
                         ))
                         return None
                     return self._switch_noop(
@@ -7471,7 +7577,7 @@ class ClaudeAccountSwitcher:
                         reason="already-active",
                         from_ref=ref,
                         to_ref=ref,
-                        message=f"Already on Account-{target_account} ({email})",
+                        message=f"Already on {ref['name']}",
                     )
         if not allow_dead_login and data:
             refused = self._refuse_dead_target(
@@ -7503,9 +7609,7 @@ class ClaudeAccountSwitcher:
         if result is not None and force and not result["switched"]:
             to = result["to"]
             result["reason"] = "activated"
-            result["message"] = (
-                f"Activated Account-{to['number']} ({to['email']}) from stored backup"
-            )
+            result["message"] = f"Activated {to['name']} from stored backup"
         return result
 
     def _refuse_dead_target(
@@ -7526,21 +7630,22 @@ class ClaudeAccountSwitcher:
         dead = self.dead_login_reason(target)
         if dead is None:
             return None
-        override = f"cc-swap switch {target} --allow-dead-login"
+        name = self.account_name(target, data=data)
+        override = f"cc-swap switch {cli_arg(name)} --allow-dead-login"
         message = (
-            f"Not switching to Account-{target}: its stored login cannot be used "
+            f"Not switching to {name}: its stored login cannot be used "
             f"({dead}), so Claude Code would be logged out. "
-            f"Fix: {oauth.relogin_fix(target)}. "
+            f"Fix: {oauth.relogin_fix(name)}. "
             f"To switch anyway: {override}"
         )
         if not json_output:
             raise SwitchRefusedError(message, reason="login-dead")
         email = (data.get("accounts", {}).get(str(current), {}) or {}).get("email", "")
-        ref = account_ref(int(current), email) if current else None
+        ref = self._account_ref(int(current), email) if current else None
         payload = self._switch_noop(
             strategy="direct", reason="login-dead", to_ref=ref, message=message,
         )
-        payload["target"] = account_ref(
+        payload["target"] = self._account_ref(
             int(target), data.get("accounts", {}).get(target, {}).get("email", "")
         )
         payload["loginProblem"] = dead
@@ -7573,23 +7678,25 @@ class ClaudeAccountSwitcher:
             places = []
         if not places:
             return None
-        override = f"cc-swap switch {target} --allow-dead-login"
+        names = self.account_names(data)
+        name = name_of(names, target, email)
+        override = f"cc-swap switch {cli_arg(name)} --allow-dead-login"
         message = (
-            f"Not switching to Account-{target}: its login is also held by "
+            f"Not switching to {name}: its login is also held by "
             f"{', '.join(label for label, _slot in places)}, and a refresh token "
             "works once — Claude Code's first refresh would log that copy out. "
-            f"Fix: {shared_login.fix([target, *(s for _l, s in places if s)])}. "
+            f"Fix: {shared_login.fix([target, *(s for _l, s in places if s)], names)}. "
             f"To switch anyway: {override}"
         )
         if not json_output:
             raise SwitchRefusedError(message, reason=shared_login.SHARED_LOGIN)
         cur_email = (data.get("accounts", {}).get(str(current), {}) or {}).get("email", "")
-        ref = account_ref(int(current), cur_email) if current else None
+        ref = self._account_ref(int(current), cur_email) if current else None
         payload = self._switch_noop(
             strategy="direct", reason=shared_login.SHARED_LOGIN, to_ref=ref,
             message=message,
         )
-        payload["target"] = account_ref(int(target), email)
+        payload["target"] = self._account_ref(int(target), email)
         payload["override"] = override
         return payload
 
@@ -7643,10 +7750,10 @@ class ClaudeAccountSwitcher:
         provenance = self._prefetch_live_identity()
         if provenance.get("resolved") is None:
             self._logger.info(
-                "Live credential diverges from Account-%s's stored backup "
+                "Live credential diverges from %s's stored backup "
                 "and ownership could not be verified; self-switch left "
                 "everything untouched (pre-fix no-op).",
-                slot,
+                self.account_name(slot),
             )
             return "noop-diverged", None
         return "reconcile", provenance
@@ -7902,10 +8009,10 @@ class ClaudeAccountSwitcher:
             dedupe=reason in ("behind", "replaced-login"),
         )
         self._logger.warning(
-            "Live credential does not belong to Account-%s (%s): stashed as %s "
+            "Live credential does not belong to %s (%s): stashed as %s "
             "(credentials mtime %s). Something outside cswap rewrote the live "
             "login after the last switch.",
-            current_account,
+            self.account_name(current_account),
             reason,
             entry_id,
             creds_mtime or "unknown",
@@ -7928,17 +8035,18 @@ class ClaudeAccountSwitcher:
         )
         if creds:
             return creds
+        name = self.account_name(account_num, email)
         if unreadable:
             # The backup may exist but the Keychain cannot be read right now
             # (locked / non-GUI session) — a re-add would needlessly burn the
             # stored grant.
             raise SwitchError(
-                f"Account-{account_num}'s backup is in the macOS Keychain "
+                f"{name}'s backup is in the macOS Keychain "
                 f"but it is unreadable right now (locked or no GUI "
                 f"session). Retry from a GUI terminal; do not re-add."
             )
         raise SwitchError(
-            f"Account-{account_num} has no stored credentials. "
+            f"{name} has no stored credentials. "
             f"Re-add with: cc-swap add --slot {account_num}"
         )
 
@@ -8029,6 +8137,7 @@ class ClaudeAccountSwitcher:
         pre_data = self._get_sequence_data() or {}
         pre_account = pre_data.get("accounts", {}).get(target_account, {})
         pre_email = pre_account.get("email", "")
+        names = self.account_names(pre_data)
         if pre_email:
             pre_org = pre_account.get("organizationUuid", "") or ""
             sessions, unreadable = scan_live_sessions(
@@ -8044,7 +8153,7 @@ class ClaudeAccountSwitcher:
                         else f"{unreadable} session record(s) that could not be read"
                     )
                     raise SwitchError(
-                        f"Account-{target_account} ({pre_email}) has {who}, and "
+                        f"{name_of(names, target_account, pre_email)} has {who}, and "
                         "its session profile's credential has rotated past the "
                         "stored backup: the backup is a consumed generation, and "
                         "activating it would fail with invalid_grant on its first "
@@ -8054,13 +8163,13 @@ class ClaudeAccountSwitcher:
                     )
                 if pids:
                     msg = (
-                        f"Account-{target_account} ({pre_email}) has a live "
+                        f"{name_of(names, target_account, pre_email)} has a live "
                         "session-mode Claude instance "
                         f"(PID {', '.join(map(str, pids))}). Running the same "
                         "account as both the default login and a session can make "
                         "one copy's token go stale if the server rotates it. If the "
                         "session later fails to authenticate, exit it and re-run "
-                        f"'cswap run {target_account}'."
+                        f"'cswap run {cli_arg(name_of(names, target_account, pre_email))}'."
                     )
                     if emit_output:
                         warning(msg)
@@ -8093,7 +8202,8 @@ class ClaudeAccountSwitcher:
             active_account = data.get("activeAccountNumber")
             current_account = str(active_account) if active_account is not None else None
             target_email = data["accounts"][target_account]["email"]
-            to_ref = account_ref(int(target_account), target_email)
+            names = self.account_names(data)
+            to_ref = self._account_ref(int(target_account), target_email)
             current_identity = self._get_current_account()
             if current_identity is not None:
                 current_email, current_org_uuid = current_identity
@@ -8118,16 +8228,16 @@ class ClaudeAccountSwitcher:
                 if current_identity is None:
                     from_ref = None
                 elif current_account is None:
-                    from_ref = account_ref(None, current_identity[0])
+                    from_ref = self._account_ref(None, current_identity[0])
                 else:
-                    from_ref = account_ref(int(current_account), current_identity[0])
+                    from_ref = self._account_ref(int(current_account), current_identity[0])
                 target_creds = self._read_target_credentials(
                     target_account, target_email
                 )
                 target_config = self._read_account_config(target_account, target_email)
                 if not target_config:
                     raise SwitchError(
-                        f"Account-{target_account} has no stored config backup. "
+                        f"{name_of(names, target_account, target_email)} has no stored config backup. "
                         f"Re-add with: cc-swap add --slot {target_account}"
                     )
                 try:
@@ -8280,6 +8390,8 @@ class ClaudeAccountSwitcher:
                             )
                     raise
 
+                # Slot numbers on purpose: maximize/ledger.py parses these two
+                # lines (_ACTIVATED_RE); internal, never shown to the user.
                 if force_activate and current_identity is not None:
                     self._logger.info(
                         f"Activated account {target_account} "
@@ -8291,7 +8403,7 @@ class ClaudeAccountSwitcher:
                     )
                 if emit_output:
                     print(
-                        f"{accent('Activated')} Account-{target_account} ({target_email})"
+                        f"{accent('Activated')} {name_of(names, target_account, target_email)}"
                     )
                     print()
                     self._print_switch_followup()
@@ -8304,7 +8416,7 @@ class ClaudeAccountSwitcher:
                 return {"from": from_ref, "to": to_ref, "warnings": warnings_out}
 
             current_email, _ = current_identity
-            from_ref = account_ref(int(current_account), current_email)
+            from_ref = self._account_ref(int(current_account), current_email)
 
             # Create transaction for rollback capability
             try:
@@ -8367,7 +8479,7 @@ class ClaudeAccountSwitcher:
                         provenance.get("resolved"),
                     )
                     self._logger.info(
-                        f"Kept account {current_account}'s stored login (the "
+                        f"Kept {name_of(names, current_account)}'s stored login (the "
                         "new login cc-swap login stored); the live one was "
                         "stashed"
                     )
@@ -8384,8 +8496,8 @@ class ClaudeAccountSwitcher:
                         msg = (
                             "Credential ownership mismatch detected. The live "
                             "credential was preserved and was not written "
-                            f"into Account-{current_account}. If Account-"
-                            f"{foreign_slot} later cannot authenticate, log "
+                            f"into {name_of(names, current_account)}. If "
+                            f"{name_of(names, foreign_slot)} later cannot authenticate, log "
                             "in as it and run: cc-swap add --slot "
                             f"{foreign_slot}"
                         )
@@ -8393,7 +8505,7 @@ class ClaudeAccountSwitcher:
                         msg = (
                             "The live credential was previously identified "
                             "as another account's. It was preserved and not "
-                            f"written into Account-{current_account}. If the "
+                            f"written into {name_of(names, current_account)}. If the "
                             "owning account later cannot authenticate, log "
                             "in as it and run: cc-swap add"
                         )
@@ -8401,7 +8513,7 @@ class ClaudeAccountSwitcher:
                         msg = (
                             "The live login does not match a managed "
                             "account. It was preserved and not written into "
-                            f"Account-{current_account}. If you need that "
+                            f"{name_of(names, current_account)}. If you need that "
                             "account, log in as it and run: cc-swap add"
                         )
                     if emit_output:
@@ -8414,9 +8526,9 @@ class ClaudeAccountSwitcher:
                     # may be written.
                     msg = (
                         "Credential ownership mismatch detected. The live "
-                        f"credential already matches Account-{foreign_slot}'s "
+                        f"credential already matches {name_of(names, foreign_slot)}'s "
                         "stored backup, so nothing was written into "
-                        f"Account-{current_account}."
+                        f"{name_of(names, current_account)}."
                     )
                     if emit_output:
                         warning(msg)
@@ -8429,7 +8541,7 @@ class ClaudeAccountSwitcher:
                         current_account, current_email, original_config
                     )
                     self._logger.info(
-                        f"Backed up account {current_account} (config only; the "
+                        f"Backed up {name_of(names, current_account)} (config only; the "
                         "live credential holds no Claude login, only MCP logins)"
                     )
                 elif kind == "wiped":
@@ -8446,7 +8558,7 @@ class ClaudeAccountSwitcher:
                     msg = (
                         "The live credential's tokens were wiped (Claude "
                         "Code clears them when a refresh is rejected). "
-                        f"Account-{current_account}'s stored backup was "
+                        f"{name_of(names, current_account)}'s stored backup was "
                         "kept. If the account cannot authenticate after "
                         "switching back, log in with Claude Code and run: "
                         "cc-swap add"
@@ -8472,7 +8584,7 @@ class ClaudeAccountSwitcher:
                         current_account, current_email, original_config
                     )
                     self._logger.info(
-                        f"Backed up account {current_account} (lineage "
+                        f"Backed up {name_of(names, current_account)} (lineage "
                         "differs from the stored backup and ownership could "
                         "not be verified — pre-fix backup)"
                     )
@@ -8486,7 +8598,7 @@ class ClaudeAccountSwitcher:
                         current_account, current_email, original_config
                     )
                     self._logger.info(
-                        f"Backed up account {current_account} (config only; "
+                        f"Backed up {name_of(names, current_account)} (config only; "
                         "credentials unchanged)"
                     )
                 else:  # own-family / own-rotated
@@ -8504,7 +8616,7 @@ class ClaudeAccountSwitcher:
                         acct = data.get("accounts", {}).get(current_account, {})
                         if not acct.get("uuid") and resolved.get("uuid"):
                             acct["uuid"] = resolved["uuid"]
-                    self._logger.info(f"Backed up account {current_account}")
+                    self._logger.info(f"Backed up {name_of(names, current_account)}")
 
                 # Step 2: Retrieve target account
                 target_creds = self._read_target_credentials(
@@ -8514,7 +8626,7 @@ class ClaudeAccountSwitcher:
 
                 if not target_config:
                     raise SwitchError(
-                        f"Account-{target_account} has no stored config backup. "
+                        f"{name_of(names, target_account, target_email)} has no stored config backup. "
                         f"Re-add with: cc-swap add --slot {target_account}"
                     )
 
@@ -8561,6 +8673,8 @@ class ClaudeAccountSwitcher:
                 self._write_json(self.sequence_file, data)
                 transaction.record_step("sequence_updated")
 
+                # Slot numbers on purpose: maximize/ledger.py parses this
+                # line (_SWITCHED_RE); internal, never shown to the user.
                 self._logger.info(
                     f"Switched from account {current_account} to {target_account}"
                 )
@@ -8587,7 +8701,7 @@ class ClaudeAccountSwitcher:
         # only — suppressed in JSON mode (the nested list_accounts() would
         # otherwise leak human output onto the JSON stdout).
         if emit_output:
-            print(f"{accent('Switched to')} Account-{target_account} ({target_email})")
+            print(f"{accent('Switched to')} {name_of(names, target_account, target_email)}")
             try:
                 self.list_accounts()
             except Exception as e:

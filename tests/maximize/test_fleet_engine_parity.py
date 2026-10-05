@@ -255,7 +255,7 @@ def test_the_summary_counts_only_trusted_readings():
     rows = fx.fleet_rows(snap, MX, PRIME, MaximizeState(), now=NOW)
     cap = home.capacity(rows, MX, NOW)
     assert cap.usable == 3 and cap.free5 == 2       # #1 and #3
-    assert cap.back5 == (NOW + H, "4")
+    assert cap.back5 == (NOW + H, "u4")
     assert cap.left7 == pytest.approx((60 + 95 + 80) / 100)
 
 

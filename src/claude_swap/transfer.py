@@ -241,16 +241,19 @@ def export_accounts(
             creds_text = switcher._read_account_credentials(num, email)
             config_text = switcher._read_account_config(num, email)
             if not creds_text or not config_text:
+                from claude_swap.maximize.names import labeled, record_names, name_of
+
+                shown = labeled(name_of(record_names(accounts_map), num, email), email)
                 if explicit_account:
                     if not creds_text:
                         raise CredentialReadError(
-                            f"no backup credentials found for account {num} ({email})"
+                            f"no backup credentials found for {shown}"
                         )
                     raise ConfigError(
-                        f"no backup config found for account {num} ({email})"
+                        f"no backup config found for {shown}"
                     )
                 _eprint(
-                    f"Skipping Account-{num} ({email}): no stored "
+                    f"Skipping {shown}: no stored "
                     f"credentials/config — re-add with: "
                     f"cc-swap add --slot {num}"
                 )
@@ -533,7 +536,7 @@ def import_accounts(
             live_pids = switcher._live_session_pids(target_num, entry["email"])
             if live_pids:
                 _eprint(
-                    f"Warning: {entry['email']} (slot {target_num}) has a live "
+                    f"Warning: {entry['email']} has a live "
                     f"session-mode instance (PID {', '.join(map(str, live_pids))}); "
                     "its session profile keeps the pre-import credentials until "
                     "it is restarted via 'cswap run'."
@@ -590,7 +593,7 @@ def import_accounts(
         written_slots.add(target_num)
 
         if outcome == "overwrote":
-            _eprint(f"Overwrote {entry['email']} (slot {target_num})")
+            _eprint(f"Overwrote {entry['email']}")
             if had_strike:
                 # Store-fact wording on purpose: import rewrites the backup,
                 # so for the active slot the next poll may still exercise the
@@ -612,12 +615,12 @@ def import_accounts(
             # Describe the observed trigger (the quarantine verdict), not the
             # token itself — a stale verdict can sit over newer working creds.
             _eprint(
-                f"Replaced {entry['email']} (slot {target_num} was "
+                f"Replaced {entry['email']} (it was "
                 "quarantined: refresh token dead)"
             )
             replaced += 1
         else:
-            _eprint(f"Imported {entry['email']} → slot {target_num}")
+            _eprint(f"Imported {entry['email']}")
             imported += 1
 
     # Migration UX: if the destination has no recorded active account
@@ -752,9 +755,9 @@ def import_usage(
     adopted = switcher._usage_store.adopt(readings, identities, hold_s=hold_s)
     for num, (email, _org_uuid) in identities.items():
         if num in adopted:
-            _eprint(f"Adopted usage for {email} → slot {num}")
+            _eprint(f"Adopted usage for {email}")
         else:
-            _eprint(f"Kept slot {num}'s own reading for {email}: it is newer")
+            _eprint(f"Kept {email}'s own reading: it is newer")
     summary = (
         f"Done: {len(adopted)} adopted, {len(readings) - len(adopted)} kept, "
         f"{skipped} skipped"

@@ -1427,8 +1427,8 @@ class TestMapCommand:
 
         out = capsys.readouterr().out
         assert "Directory mappings" in out
-        assert "work@co.com" in out
-        assert "2:" in out  # slot number resolved
+        assert "→ work [personal]" in out  # by its name
+        assert "2:" not in out  # no slot number
 
     def test_map_list_flags_removed_account(self, temp_home, capsys):
         from claude_swap.mappings import MappingStore

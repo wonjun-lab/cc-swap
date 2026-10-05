@@ -26,10 +26,12 @@ from claude_swap.settings import load_maximize_settings, set_setting, unset_sett
 
 
 def _who(switcher, live: tuple[str, str, str]) -> str:
-    """The live login, by slot number when it is a managed account."""
+    """The live login, by its display name when it is a managed account."""
     data = switcher._get_sequence_data() or {}
     slot = switcher._find_account_slot(data, live[0], live[1])
-    return f"#{slot}" if slot else "an account cc-swap does not manage"
+    return switcher.account_name(slot, live[0], data=data) if slot else (
+        "an account cc-swap does not manage"
+    )
 
 
 NO_NEW_LOGIN = (
@@ -77,7 +79,8 @@ def relogin_store(
     data = switcher._get_sequence_data() or {}
     record = (data.get("accounts") or {}).get(number)
     if not isinstance(record, Mapping):
-        return {"stored": False, "number": number, "reason": f"there is no account #{number}"}
+        return {"stored": False, "number": number,
+                "reason": "that account is no longer managed"}
     live = switcher._get_current_identity_triple()
     if live is None:
         return {
@@ -104,7 +107,10 @@ def relogin_store(
         return {
             "stored": False,
             "number": number,
-            "reason": f"the live login is {_who(switcher, live)}, not #{number}; nothing stored",
+            "reason": (
+                f"the live login is {_who(switcher, live)}, not "
+                f"{switcher.account_name(number, want_email, data=data)}; nothing stored"
+            ),
         }
     switcher.add_account(slot=None, assume_yes=True)
     out: dict = {"stored": True, "number": number}
@@ -122,7 +128,7 @@ def relogin_store(
 def toggle_last_resort_setting(
     backup_root: Path, accounts: Mapping[str, Mapping], number: str
 ) -> bool:
-    """Toggle Account-``number`` in ``maximize.lastResort``; True when it is
+    """Toggle slot ``number``'s account in ``maximize.lastResort``; True when it is
     last-resort afterwards. ``ConfigError`` for a shared email without an
     alias (the entry would mark both accounts)."""
     current = load_maximize_settings(backup_root).last_resort
