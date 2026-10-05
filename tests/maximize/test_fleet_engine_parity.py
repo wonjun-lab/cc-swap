@@ -1,14 +1,14 @@
 """Fleet's ``order`` column and ``next`` tag against the engine's own policy.
 
-For every fixture the engine's snapshot is built the way ``engine_hook``
-builds it — ``build_snapshot`` over ``UsageEntry.decision_value()`` (a
-reading too old to trust is unknown), the stored records, accounts without
-a usable backup and logins shared with another place
-(``shared_login.shared_slots``) set aside — independently of Fleet's code.
-Fleet's numbered rows, in order, must be ``policy.landing_candidates`` of
-that snapshot; its dim ``·`` rows the rest of ``policy.escape_candidates``;
-and its ``next`` the target the engine's decision moves to, whenever it
-moves.
+For every fixture the engine's snapshot is built by the engine's own
+assembly, ``engine_hook.policy_snapshot`` (the function
+``run_maximize_tick`` calls): ``UsageEntry.decision_value()`` (a reading too
+old to trust is unknown), the stored records, accounts without a usable
+backup and logins shared with another place set aside — independently of
+Fleet's code. Fleet's numbered rows, in order, must be
+``policy.landing_candidates`` of that snapshot; its dim ``·`` rows the rest
+of ``policy.escape_candidates``; and its ``next`` the target the engine's
+decision moves to, whenever it moves.
 """
 
 from __future__ import annotations
@@ -22,12 +22,11 @@ from claude_swap.json_output import (
     USAGE_KEYCHAIN_UNAVAILABLE,
     USAGE_RELOGIN_REQUIRED,
 )
+from claude_swap.maximize import engine_hook, home, policy
 from claude_swap.maximize import fleet as fx
-from claude_swap.maximize import home, policy
 from claude_swap.maximize.model import Hold, Switch
-from claude_swap.maximize.snapshot import build_snapshot
 from claude_swap.maximize.view import MaximizeState
-from claude_swap.shared_login import SHARED_LOGIN, shared_slots
+from claude_swap.shared_login import SHARED_LOGIN
 from claude_swap.usage_store import UsageEntry
 from tests.maximize.test_fleet import H, MX, NOW, PRIME, acc, accounts, mockup, usage
 
@@ -39,23 +38,26 @@ def _old(pct5, pct7, *, age_s, trusted=False, reset5=None) -> UsageEntry:
 
 
 def _engine_snapshot(snap, mx, state):
-    """What ``engine_hook.run_maximize_tick`` decides on, from the same store."""
+    """What ``engine_hook.run_maximize_tick`` decides on, from the same
+    store: its own assembly (``engine_hook.policy_snapshot``) over what the
+    tick reads — the usage entries and their decision values
+    (``autoswitch``: ``entry.decision_value()``), the ``sequence.json``
+    records, the switchable slots (``switchable_account_numbers``: a usable
+    backup, not disabled)."""
+    entries = {a.number: a.usage for a in snap.accounts}
     records = {
-        a.number: {"email": a.email, "alias": a.alias, "disabled": a.disabled}
+        a.number: {"email": a.email, "alias": a.alias, "disabled": a.disabled,
+                   **({"kind": "api_key"} if a.kind == "api_key" else {})}
         for a in snap.accounts
     }
-    unavailable = {
-        a.number for a in snap.accounts
-        if a.number != snap.active_number and not a.switchable and not a.disabled
-    }
-    shared = shared_slots({a.number: a.usage for a in snap.accounts}, snap.active_number)
-    return build_snapshot(
+    esnap, _shared = engine_hook.policy_snapshot(
         now=NOW,
-        active=snap.active_number,
-        usage={a.number: a.usage.decision_value() for a in snap.accounts},
+        current=snap.active_number,
+        entries=entries,
+        usage={n: e.decision_value() for n, e in entries.items()},
         records=records,
-        quarantined=set(state.quarantined) | unavailable | shared,
-        api_key_accounts={a.number for a in snap.accounts if a.kind == "api_key"},
+        quarantined=set(state.quarantined),
+        switchable={a.number for a in snap.accounts if a.switchable and not a.disabled},
         rate_limit_tiers={a.number: state.plans.get(a.number) for a in snap.accounts},
         samples=state.samples if state.samples_account == snap.active_number else (),
         last_switch_at=state.last_switch_at,
@@ -65,6 +67,7 @@ def _engine_snapshot(snap, mx, state):
             for a in snap.accounts if a.login_expires_at is not None
         },
     )
+    return esnap
 
 
 def _deadline(acc_snapshot, seconds):

@@ -546,7 +546,9 @@ class AutoScreen(Screen):
         hold's reason, else the pending-switch line).
 
         Built from the store snapshot and the state file the engine itself
-        reads, so it reads the same whether the engine runs here or elsewhere.
+        reads, so it reads the same whether the engine runs here or elsewhere:
+        Fleet's snapshot (``fleet.fleet_snapshot``) — the readings the engine
+        trusts, slots without a usable backup and shared logins set aside.
         """
         palette = Palette.from_theme(self.app.current_theme)
         now = time.time()
@@ -554,7 +556,7 @@ class AutoScreen(Screen):
         text.append("Maximize — tier · score · landable · 5h window", style=palette.muted)
         try:
             state = mxview.read_state(self.app.switcher.backup_dir)
-            msnap = mxview.snapshot_from_accounts(snap, self._mx, state, now=now)
+            msnap = mxfleet.fleet_snapshot(snap, self._mx, state, now=now)
             ranked = mxview.rows(msnap, state.primes)
             waiting = mxview.pending(msnap)
             decided = mxfleet.decision_view(

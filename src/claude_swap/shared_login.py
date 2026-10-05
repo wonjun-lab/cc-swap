@@ -85,13 +85,23 @@ def shared_slots(entries: Mapping[str, object], active: str | None) -> set[str]:
     }
 
 
-def skip_text(numbers: list[str]) -> str:
-    """``#2 shares its login — re-login one of them`` (``cc-swap why``)."""
-    if not numbers:
-        return ""
-    who = ", ".join(f"#{n}" for n in numbers)
-    verb = "shares its" if len(numbers) == 1 else "share their"
-    return f"{who} {verb} login — re-login one of them ({fix(numbers).split(': ', 1)[1]})"
+def skip_text(
+    numbers: list[str],
+    partners: Mapping[str, list[tuple[str, str | None]]] | None = None,
+) -> str:
+    """``#2 shares its login with #3 — re-login one of them (cc-swap login 2
+    or cc-swap login 3)`` for ``cc-swap why``: each slot set aside, the
+    places that hold its login too (``partners``: slot -> ``(label, slot to
+    re-login or None)``, as ``switcher.shared_login_places`` and doctor name
+    them), and the fix. Without ``partners``: ``#2 shares its login —
+    re-login one of them (cc-swap login 2)``."""
+    parts = []
+    for n in numbers:
+        places = list((partners or {}).get(n) or [])
+        with_ = f" with {', '.join(label for label, _slot in places)}" if places else ""
+        remedy = fix([n, *(slot for _label, slot in places if slot)]).split(": ", 1)[1]
+        parts.append(f"#{n} shares its login{with_} — re-login one of them ({remedy})")
+    return "; ".join(parts)
 
 
 def fix(numbers: list[str]) -> str:

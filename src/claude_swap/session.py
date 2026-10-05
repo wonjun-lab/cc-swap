@@ -1034,6 +1034,7 @@ class SessionManager:
         self._logger.info(
             f"Bootstrapped session profile for account {account_num} at {session_dir}"
         )
+        self._recheck_shared_logins()  # its old copy may have been shared
 
     @staticmethod
     def _has_refresh_token(creds: str) -> bool:
@@ -1049,6 +1050,14 @@ class SessionManager:
         delete_macos_keychain_entry(session_dir)
         shutil.rmtree(session_dir, ignore_errors=True)
         clear_session_stale(session_dir)
+        self._recheck_shared_logins()
+
+    def _recheck_shared_logins(self) -> None:
+        """cc-swap fork: a profile gone (or re-seeded) can end a shared
+        login (``switcher._recheck_shared_logins``)."""
+        recheck = getattr(self.switcher, "_recheck_shared_logins", None)
+        if recheck is not None:
+            recheck()
 
     # -- validation ------------------------------------------------------
 

@@ -396,16 +396,51 @@ def _records(engine: aw.AutoSwitchEngine, current: str) -> dict[str, dict]:
     return out
 
 
-def _unavailable(
-    engine: aw.AutoSwitchEngine, records: Mapping[str, Mapping], current: str
+def unavailable_slots(
+    records: Mapping[str, Mapping], current: str | None, switchable: set[str]
 ) -> set[str]:
-    """Enabled slots without usable stored backups (cannot be activated)."""
-    switchable = set(engine.switcher.switchable_account_numbers())
+    """Enabled slots other than ``current`` not in ``switchable`` (no usable
+    stored backup: they cannot be activated)."""
     return {
         n
         for n, r in records.items()
         if n != current and n not in switchable and not r.get("disabled")
     }
+
+
+def policy_snapshot(
+    *,
+    now: float,
+    current: str | None,
+    entries: Mapping[str, Any],
+    usage: Mapping[str, dict | str | None],
+    records: Mapping[str, Mapping],
+    quarantined: set[str] | frozenset[str],
+    switchable: set[str],
+    **inputs: Any,
+) -> tuple[Snapshot, set[str]]:
+    """The policy's input for one tick, and the slots set aside as shared.
+    Pure: everything read from disk is passed in, so a test (Fleet's
+    parity test) builds exactly what the engine decides on.
+
+    ``usage``: the decision values (``UsageEntry.decision_value``) per slot;
+    ``entries``: the usage entries they came from. Set aside like a dead
+    login (``quarantined``): slots without a usable backup
+    (:func:`unavailable_slots`) and logins also held elsewhere
+    (``shared_login.shared_slots``: a switch onto one is refused, so no
+    decision may target it). ``inputs`` go to ``build_snapshot`` as they are
+    (plans, samples, deadlines, forecast, hold, ride state …)."""
+    shared = shared_login.shared_slots(entries, current) & set(records)
+    snap = build_snapshot(
+        now=now,
+        active=current,
+        usage=usage,
+        records=records,
+        quarantined=set(quarantined) | unavailable_slots(records, current, switchable) | shared,
+        api_key_accounts={n for n, r in records.items() if r.get("kind") == "api_key"},
+        **inputs,
+    )
+    return snap, shared
 
 
 def _rate_limit_tiers(
@@ -1473,16 +1508,14 @@ def run_maximize_tick(
     )
     last = state.get("lastSwitchAt")
     tiers = _rate_limit_tiers(engine, rt, records, now)
-    # A login also held elsewhere (shared_login.py): a switch onto it is
-    # refused, so the policy never targets it (from the entries in hand).
-    shared = shared_login.shared_slots(entries, current) & set(records)
-    snap = build_snapshot(
+    snap, shared = policy_snapshot(
         now=now,
-        active=current,
+        current=current,
+        entries=entries,
         usage=usage,
         records=records,
-        quarantined=set(quarantined) | _unavailable(engine, records, current) | shared,
-        api_key_accounts={n for n, r in records.items() if r.get("kind") == "api_key"},
+        quarantined=quarantined,
+        switchable=set(engine.switcher.switchable_account_numbers()),
         rate_limit_tiers=tiers,
         samples=samples,
         last_switch_at=(

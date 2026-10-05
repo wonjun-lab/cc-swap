@@ -561,6 +561,9 @@ def import_accounts(
         switcher._usage_store.clear_dead_token(
             [target_num], {target_num: (entry["email"], entry["org_uuid"])}
         )
+        recheck = getattr(switcher, "_recheck_shared_logins", None)
+        if recheck is not None:  # cc-swap fork: an import can end a shared login
+            recheck()
 
         data.setdefault("accounts", {})
         data.setdefault("sequence", [])

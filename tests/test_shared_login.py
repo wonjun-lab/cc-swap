@@ -437,3 +437,107 @@ def test_two_api_key_slots_with_the_same_key_are_not_refused(temp_home):
     s._write_json(s.sequence_file, data)
     assert s.shared_login_places("2", "sk-ant-api03-same", is_active=False) == []
     assert s._refuse_shared_target("2", (_email(1), ""), False) is None
+
+
+# -- ending a share: the set-aside slot is re-checked at once ----------------------------
+
+
+def _flag_shared(s, n: int, *, now: float) -> None:
+    """What a pass leaves on a slot the consume gate refused: the error and
+    its backoff (up to 600 s)."""
+    def apply(_num, row):
+        row.update(lastError=shared_login.SHARED_LOGIN, backoffUntil=now + 600,
+                   consecutiveFailures=1)
+
+    s._usage_store._mutate({str(n): (_email(n), "")}, [str(n)], apply)
+
+
+def _engine_candidates(s) -> list[str]:
+    """The maximize landing candidates the engine would see now."""
+    from claude_swap.maximize import policy
+    from claude_swap.maximize.snapshot import build_snapshot
+    from claude_swap.settings import MaximizeSettings
+
+    identities = {str(n): (_email(n), "") for n in (1, 2, 3)}
+    entries = s._usage_store.entries(identities)
+    usage = {
+        "1": {"five_hour": {"pct": 62}, "seven_day": {"pct": 40}},
+        "2": {"five_hour": {"pct": 0}, "seven_day": {"pct": 10}},
+        "3": {"five_hour": {"pct": 0}, "seven_day": {"pct": 50}},
+    }
+    snap = build_snapshot(
+        now=s._usage_store.clock(), active="1", usage=usage,
+        records={str(n): {"email": _email(n)} for n in (1, 2, 3)},
+        quarantined=shared_login.shared_slots(entries, "1"),
+        api_key_accounts=set(), rate_limit_tiers={}, samples=(), last_switch_at=None,
+        settings=MaximizeSettings(),
+    )
+    return [v.number for v in policy.landing_candidates(snap)]
+
+
+def test_relogging_the_partner_puts_the_shared_slot_back_at_once(temp_home):
+    """#2 shared with #3 and set aside; `cc-swap login 3` ends the share: the
+    next tick has #2 as a candidate again, without waiting out the backoff."""
+    s = _switcher(temp_home)
+    s._write_account_credentials("3", _email(3), _creds("rt-2"))  # #3 got #2's login
+    now = s._usage_store.clock()
+    _flag_shared(s, 2, now=now)
+    assert _engine_candidates(s) == ["3"]
+    entry = s._usage_store.entries({"2": (_email(2), "")})["2"]
+    assert entry.in_backoff(now)
+    s.store_relogin("3", _creds("rt-3-new", expires=FRESH), {
+        "emailAddress": _email(3), "organizationUuid": "", "accountUuid": "uuid-3",
+    }, activate=False)
+    entry = s._usage_store.entries({"2": (_email(2), "")})["2"]
+    assert entry.last_error is None and not entry.in_backoff(now)
+    assert _engine_candidates(s) == ["2", "3"]
+
+
+def test_removing_a_leftover_profile_or_a_slot_rechecks_too(temp_home):
+    s = _switcher(temp_home)
+    now = s._usage_store.clock()
+    _flag_shared(s, 2, now=now)
+    s._delete_session_profile("3", _email(3))  # the leftover profile holding #2's login
+    assert s._usage_store.entries({"2": (_email(2), "")})["2"].last_error is None
+    _flag_shared(s, 2, now=now)
+    s._invalidate_session_credentials("3", _email(3))  # no profile: nothing to do
+    assert s._usage_store.entries({"2": (_email(2), "")})["2"].last_error == (
+        shared_login.SHARED_LOGIN
+    )
+    _profile(s, 3, _creds("rt-2"))
+    s._invalidate_session_credentials("3", _email(3))
+    assert s._usage_store.entries({"2": (_email(2), "")})["2"].last_error is None
+
+
+def test_why_names_the_partner_as_doctor_does(temp_home):
+    from claude_swap.maximize.doctor_cli import _why_lines, shared_partners
+
+    s = _switcher(temp_home)
+    s._write_account_credentials("3", _email(3), _creds("rt-2"))  # #3 got #2's login
+    partners = shared_partners(["2"], switcher=s)
+    assert partners == {"2": [["#3", "3"]]}
+    assert shared_login.skip_text(["2"], {"2": [("#3", "3")]}) == (
+        "#2 shares its login with #3 — re-login one of them "
+        "(cc-swap login 2 or cc-swap login 3)"
+    )
+    why = {"source": "engine", "decision": "hold", "pending": True, "target": "1",
+           "reason": "r", "ageS": 3, "shared": ["2"], "sharedWith": partners}
+    assert "  skipped  #2 shares its login with #3 — re-login one of them " \
+        "(cc-swap login 2 or cc-swap login 3)" in _why_lines(why)
+    # A leftover cswap run profile is named the way doctor names it.
+    s._write_account_credentials("3", _email(3), _creds("rt-3"))
+    _profile(s, 3, _creds("rt-2"))
+    assert shared_partners(["2"], switcher=s) == {"2": [["#3's cswap run profile", "3"]]}
+
+
+def test_clear_error_touches_only_that_error(temp_home):
+    s = _switcher(temp_home)
+    now = s._usage_store.clock()
+    _flag_shared(s, 2, now=now)
+    s._usage_store._mutate({"3": (_email(3), "")}, ["3"],
+                           lambda _n, row: row.update(lastError="http-429",
+                                                      backoffUntil=now + 600))
+    assert s._usage_store.clear_error(shared_login.SHARED_LOGIN) == ["2"]
+    third = s._usage_store.entries({"3": (_email(3), "")})["3"]
+    assert third.last_error == "http-429" and third.in_backoff(now)
+    assert s._usage_store.clear_error(shared_login.SHARED_LOGIN) == []

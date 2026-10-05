@@ -283,7 +283,7 @@ def fleet_snapshot(
 ) -> Snapshot:
     """The policy Snapshot the TUI decides on: :func:`view.snapshot_from_accounts`
     with the published plans, and slots without a usable stored login set
-    aside like the engine does (``engine_hook._unavailable``), and so are
+    aside like the engine does (``engine_hook.unavailable_slots``), and so are
     logins also held elsewhere (``shared_login.shared_slots``). ``history``
     (``view.read_history``) gives the decisions Fleet computes itself the
     idle pattern and burn rates the engine's preempt and rebalance deferral

@@ -1021,6 +1021,22 @@ class TestSharedLogin:
         lines = "\n".join(_why_lines(why))
         assert "skipped  #2 shares its login — re-login one of them (cc-swap login 2)" in lines
 
+    def test_the_tick_decides_on_policy_snapshot(self, temp_home):
+        """The assembly Fleet's parity test calls is the one the tick uses."""
+        from claude_swap.maximize import engine_hook
+
+        h = make(temp_home)
+        real, seen = engine_hook.policy_snapshot, []
+
+        def spy(**kwargs):
+            out = real(**kwargs)
+            seen.append(out[0])
+            return out
+
+        with patch.object(engine_hook, "policy_snapshot", spy):
+            h.tick_with_usage({"1": win(62, 40), "2": win(0, 10), "3": win(0, 50)})
+        assert seen and runtime_for(h.engine).last_snapshot is seen[-1]
+
     def test_no_shared_slot_publishes_no_shared_key(self, temp_home):
         h = make(temp_home)
         h.tick_with_usage({"1": win(62, 40), "2": win(0, 10), "3": win(0, 50)})
