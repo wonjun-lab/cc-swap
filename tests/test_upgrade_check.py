@@ -139,7 +139,7 @@ class TestUpgradeCheck:
         assert run_upgrade_check() == 2
 
         err = capsys.readouterr().err
-        assert "could not reach GitHub" in err
+        assert "couldn't reach GitHub" in err
         assert "cannot confirm the latest release" in err
 
     def test_offline_falls_back_to_the_cached_tag_with_a_warning(self, v020, capsys):
@@ -318,7 +318,8 @@ class TestUpgradeWhenGitHubCannotBeAsked:
 
         captured = capsys.readouterr()
         assert (
-            f"could not reach GitHub (rate limited until {until}); "
+            f"GitHub API rate limit reached (resets at {until}); "
+            "couldn't check for a newer cc-swap; "
             "using cached cc-v0.3.1 from 2h ago — it may be out of date"
         ) in captured.err
         assert "cannot confirm the latest release" in captured.err
@@ -343,7 +344,7 @@ class TestUpgradeWhenGitHubCannotBeAsked:
 
         assert run_self_upgrade() == 2
 
-        assert "could not reach GitHub (network error" in capsys.readouterr().err
+        assert "couldn't reach GitHub (network error" in capsys.readouterr().err
 
     def test_force_still_reinstalls_the_cached_tag(self, v031, monkeypatch, capsys):
         _rate_limited(monkeypatch)
@@ -366,7 +367,7 @@ class TestUpgradeWhenGitHubCannotBeAsked:
 
         assert calls == [["uv", "tool", "install", "--force", f"{FORK}@cc-v0.3.2"]]
         err = capsys.readouterr().err
-        assert "could not reach GitHub (rate limited until" in err
+        assert "GitHub API rate limit reached (resets at" in err
         assert "using cached cc-v0.3.2 from 2h ago" in err
         assert "it may be out of date" in err
 
@@ -380,7 +381,7 @@ class TestUpgradeWhenGitHubCannotBeAsked:
 
         assert calls == [["uv", "tool", "install", "--force", FORK]]
         captured = capsys.readouterr()
-        assert "could not reach GitHub (rate limited until" in captured.err
+        assert "GitHub API rate limit reached (resets at" in captured.err
         assert "default branch" in captured.out
 
     def test_an_unauthenticated_rate_limit_suggests_a_token(self, v031, monkeypatch, capsys):
@@ -438,7 +439,8 @@ class TestCheckWhenGitHubCannotBeAsked:
 
         captured = capsys.readouterr()
         assert (
-            f"could not reach GitHub (rate limited until {until}); "
+            f"GitHub API rate limit reached (resets at {until}); "
+            "couldn't check for a newer cc-swap; "
             "using cached cc-v0.3.1 from 2h ago — it may be out of date"
         ) in captured.err
         assert "cannot confirm the latest release" in captured.err
@@ -475,7 +477,7 @@ class TestCheckWhenGitHubCannotBeAsked:
         assert run_upgrade_check() == 2
 
         err = capsys.readouterr().err
-        assert "could not reach GitHub (rate limited until" in err
+        assert "GitHub API rate limit reached (resets at" in err
         assert "cannot confirm the latest release" in err
 
     def test_no_published_release_is_not_a_lookup_failure(self, v031, monkeypatch, capsys):
@@ -484,7 +486,7 @@ class TestCheckWhenGitHubCannotBeAsked:
         assert run_upgrade_check() == 1
 
         err = capsys.readouterr().err
-        assert "could not reach GitHub" not in err
+        assert "couldn't reach GitHub" not in err
         assert "no published" in err.lower()
 
     def test_a_live_answer_is_silent_on_stderr(self, v031, monkeypatch, capsys):
@@ -616,3 +618,246 @@ class TestUpgradeRefreshesTheService:
             assert service.reinstall_command() == [
                 "/x/cc-swap", "service", "install", "--reuse-installed-env",
             ]
+
+
+def _status_error(code: int, body: bytes = b"", **headers: str) -> urllib.error.HTTPError:
+    """An HTTPError carrying a response body (GitHub explains its 403s there)."""
+    import io
+
+    message = http.client.HTTPMessage()
+    for name, value in headers.items():
+        message[name.replace("_", "-")] = value
+    return urllib.error.HTTPError(RELEASES_URL, code, "error", message, io.BytesIO(body))
+
+
+def _answer(monkeypatch, *answers) -> list:
+    """Answer successive requests with ``answers`` (an exception is raised, a
+    payload returned); the last one repeats. Returns the requests seen."""
+    seen: list = []
+    queue = list(answers)
+
+    def _urlopen(req, timeout=None):
+        seen.append(req)
+        answer = queue.pop(0) if len(queue) > 1 else queue[0]
+        if isinstance(answer, BaseException):
+            raise answer
+        return _json_response(answer)
+
+    monkeypatch.setattr("claude_swap.update_check.urllib.request.urlopen", _urlopen)
+    return seen
+
+
+_SECONDARY_LIMIT_BODY = (
+    b'{"message": "You have exceeded a secondary rate limit. Please wait a few '
+    b'minutes before you try again."}'
+)
+_FAILURES = {
+    "403 spent quota": lambda: _status_error(
+        403, X_RateLimit_Remaining="0", X_RateLimit_Reset=str(int(time.time()) + 900)
+    ),
+    "403 body only": lambda: _status_error(403, _SECONDARY_LIMIT_BODY),
+    "429": lambda: _status_error(429, Retry_After="900"),
+}
+
+
+class TestRateLimitIsNeverUpToDate:
+    """Whatever shape GitHub's rate limit takes, a lookup that did not happen
+    must not be reported as "up to date" or "already on ..."."""
+
+    @pytest.mark.parametrize("kind", _FAILURES)
+    @pytest.mark.parametrize("cached", [None, "cc-v0.3.1"])
+    def test_check_exits_2_and_says_the_check_did_not_happen(
+        self, v031, monkeypatch, capsys, kind, cached
+    ):
+        _answer(monkeypatch, _FAILURES[kind]())
+        if cached:
+            _cache_tag(cached, TWO_HOURS)
+
+        assert run_upgrade_check() == uc.EXIT_LOOKUP_FAILED == 2
+
+        captured = capsys.readouterr()
+        err = captured.err
+        assert "GitHub API rate limit reached" in err
+        assert "couldn't check for a newer cc-swap" in err
+        assert "gh auth login" in err
+        assert "cannot confirm the latest release" in err
+        if kind != "403 body only":
+            assert "(resets at " in err
+        if cached:
+            assert "cached cc-v0.3.1 from 2h ago" in err and "may be out of date" in err
+        everything = (captured.out + err).lower()
+        assert "up to date" not in everything and "already on" not in everything
+
+    @pytest.mark.parametrize("kind", _FAILURES)
+    def test_upgrade_exits_2_without_installing(self, v031, monkeypatch, capsys, kind):
+        _answer(monkeypatch, _FAILURES[kind]())
+        _cache_tag("cc-v0.3.1", TWO_HOURS)
+
+        assert run_self_upgrade() == 2
+
+        captured = capsys.readouterr()
+        assert "GitHub API rate limit reached" in captured.err
+        everything = (captured.out + captured.err).lower()
+        assert "up to date" not in everything and "already on" not in everything
+        assert "nothing to do" not in everything
+
+    def test_other_network_failures_say_they_could_not_reach_github(
+        self, v031, monkeypatch, capsys
+    ):
+        _answer(monkeypatch, _status_error(503))
+        _cache_tag("cc-v0.3.1", TWO_HOURS)
+
+        assert run_upgrade_check() == 2
+
+        err = capsys.readouterr().err
+        assert "couldn't reach GitHub (HTTP 503)" in err
+        assert "rate limit" not in err
+        assert "cached cc-v0.3.1 from 2h ago" in err
+
+    def test_a_403_that_is_not_a_rate_limit_is_not_called_one(self, monkeypatch):
+        _answer(monkeypatch, _status_error(403, b'{"message": "Resource not accessible"}'))
+
+        with pytest.raises(uc._LookupFailed) as excinfo:
+            uc._fetch_json(RELEASES_URL, 2)
+
+        assert not excinfo.value.rate_limited and excinfo.value.reason == "HTTP 403"
+
+    def test_a_403_body_that_cannot_be_read_is_not_evidence(self, monkeypatch):
+        exc = _status_error(403)
+        exc.read = MagicMock(side_effect=OSError("closed"))
+        _answer(monkeypatch, exc)
+
+        with pytest.raises(uc._LookupFailed) as excinfo:
+            uc._fetch_json(RELEASES_URL, 2)
+
+        assert not excinfo.value.rate_limited
+
+    def test_a_body_rate_limit_without_a_reset_time_omits_the_clock(
+        self, v031, monkeypatch, capsys
+    ):
+        _answer(monkeypatch, _status_error(403, _SECONDARY_LIMIT_BODY))
+
+        assert run_upgrade_check() == 2
+
+        err = capsys.readouterr().err
+        assert "GitHub API rate limit reached; couldn't check" in err
+        assert "resets at" not in err
+
+    def test_an_answer_from_github_still_exits_0_when_current(self, v031, monkeypatch, capsys):
+        _answer(monkeypatch, [_release("cc-v0.3.1")])
+        monkeypatch.setattr(uc, "_release_notes_between", lambda *a: [])
+
+        assert run_upgrade_check() == 0
+
+        assert "cc-swap is up to date (0.3.1)" in capsys.readouterr().out
+
+
+class TestTokenEndToEnd:
+    """The lookup `upgrade --check` makes, with fakes for the network and `gh`."""
+
+    SECRET = "ghp_SECRETSECRETSECRET"
+
+    @staticmethod
+    def _auth(req) -> str | None:
+        return req.get_header("Authorization")
+
+    def _fake_gh(self, monkeypatch, *, token: str, returncode: int = 0) -> list[list[str]]:
+        gh_calls: list[list[str]] = []
+
+        def _run(cmd, **kw):
+            gh_calls.append(cmd)
+            assert kw.get("timeout"), "gh must be given a bounded timeout"
+            assert kw.get("stdin") == uc.subprocess.DEVNULL, "gh must never prompt"
+            return SimpleNamespace(returncode=returncode, stdout=token + "\n")
+
+        monkeypatch.setattr(uc, "shutil", SimpleNamespace(which=lambda name, **k: "/fake/gh"))
+        monkeypatch.setattr("claude_swap.update_check.subprocess.run", _run)
+        return gh_calls
+
+    def _current(self, monkeypatch) -> list:
+        seen = _answer(monkeypatch, [_release("cc-v0.3.1")])
+        monkeypatch.setattr(uc, "_release_notes_between", lambda *a: [])
+        return seen
+
+    def test_a_token_from_the_environment_is_sent(self, v031, monkeypatch):
+        monkeypatch.setenv("GITHUB_TOKEN", self.SECRET)
+        seen = self._current(monkeypatch)
+
+        assert run_upgrade_check() == 0
+
+        assert self._auth(seen[0]) == f"Bearer {self.SECRET}"
+
+    def test_a_token_from_gh_is_sent_when_the_environment_has_none(self, v031, monkeypatch):
+        gh_calls = self._fake_gh(monkeypatch, token=self.SECRET)
+        seen = self._current(monkeypatch)
+
+        assert run_upgrade_check() == 0
+
+        assert gh_calls == [["/fake/gh", "auth", "token"]]
+        assert self._auth(seen[0]) == f"Bearer {self.SECRET}"
+
+    @pytest.mark.parametrize("returncode,token", [(1, ""), (0, ""), (0, "not a token")])
+    def test_a_gh_that_fails_means_an_anonymous_request(
+        self, v031, monkeypatch, returncode, token
+    ):
+        self._fake_gh(monkeypatch, token=token, returncode=returncode)
+        seen = self._current(monkeypatch)
+
+        assert run_upgrade_check() == 0
+
+        assert self._auth(seen[0]) is None
+
+    def test_a_gh_that_times_out_means_an_anonymous_request(self, v031, monkeypatch):
+        def _hang(cmd, **kw):
+            raise uc.subprocess.TimeoutExpired(cmd, kw["timeout"])
+
+        monkeypatch.setattr(uc, "shutil", SimpleNamespace(which=lambda name, **k: "/fake/gh"))
+        monkeypatch.setattr("claude_swap.update_check.subprocess.run", _hang)
+        seen = self._current(monkeypatch)
+
+        assert run_upgrade_check() == 0
+
+        assert self._auth(seen[0]) is None
+
+    def test_no_gh_on_path_means_an_anonymous_request(self, v031, monkeypatch):
+        seen = self._current(monkeypatch)
+
+        assert run_upgrade_check() == 0
+
+        assert self._auth(seen[0]) is None
+
+    def test_a_401_retries_once_without_the_token(self, v031, monkeypatch):
+        monkeypatch.setenv("GITHUB_TOKEN", self.SECRET)
+        seen = _answer(monkeypatch, _status_error(401), [_release("cc-v0.3.1")])
+        monkeypatch.setattr(uc, "_release_notes_between", lambda *a: [])
+
+        assert run_upgrade_check() == 0
+
+        assert [self._auth(r) for r in seen] == [f"Bearer {self.SECRET}", None]
+
+    def test_a_401_that_persists_is_tried_only_twice(self, v031, monkeypatch, capsys):
+        monkeypatch.setenv("GITHUB_TOKEN", self.SECRET)
+        seen = _answer(monkeypatch, _status_error(401))
+
+        assert run_upgrade_check() == 2
+
+        assert len(seen) == 2
+        assert "couldn't reach GitHub (HTTP 401)" in capsys.readouterr().err
+
+    def test_the_token_appears_in_no_output_log_or_cache(
+        self, v031, monkeypatch, capsys, caplog
+    ):
+        caplog.set_level("DEBUG")
+        self._fake_gh(monkeypatch, token=self.SECRET)
+        _cache_tag("cc-v0.3.1", TWO_HOURS)
+
+        for kind in _FAILURES:
+            _answer(monkeypatch, _FAILURES[kind]())
+            run_upgrade_check()
+            run_self_upgrade()
+        _answer(monkeypatch, _status_error(401), OSError("down"))
+        run_upgrade_check()
+
+        captured = capsys.readouterr()
+        assert self.SECRET not in captured.out + captured.err + caplog.text
+        assert self.SECRET not in uc.CACHE_PATH.read_text()
