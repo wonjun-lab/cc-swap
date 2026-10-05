@@ -116,6 +116,10 @@ EXTERNAL_REPORTS_MAX = 600
 LEGACY_EXTERNAL_CALLERS = frozenset({"log stream", "crash report"})
 #: A killed mark recorded by this version: a ``claude`` cc-swap launched.
 ORIGIN_CC_SWAP = "cc-swap"
+#: A started ``claude`` whose end was never recorded is forgotten this late.
+INFLIGHT_MAX_S = 3600.0
+#: A ``running`` probe this old died with its engine: another may run.
+PROBE_STALE_S = PROBE_TIMEOUT_S + KILL_GRACE_S + 60.0
 
 CODESIGN = "/usr/bin/codesign"
 XATTR = "/usr/bin/xattr"
@@ -389,12 +393,17 @@ def _upgrade_legacy_external(state: dict) -> None:
     """A killed mark 0.5.3 set from a kill it only SAW (``log stream``, a
     crash report) is evidence now, not a pause: it becomes the ``external``
     entry with a probe due at once (:func:`probe_external`). In memory for
-    every reader; written by the next update of the state."""
+    every reader; written by the next update of the state. A mark a launch
+    of cc-swap's was killed under later on (``lastCaller`` one of its own
+    callers) keeps the pause: that kill was real."""
     killed = state.get("killed")
     if not (
         isinstance(killed, dict) and "origin" not in killed
         and killed.get("caller") in LEGACY_EXTERNAL_CALLERS
     ):
+        return
+    last_caller = killed.get("lastCaller")
+    if last_caller and last_caller not in LEGACY_EXTERNAL_CALLERS:
         return
     state.pop("killed", None)
     ext = state.get("external")
@@ -856,14 +865,66 @@ def mark_killed_by_os(
     return True
 
 
+def _note_inflight(root: Path | None, pid: int, at: float, caller: str,
+                   real: str | None, finishes: bool) -> None:
+    """A ``claude`` cc-swap just started (pid, start): a kill seen in the
+    log before its own end is recorded must still count as cc-swap's
+    (:func:`cc_swap_launch`). ``finishes``: its :class:`Launch` will record
+    how it ended (not so for ``cswap run``, which execs ``claude`` in its
+    own process). Entries older than :data:`INFLIGHT_MAX_S` are dropped."""
+
+    def mutate(state: dict) -> bool:
+        section = _section(state, "inflight")
+        for key in [k for k, v in section.items()
+                    if not isinstance(v, dict) or not (at - (_num(v.get("at")) or 0.0)
+                                                       < INFLIGHT_MAX_S)]:
+            section.pop(key, None)
+        section[str(pid)] = {
+            "kind": "inflight", "pid": pid, "at": at, "caller": caller, "real": real,
+            "finishes": finishes,
+        }
+        _trim(section)
+        return True
+
+    _mutate(root, mutate)
+
+
+def _drop_inflight(root: Path | None, pid: int) -> None:
+    current = load_state(root).get("inflight")
+    if not isinstance(current, dict) or str(pid) not in current:
+        return
+    _mutate(root, lambda state: _section(state, "inflight").pop(str(pid), None) is not None)
+
+
+def inflight(root: Path | None) -> list[dict]:
+    """The ``claude`` runs cc-swap started and has not seen end yet."""
+    section = load_state(root).get("inflight")
+    return [v for v in section.values() if isinstance(v, dict)] if isinstance(section, dict) else []
+
+
+def inflight_near(root: Path | None, real: str | None, at: float, window_s: float) -> dict | None:
+    """A running ``claude`` of cc-swap's of the file ``real`` started in the
+    ``window_s`` before ``at`` (a kill line naming no process may be its)."""
+    for entry in inflight(root):
+        t = _num(entry.get("at"))
+        if entry.get("real") == real and t is not None and at - window_s <= t <= at + 1.0:
+            return entry
+    return None
+
+
 def cc_swap_launch(root: Path | None, pid: int | None, at: float, *,
                    window_s: float = 3600.0, records: list[dict] | None = None) -> dict | None:
-    """The ``claude`` run cc-swap recorded (``claude-exec.jsonl``, or
-    ``records`` read from it already) with process id ``pid`` that started
-    within ``window_s`` before ``at`` (pids are reused; the window keeps an
-    old run from matching), or None."""
+    """The ``claude`` run cc-swap started with process id ``pid`` within
+    ``window_s`` before ``at`` (pids are reused; the window keeps an old run
+    from matching), or None: one still running (``kind`` ``inflight``, from
+    the state: its own end has not been recorded yet), else a finished one
+    in ``claude-exec.jsonl`` (or ``records`` read from it already)."""
     if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
         return None
+    for entry in inflight(root):
+        t = _num(entry.get("at"))
+        if entry.get("pid") == pid and t is not None and at - window_s <= t <= at + 5.0:
+            return entry
     for rec in reversed(read_jsonl(root) if records is None else records):
         t = _num(rec.get("at"))
         if (
@@ -1005,11 +1066,32 @@ def current_external(root: Path | None) -> dict | None:
     return None
 
 
+def probe_stale(ext: Mapping[str, Any], now: float) -> bool:
+    """Whether the evidence's probe says ``running`` but started longer ago
+    than any probe can take (:data:`PROBE_STALE_S`): its engine stopped
+    mid-probe, and nothing would ever run it again."""
+    probe = ext.get("probe")
+    started = _num(probe.get("at")) if isinstance(probe, dict) else None
+    return (
+        isinstance(probe, dict) and probe.get("result") == "running"
+        and started is not None and now - started > PROBE_STALE_S
+    )
+
+
+def _due_at(ext: Mapping[str, Any], now: float) -> float | None:
+    """When the evidence's probe is due: its ``probeDueAt``, or now when a
+    ``running`` probe is stale (:func:`probe_stale`)."""
+    due = _num(ext.get("probeDueAt"))
+    if due is None and probe_stale(ext, now):
+        return now
+    return due
+
+
 def probe_pending(root: Path | None, now: float) -> bool:
     """Whether a probe of any identity is due (no ``stat``: the tick's
     cheap pre-check before :func:`external_probe_due`)."""
     ext = load_state(root).get("external")
-    due = _num(ext.get("probeDueAt")) if isinstance(ext, dict) else None
+    due = _due_at(ext, now) if isinstance(ext, dict) else None
     return due is not None and due <= now
 
 
@@ -1018,7 +1100,7 @@ def external_probe_due(root: Path | None, binary: Binary, now: float) -> bool:
     ext = load_state(root).get("external")
     if not isinstance(ext, dict) or binary.identity is None:
         return False
-    due = _num(ext.get("probeDueAt"))
+    due = _due_at(ext, now)
     return ext.get("identity") == binary.identity and due is not None and due <= now
 
 
@@ -1045,7 +1127,7 @@ def probe_external(root: Path, claude_path: str, *, now: float | None = None) ->
             or ext.get("identity") != binary.identity
         ):
             return False
-        due = _num(ext.get("probeDueAt"))
+        due = _due_at(ext, now)
         if due is None or due > now:
             return False
         ext["probeDueAt"] = None
@@ -1293,9 +1375,24 @@ class Launch:
     # -- running ---------------------------------------------------------------------------
 
     def mark_started(self, pid: int | None = None) -> None:
+        """Started now; ``pid`` given: a caller that runs ``claude`` in its
+        own process (``cswap run`` execs it), so no end will be recorded."""
         self._start = time.monotonic()
         self._start_at = self.clock()
         self.pid = pid
+        if pid is not None:
+            self._note_inflight(finishes=False)
+
+    def _note_inflight(self, *, finishes: bool) -> None:
+        if self.root is None or self.record_only or self.pid is None:
+            return
+        try:
+            _note_inflight(
+                self.root, self.pid, self._start_at or self.clock(), self.caller,
+                self.binary.real, finishes,
+            )
+        except Exception as e:  # bookkeeping never breaks a launch
+            _logger.debug("claude exec: in-flight note failed: %s", type(e).__name__)
 
     def popen(self, **kwargs) -> subprocess.Popen:
         """``subprocess.Popen(argv, **kwargs)``, recorded; a spawn error is
@@ -1307,6 +1404,7 @@ class Launch:
             self.finish(None, error=f"{type(e).__name__}: {e.strerror or e}")
             raise
         self.pid = proc.pid
+        self._note_inflight(finishes=True)
         return proc
 
     def finish(
@@ -1354,6 +1452,11 @@ class Launch:
             _logger.info("claude exec: %s", line)
         append_record(self.root, record)
         if self.root is not None and not self.record_only:
+            if self.pid is not None:
+                try:  # after the record: one of the two always names it
+                    _drop_inflight(self.root, self.pid)
+                except Exception:
+                    pass
             try:
                 self._after(record, killed, now)
             except Exception as e:

@@ -681,13 +681,46 @@ def test_the_provenance_line_goes_with_the_kill_after_it(home, root, sent):
     assert "AppleSystemPolicy" in f.fix and "quit and reopen T3 Code (Alpha)" in f.fix
 
 
-def test_a_kill_line_whose_pid_is_a_cc_swap_run_is_left_to_that_run(home, root, sent):
-    link, real = _install(home, "2.1.289")
-    cx.append_record(root, {"kind": "exec", "at": time.time() - 1, "pid": 56959, "caller": "prime"})
+def test_a_kill_line_seen_before_a_cc_swap_runs_end_is_left_to_that_run(home, root, sent):
+    import subprocess
+
+    link, real = _install_body(home, "2.1.289", "sleep 30\n")
     w = cw.Watcher(root, lambda: str(link), home=home)
-    w.handle_line(json.dumps(_asp(real)) + "\n")
+    launch = cx.Launch([str(link), "--version"], caller="prime", root=root, manual=None)
+    proc = launch.popen(stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    try:
+        [running] = cx.inflight(root)
+        assert running["pid"] == proc.pid and running["finishes"] is True
+        # the log reports the kill before the run's own end is recorded
+        w.handle_line(json.dumps(_asp(real, pid=proc.pid)) + "\n")
+        w.handle_line(json.dumps(_kernel()) + "\n")
+        w.handle_line(json.dumps(_kernel()) + "\n")  # no ASP line, no pid: still that run's
+        assert cx.current_external(root) is None and cx.any_killed(root) is None
+    finally:
+        proc.kill()
+        launch.finish(proc.wait())
+    # its end takes the killed path, once; nothing is left in flight
+    killed = cx.current_killed(root)
+    assert killed is not None and killed["count"] == 1 and killed["caller"] == "prime"
+    assert cx.inflight(root) == [] and len(sent) == 1
+    # a crash report of it, read afterwards, adds nothing
+    w._attribute(str(link), source="crash report", at=time.time() - 1, detail="x.ips",
+                 pid=proc.pid)
+    assert cx.current_killed(root)["count"] == 1 and cx.current_external(root) is None
+
+
+def test_a_cswap_run_killed_at_launch_is_cc_swaps_kill(home, root, sent):
+    link, real = _install(home, "2.1.289")
+    # `cswap run` execs claude in its own process: no end is ever recorded
+    launch = cx.Launch([str(link)], caller="cswap run", root=root, manual=cx.Manual("cswap run"))
+    launch.mark_started(4242)
+    [entry] = cx.inflight(root)
+    assert entry["finishes"] is False
+    w = cw.Watcher(root, lambda: str(link), home=home)
+    w.handle_line(json.dumps(_asp(real, pid=4242)) + "\n")
     w.handle_line(json.dumps(_kernel()) + "\n")
-    assert cx.current_external(root) is None and cx.any_killed(root) is None
+    assert cx.current_killed(root) is not None and cx.current_external(root) is None
+    assert len(sent) == 1
 
 
 def test_the_engine_probes_after_the_episode_and_a_working_claude_pauses_nothing(home, root, sent):
@@ -807,6 +840,40 @@ def test_a_0_5_3_mark_of_a_cc_swap_launch_still_pauses(home, root):
     _legacy_mark(root, link, "prime")
     assert cx.current_killed(root) is not None
     assert cx.current_external(root) is None
+
+
+def test_a_0_5_3_external_mark_a_cc_swap_launch_was_killed_under_still_pauses(home, root):
+    link, _real = _install(home, "2.1.289")
+    _legacy_mark(root, link, "log stream")
+    state = json.loads((root / cx.STATE_FILENAME).read_text())
+    state["killed"]["lastCaller"] = "prime"  # 0.5.3 counted a real kill of its own on it
+    (root / cx.STATE_FILENAME).write_text(json.dumps(state))
+    assert cx.current_killed(root) is not None and cx.current_external(root) is None
+    state["killed"]["lastCaller"] = "crash report"  # only seen kills: evidence
+    (root / cx.STATE_FILENAME).write_text(json.dumps(state))
+    assert cx.current_killed(root) is None and cx.current_external(root) is not None
+
+
+def test_a_probe_left_running_by_a_stopped_engine_runs_again(home, root):
+    link, _real = _install(home, "2.1.289")
+    now = time.time()
+    cx.note_external_kill(root, str(link), source="log stream", at=now, detail="")
+    started = now + cx.PROBE_DELAY_S
+    state = json.loads((root / cx.STATE_FILENAME).read_text())
+    state["external"].update(probeDueAt=None, pendingSince=None,
+                             probe={"at": started, "result": "running"})
+    (root / cx.STATE_FILENAME).write_text(json.dumps(state))
+    binary = cx.stat_binary(str(link))
+    soon = started + cx.PROBE_TIMEOUT_S
+    assert not cx.probe_pending(root, soon) and not cx.external_probe_due(root, binary, soon)
+    [f] = dr.check_claude_exec(_doctor(root, home, soon))
+    assert "the engine is checking claude --version now" in f.detail
+    late = started + cx.PROBE_STALE_S + 1
+    [f] = dr.check_claude_exec(_doctor(root, home, late))
+    assert "never finished" in f.detail
+    assert cx.probe_pending(root, late) and cx.external_probe_due(root, binary, late)
+    assert cx.probe_external(root, str(link), now=late) == "ok"
+    assert cx.current_external(root)["probe"]["result"] == "ok"
 
 
 def test_a_new_file_at_the_path_drops_the_old_evidence(home, root):

@@ -3956,6 +3956,14 @@ class ClaudeAccountSwitcher:
                 "Active login is an API-key account. Add it with "
                 "'cswap --add-token sk-ant-api...' instead of --add-account."
             )
+        if holds_only_shared_fields(creds):
+            # cc-swap: Claude Code's MCP-only fallback file (written while the
+            # Keychain was unavailable) answered — no login. Registering it
+            # would store it over the slot's real login.
+            raise CredentialReadError(
+                "The live credential holds only MCP logins, no Claude login; "
+                "run claude and /login"
+            )
 
     def _reject_cross_kind_collision(self, email: str, is_api_key: bool) -> None:
         """Reject registering a token whose (email, personal-org) already exists as

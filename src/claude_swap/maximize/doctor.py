@@ -713,7 +713,17 @@ def _external_kills(p: Probes, ext: dict | None) -> Finding | None:
     when = _clock(float(probed)) if isinstance(probed, (int, float)) else "?"
     if result == "ok":
         verdict = f"cc-swap's own launches work (claude --version ran fine at {when})"
-    elif isinstance(ext.get("probeDueAt"), (int, float)) or result == "running":
+    elif result == "running" and claude_exec.probe_stale(ext, p.now):
+        verdict = (
+            f"the engine's claude --version check started at {when} never finished "
+            "(its engine stopped?); a running engine checks again; priming is not paused"
+        )
+    elif result == "running":
+        verdict = (
+            f"the engine is checking claude --version now (since {when}); priming is "
+            "not paused meanwhile"
+        )
+    elif isinstance(ext.get("probeDueAt"), (int, float)):
         verdict = (
             "the engine checks claude --version itself shortly; priming is not "
             "paused meanwhile"

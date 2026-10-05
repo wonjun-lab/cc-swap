@@ -642,11 +642,44 @@ class Watcher:
         ):
             provenance = None
         pid = provenance.get("pid") if provenance else None
-        if pid is not None and claude_exec.cc_swap_launch(self.root, pid, at) is not None:
-            return  # a run of cc-swap's: its own SIGKILL already took that path
+        self._attribute(
+            claude, source="log stream", at=at, detail=event["message"], pid=pid,
+            provenance=provenance,
+        )
+
+    def _attribute(self, claude: str, *, source: str, at: float, detail: str,
+                   pid: int | None, records: list[dict] | None = None,
+                   **evidence: Any) -> None:
+        """A kill of the current ``claude`` file: whose launch was it?
+
+        * a ``claude`` cc-swap started with that pid and still running (its
+          end not recorded yet): its own SIGKILL takes the killed path —
+          nothing here; one that runs ``claude`` in place (``cswap run``)
+          records no end, so this marks it;
+        * a finished one: :func:`claude_exec.mark_killed_by_os` (a no-op
+          when its end already marked it);
+        * a kernel line with no pid while cc-swap's own run of this file
+          started moments before: left to that run (its end, or its crash
+          report with the pid, decides);
+        * anything else: evidence (:func:`claude_exec.note_external_kill`).
+        """
+        launch = (
+            claude_exec.cc_swap_launch(self.root, pid, at, records=records)
+            if pid is not None else None
+        )
+        if launch is None and pid is None:
+            real = claude_exec.stat_binary(claude).real
+            if claude_exec.inflight_near(self.root, real, at, PROVENANCE_WINDOW_S):
+                return
+        if launch is not None:
+            if launch.get("kind") == "inflight" and launch.get("finishes"):
+                return
+            claude_exec.mark_killed_by_os(
+                self.root, claude, source=source, at=at, detail=detail, pid=pid,
+            )
+            return
         claude_exec.note_external_kill(
-            self.root, claude, source="log stream", at=at, detail=event["message"],
-            pid=pid, provenance=provenance,
+            self.root, claude, source=source, at=at, detail=detail, pid=pid, **evidence,
         )
 
     def scan(self, now: float) -> list[CrashKill]:
@@ -678,16 +711,10 @@ class Watcher:
             mine = [k for k in new if k.path and os.path.realpath(k.path) == real]
             launches = claude_exec.read_jsonl(self.root) if mine else []
             for k in mine:
-                if claude_exec.cc_swap_launch(self.root, k.pid, k.at, records=launches):
-                    claude_exec.mark_killed_by_os(
-                        self.root, claude, source="crash report", at=k.at, detail=k.file,
-                        pid=k.pid,
-                    )
-                else:
-                    claude_exec.note_external_kill(
-                        self.root, claude, source="crash report", at=k.at, detail=k.file,
-                        pid=k.pid, launcher=launcher_of(k), report=k.file,
-                    )
+                self._attribute(
+                    claude, source="crash report", at=k.at, detail=k.file, pid=k.pid,
+                    records=launches, launcher=launcher_of(k), report=k.file,
+                )
         return new
 
 

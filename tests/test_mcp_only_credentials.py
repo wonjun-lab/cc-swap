@@ -21,6 +21,7 @@ import pytest
 
 from claude_swap import macos_keychain as kc
 from claude_swap.credentials import CLAUDE_CODE_KEYCHAIN_SERVICE, holds_only_shared_fields
+from claude_swap.exceptions import CredentialReadError
 from claude_swap.models import Platform
 from claude_swap.switcher import ClaudeAccountSwitcher
 
@@ -117,6 +118,51 @@ def test_a_switch_never_backs_up_mcp_only_bytes_over_the_slots_login(mac):
     assert live["claudeAiOauth"]["refreshToken"] == "rt-2"
     assert live["mcpOAuth"] == json.loads(MCP_ONLY)["mcpOAuth"]  # still composed in
     assert sw.list_unclaimed_credentials() == {}  # nothing stashed as a login
+
+
+@pytest.fixture
+def linux(temp_home: Path, block_real_keychain):
+    sw = ClaudeAccountSwitcher()
+    sw.platform = Platform.LINUX
+    sw._setup_directories()
+    sw._init_sequence_file()
+    _seed(sw, 1, "a@example.com", CRED1)
+    _seed(sw, 2, "b@example.com", CRED2)
+    (temp_home / ".claude.json").write_text(json.dumps(
+        {"oauthAccount": {"emailAddress": "a@example.com", "accountUuid": "uuid-1"}}))
+    cred = temp_home / ".claude" / ".credentials.json"
+    cred.write_text(MCP_ONLY)
+    cred.chmod(0o600)
+    return sw, temp_home
+
+
+def test_add_never_captures_mcp_only_bytes_on_macos(mac):
+    sw, _home, store = mac
+    store.delete_password(CLAUDE_CODE_KEYCHAIN_SERVICE, kc.keychain_account_name())
+    with patch("claude_swap.oauth.fetch_oauth_profile", return_value=None):
+        with pytest.raises(CredentialReadError, match="only MCP logins, no Claude login"):
+            sw.add_account(slot=1, assume_yes=True)
+    assert sw._read_account_credentials("1", "a@example.com") == CRED1
+
+
+def test_add_never_captures_mcp_only_bytes_on_linux(linux):
+    sw, _home = linux
+    with patch("claude_swap.oauth.fetch_oauth_profile", return_value=None):
+        with pytest.raises(CredentialReadError, match="only MCP logins, no Claude login"):
+            sw.add_account(slot=1, assume_yes=True)
+    assert sw._read_account_credentials("1", "a@example.com") == CRED1
+
+
+def test_a_linux_switch_writes_the_full_login_with_the_mcp_logins(linux):
+    sw, home = linux
+    assert sw._read_active_credentials().value == MCP_ONLY  # Linux: the file is the store
+    with patch("claude_swap.oauth.fetch_oauth_profile", return_value=None):
+        sw.switch_to("2", json_output=True)
+    live = json.loads((home / ".claude" / ".credentials.json").read_text())
+    assert live["claudeAiOauth"]["refreshToken"] == "rt-2"
+    assert live["mcpOAuth"] == json.loads(MCP_ONLY)["mcpOAuth"]
+    assert sw._read_account_credentials("1", "a@example.com") == CRED1
+    assert sw.list_unclaimed_credentials() == {}
 
 
 def test_nothing_to_back_up_when_the_live_credential_is_mcp_only(mac):
