@@ -1545,7 +1545,9 @@ def check_slots(ctx: Context) -> list[Finding]:
         )]
     if not ctx.slots:
         return [Finding(
-            "accounts", "warn", "no accounts yet", "run claude, /login, then cc-swap add", "accounts",
+            "accounts", "warn", "no accounts yet",
+            "cc-swap login (signs in and adds it), or run claude, /login, then cc-swap add",
+            "accounts",
         )]
     live_number = _slot_for_identity(ctx)
     quarantine = ctx.state.get("quarantine")

@@ -26,13 +26,23 @@ Otherwise the live login is not touched — nothing switches and no engine
 pause is involved. A login that could not be stored is kept as an unclaimed
 entry (``cc-swap unclaimed``), so a finished browser login is never lost.
 
-``cc-swap login --new`` (and Fleet's *Sign in a new account*) runs the same
-login without ``--email`` (or with the one the user gave) to ADD an account:
-:class:`NewLoginAttempt` reads the identity from the profile, refuses an
-account that is already in a slot (pointing at ``cc-swap login N``; the CLI
-may offer to keep the login as that slot's re-login instead), and otherwise
-stores it in the next free slot (or ``--slot N``) through
-``switcher.store_new_login``. The live login is never read or written.
+``cc-swap login --new`` runs the same login without ``--email`` (or with
+the one the user gave) to ADD an account: :class:`NewLoginAttempt` reads the
+identity from the profile, refuses an account that is already in a slot
+(pointing at ``cc-swap login N``; the CLI may offer to keep the login as
+that slot's re-login instead), and otherwise stores it in the next free
+slot (or ``--slot N``) through ``switcher.store_new_login``. The live login
+is never read or written.
+
+Bare ``cc-swap login`` (and Fleet's *Sign in (add or renew)*) runs that
+login too and decides by who signed in (:func:`match_login`, the duplicate
+rule ``store_new_login`` uses): an account a slot already holds gets its
+login renewed exactly like ``cc-swap login N`` (:class:`SignInAttempt`),
+one cc-swap does not have is added like ``--new``, and a login that
+matches a slot only in part — the same email in another organization, the
+same account id under another email — is not guessed at: nothing is
+stored, the login is kept unclaimed and the message names the match and
+the commands that resolve it.
 
 The profile — directory and Keychain item — is removed whatever happens:
 success, mismatch, Ctrl-C, SIGTERM/SIGHUP, a crash. A profile a killed
@@ -75,6 +85,7 @@ CANCELLED = "cancelled"
 FAILED = "failed"
 UNAVAILABLE = "unavailable"  # claude (or its `auth login`) cannot be run: guide instead
 DUPLICATE = "duplicate"  # login --new: that account is already in a slot (``number``)
+AMBIGUOUS = "ambiguous"  # bare login: matches a slot only in part (``number`` = the first)
 
 
 @dataclass(frozen=True)
@@ -301,9 +312,10 @@ def sweep_stale_profiles(root: Path, *, max_age_s: float = STALE_PROFILE_S,
                 continue
             if _remove_profile(path):
                 removed.append(path)
-        except Exception:
-            _logger.warning("Could not remove the leftover re-login profile %s", path,
-                            exc_info=True)
+        except Exception as e:  # the type only: the text is not ours to log at WARNING
+            _logger.warning("Could not remove the leftover re-login profile %s: %s", path,
+                            type(e).__name__)
+            _logger.debug("Removing %s failed", path, exc_info=True)
     if removed:
         _logger.info("Removed %d leftover re-login profile(s)", len(removed))
     return removed
@@ -435,14 +447,12 @@ class LoginAttempt:
         try:
             creds, account = self.read_login()
         except Exception as e:
-            return Outcome(FAILED, t.number, f"could not read the new login: {e}")
+            return self.salvage(switcher, t.number, f"could not read the new login: {e}")
         pair = _full_pair(creds)
         if pair is None:
-            return Outcome(FAILED, t.number, "claude saved no login; nothing stored")
+            return self.salvage(switcher, t.number, "claude saved no login")
         if account is None:
-            return Outcome(
-                FAILED, t.number, "the new login names no account; nothing stored"
-            )
+            return self.salvage(switcher, t.number, "the new login names no account")
         problem = identity_problem(t, account)
         if problem is None:
             problem = _oracle_problem(switcher, t, pair)
@@ -458,8 +468,7 @@ class LoginAttempt:
         except Exception as e:
             if not committed:
                 return Outcome(FAILED, t.number, _not_stored(switcher, t, creds, e))
-            _logger.warning("re-login #%s: stored, then %s: %s", t.number,
-                            type(e).__name__, e)
+            _log_failure("re-login: stored, then the after-work failed", t.number, e)
             result = committed[0]  # stored; only the after-work failed
         except BaseException as e:  # Ctrl-C / SIGTERM mid-store: keep it, then unwind
             if not committed:  # once stored, a stash would only duplicate it
@@ -470,6 +479,35 @@ class LoginAttempt:
             return Outcome(STORED, t.number, f"{stored}; the live login now uses it",
                            activated=True)
         return Outcome(STORED, t.number, stored)
+
+    def retry(self) -> str:
+        """The command that runs this sign-in again."""
+        return f"cc-swap login {self.target.number}"
+
+    def salvage(self, switcher, number: str, why: str) -> Outcome:
+        """The browser step finished but its login cannot be checked or
+        stored (unreadable, incomplete, names no account): keep whatever
+        credential the profile still yields as an unclaimed entry (best
+        effort, before the cleanup deletes it) and never end silently —
+        the message always says to sign in again."""
+        from claude_swap.session import read_config_dir_credentials
+
+        creds = None
+        try:
+            creds = read_config_dir_credentials(str(self.profile), strict_keychain=True)
+        except Exception as e:
+            _log_failure("reading the new login", number, e)
+        message = f"{why}; nothing stored"
+        if _full_pair(creds) is not None:
+            try:
+                entry = switcher.stash_relogin_credential(
+                    number or "new", creds, "login-unreadable",
+                )
+            except Exception as e:
+                _log_failure("keeping the unreadable login", number, e)
+            else:
+                message += f". The new login was kept as {entry} (cc-swap unclaimed)"
+        return Outcome(FAILED, number, f"{message}. Sign in again: {self.retry()}")
 
     def cleanup(self) -> None:
         """Delete the profile's Keychain item and the directory. Idempotent."""
@@ -495,11 +533,18 @@ def _not_stored(switcher, target: Target, creds: str, error: Exception) -> str:
     message = f"not stored ({why}); the slot and the live login are unchanged"
     try:
         entry = switcher.stash_relogin_credential(target.number, creds, "relogin-unstored")
-    except Exception:
-        _logger.warning("Could not keep the unstored login of #%s", target.number,
-                        exc_info=True)
+    except Exception as e:
+        _log_failure("keeping the unstored login", target.number, e)
         return message
     return f"{message}. The new login was kept as {entry} (cc-swap unclaimed); retry cc-swap login {target.number}"
+
+
+def _log_failure(what: str, number: str, error: BaseException) -> None:
+    """Log a failure by its exception type and slot number only: the text
+    can carry a config or credential filename, which holds the account's
+    email. The full text (and traceback) goes to DEBUG."""
+    _logger.warning("%s (#%s): %s", what, number or "new", type(error).__name__)
+    _logger.debug("%s (#%s): %s", what, number or "new", error, exc_info=True)
 
 
 def _oracle_problem(switcher, target: Target, pair: Mapping) -> str | None:
@@ -535,6 +580,9 @@ class NewLoginAttempt(LoginAttempt):
     def what(self) -> str:
         return "sign-in of a new account"
 
+    def retry(self) -> str:
+        return "cc-swap login --new"
+
     def banner(self) -> str:
         who = f" as {self.target.email}" if self.target.email else ""
         return (
@@ -559,12 +607,11 @@ class NewLoginAttempt(LoginAttempt):
         try:
             creds, account = self.read_login()
         except Exception as e:
-            return Outcome(FAILED, "", f"could not read the new login: {e}")
-        pair = _full_pair(creds)
-        if pair is None:
-            return Outcome(FAILED, "", "claude saved no login; nothing stored")
+            return self.salvage(switcher, "", f"could not read the new login: {e}")
+        if _full_pair(creds) is None:
+            return self.salvage(switcher, "", "claude saved no login")
         if account is None:
-            return Outcome(FAILED, "", "the new login names no account; nothing stored")
+            return self.salvage(switcher, "", "the new login names no account")
         try:
             return self._place(switcher, creds, account, adopt_existing)
         except Exception as e:  # e.g. a torn sequence.json: keep the login
@@ -600,8 +647,8 @@ class NewLoginAttempt(LoginAttempt):
                 existing = e.number  # added meanwhile: same answer as below
             except Exception as e:
                 if committed:  # stored; only the after-work failed
-                    _logger.warning("new account #%s: stored, then %s: %s",
-                                    committed[0], type(e).__name__, e)
+                    _log_failure("new account: stored, then the after-work failed",
+                                 committed[0], e)
                     return self._stored(committed[0], email, account, creds)
                 return Outcome(FAILED, "", _new_not_stored(switcher, creds, e))
             except BaseException as e:  # Ctrl-C / SIGTERM mid-store: keep it, then unwind
@@ -633,14 +680,19 @@ class NewLoginAttempt(LoginAttempt):
     def _stored(number: str, email: str, account: Mapping, creds: str) -> Outcome:
         """The success message: the account, its organization and the plan
         its credential names (``rateLimitTier``, as every slot's plan)."""
-        from claude_swap.maximize.plan import plan_label, rate_limit_tier_from_credentials
-
-        org = str(account.get("organizationName") or "") or (
-            "org" if account.get("organizationUuid") else "personal"
-        )
-        plan = plan_label(rate_limit_tier_from_credentials(creds))
-        tag = f"{org} · {plan}" if plan else org
+        tag = _plan_tag(account, creds)
         return Outcome(STORED, number, f"new account #{number} stored ({email} [{tag}])")
+
+
+def _plan_tag(account: Mapping, creds: str) -> str:
+    """``Team · 20x``: the organization and the plan the credential names."""
+    from claude_swap.maximize.plan import plan_label, rate_limit_tier_from_credentials
+
+    org = str(account.get("organizationName") or "") or (
+        "org" if account.get("organizationUuid") else "personal"
+    )
+    plan = plan_label(rate_limit_tier_from_credentials(creds))
+    return f"{org} · {plan}" if plan else org
 
 
 def _kept(switcher, number: str, creds: str, message: str) -> str:
@@ -649,8 +701,8 @@ def _kept(switcher, number: str, creds: str, message: str) -> str:
     never simply thrown away."""
     try:
         entry = switcher.stash_relogin_credential(number, creds, "login-new-not-stored")
-    except Exception:
-        _logger.warning("Could not keep the unstored new login", exc_info=True)
+    except Exception as e:
+        _log_failure("keeping the unstored new login", number, e)
         return message
     return f"{message}. This login was kept as {entry} (cc-swap unclaimed)"
 
@@ -665,10 +717,296 @@ def _new_not_stored(switcher, creds: str, error: BaseException) -> str:
     message = f"not stored ({why}); the live login is unchanged"
     try:
         entry = switcher.stash_relogin_credential("new", creds, "login-new-unstored")
-    except Exception:
-        _logger.warning("Could not keep the unstored new login", exc_info=True)
+    except Exception as e:
+        _log_failure("keeping the unstored new login", "", e)
         return message
     return f"{message}. The new login was kept as {entry} (cc-swap unclaimed)"
+
+
+# -- bare `cc-swap login`: add or renew, by who signed in ---------------------------------
+
+#: :attr:`LoginMatch.kind` values (and :data:`AMBIGUOUS`).
+RENEW = "renew"
+ADD = "add"
+
+
+@dataclass(frozen=True)
+class LoginMatch:
+    """Who signed in, held against the slots (:func:`match_login`)."""
+
+    kind: str  # RENEW | ADD | AMBIGUOUS
+    number: str = ""  # RENEW: the slot; AMBIGUOUS: the first slot it matches in part
+    partial: tuple[str, ...] = ()  # AMBIGUOUS: what matched, one line per slot
+    fixes: tuple[tuple[str, str], ...] = ()  # AMBIGUOUS: (command, what it does)
+
+
+def _org_label(name: str, org_uuid: str) -> str:
+    return name or (f"org {org_uuid}" if org_uuid else "personal")
+
+
+def match_login(data: Mapping | None, account: Mapping) -> LoginMatch:
+    """Which slot the login ``account`` (a profile's ``oauthAccount``) is.
+
+    RENEW: exactly one OAuth slot holds that account — the email
+    (case-insensitive) and organization agree and the account uuids do not
+    disagree (``identity_problem``'s rule, which the re-login re-checks).
+    ADD: no slot has it in any form. AMBIGUOUS otherwise — the same email in
+    another organization, the same email under another account uuid, the
+    same account uuid under another email (an email change), an API-key
+    slot under that email, or two slots for one account: cc-swap does not
+    guess, and says what matched and which commands resolve it."""
+    email = str(account.get("emailAddress") or "").strip()
+    org = str(account.get("organizationUuid") or "")
+    uuid = str(account.get("accountUuid") or "").strip()
+    here = _org_label(str(account.get("organizationName") or ""), org)
+    exact: list[tuple[str, str]] = []
+    partial: list[str] = []
+    fixes: list[tuple[str, str]] = []
+    first = ""
+    accounts = (data or {}).get("accounts") or {}
+    for raw_num, rec in accounts.items():
+        if not isinstance(rec, Mapping) or not rec.get("email"):
+            continue
+        num = str(raw_num)
+        rec_email = str(rec.get("email") or "").strip()
+        rec_org = str(rec.get("organizationUuid") or "")
+        rec_uuid = str(rec.get("uuid") or "").strip()
+        there = _org_label(str(rec.get("organizationName") or ""), rec_org)
+        same_email = rec_email.lower() == email.lower()
+        same_id = bool(uuid and rec_uuid and uuid == rec_uuid)
+        other_id = bool(uuid and rec_uuid and uuid != rec_uuid)
+        api_key = rec.get("kind") == "api_key"
+        if same_email and rec_org == org and not other_id and not api_key:
+            exact.append((num, there))
+            continue
+        if not (same_email or same_id):
+            continue
+        first = first or num
+        if api_key:
+            partial.append(f"#{num} is an API key under {rec_email}")
+            fixes.append((f"cc-swap remove {num}; cc-swap login",
+                          f"replace the API key #{num} with this login"))
+        elif same_email and rec_org != org:
+            ours = here
+            if there == here:  # two organizations under one name: tell them apart
+                there, ours = _org_label("", rec_org), _org_label("", org)
+            partial.append(f"#{num} is {rec_email} in {there}; you signed in to {ours}")
+            if rec_org:
+                fixes.append((f"cc-swap login {num}",
+                              f"renew #{num}: sign in to {there} this time"))
+            else:
+                # Stored without an organization (a setup-token / add-token
+                # slot): `cc-swap login N` compares the org strictly and can
+                # never match a browser login, so replacing it is the way.
+                fixes.append((f"cc-swap remove {num}; cc-swap login",
+                              f"replace #{num} (stored without an organization) with this login"))
+        elif same_email:
+            partial.append(f"#{num} is {rec_email} in {there}, but another account id")
+            fixes.append((f"cc-swap remove {num}; cc-swap login",
+                          f"replace #{num} with the account you signed in as"))
+        else:
+            partial.append(f"#{num} is this account id under another email, {rec_email}")
+            fixes.append((f"cc-swap remove {num}; cc-swap login",
+                          f"replace #{num} (its email changed)"))
+    if len(exact) == 1:
+        return LoginMatch(RENEW, exact[0][0])
+    if exact:  # two slots claim one account (a hand-edited sequence.json)
+        first = exact[0][0]
+        for num, there in exact:
+            partial.insert(0, f"#{num} is {email} in {there} too")
+            fixes.insert(0, (f"cc-swap login {num}", f"renew #{num}"))
+    if not partial:
+        return LoginMatch(ADD)
+    from claude_swap.switcher import ClaudeAccountSwitcher
+
+    if ClaudeAccountSwitcher.slot_for_login(dict(data or {}), email, org, uuid) is None:
+        fixes.append(("cc-swap login --new [--slot N]", "add it as a separate account"))
+    return LoginMatch(AMBIGUOUS, first, tuple(partial), tuple(fixes))
+
+
+def _day(deadline_ms: int) -> str:
+    """``Nov 4``: the local date of a login deadline."""
+    from datetime import datetime, timezone
+
+    when = datetime.fromtimestamp(deadline_ms / 1000.0, tz=timezone.utc).astimezone()
+    return when.strftime(f"%b {when.day}")
+
+
+def _slot_name(data: Mapping, number: str) -> str:
+    """Slot ``number``'s short name (its alias, else its email's local part),
+    as Fleet and the fork's CLI lines name it."""
+    from claude_swap.maximize.names import display_names
+
+    accounts = (data or {}).get("accounts") or {}
+    names = display_names(
+        (str(n), str(r.get("email") or ""), str(r.get("alias") or ""))
+        for n, r in accounts.items() if isinstance(r, Mapping)
+    )
+    return names.get(str(number), f"#{number}")
+
+
+class SignInAttempt(NewLoginAttempt):
+    """Bare ``cc-swap login``: ``claude auth login`` with no account named,
+    then add or renew by who signed in (:func:`match_login`). Never asks."""
+
+    def what(self) -> str:
+        return "sign-in"
+
+    def retry(self) -> str:
+        return "cc-swap login"
+
+    def banner(self) -> str:
+        who = f" as {self.target.email}" if self.target.email else ""
+        return (
+            f"\ncc-swap: signing in{who} with `claude auth login`.\n"
+            "Finish in the browser; over SSH open the printed URL on any device "
+            "and paste the code here.\n"
+            "Ctrl-C cancels. An account cc-swap has gets its login renewed, a new "
+            "one is added; the live login changes only when you sign in as the "
+            "account it is logged in as.\n"
+        )
+
+    def finish(self, switcher) -> Outcome:  # type: ignore[override]
+        """Renew the slot that holds the signed-in account, or add it to a
+        free slot (``--slot``), or — a partial match — store nothing. A
+        login that is not stored is kept unclaimed whatever went wrong."""
+        try:
+            creds, account = self.read_login()
+        except Exception as e:
+            return self.salvage(switcher, "", f"could not read the new login: {e}")
+        if _full_pair(creds) is None:
+            return self.salvage(switcher, "", "claude saved no login")
+        if account is None:
+            return self.salvage(switcher, "", "the new login names no account")
+        try:
+            return self._decide(switcher, creds, account)
+        except Exception as e:  # e.g. a torn sequence.json: keep the login
+            return Outcome(FAILED, "", _new_not_stored(switcher, creds, e))
+
+    def _decide(self, switcher, creds: str, account: Mapping, *, again: bool = True) -> Outcome:
+        from claude_swap.exceptions import DuplicateAccountError
+
+        data = switcher._get_sequence_data() or {}
+        match = match_login(data, account)
+        if match.kind == RENEW:
+            return self._renew(switcher, match.number, creds, data)
+        if match.kind == AMBIGUOUS:
+            return self._ambiguous(switcher, match, creds, account)
+        email = str(account.get("emailAddress") or "").strip()
+        committed: list[str] = []
+        try:
+            number = switcher.store_new_login(
+                creds, account, slot=self.target.slot, on_commit=committed.append,
+            )
+        except DuplicateAccountError:
+            if again:  # added meanwhile: decide again on what is stored now
+                return self._decide(switcher, creds, account, again=False)
+            raise
+        except Exception as e:
+            if committed:  # stored; only the after-work failed
+                _log_failure("sign-in: added, then the after-work failed", committed[0], e)
+                number = committed[0]
+            else:
+                return Outcome(FAILED, "", _new_not_stored(switcher, creds, e))
+        except BaseException as e:  # Ctrl-C / SIGTERM mid-store: keep it, then unwind
+            if not committed:
+                _new_not_stored(switcher, creds, e)
+            raise
+        return Outcome(STORED, number,
+                       f"added #{number} {email} [{_plan_tag(account, creds)}]")
+
+    def _renew(self, switcher, number: str, creds: str, data: Mapping) -> Outcome:
+        """Exactly ``cc-swap login N``'s checks and store (``store_relogin``,
+        which rewrites the live login only when slot ``number`` IS the live
+        account)."""
+        asked = self.target.slot
+        try:
+            self.target = target_for(switcher, number)  # type: ignore[assignment]
+        except (AccountNotFoundError, ValidationError) as e:
+            return Outcome(FAILED, number, _kept(switcher, number, creds, f"{e}; not stored"))
+        outcome = LoginAttempt.finish(self, switcher)
+        if outcome.status == MISMATCH:  # the token-owner oracle disagreed
+            return Outcome(MISMATCH, number, _kept(switcher, number, creds, outcome.message))
+        if not outcome.ok:
+            return outcome
+        deadline = oauth.login_expires_at_ms(creds)
+        ends = f"; login now ends {_day(deadline)}" if deadline else ""
+        lines = [f"updated #{number} {_slot_name(data, number)} (token renewed{ends})"]
+        if outcome.activated:
+            lines.append(
+                f"#{number} is the account Claude Code is logged in as: the live "
+                "login now uses the new token too (same account, nothing switched)"
+            )
+        if asked is not None and str(int(str(asked))) != number:
+            lines.append(f"--slot {asked} not used: this account is already #{number}")
+        return Outcome(STORED, number, "\n".join(lines), activated=outcome.activated)
+
+    @staticmethod
+    def _ambiguous(switcher, match: LoginMatch, creds: str, account: Mapping) -> Outcome:
+        """Store nothing; keep the login unclaimed; say what matched and the
+        commands that resolve it (CLI and Fleet output, never a log)."""
+        email = str(account.get("emailAddress") or "").strip()
+        here = _org_label(str(account.get("organizationName") or ""),
+                          str(account.get("organizationUuid") or ""))
+        lines = [
+            f"signed in as {email} ({here}), which matches an account cc-swap "
+            "has only in part, so nothing was stored:",
+            *(f"  {p}" for p in match.partial),
+        ]
+        if match.fixes:
+            lines.append("Run the one you mean:")
+            width = max(len(cmd) for cmd, _ in match.fixes)
+            lines += [f"  {cmd.ljust(width)}  {what}" for cmd, what in match.fixes]
+        try:
+            entry = switcher.stash_relogin_credential(
+                match.number or "new", creds, "login-ambiguous",
+            )
+        except Exception as e:
+            _log_failure("keeping the unstored sign-in", match.number, e)
+            lines.append("The slots and the live login are unchanged.")
+        else:
+            lines.append(
+                f"This login was kept as {entry} (cc-swap unclaimed); the slots "
+                "and the live login are unchanged."
+            )
+        return Outcome(AMBIGUOUS, match.number, "\n".join(lines))
+
+
+def sign_in(
+    switcher,
+    new: NewAccount,
+    *,
+    claude: str,
+    run: Callable[[Sequence[str], Mapping[str, str], Path], int | None] = run_interactive,
+    announce: Callable[[str], None] | None = print,
+    base_env: Mapping[str, str] | None = None,
+) -> Outcome:
+    """The whole bare ``cc-swap login`` (Fleet runs the same steps around
+    ``App.suspend``). ``new.email`` only pre-fills; ``new.slot`` is where a
+    new account goes. Only its number is checked before the browser: a
+    renew does not use it, and adding to a taken one is refused when
+    storing (the login is then kept unclaimed)."""
+    check_new_slot(switcher, new.slot, free=False)
+    refuse = getattr(switcher, "_refuse_session_shell", None)
+    if refuse is not None:
+        refuse()  # before the browser: storing would refuse anyway
+    with terminate_as_interrupt(), SignInAttempt(switcher.backup_dir, new, claude) as attempt:
+        if announce is not None:
+            announce(attempt.banner())
+        early = attempt.launch(run, base_env=base_env)
+        if early is not None:
+            return early
+        return attempt.finish(switcher)
+
+
+def guided_signin_steps(claude: str | None) -> list[str]:
+    """Signing in by hand, for when claude cannot be launched here."""
+    return [
+        "Sign in by hand:",
+        f"  1. run  {claude or 'claude'}  and type /login, sign in as the account",
+        "  2. run  cc-swap add  (adds it, or refreshes the slot it is already in)",
+        "  3. switch back to the account you were on",
+    ]
 
 
 def login_new(
@@ -697,12 +1035,17 @@ def login_new(
         return attempt.finish(switcher, adopt_existing=adopt_existing)
 
 
-def check_new_slot(switcher, slot: str | None) -> None:
-    """``ValidationError`` when ``slot`` is not a free slot number."""
+def check_new_slot(switcher, slot: str | None, *, free: bool = True) -> None:
+    """``ValidationError`` when ``slot`` is not a slot number or, with
+    ``free``, is taken. The bare ``cc-swap login`` checks only the number
+    before the browser: whether the slot must be free depends on who signs
+    in (a renew does not use it; ``store_new_login`` re-checks an add)."""
     if slot is None:
         return
     if not str(slot).isdigit() or int(str(slot)) < 1:
         raise ValidationError(f"--slot takes a slot number >= 1, not {slot}")
+    if not free:
+        return
     accounts = (switcher._get_sequence_data() or {}).get("accounts") or {}
     if str(int(str(slot))) in accounts:
         raise ValidationError(

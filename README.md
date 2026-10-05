@@ -65,6 +65,8 @@ Do not run `/logout` before logging in as the next account. Current Claude Code 
 
 Repeat step 2 for every account. You can give an account a short name as you add it (`cc-swap add --alias work`) or later (`cc-swap alias 2 work`).
 
+Instead of step 2 you can run `cc-swap login`: it opens Claude Code's own login in the browser and adds whoever you sign in as, without touching the account you are logged in to (see [Renew a login](#renew-a-login-before-it-expires)).
+
 **3. Check what is left and let cc-swap do the rest:**
 
 ```bash
@@ -282,11 +284,17 @@ A soft threshold can't be set above its hard one. In Fleet, `m` → `s` (Swap st
 
 Every Claude Code login has a fixed deadline, about 27 to 30 days after you logged in. Using the account does not extend it. Once it passes, the account stops working until you log in again. cc-swap warns you from 7 days out: Fleet tags the account `login 3d left`, `cc-swap list` shows `login expires …`, and you get a notification in the last 24 hours.
 
-To renew (early, or once it has expired), run `cc-swap login 4`, or in Fleet select the account and press `r`. cc-swap launches Claude Code's own login for that account's email (`claude auth login`) in a throwaway profile; you only sign in in the browser (over SSH, open the printed URL on any device and paste the code back). It stores the new login into the slot only if it is that account, and leaves the login you are using alone, unless the account you renewed is the one you are on: then that gets the new login too. Ctrl-C cancels and stores nothing.
+To renew (early, or once it has expired), run `cc-swap login` — no slot number to remember. cc-swap launches Claude Code's own login (`claude auth login`) in a throwaway profile; you only sign in in the browser (over SSH, open the printed URL on any device and paste the code back). Then it looks at who you signed in as:
+
+- **an account cc-swap has** — its slot gets the new login: `updated #3 dev.master (token renewed; login now ends Nov 4)`. The login you are using is left alone, unless that account is the one you are on: then it gets the new token too (still the same account; nothing switches).
+- **an account cc-swap doesn't have** — it is added to the next free slot (`--slot N` to choose): `added #7 new@example.com [Team · 20x]`.
+- **a partial match** — the same email in another organization, or the same account under a changed email: cc-swap does not guess. Nothing is stored, the login is kept in `cc-swap unclaimed`, and cc-swap prints which slot matched and the command to run (`cc-swap login N`, `cc-swap login --new --slot N`, or `cc-swap remove N` first).
+
+`cc-swap login --email you@example.com` pre-fills the browser. In Fleet, `m` → `a` → `s` (Sign in) does the same; selecting an account and pressing `r` renews that one with its email pre-filled. Ctrl-C cancels and stores nothing.
+
+For scripts, the explicit forms remain: `cc-swap login 4` (or an email or alias) renews that account only and refuses a login as anyone else; `cc-swap login --new` only adds, and refuses an account cc-swap already has. Behaviour change: a bare `cc-swap login` used to exit with "name the account to re-login"; it now opens the browser sign-in, so a script that called it without arguments now starts an interactive login.
 
 When claude can't be launched (not found, or too old for `claude auth login`), cc-swap shows the manual steps instead: run `claude`, `/login` as that account, then `cc-swap add`. cc-swap recognises the account and updates its slot instead of adding a duplicate.
-
-To add another account the same way without touching the login you are using, run `cc-swap login --new` (Fleet: `m` → `a` → `s`). It is stored in the next free slot (`--slot N` to choose); an account cc-swap already has is refused with its `cc-swap login N`.
 
 Two places holding the same login (two slots, or a slot and another slot's `cswap run` profile) cannot both stay logged in: a refresh token works once. `cc-swap doctor` reports it as `shared-login`, and cc-swap does not refresh that login until you re-login one of them.
 
@@ -366,7 +374,7 @@ cc-swap why      # the engine's last decision and its reason code, explained
 
 **"Keychain unreadable; holding" or `rc=36` (macOS).** The login Keychain is locked, the session can't reach it (for example over SSH), or a `/login` is still being written. cc-swap stops switching rather than overwrite a login it can't see, and resumes by itself once the Keychain answers. Unlock the login keychain. If it lasts more than 15 minutes you get a notification and the service restarts itself.
 
-**`re-login needed — login expired` or `invalid_grant`.** The login passed its fixed deadline, or its refresh token was revoked. Log in again: `cc-swap login N`, or Fleet → select the account → `r`.
+**`re-login needed — login expired` or `invalid_grant`.** The login passed its fixed deadline, or its refresh token was revoked. Log in again: `cc-swap login` and sign in as that account (`cc-swap login N` pre-fills its email), or Fleet → select the account → `r`.
 
 **`unmanaged login, run cc-swap add`.** You are logged in to Claude Code as an account cc-swap doesn't have, or as a different account than the slot expects. Check which account you are logged in as, then run `cc-swap add`.
 

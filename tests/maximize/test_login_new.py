@@ -329,7 +329,7 @@ def test_cli_new_taken_slot_exits_one_before_the_browser(temp_home, monkeypatch,
     assert not login.calls
 
 
-@pytest.mark.parametrize("argv", [["--new", "4"], [], ["4", "--slot", "2"],
+@pytest.mark.parametrize("argv", [["--new", "4"], ["4", "--slot", "2"],
                                   ["4", "--email", NEW]])
 def test_cli_argument_combinations(temp_home, monkeypatch, argv):
     _switcher(temp_home)
