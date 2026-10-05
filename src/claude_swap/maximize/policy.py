@@ -605,17 +605,24 @@ def ride_k(snap: Snapshot, a: AccountView | None) -> float | None:
     """Account ``a``'s 7d-per-5h ratio the 7d ride may read its last point
     by, or None (the time rule rides): a k learned for it under the ride's
     stricter rule (``Snapshot.ride_k7``, ``drain.ride_k``: enough windows
-    that agree) and within ``drain.K_RIDE_PLAN_BAND`` of its plan's default
-    (``drain.fallback_k``; outside it the history still mixes another plan
-    or login in). ``used`` scales with k, so a k x% off moves the switch
-    by about x% of the point; a plan default alone is too coarse."""
+    that agree) and within its plan's default (``drain.fallback_k``) less
+    ``drain.K_RIDE_PLAN_BAND_BELOW`` to plus ``drain.K_RIDE_PLAN_BAND``
+    (outside it the history still mixes another plan or login in).
+    ``used`` scales with k, so a k x% off moves the switch by about x% of
+    the point; a plan default alone is too coarse. The band is tighter
+    below: a low k under-reads the last point and rides into 100%, a high
+    one only switches early."""
     k = snap.ride_k7.get(a.number) if a is not None else None
     if not (
         isinstance(k, (int, float)) and not isinstance(k, bool) and math.isfinite(k) and k > 0
     ):
         return None
     default = drain.fallback_k(a.plan if a is not None else None)
-    if abs(float(k) - default) > drain.K_RIDE_PLAN_BAND * default:
+    if not (
+        (1 - drain.K_RIDE_PLAN_BAND_BELOW) * default
+        <= float(k)
+        <= (1 + drain.K_RIDE_PLAN_BAND) * default
+    ):
         return None
     return float(k)
 

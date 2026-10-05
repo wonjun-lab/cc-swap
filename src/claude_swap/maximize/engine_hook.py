@@ -63,6 +63,7 @@ from claude_swap.maximize import (
     notify,
     pause,
     policy,
+    ride_slots,
 )
 from claude_swap.maximize import estimate as est
 from claude_swap.maximize import hold as account_hold
@@ -1189,6 +1190,57 @@ def _ride_track(
     )
 
 
+def _reconcile_ride_slots(
+    engine: aw.AutoSwitchEngine,
+    rt: MaximizeRuntime,
+    state: dict,
+    records: Mapping[str, Mapping],
+    tiers: Mapping[str, str | None],
+) -> None:
+    """Drop the learned ride of a slot whose login or plan changed, or that
+    is gone (maximize/ride_slots.py): its own q/t/pace in the state file
+    (and ``state``, this tick's copy) and its usage-history points, on disk
+    and in the recorder's memory, so a previous login's k, t and q never
+    carry over. Writes only when something changed; a dry run writes
+    nothing. Never raises."""
+    if engine.dry_run or not records:
+        return
+    slots = {n: (ride_slots.fingerprint(r), tiers.get(n)) for n, r in records.items()}
+    keys = (learned_ride.LEARN_KEY, learned_ride.STEPS_KEY, ride_slots.IDS_KEY)
+    probe = {k: state[k] for k in keys if k in state}
+    if ride_slots.reconcile(probe, slots) == (set(), set()) and probe.get(
+        ride_slots.IDS_KEY
+    ) == state.get(ride_slots.IDS_KEY):
+        return
+    result: dict[str, tuple[set[str], set[str]]] = {}
+
+    def mutate(st: dict) -> None:
+        result["v"] = ride_slots.reconcile(st, slots)
+
+    try:
+        written = engine._mutate_state(mutate)
+        changed, gone = result["v"]
+        for k in keys:
+            if k in written:
+                state[k] = written[k]
+            else:
+                state.pop(k, None)
+        forgotten = changed | gone
+        if not forgotten:
+            return
+        ride_slots.forget_points(engine.switcher.backup_dir, forgotten)
+        if rt.history is not None and rt.history.loaded:
+            rt.history.history = ride_slots.drop_points(rt.history.history, forgotten)
+    except Exception as e:
+        _logger.debug("could not reconcile the learned ride's slots: %s", type(e).__name__)
+        return
+    if changed:
+        _logger.info(
+            "learned ride: forgot %s (another login or plan)",
+            ", ".join(engine._name(n) for n in sorted(changed)),
+        )
+
+
 def _ride_commit(
     engine: aw.AutoSwitchEngine,
     rt: MaximizeRuntime,
@@ -1799,6 +1851,8 @@ def run_maximize_tick(
     # keep running on the readings themselves; a reported limit is a ride's
     # hit all the same.
     estimate = active_estimate(engine, current)
+    tiers = _rate_limit_tiers(engine, rt, records, now)
+    _reconcile_ride_slots(engine, rt, state, records, tiers)
     ride_tick = _ride_track(
         engine, rt, state, current, entries.get(current), usage,
         samples, new_sample, prev_ts, now,
@@ -1808,7 +1862,6 @@ def run_maximize_tick(
         engine, rt, entries, usage, current, samples, now
     )
     last = state.get("lastSwitchAt")
-    tiers = _rate_limit_tiers(engine, rt, records, now)
     decided = dict(usage) if estimate is None else {**usage, current: estimate.value}
     snap, shared = policy_snapshot(
         now=now,

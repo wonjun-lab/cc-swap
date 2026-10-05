@@ -78,8 +78,10 @@ plan in), a bias of its own: one shared t would settle on the mix of
 accounts and let the one whose k reads low hit on most rides. The
 5h measure also needs a k it can trust (``policy.ride_k``: at least
 ``drain.K_RIDE_MIN_WINDOWS`` windows that agree within
-``drain.K_RIDE_MAX_SPREAD``, and within ``drain.K_RIDE_PLAN_BAND`` of the
-plan's default), else the time rule rides.
+``drain.K_RIDE_MAX_SPREAD``, and from ``drain.K_RIDE_PLAN_BAND_BELOW``
+under the plan's default to ``drain.K_RIDE_PLAN_BAND`` over it), else the
+time rule rides. A slot that comes to hold another login or plan loses its
+own record, pace and k history (maximize/ride_slots.py).
 
 Slot numbers and percentages only — never an email or a token.
 """
@@ -364,12 +366,13 @@ def describe(raw: object, windows: tuple[str, ...], off: str | None = None) -> s
     """The doctor and ``cc-swap why`` line: ``learned ride: 5h off
     (rideWindows; learned 0.60) · 7d rides to 0.88 of the last point by
     its 5h, else 0.62 of its time (aims for ~1 hit in 10, 5 ok, 1 hit;
-    per account: 1 0.86, 2 0.90)``. ``windows`` are the ones that ride;
+    per account t: 1 0.86, 2 0.90; per account q: 2 0.70)``. ``windows`` are the ones that ride;
     ``off`` says why none does when the ride is off altogether."""
     if off:
         return f"learned ride: off ({off})"
     data = learned(raw)
     accounts = learned_accounts(raw)
+    raw_own = _own(raw)
     aim = f"aims for ~1 hit in {round(1 / TARGET_HIT_RATE)}"
     parts = []
     for w in WINDOWS:
@@ -379,18 +382,25 @@ def describe(raw: object, windows: tuple[str, ...], off: str | None = None) -> s
         ]
         counts = f"({aim}, {item['n_ok']} ok, {item['n_hit']} hit"
         if w in windows and w == "7d":
-            if own:
-                counts += "; per account: " + ", ".join(
-                    f"{number} {mine['t']:.2f}" for number, mine in own
+            own_t = [(n, m) for n, m in own if "t" in raw_own.get(n, {}).get(w, {})]
+            own_q = [(n, m) for n, m in own if "q" in raw_own.get(n, {}).get(w, {})]
+            if own_t:
+                counts += "; per account t: " + ", ".join(
+                    f"{number} {mine['t']:.2f}" for number, mine in own_t
+                )
+            if own_q:
+                counts += "; per account q: " + ", ".join(
+                    f"{number} {mine['q']:.2f}" for number, mine in own_q
                 )
             parts.append(
                 f"{w} rides to {item['t']:.2f} of the last point by its 5h, "
                 f"else {item['q']:.2f} of its time {counts})"
             )
         elif w in windows:
-            if own:
+            own_q = [(n, m) for n, m in own if "q" in raw_own.get(n, {}).get(w, {})]
+            if own_q:
                 counts += "; per account: " + ", ".join(
-                    f"{number} {mine['q']:.2f}" for number, mine in own
+                    f"{number} {mine['q']:.2f}" for number, mine in own_q
                 )
             parts.append(f"{w} rides {item['q']:.2f} of the last point {counts})")
         else:

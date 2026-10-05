@@ -473,9 +473,15 @@ def test_the_ride_takes_only_a_k_from_enough_windows_that_agree():
 @pytest.mark.parametrize(
     ("plan", "k", "ok"),
     [(None, 0.165, True), (None, 0.22, True), (None, 0.23, False), (None, 0.105, False),
-     ("5x", 0.105, True), ("5x", 0.165, False), ("20x", 0.11, True), ("20x", 0.10, False)],
+     (None, 0.135, True), (None, 0.13, False),
+     ("5x", 0.105, True), ("5x", 0.141, True), ("5x", 0.142, False),
+     ("5x", 0.085, True), ("5x", 0.083, False), ("5x", 0.165, False),
+     # A 5x login's k on a 20x slot: a third low, it would ride into 100%.
+     ("20x", 0.11, False), ("20x", 0.12, False), ("20x", 0.10, False)],
 )
-def test_the_ride_takes_a_k_only_within_35_percent_of_the_plan_default(plan, k, ok):
+def test_the_ride_takes_a_k_only_from_20_percent_below_to_35_percent_above_the_plan(
+    plan, k, ok
+):
     snap = Snapshot(
         now=0.0, active="1", accounts=(), samples=(), last_switch_at=None,
         settings=SETTINGS, ride_k7={"1": k},
@@ -606,3 +612,23 @@ def test_a_5h_reset_with_no_drop_is_seen_by_its_resets_at():
     # A drop is still a reset without resets_at.
     assert ride.rise_5h(3.0, 40.0, 1.0, 0.5) == pytest.approx(4.5)
     assert ride.rise_5h(3.0, 1.0, 1.0, 0.5, reset=True) == pytest.approx(4.5)
+
+
+# -- describe: per account, only what an account learned itself ---------------------------
+
+
+def test_describe_shows_an_accounts_own_t_and_own_q_only():
+    data = ride.learn(None, "7d", "ok", 1.0, account="2")             # q only
+    data = ride.learn(data, "7d", "ok", 2.0, by_5h=True, account="1")  # t only
+    line = ride.describe(data, ("7d",))
+    t1 = ride.t_values(data, "1")["7d"]
+    q2 = ride.q_values(data, "2")["7d"]
+    assert line.endswith(f"; per account t: 1 {t1:.2f}; per account q: 2 {q2:.2f})")
+    # The review's example: a q-only account shows no t of its own.
+    only_q = ride.describe(ride.learn(None, "7d", "ok", 1, account="2"), ("7d",))
+    assert "per account t" not in only_q and "per account q: 2 " in only_q
+    # The 5h (time rule only) lists own q's, never a t-only account.
+    five = ride.learn(None, "5h", "ok", 1.0, by_5h=True, account="3")
+    assert "per account" not in ride.describe(five, ("5h",))
+    five = ride.learn(five, "5h", "ok", 2.0, account="4")
+    assert "per account: 4 " in ride.describe(five, ("5h",))

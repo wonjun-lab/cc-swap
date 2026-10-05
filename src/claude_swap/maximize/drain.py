@@ -95,10 +95,15 @@ K_RIDE_MIN_WINDOWS = 5
 #: each window's Δ7d is a handful of whole points, so a few windows'
 #: median can be 5-8% off ...
 K_RIDE_MAX_SPREAD = 0.10
-#: ... and within this share of the plan's default (``policy.ride_k``): a
-#: plan change (5x/20x, k ×1.6) or a slot given to another login mixes two
-#: accounts in the 8 days of history.
+#: ... and within this share above the plan's default (``policy.ride_k``):
+#: a plan change (5x/20x, k ×1.6) or a slot given to another login mixes
+#: two accounts in the 8 days of history ...
 K_RIDE_PLAN_BAND = 0.35
+#: ... and within this share below it. Tighter: a low k under-reads the
+#: last point (``used`` scales with k) and rides into 100%, while a high
+#: one only switches early. A 5x login's k (~0.11) read for a 20x slot
+#: (default 0.165) is a third low; this rejects it.
+K_RIDE_PLAN_BAND_BELOW = 0.20
 
 Rule = Literal["hours", "headroom"]
 
