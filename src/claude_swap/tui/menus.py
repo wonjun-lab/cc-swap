@@ -331,8 +331,9 @@ def help_entries(idle_pattern: str | None = None) -> list[tuple[str, str]]:
                   "would land on, in the order it would try them (the engine's own "
                   "list, over the readings it trusts); · only when forced (a hard mark, "
                   "or every account at its limit); – not now (a dead or expired login, "
-                  "excluded, a locked keychain, a reading too old to trust or none, "
-                  "past its hard marks). Dim while nothing is switching. The table "
+                  "excluded, a locked keychain, a login shared with another place, a "
+                  "reading too old to trust or none, past its hard marks). Dim while "
+                  "nothing is switching. The table "
                   "lists the accounts in this order"),
         ("account", "the alias, else the part of the address before the @ (two alike "
                     "say where they are from: jordan.lee@uni), then #N: its slot number, "

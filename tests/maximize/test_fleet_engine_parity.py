@@ -6,7 +6,10 @@ reading too old to trust is unknown), the stored records, accounts without
 a usable backup set aside — independently of Fleet's code. Fleet's numbered
 rows, in order, must be ``policy.landing_candidates`` of that snapshot; its
 dim ``·`` rows the rest of ``policy.escape_candidates``; and its ``next``
-the target the engine's decision moves to, whenever it moves.
+the target the engine's decision moves to, whenever it moves. One
+exception, on purpose: a login shared with another place
+(``FleetRow.shared``) is never numbered nor ``next`` — a switch onto it is
+refused (``switcher._refuse_shared_target``).
 """
 
 from __future__ import annotations
@@ -25,6 +28,7 @@ from claude_swap.maximize import home, policy
 from claude_swap.maximize.model import Hold, Switch
 from claude_swap.maximize.snapshot import build_snapshot
 from claude_swap.maximize.view import MaximizeState
+from claude_swap.shared_login import SHARED_LOGIN
 from claude_swap.usage_store import UsageEntry
 from tests.maximize.test_fleet import H, MX, NOW, PRIME, acc, accounts, mockup, usage
 
@@ -61,6 +65,10 @@ def _engine_snapshot(snap, mx, state):
             for a in snap.accounts if a.login_expires_at is not None
         },
     )
+
+
+def _shared(snap) -> set[str]:
+    return {a.number for a in snap.accounts if a.usage.last_error == SHARED_LOGIN}
 
 
 def _deadline(acc_snapshot, seconds):
@@ -112,6 +120,13 @@ def _fixtures():
         acc(4, usage(5, 20)),
     ), replace(MX, last_resort="u3@x.com"), plain
     # Nothing to land on: the active one stays.
+    # #2 would be the engine's first pick, but its login is shared.
+    yield "shared", accounts(
+        acc(1, usage(62, 40), active=True),
+        acc(2, replace(usage(0, 5), last_error=SHARED_LOGIN)),
+        acc(3, usage(20, 30)),
+        acc(4, usage(70, 30)),
+    ), MX, plain
     yield "nowhere", accounts(
         acc(1, usage(55, 40), active=True),
         acc(2, usage(60, 30)),
@@ -125,15 +140,17 @@ FIXTURES = list(_fixtures())
 @pytest.mark.parametrize(("name", "snap", "mx", "state"), FIXTURES,
                          ids=[f[0] for f in FIXTURES])
 def test_fleet_numbers_exactly_the_engines_landing_order(name, snap, mx, state):
+    shared = _shared(snap)
     engine = _engine_snapshot(snap, mx, state)
-    landing = [v.number for v in policy.landing_candidates(engine)]
-    escape = {v.number for v in policy.escape_candidates(engine)} - set(landing)
+    landing = [v.number for v in policy.landing_candidates(engine) if v.number not in shared]
+    escape = {
+        v.number for v in policy.escape_candidates(engine) if v.number not in shared
+    } - set(landing)
 
     # Fleet, as tui/fleet.py lays the table out.
     rows = fx.fleet_rows(snap, mx, PRIME, state, now=NOW)
     msnap = fx.fleet_snapshot(snap, mx, state, now=NOW)
-    picks = [v.number for v in policy.landing_candidates(msnap)]
-    forced = frozenset(v.number for v in policy.escape_candidates(msnap)) - set(picks)
+    picks, forced = home.engine_lists(msnap, rows)
     ordered = home.ordered_rows(rows, picks, now=NOW, forced=forced)
     marks = home.order_marks(ordered, picks, forced)
 
@@ -154,6 +171,7 @@ def test_fleets_next_is_the_engines_target(name, snap, mx, state):
     engine = _engine_snapshot(snap, mx, state)
     decision = policy.decide(engine)
     landing = policy.landing_candidates(engine)
+    shared = _shared(snap)
     if isinstance(decision, Switch):
         target = decision.target
     elif isinstance(decision, Hold) and decision.pending:
@@ -163,13 +181,14 @@ def test_fleets_next_is_the_engines_target(name, snap, mx, state):
 
     rows = fx.fleet_rows(snap, mx, PRIME, state, now=NOW)
     msnap = fx.fleet_snapshot(snap, mx, state, now=NOW)
-    picks = [v.number for v in policy.landing_candidates(msnap)]
+    picks, _forced = home.engine_lists(msnap, rows)
     dv = fx.preview_decision(msnap, mx)
-    untrusted = {r.number for r in rows if not r.trusted}
-    nxt = home.next_number(dv, picks, "live", untrusted)
-    if target is not None:
+    never = home.never_next(rows)
+    nxt = home.next_number(dv, picks, "live", never)
+    if target is not None and target not in shared:
         assert nxt == target, (name, decision)
-    assert nxt is None or nxt not in untrusted
+    assert nxt is None or nxt not in never
+    assert not shared & {nxt}
     if nxt is not None:
         row = {r.number: r for r in rows}[nxt]
         assert home.tag_for(row, is_next=True, now=NOW)[0] == "next"
@@ -198,3 +217,22 @@ def test_the_summary_counts_only_trusted_readings():
     assert cap.usable == 3 and cap.free5 == 2       # #1 and #3
     assert cap.back5 == (NOW + H, "4")
     assert cap.left7 == pytest.approx((60 + 95 + 80) / 100)
+
+
+def test_a_shared_login_is_never_numbered_next_or_counted():
+    snap = accounts(
+        acc(1, usage(62, 40), active=True),
+        acc(2, replace(usage(0, 5), last_error=SHARED_LOGIN)),
+        acc(3, usage(20, 30)),
+    )
+    rows = fx.fleet_rows(snap, MX, PRIME, MaximizeState(), now=NOW)
+    msnap = fx.fleet_snapshot(snap, MX, MaximizeState(), now=NOW)
+    assert [v.number for v in policy.landing_candidates(msnap)][0] == "2"  # the engine's pick
+    picks, forced = home.engine_lists(msnap, rows)
+    assert "2" not in picks and "2" not in forced
+    marks = home.order_marks(home.ordered_rows(rows, picks, now=NOW, forced=forced),
+                             picks, forced)
+    assert marks["2"] == home.ORDER_NONE and marks["3"] == "1"
+    row = {r.number: r for r in rows}["2"]
+    assert row.shared and home.tag_for(row, is_next=True, now=NOW) != ("next", "accent")
+    assert home.capacity(rows, MX, NOW).usable == 2  # #1 and #3

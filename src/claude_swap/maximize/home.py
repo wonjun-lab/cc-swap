@@ -49,9 +49,11 @@ from typing import TYPE_CHECKING, Literal
 from claude_swap import oauth
 from claude_swap.maximize import fleet as fx
 from claude_swap.maximize import hold as account_hold
+from claude_swap.maximize import policy
 from claude_swap.settings import MaximizeSettings
 
 if TYPE_CHECKING:
+    from claude_swap.maximize.model import Snapshot
     from claude_swap.maximize.prime_verify import PausedView
 
 Tone = str
@@ -114,6 +116,25 @@ def ordered_rows(
         r.rank is None, r.rank or 0,
     ))
     return out + rest
+
+
+def engine_lists(
+    msnap: "Snapshot | None", rows: Sequence[fx.FleetRow]
+) -> tuple[list[str], frozenset[str]]:
+    """``(picks, forced)`` for the ``order`` column and ``next``: the
+    engine's ``policy.landing_candidates`` in its order and the rest of its
+    ``policy.escape_candidates``, over the readings it trusts (``msnap``:
+    ``fleet.fleet_snapshot``) — less a login shared with another place
+    (``FleetRow.shared``: a switch onto it is refused, and refreshing it
+    would log the other copy out)."""
+    if msnap is None:
+        return [], frozenset()
+    shared = {r.number for r in rows if r.shared}
+    picks = [v.number for v in policy.landing_candidates(msnap) if v.number not in shared]
+    forced = frozenset(
+        v.number for v in policy.escape_candidates(msnap) if v.number not in shared
+    ) - set(picks)
+    return picks, forced
 
 
 #: The ``order`` column: the active account, an account only a forced move
@@ -196,7 +217,7 @@ def tag_for(
     old = f"reading {ago_text(age or 0.0)} old"
     if row.login == "ok" and not row.trusted and age is not None:
         return old, "warn"  # the engine counts it as unknown: never next
-    if is_next and row.trusted:
+    if is_next and row.trusted and not row.shared:
         return "next", "accent"
     if fx.login_due(row, now):
         left = fx.login_left(row, now) or 0.0
@@ -604,11 +625,13 @@ class Capacity:
 
 def usable_for_capacity(row: fx.FleetRow, now: float) -> bool:
     """An account the summary counts: one automatic switching may use
-    (not :func:`unusable`), with usage windows (no API key) it can read and
-    a reading the engine still decides on (``FleetRow.trusted``)."""
+    (not :func:`unusable`), with usage windows (no API key) it can read,
+    a reading the engine still decides on (``FleetRow.trusted``), and a
+    login not shared with another place (``FleetRow.shared``)."""
     return (
         not unusable(row, now)
         and row.trusted
+        and not row.shared
         and row.login != "api"
         and row.pct5 is not None
         and row.pct7 is not None
@@ -759,21 +782,27 @@ def next_number(
     dv: fx.DecisionView,
     picks: Sequence[str],
     sit: Situation,
-    untrusted: Collection[str] = (),
+    never: Collection[str] = (),
 ) -> str | None:
     """The account automatic switching goes to next: the decision's target
     while it is moving (a pending switch, a switch, a preempt waiting for
     idle, a rebalance deferred to a quiet time), else the engine's first
     pick. None while nothing switches or the engine stopped reporting, and
-    never an account whose reading the engine no longer trusts
-    (``untrusted``: a published target the reading has since aged out of)."""
+    never one of ``never`` (:func:`never_next`: a reading the engine no
+    longer trusts — a published target whose reading has since aged out —
+    or a login shared with another place)."""
     if not switching_live(sit):
         return None
     moving = dv.kind in ("pending", "switch") or (
         dv.kind == "hold" and dv.code in ("preempt", "rebalance-deferred")
     )
     out = dv.target if moving and dv.target else (picks[0] if picks else None)
-    return None if out in untrusted else out
+    return None if out in never else out
+
+
+def never_next(rows: Sequence[fx.FleetRow]) -> set[str]:
+    """Accounts never tagged ``next``: an untrusted reading, a shared login."""
+    return {r.number for r in rows if not r.trusted or r.shared}
 
 
 # -- the status sentence ---------------------------------------------------------------

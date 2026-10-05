@@ -60,7 +60,6 @@ from textual.widgets import Static
 from claude_swap.maximize import fleet as fx
 from claude_swap.maximize import hold as account_hold
 from claude_swap.maximize import home
-from claude_swap.maximize import policy
 from claude_swap.maximize import view as mxview
 from claude_swap.maximize.primer import plan_text as mxprimer_plan_text
 from claude_swap.models import AccountsSnapshot
@@ -810,10 +809,7 @@ class FleetScreen(Screen):
         msnap = self._msnap(now)
         dv = self._decision(msnap, now)
         # The engine's own lists, over the readings it trusts (msnap).
-        picks = [v.number for v in policy.landing_candidates(msnap)] if msnap else []
-        forced = frozenset(
-            v.number for v in policy.escape_candidates(msnap)
-        ) - set(picks) if msnap else frozenset()
+        picks, forced = home.engine_lists(msnap, self._rows)
         snap = self.app.snapshot
         published = self._state.decision
         sit = home.situation(
@@ -827,7 +823,7 @@ class FleetScreen(Screen):
             ticks=mxview.window_ticks(self._mx),
             now=now,
             next_no=home.next_number(
-                dv, picks, sit, untrusted={r.number for r in self._rows if not r.trusted},
+                dv, picks, sit, home.never_next(self._rows),
             ),
             priming=self._priming(es, sit),
             picks=tuple(picks),
