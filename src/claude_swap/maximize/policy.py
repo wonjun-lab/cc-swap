@@ -67,9 +67,10 @@ and still under 100%, the hard switch waits until
 before the first one at the mark (the crossing may have come right after
 it), else ``ride.ARM_UNKNOWN_GAP_S`` before that first one
 (``ride.arm_time``, ``Snapshot.ride_armed_at``). ``T1`` is the time one
-point takes (the shorter of ``Snapshot.ride_point_s``, measured from
-whole-point steps, and the recent velocity's; unknown = no ride), ``q``
-the learned share
+point takes (``Snapshot.ride_point_s``, the pace of the whole-point steps
+timed while the account was in use; the recent velocity only when no step
+was timed or it shows a burst, ``ride.point_estimate``; unknown = no
+ride), ``q`` the learned share
 (``Snapshot.ride_q``). Until then the decision is a ``Hold`` with code
 ``ride``, unless the account goes idle (the cheapest moment to switch: a
 hard switch at once, ``Switch.ride == "idle"``) or every ridden window
@@ -552,20 +553,19 @@ def rideable(snap: Snapshot, a: AccountView, window: Window) -> bool:
 
 
 def ride_point_s(snap: Snapshot, window: Window) -> float | None:
-    """``T1``, seconds per point on ``window``: the shorter of the engine's
-    (``Snapshot.ride_point_s``, measured steps) and the recent velocity's,
-    whichever are known; None when neither is (or the window is not
-    climbing). Shorter is safer: a T1 too long rides into 100%."""
-    out: list[float] = []
+    """``T1``, seconds per point on ``window``: the engine's
+    (``Snapshot.ride_point_s``, the timed steps' pace frozen at the arm
+    time) unless the recent velocity over ``idleWindowMin`` shows a burst
+    or nothing else is known (``ride.point_estimate``); None when neither
+    is (or the window is not climbing)."""
     known = snap.ride_point_s.get(window)
-    if known is not None and math.isfinite(known) and known > 0:
-        out.append(float(known))
-    if _fresh_samples(snap):
-        v5, v7 = idle.velocity(snap.samples, snap.settings)
-        rate = v5 if window == "5h" else v7
-        if rate is not None and rate > 0:
-            out.append(60.0 / rate)
-    return min(out) if out else None
+    velocity_s, points = (
+        idle.point_pace(snap.samples, snap.settings, window)
+        if _fresh_samples(snap) else (None, 0.0)
+    )
+    return learned_ride.point_estimate(
+        float(known) if known is not None else None, velocity_s, points
+    )
 
 
 def ride_armed_at(snap: Snapshot, window: Window) -> float:

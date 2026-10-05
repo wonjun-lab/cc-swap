@@ -13,34 +13,49 @@ from claude_swap.maximize import ride
 from claude_swap.maximize.engine_hook import DECISION_KEY, RIDE_KEY, runtime_for
 from tests.maximize.test_engine_maximize import EMAILS, make, no_switch_reasons, of, win
 
-# -- AIMD --------------------------------------------------------------------------------
+# -- the controller ----------------------------------------------------------------------
+
+
+def fresh(q: float, **kw) -> dict:
+    """One window's record as this controller writes it."""
+    return {"q": q, "n_ok": 0, "n_hit": 0, "settled": False, "v": ride.LEARN_VERSION,
+            "updatedAt": None, **kw}
 
 
 class TestLearn:
     def test_defaults_for_a_missing_or_broken_record(self):
         for raw in (None, {}, "x", {"7d": {"q": "high", "n_ok": -3}}, {"5h": []}):
             data = ride.learned(raw)
-            assert data["7d"] == {"q": 0.3, "n_ok": 0, "n_hit": 0, "updatedAt": None}
-            assert data["5h"]["q"] == 0.3
+            assert data["7d"] == fresh(0.6)
+            assert data["5h"]["q"] == 0.6
 
-    def test_success_adds_a_step(self):
+    def test_the_constants_target_a_ten_percent_hit_rate(self):
+        assert ride.TARGET_HIT_RATE == pytest.approx(0.1)
+        assert (ride.Q_START, ride.Q_MIN, ride.Q_MAX) == (0.6, 0.3, 0.95)
+
+    def test_before_the_first_hit_a_success_climbs_fast(self):
         out = ride.learn(None, "7d", "ok", 100.0)
-        assert out["7d"] == {"q": 0.35, "n_ok": 1, "n_hit": 0, "updatedAt": 100.0}
-        assert out["5h"]["q"] == 0.3  # the other window is untouched
+        assert out["7d"] == fresh(0.65, n_ok=1, updatedAt=100.0)
+        assert out["5h"]["q"] == 0.6  # the other window is untouched
 
-    def test_a_hit_halves_q(self):
-        out = ride.learn({"7d": {"q": 0.4, "n_ok": 2}}, "7d", "hit", 5.0)
-        assert out["7d"] == {"q": 0.2, "n_ok": 2, "n_hit": 1, "updatedAt": 5.0}
+    def test_a_hit_takes_the_down_step_and_settles_the_window(self):
+        out = ride.learn({"7d": fresh(0.8, n_ok=2)}, "7d", "hit", 5.0)
+        assert out["7d"] == fresh(0.71, n_ok=2, n_hit=1, settled=True, updatedAt=5.0)
+        # From then on a success adds the small step.
+        out = ride.learn(out, "7d", "ok", 6.0)
+        assert out["7d"]["q"] == pytest.approx(0.72)
+        assert out["7d"]["settled"] is True
 
-    def test_q_stays_between_005_and_09(self):
+    def test_q_stays_between_03_and_095(self):
         data: object = None
         for _ in range(30):
             data = ride.learn(data, "5h", "ok", 0.0)
-        assert ride.q_values(data)["5h"] == 0.9
+        assert ride.q_values(data)["5h"] == 0.95
         for _ in range(10):
             data = ride.learn(data, "5h", "hit", 0.0)
-        assert ride.q_values(data)["5h"] == 0.05
-        assert ride.q_values({"7d": {"q": 7}})["7d"] == 0.9
+        assert ride.q_values(data)["5h"] == 0.3
+        assert ride.q_values({"7d": {"q": 7, "v": 2}})["7d"] == 0.95
+        assert ride.q_values({"7d": {"q": 0.1, "v": 2}})["7d"] == 0.3
 
     def test_the_record_survives_json(self):
         data = ride.learn(ride.learn(None, "7d", "ok", 1.0), "5h", "hit", 2.0)
@@ -49,12 +64,46 @@ class TestLearn:
     def test_describe(self):
         data = ride.learn(None, "7d", "ok", 1.0)
         assert ride.describe(data, ("7d",)) == (
-            "learned ride: 5h off (rideWindows; learned 0.30) · "
-            "7d rides 0.35 of the last point (1 ok, 0 hit)"
+            "learned ride: 5h off (rideWindows; learned 0.60) · "
+            "7d rides 0.65 of the last point (target ~0.9, 1 ok, 0 hit)"
         )
         assert ride.describe(data, (), "maximize.learnedRide is false") == (
             "learned ride: off (maximize.learnedRide is false)"
         )
+
+
+class TestMigration:
+    """Records the halving rule wrote carry no ``"v"``."""
+
+    def test_a_halved_q_starts_over_from_the_start_value(self):
+        old = {"7d": {"q": 0.2, "n_ok": 3, "n_hit": 2, "updatedAt": 9.0}}
+        data = ride.learned(old)
+        assert data["7d"] == fresh(0.6, n_ok=3, n_hit=2, updatedAt=9.0)
+
+    def test_a_q_earned_by_clean_rides_is_kept(self):
+        old = {"7d": {"q": 0.85, "n_ok": 12, "n_hit": 1}}
+        assert ride.q_values(old)["7d"] == 0.85
+        assert ride.learned(old)["7d"]["settled"] is False
+
+    def test_a_migrated_window_gets_the_slow_start_then_settles(self):
+        old = {"7d": {"q": 0.85, "n_ok": 12, "n_hit": 1}, "5h": {"q": 0.1}}
+        out = ride.learn(old, "7d", "ok", 1.0)
+        assert out["7d"]["q"] == pytest.approx(0.9)
+        out = ride.learn(out, "7d", "hit", 2.0)
+        assert out["7d"] == fresh(0.81, n_ok=13, n_hit=2, settled=True, updatedAt=2.0)
+        # The untouched window is written migrated, and stays so.
+        assert out["5h"] == fresh(0.6)
+        assert ride.learned(out) == out
+
+    def test_once_written_a_low_q_is_not_lifted_again(self):
+        data = ride.learned(None)
+        for _ in range(3):
+            data = ride.learn(data, "7d", "hit", 0.0)
+        assert ride.q_values(json.loads(json.dumps(data)))["7d"] == pytest.approx(0.33)
+
+    def test_settled_needs_the_current_version(self):
+        assert ride.learned({"7d": {"q": 0.7, "settled": True}})["7d"]["settled"] is False
+        assert ride.learned({"7d": {"q": 0.7, "settled": True, "v": 2}})["7d"]["settled"]
 
 
 # -- steps -------------------------------------------------------------------------------
@@ -102,16 +151,41 @@ class TestSteps:
         raw = feed([(0, 96), (300, 96), (600, 97), (900, 97), (1200, 97), (1500, 98)])
         assert seconds(raw, 1500) == 900.0
 
-    def test_t1_is_the_median_of_the_last_three_intervals(self):
+    def test_t1_is_the_pace_over_the_timed_steps(self):
         readings = [(0, 90), (100, 91), (500, 92), (800, 93), (1300, 94), (1600, 95)]
         raw = feed(readings)
-        # intervals 400, 300, 500, 300 -> the last three: 300, 500, 300
-        assert [s for _, s in raw["1"]["7d"]["intervals"]] == [300.0, 500.0, 300.0]
-        assert seconds(raw, 1600) == 300.0
+        # intervals 400, 300, 500, 300: 1500 s for 4 points, the first step
+        # to the last (the median of the last three said 300)
+        assert [s for _, s, _ in raw["1"]["7d"]["intervals"]] == [400.0, 300.0, 500.0, 300.0]
+        assert seconds(raw, 1600) == 375.0
+
+    def test_it_keeps_the_last_six_intervals(self):
+        readings = [(i * 300.0 + (60 if i == 1 else 0), 90 + i) for i in range(9)]
+        raw = feed(readings)
+        kept = raw["1"]["7d"]["intervals"]
+        assert len(kept) == ride.KEEP_INTERVALS == 6
+        assert seconds(raw, 2400) == 300.0
+
+    def test_a_pause_shorter_than_the_idle_window_is_left_out(self):
+        # 300 s a point, one 900 s interval (a 9-minute pause with the 5h
+        # still creeping): slower than twice the median, so not the pace.
+        raw = feed([(0, 90), (300, 91), (600, 92), (1500, 93), (1800, 94), (2100, 95)])
+        assert seconds(raw, 2100) == 300.0
 
     def test_a_jump_of_two_points_is_per_point(self):
         raw = feed([(0, 95), (60, 96), (360, 97), (660, 97), (960, 99)])
         assert seconds(raw, 960) == 300.0  # 300, then 600 s for two points
+        assert raw["1"]["7d"]["intervals"][-1][1:] == [300.0, 2.0]
+
+    def test_the_projection_reads_the_median_of_the_last_three(self):
+        readings = [(0, 90), (100, 91), (500, 92), (800, 93), (1300, 94), (1600, 95)]
+        raw = feed(readings)
+        assert ride.point_seconds(raw, "1", "7d", 1600, median_of=3) == 300.0
+
+    def test_older_two_element_intervals_count_one_point(self):
+        raw = {"1": {"7d": {"pct": 98, "stepAt": 900.0,
+                            "intervals": [[600.0, 600.0], [900.0, 300.0, 1.0]]}}}
+        assert seconds(raw, 900) == 450.0
 
     def test_a_hole_or_a_new_tenure_leaves_the_next_step_untimed(self):
         raw = feed([(0, 95), (60, 96), (300, 96), (600, 97)], gap_after=3)
@@ -129,6 +203,24 @@ class TestSteps:
         raw = ride.observe(raw, "2", 0.0, 50.0, 700.0, None)
         assert seconds(raw, 700) == 300.0
         assert seconds(raw, 700, number="2") is None
+
+
+class TestPointEstimate:
+    """The timed steps over the short velocity; the velocity only for a
+    burst or when nothing was timed."""
+
+    def test_the_steps_win_over_one_step_in_the_idle_window(self):
+        # One 7d step in 10 minutes reads as 600 s a point whatever the pace.
+        assert ride.point_estimate(1800.0, 600.0, 1.0) == 1800.0
+
+    def test_a_burst_wins(self):
+        assert ride.point_estimate(1800.0, 300.0, 2.0) == 300.0
+        assert ride.point_estimate(200.0, 300.0, 2.0) == 200.0  # slower: the steps
+
+    def test_with_no_timed_step_the_velocity_decides(self):
+        assert ride.point_estimate(None, 600.0, 1.0) == 600.0
+        assert ride.point_estimate(None, None, 0.0) is None
+        assert ride.point_estimate(0.0, float("nan"), 3.0) is None
 
 
 class TestStaleT1:
@@ -239,11 +331,11 @@ def learning(h) -> dict:
 def test_the_reviewers_overnight_case_rides_minutes_not_hours(temp_home):
     """7d 97 at 18:00, idle all night (polled every 300 s), busy from
     08:50, 98 at 09:00, 99 at 09:20. Untouched, T1 was 7.67 h and even
-    q 0.05 rode 22 min."""
+    the old floor of q 0.05 rode 22 min."""
     # soft7d 99 and peers at 7d 95: nothing soft-switches or rebalances
     # overnight; at 99 the hard path lands on the roomier #2.
     h = make(temp_home, maximize={**MARKS, "soft7d": 99, "rideMaxMin": 120})
-    h.engine._mutate_state(lambda s: s.__setitem__(ride.LEARN_KEY, {"7d": {"q": 0.05}}))
+    set_q(h, ride.Q_MIN)
     c = Climb(h, {"2": win(0, 95), "3": win(0, 95)})
     for p7 in (96, 96, 97):                      # 17:50 - 18:00, busy
         c.tick(1, p7, advance=300)
@@ -258,8 +350,9 @@ def test_the_reviewers_overnight_case_rides_minutes_not_hours(temp_home):
     steps = h.state()[ride.STEPS_KEY]
     assert ride.point_seconds(steps, "1", "7d", h.clock.now) == 1200.0
     decision = of(h, MaximizeDecisionEvent)[-1]
-    # T1 is at most 20 min (the velocity's 10 min here), so q 0.05 rides
-    # at most a minute: it is due at once.
+    # T1 is the 20 min the steps timed, and the ride counts from the 98
+    # read 5 minutes back: q 0.3 rides 0.3 x 1200 - 90 = 270 s of it, due
+    # at once.
     assert (decision.decision, decision.trigger) == ("switch", "hard")
     assert h.active_number() == 2
 
@@ -270,50 +363,56 @@ def busy(h, peers, **kw) -> Climb:
 
 
 def set_q(h, q: float) -> None:
-    h.engine._mutate_state(lambda s: s.__setitem__(ride.LEARN_KEY, {"7d": {"q": q}}))
+    """A ``rideLearning`` record this controller wrote, 7d at ``q``."""
+    h.engine._mutate_state(
+        lambda s: s.__setitem__(ride.LEARN_KEY, {"7d": {"q": q, "v": ride.LEARN_VERSION}})
+    )
 
 
-def test_q_rises_after_successes_and_halves_after_a_hit(temp_home):
+def test_q_rises_after_successes_and_drops_after_a_hit(temp_home):
     h = make(temp_home, n=4, maximize=MARKS)
     peers = {"1": win(5, 99), "2": win(5, 99), "3": win(5, 10), "4": win(5, 20)}
     c = busy(h, peers)
 
     def ride_once(active: int, last: float = 99) -> list[TickOutcome]:
-        """Up to 99 (T1 600 s: the steps and the velocity agree), then a
-        reading every 60 s (``last``: its 7d, e.g. 100) until it switches."""
+        """Up to 99 (T1 600 s: the steps' pace), then a reading every 60 s
+        (``last``: its 7d, e.g. 100) until it switches."""
         out = [approach(c, active)]
         while out[-1] is TickOutcome.NO_ACTION and len(out) < 20:
             out.append(c.tick(active, last, advance=URGENT))
         return out
 
-    # Ride 1 on #1: armed at the last 98 (60 s back), q 0.3: the switch is
-    # due 0.3 x 600 - 90 = 90 s after it, at the next reading.
+    # Ride 1 on #1: armed at the last 98 (60 s back), q 0.6: the switch is
+    # due 0.6 x 600 - 90 = 270 s after it, at the fourth reading after the 99.
     out = ride_once(1)
-    assert out == [TickOutcome.NO_ACTION, TickOutcome.SWITCHED]
+    assert out == [TickOutcome.NO_ACTION] * 4 + [TickOutcome.SWITCHED]
     assert no_switch_reasons(h)[-1] == "ride"
     [first] = of(h, SwitchEvent)
     assert first.trigger == "hard"
-    assert learning(h)["7d"]["q"] == pytest.approx(0.35)
+    assert learning(h)["7d"]["q"] == pytest.approx(0.65)   # the slow start
     assert learning(h)["7d"]["n_ok"] == 1
     landed = h.active_number()
     assert landed == 3
 
-    # Ride 2 on #3: its own steps from its own tenure, q 0.35 -> another success.
+    # Ride 2 on #3: its own steps from its own tenure, q 0.65 -> another success.
     out = ride_once(landed)
     assert out[-1] is TickOutcome.SWITCHED
-    assert learning(h)["7d"]["q"] == pytest.approx(0.40)
+    assert learning(h)["7d"]["q"] == pytest.approx(0.70)
     assert learning(h)["7d"]["n_ok"] == 2
     landed = h.active_number()
     assert landed == 4
 
-    # Ride 3 on #4: q 0.4 -> due 150 s after the last 98, but 100% shows
-    # up at the next reading: a hit halves q, and at-limit moves on at once.
+    # Ride 3 on #4: q 0.7 -> due 330 s after the last 98, but 100% shows
+    # up at the next reading: a hit takes 0.09 off and settles the window,
+    # and at-limit moves on at once.
     out = ride_once(landed, last=100)
     assert out == [TickOutcome.NO_ACTION, TickOutcome.SWITCHED]
     assert [e.trigger for e in of(h, SwitchEvent)][-1] == "at-limit"
     data = learning(h)["7d"]
-    assert (data["q"], data["n_ok"], data["n_hit"]) == (pytest.approx(0.2), 2, 1)
-    assert learning(h)["5h"]["q"] == 0.3  # the 5h never rode
+    assert (data["q"], data["n_ok"], data["n_hit"], data["settled"]) == (
+        pytest.approx(0.61), 2, 1, True
+    )
+    assert learning(h)["5h"]["q"] == 0.6  # the 5h never rode
 
 
 def test_the_ride_is_published_with_its_switch_time(temp_home):
@@ -425,6 +524,7 @@ def test_an_arm_time_in_the_future_is_pulled_back_and_kept(temp_home):
     # only at decision time would count the ride from "now" on every tick:
     # it would slide forward forever.
     h = make(temp_home, maximize=MARKS)
+    set_q(h, 0.3)                                     # 0.3 x 600 - 90 = 90 s
     seed_armed(h, h.clock.now + 3600)
     c = busy(h, {"2": win(0, 10), "3": win(0, 50)})
     assert c.tick(1, 99, advance=URGENT) is TickOutcome.NO_ACTION   # due in 90 s
@@ -501,3 +601,57 @@ def test_auto_off_never_counts_a_ride(temp_home):
     c.tick(1, 100, advance=URGENT)
     assert learning(h)["7d"]["n_hit"] == 0
     assert h.active_number() == 1
+
+
+class TestRefusalIsAHit:
+    """Claude Code's own limit refusal (maximize/limit_watch.py, the
+    ``reported`` estimate) ends a ride at once, as a 100% reading does, and
+    counts as its hit: the reading may still say 99."""
+
+    @staticmethod
+    def refuse(h, c: Climb, window: str = "7d") -> None:
+        from claude_swap.maximize import estimate as est
+
+        def reported(current, entries, usage, now, *, poll):
+            value = win(c.p5 if window == "7d" else 100, 100 if window == "7d" else 99)
+            return est.Estimate(
+                number=current, kind="reported", value=value,
+                note=f"Claude Code reported the {window} usage limit at 09:00",
+                reported_at=now - 10, refused=(window,),
+            )
+
+        h.engine._estimate_active = reported
+
+    def test_a_refusal_while_riding_switches_and_lowers_q(self, temp_home):
+        h = make(temp_home, maximize={**MARKS, "rideMaxMin": 120})
+        set_q(h, 0.9)
+        c = busy(h, {"2": win(0, 10), "3": win(0, 50)})
+        assert approach(c, 1) is TickOutcome.NO_ACTION
+        assert h.state()[RIDE_KEY]["riding"] == ["7d"]
+        self.refuse(h, c)
+        assert c.tick(1, 99, advance=URGENT) is TickOutcome.SWITCHED
+        assert of(h, SwitchEvent)[-1].trigger == "at-limit"
+        data = learning(h)["7d"]
+        assert (data["q"], data["n_ok"], data["n_hit"], data["settled"]) == (
+            pytest.approx(0.81), 0, 1, True
+        )
+
+    def test_a_refusal_with_no_ride_under_way_teaches_nothing(self, temp_home):
+        h = make(temp_home, maximize=MARKS)
+        c = busy(h, {"2": win(0, 10), "3": win(0, 50)})
+        for p7 in [97] * 3:
+            c.tick(1, p7, advance=URGENT)
+        self.refuse(h, c)
+        assert c.tick(1, 97, advance=URGENT) is TickOutcome.SWITCHED
+        data = learning(h)["7d"]
+        assert (data["n_ok"], data["n_hit"]) == (0, 0)
+
+    def test_a_refusal_for_the_other_window_is_not_this_rides_hit(self, temp_home):
+        h = make(temp_home, maximize={**MARKS, "rideMaxMin": 120})
+        set_q(h, 0.9)
+        c = busy(h, {"2": win(0, 10), "3": win(0, 50)})
+        assert approach(c, 1) is TickOutcome.NO_ACTION
+        self.refuse(h, c, window="5h")
+        assert c.tick(1, 99, advance=URGENT) is TickOutcome.SWITCHED
+        data = learning(h)["7d"]
+        assert (data["n_ok"], data["n_hit"]) == (0, 0)

@@ -28,8 +28,10 @@ rides (``maximizeRide``: each account's arm time and T1 per window at its
 mark, kept until that window resets, and which windows the active
 account's last acted-on decision rode), and what was learned
 (``rideLearning``, q per window). A ride the engine ended with its
-hard switch before 100% raises q; 100% read while it rode halves q; an
-idle switch, a dry run, ``auto off`` and an unreadable tick teach nothing.
+hard switch before 100% raises q; 100% while it rode — read, or a limit
+refusal Claude Code reported (maximize/limit_watch.py) — lowers it
+(``ride.learn``); an idle switch, a dry run, ``auto off`` and an
+unreadable tick teach nothing.
 A ride polls the active account at the 120 s high-usage cadence over its last
 ``RESET_WAIT_URGENT_S``, at ``pendingPollS`` before that.
 
@@ -938,13 +940,12 @@ def _disarm_parked(
 
 def _velocity_point_s(
     samples: tuple[Sample, ...], s: MaximizeSettings, now: float, window: str
-) -> float | None:
-    """Seconds per point at the recent velocity (fresh samples only)."""
+) -> tuple[float | None, float]:
+    """``(seconds per point, points risen)`` at the recent velocity over
+    ``idleWindowMin`` (fresh samples only; ``idle.point_pace``)."""
     if not samples or now - samples[-1].ts > s.idle_window_min * 60.0:
-        return None
-    v5, v7 = idle.velocity(samples, s)
-    rate = v5 if window == "5h" else v7
-    return 60.0 / rate if rate is not None and rate > 0 else None
+        return None, 0.0
+    return idle.point_pace(samples, s, window)
 
 
 @dataclass
@@ -984,15 +985,19 @@ def _ride_track(
     new: Sample | None,
     prev_ts: float | None,
     now: float,
+    refused: tuple[str, ...] = (),
 ) -> RideTick:
     """Record this tick's whole-point steps, arm or disarm each window that
-    may ride, and note a hit: a window that reads 100% while the last
-    acted-on decision rode it. Writes nothing (:func:`_ride_commit` does).
+    may ride, and note a hit: a window at 100% while the last acted-on
+    decision rode it — read so, or in ``refused``, the windows Claude Code
+    reported a limit refusal for (the ``reported`` estimate). Writes
+    nothing (:func:`_ride_commit` does).
 
     A window is armed when it first reads its hard mark under 100% (at the
-    reading's fetch time) with its T1 frozen then: the shorter of the timed
-    steps' and the recent velocity's, else unknown until one is known. Under the mark again
-    (a reset) or at 100% disarms it."""
+    reading's fetch time) with its T1 frozen then (``ride.point_estimate``:
+    the timed steps' pace, the recent velocity only when no step was timed
+    or it shows a burst), else unknown until one is known. Under the mark
+    again (a reset) or at 100% disarms it."""
     s = rt.settings
     source = rt.dry_ride if engine.dry_run else state
     stored_steps = source.get(learned_ride.STEPS_KEY)
@@ -1016,6 +1021,8 @@ def _ride_track(
     for w, pct, cap, reset in (
         ("5h", pct5, s.hard_5h, reset5), ("7d", pct7, s.hard_7d, reset7)
     ):
+        if w in refused:
+            pct = policy.LIMIT_PCT  # Claude Code was refused for it: 100%
         if pct is None:
             continue  # unreadable this tick: keep what we had
         if pct >= policy.LIMIT_PCT:
@@ -1040,15 +1047,10 @@ def _ride_track(
             # would count from "now" on every tick and never end.
             item["at"] = min(item["at"], now)
             if item["pointS"] is None:
-                # The shorter of the measured steps and the recent velocity:
-                # a T1 too long rides into 100%.
-                known = [
-                    x for x in (
-                        learned_ride.point_seconds(steps, current, w, now),
-                        _velocity_point_s(samples, s, now, w),
-                    ) if x is not None
-                ]
-                item["pointS"] = min(known) if known else None
+                item["pointS"] = learned_ride.point_estimate(
+                    learned_ride.point_seconds(steps, current, w, now),
+                    *_velocity_point_s(samples, s, now, w),
+                )
         else:
             armed.pop(w, None)
     record["riding"] = [w for w in record["riding"] if w in armed]
@@ -1078,7 +1080,7 @@ def _ride_commit(
     ``riding``: the windows the decision the engine acted on rides (None
     keeps the previous ones: nothing was acted on this tick). ``ok``: the
     windows whose ride the engine ended with its hard switch, before 100%.
-    A hit (:func:`_ride_track`) halves q, an ok raises it, both under the
+    A hit (:func:`_ride_track`) lowers q, an ok raises it, both under the
     state lock. A dry run keeps its records in memory and learns nothing.
     Never raises: bookkeeping must not break a tick."""
     record = dict(tick.record)
@@ -1110,7 +1112,8 @@ def _ride_commit(
     for w, outcome in outcomes:
         _logger.info(
             "learned ride: %s %s", w,
-            "switched before 100%" if outcome == "ok" else "reached 100% while riding",
+            "switched before 100%" if outcome == "ok"
+            else "reached 100% (read or refused) while riding",
         )
 
 
@@ -1657,20 +1660,22 @@ def run_maximize_tick(
         engine, rt, state, current, entries.get(current), usage.get(current), now
     )
     new_sample, prev_ts = _new_sample(before, samples)
+    # The active account's usage as the engine decides on it when its
+    # reading is too old, or Claude Code reported its limit
+    # (maximize/active_watch.py). Samples, the ride and the history below
+    # keep running on the readings themselves; a reported limit is a ride's
+    # hit all the same.
+    estimate = active_estimate(engine, current)
     ride_tick = _ride_track(
         engine, rt, state, current, entries.get(current), usage,
         samples, new_sample, prev_ts, now,
+        refused=estimate.refused if estimate is not None else (),
     )
     forecast, rates7, k7 = _history_inputs(
         engine, rt, entries, usage, current, samples, now
     )
     last = state.get("lastSwitchAt")
     tiers = _rate_limit_tiers(engine, rt, records, now)
-    # The active account's usage as the engine decides on it when its
-    # reading is too old, or Claude Code reported its limit
-    # (maximize/active_watch.py). Samples, the ride and the history above
-    # keep running on the readings themselves.
-    estimate = active_estimate(engine, current)
     decided = dict(usage) if estimate is None else {**usage, current: estimate.value}
     snap, shared = policy_snapshot(
         now=now,

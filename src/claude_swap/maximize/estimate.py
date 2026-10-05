@@ -60,6 +60,9 @@ DEFAULT_RATE_5H = {"20x": 40.0, "5x": 120.0}
 #: plan's 7d-per-5h ratio (maximize/drain.py).
 DEFAULT_K = {"20x": drain.K_20X, "5x": drain.K_5X}
 WINDOW_KEYS = (("5h", "five_hour", 5 * 3600.0), ("7d", "seven_day", 7 * 86400.0))
+#: The projection's learned pace: the median of the last this many timed
+#: whole-point steps (``ride.point_seconds``'s ``median_of``).
+PROJECTION_STEPS = 3
 #: A refusal holds until a reading taken at least this long after it says
 #: otherwise (the endpoint's view of the window can trail the refusal).
 READING_AFTER_S = 30.0
@@ -93,6 +96,8 @@ class Estimate:
     cause: str = ""
     #: a reported limit: when Claude Code reported it (epoch s)
     reported_at: float | None = None
+    #: a reported limit: the windows ("5h"/"7d") Claude Code was refused for
+    refused: tuple[str, ...] = ()
 
     def for_snapshot(self) -> UsageEstimate:
         return UsageEstimate(kind=self.kind, note=self.note, rates=dict(self.rates))
@@ -167,8 +172,9 @@ def burn_rates(
     """``({window: pct per hour}, {window: source})`` for the projection.
 
     Learned first: the faster of the learned ride's step pace
-    (``ride.point_seconds``, its in-use pace over the last 6h) and the
-    samples' recent velocity (however old the samples). A 7d with neither
+    (``ride.point_seconds``, the median of its last three timed steps over
+    the last 6h) and the samples' recent velocity (however old the
+    samples). A 7d with neither
     follows the 5h at the plan's 7d-per-5h ratio. Anything still unknown
     takes the plan's default (an unknown plan reads as 20x)."""
     rates: dict[str, float] = {}
@@ -184,7 +190,9 @@ def burn_rates(
             v5, v7 = d5 / span * 3600.0, d7 / span * 3600.0
     for w, velocity in (("5h", v5), ("7d", v7)):
         known: list[tuple[float, str]] = []
-        point = learned_ride.point_seconds(steps, number, w, now)  # type: ignore[arg-type]
+        point = learned_ride.point_seconds(  # type: ignore[arg-type]
+            steps, number, w, now, median_of=PROJECTION_STEPS
+        )
         if point is not None and point > 0:
             known.append((3600.0 / point, "learned"))
         if velocity is not None and velocity > 0:
@@ -393,4 +401,5 @@ def reported(
         age_s=base.age_s if base is not None else 0.0,
         cause=base.cause if base is not None else "",
         reported_at=first_ts,
+        refused=tuple(parts),
     )

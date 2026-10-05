@@ -199,7 +199,7 @@ def test_the_published_ride_is_read_back(tmp_path: Path):
             "target": None, "reason": "#5 7d 99% — riding", "pending": False,
             "code": "ride", "rideUntil": NOW + 120,
         },
-        learned_ride.LEARN_KEY: {"7d": {"q": 0.45, "n_ok": 3, "n_hit": 0}},
+        learned_ride.LEARN_KEY: {"7d": {"q": 0.72, "n_ok": 3, "n_hit": 0, "v": 2}},
         "maximizeRide": {
             "account": "5", "riding": ["7d"],
             "accounts": {
@@ -210,7 +210,7 @@ def test_the_published_ride_is_read_back(tmp_path: Path):
     }))
     state = read_state(tmp_path)
     assert state.decision.code == "ride" and state.decision.ride_until == NOW + 120
-    assert state.ride_q == {"5h": 0.3, "7d": 0.45}
+    assert state.ride_q == {"5h": 0.6, "7d": 0.72}
     assert state.ride_armed_at == {"5": {"7d": NOW - 30}, "2": {"7d": NOW - 900}}
     assert state.ride_point_s == {"5": {"7d": 900.0}}
 
@@ -230,7 +230,9 @@ def test_why_explains_a_ride_and_shows_what_was_learned(tmp_path, monkeypatch, c
             "trigger": None, "target": None, "reason": reason, "pending": False,
             "plans": {}, "code": "ride", "rideUntil": NOW + 90,
         },
-        learned_ride.LEARN_KEY: {"7d": {"q": 0.4, "n_ok": 2, "n_hit": 0}},
+        learned_ride.LEARN_KEY: {
+            "7d": {"q": 0.62, "n_ok": 5, "n_hit": 1, "settled": True, "v": 2},
+        },
     }))
     with pytest.raises(SystemExit):
         doctor_cli.why_command(["--json"], clock=lambda: NOW)
@@ -238,14 +240,14 @@ def test_why_explains_a_ride_and_shows_what_was_learned(tmp_path, monkeypatch, c
     assert payload["code"] == "ride"
     assert payload["meaning"] == doctor_cli.REASONS["ride"][0]
     assert payload["learnedRide"]["windows"] == ["7d"]
-    assert payload["learnedRide"]["learned"]["7d"]["q"] == 0.4
+    assert payload["learnedRide"]["learned"]["7d"]["q"] == 0.62
     with pytest.raises(SystemExit):
         doctor_cli.why_command([], clock=lambda: NOW)
     out = capsys.readouterr().out
     assert "code     ride" in out
     assert (
-        "ride     5h off (rideWindows; learned 0.30) · "
-        "7d rides 0.40 of the last point (2 ok, 0 hit)"
+        "ride     5h off (rideWindows; learned 0.60) · "
+        "7d rides 0.62 of the last point (target ~0.9, 5 ok, 1 hit)"
     ) in out
 
 
@@ -255,13 +257,14 @@ def test_doctor_reports_the_learned_share_per_window(tmp_path):
 
     world = World(tmp_path)
     world.healthy()
+    # A record the halving rule wrote: its 0.25 starts over from 0.6.
     world.state(**{learned_ride.LEARN_KEY: {"7d": {"q": 0.25, "n_ok": 4, "n_hit": 2}}})
     findings = dr.run_checks(world.probes())
     [f] = [f for f in findings if f.check == "learned-ride"]
     assert f.severity == "info"
     assert f.detail == (
-        "learned ride: 5h off (rideWindows; learned 0.30) · "
-        "7d rides 0.25 of the last point (4 ok, 2 hit)"
+        "learned ride: 5h off (rideWindows; learned 0.60) · "
+        "7d rides 0.60 of the last point (target ~0.9, 4 ok, 2 hit)"
     )
     world.settings(maximize={"learnedRide": False})
     [f] = [f for f in dr.run_checks(world.probes()) if f.check == "learned-ride"]

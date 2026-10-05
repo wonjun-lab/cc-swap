@@ -108,6 +108,26 @@ def is_idle(samples: Sequence[Sample], now: float, s: MaximizeSettings) -> bool:
     return d5 <= s.idle_max_delta_pct and d7 <= IDLE_MAX_DELTA_7D_PCT
 
 
+def velocity_rise(
+    samples: Sequence[Sample], s: MaximizeSettings
+) -> tuple[float, float, float] | None:
+    """``(5h points, 7d points, seconds)`` risen over the span
+    :func:`velocity` measures, or None when it is too short to trust."""
+    ordered = _ordered(samples)
+    if len(ordered) < 2:
+        return None
+    newest = ordered[-1]
+    window = s.idle_window_min * 60.0
+    inside = [i for i, x in enumerate(ordered[:-1]) if newest.ts - x.ts <= window]
+    start = inside[0] if inside else len(ordered) - 2
+    span = ordered[start:]
+    span_s = newest.ts - span[0].ts
+    if span_s < MIN_ETA_SPAN_S:
+        return None
+    d5, d7 = span_rise(span)
+    return d5, d7, span_s
+
+
 def velocity(
     samples: Sequence[Sample], s: MaximizeSettings
 ) -> tuple[float | None, float | None]:
@@ -119,20 +139,26 @@ def velocity(
     climb after it. A window that did not climb reads 0; both are None when
     the span is too short to trust.
     """
-    ordered = _ordered(samples)
-    if len(ordered) < 2:
+    rise = velocity_rise(samples, s)
+    if rise is None:
         return None, None
-    newest = ordered[-1]
-    window = s.idle_window_min * 60.0
-    inside = [i for i, x in enumerate(ordered[:-1]) if newest.ts - x.ts <= window]
-    start = inside[0] if inside else len(ordered) - 2
-    span = ordered[start:]
-    span_s = newest.ts - span[0].ts
-    if span_s < MIN_ETA_SPAN_S:
-        return None, None
+    d5, d7, span_s = rise
     span_min = span_s / 60.0
-    d5, d7 = span_rise(span)
     return d5 / span_min, d7 / span_min
+
+
+def point_pace(
+    samples: Sequence[Sample], s: MaximizeSettings, window: str
+) -> tuple[float | None, float]:
+    """``(seconds per point, points risen)`` on ``window`` ("5h"/"7d") over
+    the :func:`velocity` span: ``(None, 0)`` when it is too short to trust
+    or did not climb."""
+    rise = velocity_rise(samples, s)
+    if rise is None:
+        return None, 0.0
+    d5, d7, span_s = rise
+    points = d5 if window == "5h" else d7
+    return (span_s / points if points > 0 else None), points
 
 
 def eta_to_hard(
