@@ -31,7 +31,7 @@ uv tool install git+https://github.com/wonjun-lab/cc-swap
 To pin a release, add its tag (releases are tagged `cc-vX.Y.Z`):
 
 ```bash
-uv tool install git+https://github.com/wonjun-lab/cc-swap@cc-v0.5.4
+uv tool install git+https://github.com/wonjun-lab/cc-swap@cc-v0.5.5
 ```
 
 The install gives you two commands, `cc-swap` and `cswap`. They are the same program; this guide uses `cc-swap`.
