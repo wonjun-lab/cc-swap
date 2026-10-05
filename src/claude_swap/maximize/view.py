@@ -409,6 +409,13 @@ def snapshot_from_accounts(
         ride_armed_at=state.ride_armed_at.get(snap.active_number or "", {}),
         ride_point_s=state.ride_point_s.get(snap.active_number or "", {}),
         k7=drain_k7(history, settings, now),
+        # How old each reading is: the policy's stale landing rule, as the
+        # engine applies it (engine_hook.reading_ages).
+        ages={
+            a.number: a.usage.age_s
+            for a in accounts
+            if isinstance(getattr(a.usage, "age_s", None), (int, float))
+        },
     )
 
 

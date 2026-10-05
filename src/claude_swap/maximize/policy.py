@@ -98,11 +98,29 @@ is what it was without the drain.
 
 Unknown active usage is ``Indeterminate`` (the engine's upstream failover
 path counts it).
+
+Estimated active usage (``Snapshot.estimate``, maximize/estimate.py): when
+the active account's reading is too old (its reads 429 or fail), the engine
+hands the policy a *projection* (last reading + burn rate × elapsed), or
+100% on a window Claude Code reported a usage-limit refusal for. Every
+trigger runs on it as on a reading. While it is a projection the samples
+have stopped, so the ETA-forced hard trigger and the reset-aware wait run
+at the projection's rates; idle is "no Claude Code transcript written on
+this machine within ``idleWindowMin``" (``Snapshot.local_idle``) when that
+is known; no learned ride starts (it needs 60 s readings). Every reason
+then says so: ``(5h ~74% projected — usage reads rate-limited for 52m)``.
+
+Stale landing (``STALE_LANDING_S``): a non-active account whose reading is
+older than that is no landing target (soft, preempt, rebalance, and the
+first choice of hard/at-limit); the hard/at-limit fallbacks still take
+one, after every account read more recently. Its usage may have moved on
+another machine since.
 """
 
 from __future__ import annotations
 
 import math
+from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from typing import Literal
 
@@ -140,6 +158,35 @@ RIDE_FLOOR_PCT = LIMIT_PCT - 1.0
 # A ride switches this long before its learned end: one urgent poll
 # interval (the reading that would show 100% can be that old) plus 30 s.
 RIDE_MARGIN_S = poll_policy.URGENT_INTERVAL_S + 30.0
+# A non-active account read longer ago than this is no landing target
+# unless nothing else can take you (its usage may have moved elsewhere, on
+# another machine). Just past the slowest cadence a candidate is ever
+# planned at (poll_policy.POST_429_MAX_INTERVAL_S, 30 min, plus jitter and
+# a tick), so a reading on the scheduler's own plan still lands.
+STALE_LANDING_S = 2100.0
+
+
+def stale_reading(v: AccountView) -> bool:
+    """``v``'s reading is older than :data:`STALE_LANDING_S`."""
+    return v.age_s is not None and v.age_s > STALE_LANDING_S
+
+
+def _fresh_first(views: list[AccountView]) -> list[AccountView]:
+    """``views`` with the stale readings moved to the end (stable)."""
+    return sorted(views, key=stale_reading)
+
+
+def is_idle(snap: Snapshot) -> bool:
+    """Whether now is an idle moment: the samples' verdict, or, while the
+    active usage is projected (no samples come in), whether Claude Code
+    wrote no transcript here within ``idleWindowMin`` (``local_idle``)."""
+    if (
+        snap.estimate is not None
+        and snap.estimate.kind == "projected"
+        and snap.local_idle is not None
+    ):
+        return snap.local_idle
+    return idle.is_idle(snap.samples, snap.now, snap.settings)
 
 
 def _pct(value: float) -> str:
@@ -207,6 +254,7 @@ def landing_candidates(snap: Snapshot) -> list[AccountView]:
                 if v.number != snap.active
                 and can_land(v, snap)
                 and not login_guarded(v, snap.now, s)
+                and not stale_reading(v)
             ],
             snap.now,
             s.tie_epsilon,
@@ -217,9 +265,10 @@ def landing_candidates(snap: Snapshot) -> list[AccountView]:
 
 def escape_candidates(snap: Snapshot) -> list[AccountView]:
     """The at-limit/hard fallback pool: eligible accounts under both hard
-    caps, in §5.4 order."""
+    caps, in §5.4 order, a stale reading (:func:`stale_reading`) after
+    every fresher one."""
     s = snap.settings
-    return rank(
+    return _fresh_first(rank(
         [
             v
             for v in snap.accounts
@@ -232,7 +281,7 @@ def escape_candidates(snap: Snapshot) -> list[AccountView]:
         ],
         snap.now,
         s.tie_epsilon,
-    )
+    ))
 
 
 def hard_room(v: AccountView, window: Window, snap: Snapshot) -> float:
@@ -261,7 +310,7 @@ def roomier_candidates(
         for v in escape_candidates(snap)
         if all(hard_room(v, w, snap) > hard_room(active, w, snap) for w in windows)
     ]
-    return sorted(out, key=lambda v: -room(v))
+    return sorted(out, key=lambda v: (stale_reading(v), -room(v)))
 
 
 def binding_room(v: AccountView) -> float:
@@ -301,12 +350,23 @@ def limit_candidates(snap: Snapshot) -> list[AccountView]:
     ]
     return sorted(
         out,
-        key=lambda v: (-binding_room(v), binding_recovery(v, snap.now), slot_order(v)),
+        key=lambda v: (
+            stale_reading(v), -binding_room(v), binding_recovery(v, snap.now), slot_order(v)
+        ),
     )
 
 
 def idle_note(snap: Snapshot) -> str:
     """Human summary of the idle evidence, for reasons and dry-run output."""
+    if (
+        snap.estimate is not None
+        and snap.estimate.kind == "projected"
+        and snap.local_idle is not None
+    ):
+        window = snap.settings.idle_window_min
+        if snap.local_idle:
+            return f"no Claude Code activity here in {window} min"
+        return f"Claude Code active here within {window} min"
     span = idle.idle_span(snap.samples, snap.now, snap.settings)
     if span is None:
         window = snap.settings.idle_window_min
@@ -329,7 +389,7 @@ def _target(v: AccountView, snap: Snapshot) -> str:
 
 @dataclass(frozen=True)
 class _Force:
-    """Why the hard trigger fired, and on which window(s)."""
+    """Why the hard (or urgent) trigger fired, and on which window(s)."""
 
     reason: str
     windows: tuple[Window, ...]
@@ -354,18 +414,71 @@ def _reached(snap: Snapshot, a: AccountView) -> tuple[Window, ...]:
     )
 
 
+def _projected(snap: Snapshot) -> bool:
+    return snap.estimate is not None and snap.estimate.kind == "projected"
+
+
+def _per_min(rates: object) -> tuple[float | None, float | None]:
+    if not isinstance(rates, Mapping):
+        return None, None
+    out: list[float | None] = []
+    for w in ("5h", "7d"):
+        rate = rates.get(w)
+        out.append(
+            float(rate) / 60.0
+            if isinstance(rate, (int, float)) and not isinstance(rate, bool)
+            and math.isfinite(rate)
+            else None
+        )
+    return out[0], out[1]
+
+
+def pace(snap: Snapshot) -> tuple[tuple[float | None, float | None], float]:
+    """``((5h, 7d) points per minute, minutes since the pace's reading)``,
+    from the best rate there is: the recent velocity of fresh samples (as
+    old as the newest sample); else, while the usage is projected, the
+    projection's rates (projected to now); else the learned or per-plan
+    rate the engine hands in (``Snapshot.fallback_rates``); else unknown.
+    A velocity the samples did measure is used even when it is 0 (not
+    climbing is evidence too)."""
+    if _fresh_samples(snap):
+        velocity = idle.velocity(snap.samples, snap.settings)
+        if velocity != (None, None):
+            age = max(snap.now - snap.samples[-1].ts, 0.0) / 60.0
+            return velocity, age
+    if _projected(snap):
+        return _per_min(snap.estimate.rates), 0.0  # type: ignore[union-attr]
+    if snap.fallback_rates:
+        return _per_min(snap.fallback_rates), 0.0
+    return (None, None), 0.0
+
+
 def _eta_forced(snap: Snapshot) -> dict[Window, float]:
-    """``{window: minutes}`` for each window whose recent pace reaches its
-    hard cap within ``force_eta_min`` (none on stale samples)."""
+    """``{window: minutes}`` for each window whose pace (:func:`pace`)
+    reaches its hard cap within ``force_eta_min``. Measured from the
+    newest sample when the samples give the pace, else from the reading."""
     s = snap.settings
-    if s.force_eta_min <= 0 or not _fresh_samples(snap):
+    if s.force_eta_min <= 0:
         return {}
-    eta5, eta7 = idle.eta_to_hard(snap.samples, s)
-    return {
-        w: eta
-        for w, eta in (("5h", eta5), ("7d", eta7))
-        if eta is not None and eta <= s.force_eta_min
-    }
+    if _fresh_samples(snap):
+        eta5, eta7 = idle.eta_to_hard(snap.samples, s)
+        if (eta5, eta7) != (None, None) or idle.velocity(snap.samples, s) != (None, None):
+            return {
+                w: eta
+                for w, eta in (("5h", eta5), ("7d", eta7))
+                if eta is not None and eta <= s.force_eta_min
+            }
+    a = snap.view(snap.active)
+    if a is None or a.pct5 is None or a.pct7 is None:
+        return {}
+    (r5, r7), _age = pace(snap)
+    out: dict[Window, float] = {}
+    for w, pct, cap, rate in (("5h", a.pct5, s.hard_5h, r5), ("7d", a.pct7, s.hard_7d, r7)):
+        if rate is not None and rate > 0:
+            eta = max(cap - pct, 0.0) / rate
+            if eta <= s.force_eta_min:
+                out[w] = eta
+    return out
 
 
 def _force(
@@ -538,6 +651,8 @@ def _hard_or_ride(
         return base  # another window is about to force the switch anyway
     if snap.active_recent_429:
         return replace(base, reason=f"{base.reason}; no ride after a recent 429")
+    if snap.estimate is not None:
+        return replace(base, reason=f"{base.reason}; no ride on estimated usage")
     plans = [ride_plan(snap, w) for w in windows]
     if any(p is None for p in plans):
         return replace(base, reason=f"{base.reason}; no ride (pace unknown)")
@@ -554,7 +669,7 @@ def _hard_or_ride(
     waited = _ride_reset_wait(snap, a, windows, until)
     if waited is not None:
         return waited
-    if idle.is_idle(snap.samples, snap.now, snap.settings):
+    if is_idle(snap):
         return replace(
             base, reason=f"{base.reason}; idle during the learned ride",
             ride="idle", ride_windows=windows,
@@ -591,7 +706,11 @@ def _window_reset(v: AccountView, window: Window) -> float | None:
 
 
 def reset_wait_left(
-    snap: Snapshot, a: AccountView, window: Window, rate: float | None
+    snap: Snapshot,
+    a: AccountView,
+    window: Window,
+    rate: float | None,
+    age: float | None = None,
 ) -> float | None:
     """Minutes until ``window`` resets if the reset-aware wait may hold for
     it, else None.
@@ -619,7 +738,8 @@ def reset_wait_left(
         return None
     if rate is None or rate <= 0:
         return left if pct < cap else None
-    age = max(snap.now - snap.samples[-1].ts, 0.0) / 60.0 if snap.samples else 0.0
+    if age is None:
+        age = max(snap.now - snap.samples[-1].ts, 0.0) / 60.0 if snap.samples else 0.0
     to_limit = max(LIMIT_PCT - pct, 0.0) / rate - age
     return left if to_limit >= left + RESET_WAIT_MARGIN_MIN else None
 
@@ -643,11 +763,11 @@ def _reset_wait(
         for w, pct, mark in (("5h", a.pct5, s.soft_5h), ("7d", a.pct7, s.soft_7d))
         if pct >= mark and not (w == "7d" and draining(a, snap))
     )
-    rates = idle.velocity(snap.samples, s) if _fresh_samples(snap) else (None, None)
+    rates, age = pace(snap)
     waits: dict[Window, float] = {}
     for w, rate in zip(("5h", "7d"), rates):
         if w in reached or w in forced or w in soft:
-            left = reset_wait_left(snap, a, w, rate)
+            left = reset_wait_left(snap, a, w, rate, age)
             if left is not None:
                 waits[w] = left
     if not waits:
@@ -733,7 +853,7 @@ def _soft(snap: Snapshot, landing: list[AccountView], why: str) -> Decision:
     if not landing:
         return Hold(f"{why}; nothing landable", pending=False)
     top = landing[0]
-    if idle.is_idle(snap.samples, snap.now, snap.settings):
+    if is_idle(snap):
         return Switch(top.number, "soft", f"{why}; idle; -> {_target(top, snap)}")
     return Hold(
         f"{why}; waiting for idle to move to #{top.number} ({idle_note(snap)})",
@@ -871,7 +991,7 @@ def _preempt(
             pending=False,
             code="preempt",
         )
-    if not idle.is_idle(snap.samples, snap.now, s):
+    if not is_idle(snap):
         return Hold(
             f"{why} — will move to #{target.number} at the next idle moment "
             f"({idle_note(snap)})",
@@ -1014,7 +1134,7 @@ def _rebalance(
             pending=False,
             code="rebalance-deferred",
         )
-    if not idle.is_idle(snap.samples, snap.now, s):
+    if not is_idle(snap):
         return Hold(
             f"rebalance waits for idle ({idle_note(snap)}): {why}",
             pending=False,
@@ -1047,7 +1167,22 @@ def _held(snap: Snapshot, a: AccountView, inner: Decision) -> Decision:
     )
 
 
+def with_note(decision: Decision, note: str) -> Decision:
+    """``decision`` with ``(note)`` after the first clause of its reason
+    (the part Fleet's now line keeps), so every surface that shows the
+    reason says the usage was estimated and why."""
+    head, sep, rest = decision.reason.partition(";")
+    return replace(decision, reason=f"{head} ({note}){sep}{rest}")
+
+
 def decide(snap: Snapshot) -> Decision:
+    decision = _decide(snap)
+    if snap.estimate is None or isinstance(decision, Indeterminate):
+        return decision
+    return with_note(decision, snap.estimate.note)
+
+
+def _decide(snap: Snapshot) -> Decision:
     a = snap.view(snap.active)
     if a is None:
         return Indeterminate("no active managed account")

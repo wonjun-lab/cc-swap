@@ -201,7 +201,9 @@ Each window (5-hour and 7-day) has two thresholds on the active account:
 | Soft | 50% | 90% | Switch at the next moment you are idle |
 | Hard | 95% | 98% | Switch now |
 
-"Idle" means your usage barely moved over the last 10 minutes (at most 1 percentage point in both windows). Switching while you pause means no turn of yours is interrupted. At 100% it switches at once, whatever else is going on. It also switches if the hard threshold is less than 10 minutes away at your recent pace.
+"Idle" means your usage barely moved over the last 10 minutes (at most 1 percentage point in both windows). Switching while you pause means no turn of yours is interrupted. At 100% it switches at once, whatever else is going on. It also switches if the hard threshold is less than 10 minutes away at your pace — the recent one, else the one it learned for that account, else a fast default for the plan, so a gap in the readings never means "no idea, keep waiting".
+
+When the usage endpoint stops answering for the account you are using (several machines polling one login spend its ~30 reads an hour, and then every read returns 429), cc-swap does not keep deciding on the last reading: it projects it forward at the account's pace and says so (`5h ~74% projected — usage reads rate-limited for 52m` in `cc-swap why` and Fleet). If Claude Code itself reports the usage limit in a session transcript, cc-swap switches at once. The [reference](docs/reference.md#the-maximize-strategy) has the details, including how often each account is read.
 
 A target account has to sit at least 5 points below both soft thresholds, so you don't land somewhere you would leave again straight away.
 

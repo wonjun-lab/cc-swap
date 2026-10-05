@@ -200,8 +200,21 @@ class TestSoftAndHard:
         assert entry.next_poll_at is None
 
 
+def learn_pace(h: EngineHarness, num: int, point_s: float, window: str = "5h") -> None:
+    """Seed the learned ride's step record: account ``num`` was measured at
+    one point per ``point_s`` seconds on ``window`` while in use (the pace
+    the engine falls back to while its samples cannot measure one)."""
+    steps = {str(num): {window: {"pct": 0.0, "stepAt": h.clock.now,
+                                 "intervals": [[h.clock.now, point_s]]}}}
+    h.engine._mutate_state(lambda s: s.__setitem__("rideSteps", steps))
+
+
 class TestResetWait:
-    """``maximize.resetWaitMin``: a window about to reset is waited out."""
+    """``maximize.resetWaitMin``: a window about to reset is waited out.
+
+    #1's pace is learned at 1 point / 3 min, so the first tick (no samples
+    yet) has a pace and the wait is the only thing deciding (with none
+    learned, the plan's fast default would reach 100% before the reset)."""
 
     @staticmethod
     def usage(h: EngineHarness, p5: float, reset_at: float) -> dict:
@@ -215,6 +228,7 @@ class TestResetWait:
 
     def test_climbing_to_the_reset_never_switches(self, temp_home):
         h = make(temp_home)
+        learn_pace(h, 1, 180)
         reset_at = h.clock.now + 13 * 60
         for p5 in (93, 94, 95, 96):     # 1 pt / 3 min: 100% always well after the reset
             assert h.tick_with_usage(self.usage(h, p5, reset_at)) is TickOutcome.NO_ACTION
@@ -234,6 +248,7 @@ class TestResetWait:
 
     def test_the_wait_is_published_for_why(self, temp_home):
         h = make(temp_home)
+        learn_pace(h, 1, 180)
         h.tick_with_usage(self.usage(h, 93, h.clock.now + 600))
         record = h.state()[DECISION_KEY]
         assert (record["decision"], record["pending"], record["code"]) == ("hold", False, "reset-wait")
@@ -244,6 +259,7 @@ class TestResetWait:
 
     def test_hitting_100_during_the_wait_switches_at_once(self, temp_home):
         h = make(temp_home)
+        learn_pace(h, 1, 180)
         reset_at = h.clock.now + 10 * 60
         assert h.tick_with_usage(self.usage(h, 93, reset_at)) is TickOutcome.NO_ACTION
         h.clock.advance(60)
@@ -253,6 +269,7 @@ class TestResetWait:
 
     def test_a_faster_pace_ends_the_wait(self, temp_home):
         h = make(temp_home)
+        learn_pace(h, 1, 180)
         reset_at = h.clock.now + 10 * 60
         assert h.tick_with_usage(self.usage(h, 93, reset_at)) is TickOutcome.NO_ACTION
         h.clock.advance(180)            # +6 pts in 3 min: 100% in 30 s, before the reset
@@ -261,6 +278,8 @@ class TestResetWait:
         assert no_switch_reasons(h) == ["reset-wait"]
 
     def test_over_hard_with_no_pace_yet_switches(self, temp_home):
+        # Nothing learned: the plan's default pace (a 20x full window in
+        # ~2.5h) reaches 100% before the reset, so it does not wait.
         h = make(temp_home)
         outcome = h.tick_with_usage(self.usage(h, 96, h.clock.now + 8 * 60))
         assert outcome is TickOutcome.SWITCHED
@@ -268,12 +287,15 @@ class TestResetWait:
 
     def test_zero_turns_it_off(self, temp_home):
         h = make(temp_home, maximize={"resetWaitMin": 0})
-        h.tick_with_usage(self.usage(h, 93, h.clock.now + 8 * 60))
+        learn_pace(h, 1, 180)
+        # 90%: at 1 point / 3 min the hard cap is 15 min away (no ETA force).
+        h.tick_with_usage(self.usage(h, 90, h.clock.now + 8 * 60))
         assert no_switch_reasons(h) == ["maximize-pending"]
         assert self.next_poll(h) == pytest.approx(h.clock.now + 180)
 
     def test_urgent_polls_only_in_the_last_15_minutes(self, temp_home):
         h = make(temp_home, maximize={"resetWaitMin": 60})
+        learn_pace(h, 1, 600)   # 1 point / 10 min: 100% long after the reset
         reset_at = h.clock.now + 40 * 60
         h.tick_with_usage(self.usage(h, 93, reset_at))
         assert no_switch_reasons(h) == ["reset-wait"]
@@ -285,6 +307,7 @@ class TestResetWait:
 
     def test_urgent_poll_respects_a_recent_429(self, temp_home):
         h = make(temp_home)
+        learn_pace(h, 1, 180)
         now = h.clock.now
         entries = {
             "1": UsageEntry(last_good=win(93, 10, r5=now + 600), fetched_at=now, age_s=0.0,
@@ -301,6 +324,7 @@ class TestResetWait:
         # (hard) a token that just 429'd cannot be polled every 60 s to
         # catch a climb to 100%: the hard switch happens.
         h = make(temp_home)
+        learn_pace(h, 1, 180)
         reset_at = h.clock.now + 13 * 60
         for p5 in (93, 94):
             assert h.tick_with_usage(self.usage(h, p5, reset_at)) is TickOutcome.NO_ACTION

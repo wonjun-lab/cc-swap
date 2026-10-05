@@ -505,7 +505,7 @@ REASONS: dict[str, tuple[str, str]] = {
 #: Switch triggers (docs/reference.md's "When it switches" table plus upstream's).
 TRIGGERS: dict[str, str] = {
     "at-limit": "the active 5h or 7d window is at 100%",
-    "hard": "a hard ceiling is reached (or the recent pace reaches one within forceEtaMin)",
+    "hard": "a hard ceiling is reached (or the pace reaches one within forceEtaMin)",
     "soft": "a soft mark is crossed and the account went idle",
     "preempt": "the active 7d is on pace to pass soft7d before your next quiet time; moved while idle",
     "rebalance": "a better-scored account exists, or the active one is excluded / last resort",
@@ -733,6 +733,22 @@ def _published_shared(state: Mapping, published) -> dict:
     return {"shared": [str(n) for n in shared]}
 
 
+def _published_estimate(state: Mapping, published) -> dict:
+    """``{"estimate": {...}}``: the published decision ran on an estimate of
+    the active usage (a projection of a too-old reading, or a limit Claude
+    Code reported; maximize/estimate.py), when the record is the one
+    ``published`` was read from; else ``{}``."""
+    from claude_swap.maximize import view as mxview
+
+    raw = state.get(mxview.DECISION_KEY)
+    if not isinstance(raw, Mapping) or raw.get("at") != published.at:
+        return {}
+    found = raw.get("estimate")
+    if not isinstance(found, Mapping) or not isinstance(found.get("note"), str):
+        return {}
+    return {"estimate": dict(found)}
+
+
 def _engine_why(backup_root, *, now: float, state: Mapping | None = None) -> dict | None:
     """The engine's fresh published decision about the live account, explained."""
     from claude_swap.maximize import view as mxview
@@ -776,6 +792,7 @@ def _engine_why(backup_root, *, now: float, state: Mapping | None = None) -> dic
         meaning, action = REASONS[code] if code in REASONS else ("", "")
     return {
         **_published_shared(state or {}, published),
+        **_published_estimate(state or {}, published),
         "source": "engine",
         "decision": "pending" if published.pending else published.decision,
         "pid": published.pid,
@@ -809,6 +826,9 @@ def _why_lines(why: dict) -> list[str]:
     else:
         lines = [f"{bolded(head)}{active}  " + dimmed(f"{who}{when}")]
     lines.append(f"  reason   {why['reason']}")
+    estimate = why.get("estimate")
+    if isinstance(estimate, Mapping) and estimate.get("note"):
+        lines.append(f"  usage    {estimate['note']}")
     if why.get("code"):
         lines.append(f"  code     {why['code']}")
     if why.get("meaning"):

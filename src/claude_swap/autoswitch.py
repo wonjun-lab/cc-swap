@@ -391,6 +391,10 @@ class PollEvent(AutoSwitchEvent):
     # ("5h soft 50/hard 95 · 7d soft 90/hard 98"), shown instead of the
     # "switch at N%" threshold label maximize never switches at. Additive.
     marks: str | None = None
+    # cc-swap: account number → why its usage above is an estimate
+    # ("5h ~74% projected — usage reads rate-limited for 52m", or a limit
+    # Claude Code reported). Additive.
+    estimates: dict[str, str] = field(default_factory=dict)
 
     def _fields(self) -> dict:
         fields = {
@@ -400,6 +404,8 @@ class PollEvent(AutoSwitchEvent):
         }
         if self.marks:
             fields["marks"] = self.marks
+        if self.estimates:
+            fields["estimates"] = self.estimates
         if self.fetch_errors:
             fields["fetchErrors"] = self.fetch_errors
         if self.windows:
@@ -421,8 +427,11 @@ class PollEvent(AutoSwitchEvent):
             return "poll: no active account"
         num = self.active.get("number")
         h = self.headroom.get(str(num))
+        note = self.estimates.get(str(num))
         if h is not None:
-            used = f"{100 - h:.0f}% used"
+            used = f"{'~' if note else ''}{100 - h:.0f}% used"
+            if note:
+                used += f" [{note}]"
         else:
             err = self.fetch_errors.get(str(num))
             used = f"usage unknown ({err})" if err else "usage unknown"
@@ -592,6 +601,22 @@ class ConfigWarningEvent(AutoSwitchEvent):
 
     def human(self) -> str:
         return f"warning: {self.message}"
+
+
+@dataclass(frozen=True)
+class SettingsChangedEvent(AutoSwitchEvent):
+    """cc-swap: the engine applied a settings.json change on this tick
+    (``maximize/engine_hook.reload_if_changed``). ``changes`` are
+    ``"hard5h 97 → 90"`` lines."""
+
+    kind: ClassVar[str] = "settings-changed"
+    changes: list[str] = field(default_factory=list)
+
+    def _fields(self) -> dict:
+        return {"changes": self.changes}
+
+    def human(self) -> str:
+        return "settings changed: " + ", ".join(self.changes)
 
 
 @dataclass(frozen=True)
@@ -899,6 +924,9 @@ class AutoSwitchEngine:
         # warned) on the first tick where every relevant account has readable
         # usage — adaptive polling legitimately leaves gaps before that.
         self._model_check_done = not self._models
+        # cc-swap: this tick's estimate of the active account's usage
+        # (maximize/active_watch.py), set by _collect_scheduled_usage.
+        self._active_estimate = None
 
     # -- state file ---------------------------------------------------------
 
@@ -1182,6 +1210,13 @@ class AutoSwitchEngine:
         self._sleep_until_ts = None
         self._blocked_wait_long = False
         self._idle_hold_slow = False
+        if self.settings.strategy == "maximize":
+            # cc-swap: a settings.json change (cc-swap config set) applies
+            # from this tick on, before the poll line and the escalation
+            # read the thresholds.
+            from claude_swap.maximize.engine_hook import reload_at_tick_start
+
+            reload_at_tick_start(self)
         settings = self.settings
         state = self._read_state()
         if not self.dry_run:
@@ -1239,9 +1274,20 @@ class AutoSwitchEngine:
             "email": "",
         }
 
+        self._active_estimate = None
         entries, usage, headroom = self._collect_scheduled_usage(
             current, quarantined, threshold=settings.threshold
         )
+        # cc-swap: decide on the active account's estimate when there is one
+        # (a projection of a too-old reading, or a limit Claude Code
+        # reported); the maximize hook gets the readings themselves too.
+        estimate = self._active_estimate
+        shown = usage
+        if estimate is not None and getattr(estimate, "number", None) == current:
+            shown = {**usage, current: estimate.value}
+            headroom = _headroom_by_account(shown, self._models)
+        else:
+            estimate = None
         self._emit(
             PollEvent(
                 active=active_ref,
@@ -1250,16 +1296,17 @@ class AutoSwitchEngine:
                 fetch_errors={
                     num: entry.last_error
                     for num, entry in entries.items()
-                    if usage.get(num) is None and entry.last_error
+                    if shown.get(num) is None and entry.last_error
                 },
                 windows={
                     num: pcts
-                    for num, value in usage.items()
+                    for num, value in shown.items()
                     if (pcts := _window_pcts(
                         value if isinstance(value, dict) else None, self._models
                     ))
                 },
                 marks=self._maximize_marks(settings),
+                estimates={current: estimate.note} if estimate is not None else {},
             )
         )
 
@@ -2408,7 +2455,11 @@ class AutoSwitchEngine:
         )
         usage = {num: entry.decision_value() for num, entry in entries.items()}
 
-        active_value = usage.get(current)
+        # cc-swap: what the active account's usage is decided on when its
+        # reading is too old to be flat, or Claude Code reported its limit
+        # (maximize/active_watch.py); None = its reading.
+        estimate = self._estimate_active(current, entries, usage, now, poll=True)
+        active_value = estimate.value if estimate is not None else usage.get(current)
         active_headroom = oauth.account_headroom(
             active_value if isinstance(active_value, dict) else None, self._models
         )
@@ -2416,12 +2467,9 @@ class AutoSwitchEngine:
         # decides on the same value even if apply_threshold() lands mid-tick.
         if threshold is None:
             threshold = self.settings.threshold
-        escalate = bool(candidates) and (
-            (active_headroom is None and active_value != USAGE_TOKEN_EXPIRED)
-            or (
-                active_headroom is not None
-                and 100.0 - active_headroom >= threshold - ESCALATION_MARGIN_PCT
-            )
+        escalate = bool(candidates) and self._escalation_wanted(
+            current, entries.get(current), active_value, active_headroom, threshold,
+            now, estimate,
         )
         if escalate:
             escalation_fetch = {current, *candidates}
@@ -2445,13 +2493,75 @@ class AutoSwitchEngine:
                     and planned_headroom <= 0
                 ):
                     escalation_fetch.remove(num)
+                elif (
+                    # cc-swap: a token that 429'd within the hour keeps its
+                    # congestion-control plan (poll_policy's AIMD): every
+                    # machine sharing the account escalating past it is what
+                    # kept the 2026-10-06 budget saturated for 90 minutes.
+                    # The active account's estimate covers the gap.
+                    self.settings.strategy == "maximize"
+                    and entry is not None
+                    and entry.recent_429(now)
+                    and entry.next_poll_at is not None
+                    and now < entry.next_poll_at
+                ):
+                    escalation_fetch.remove(num)
             entries = self.switcher.usage_entries_by_account(
                 fetch=escalation_fetch
             )
             usage = {num: entry.decision_value() for num, entry in entries.items()}
+            estimate = self._estimate_active(current, entries, usage, now, poll=False)
 
+        self._active_estimate = estimate
         headroom = _headroom_by_account(usage, self._models)
         return entries, usage, headroom
+
+    def _estimate_active(
+        self,
+        current: str,
+        entries: dict,
+        usage: dict[str, dict | str | None],
+        now: float,
+        *,
+        poll: bool,
+    ):
+        """cc-swap: maximize/active_watch.estimate_active, or None when it
+        cannot run (a planning aid never breaks a tick)."""
+        try:
+            from claude_swap.maximize.active_watch import estimate_active
+
+            return estimate_active(self, current, entries, usage, now=now, poll=poll)
+        except Exception as e:
+            _logger.debug("active usage estimate unavailable: %s", type(e).__name__)
+            return None
+
+    def _escalation_wanted(
+        self,
+        current: str,
+        entry,
+        active_value,
+        active_headroom: float | None,
+        threshold: float,
+        now: float,
+        estimate,
+    ) -> bool:
+        """Whether a switch may be near enough to refetch every candidate.
+
+        Upstream: the active binding window within ESCALATION_MARGIN_PCT of
+        the threshold, or its usage unknown. cc-swap's maximize keys on each
+        window's own hard cap and the pace toward it
+        (``engine_hook.escalation_wanted``): a 7d sitting in the 80s for days
+        no longer refetches every candidate every 3 minutes."""
+        if active_headroom is None:
+            return active_value != USAGE_TOKEN_EXPIRED
+        if self.settings.strategy == "maximize":
+            try:
+                from claude_swap.maximize.engine_hook import escalation_wanted
+
+                return escalation_wanted(self, current, active_value, now, estimate)
+            except Exception as e:
+                _logger.debug("maximize escalation check failed: %s", type(e).__name__)
+        return 100.0 - active_headroom >= threshold - ESCALATION_MARGIN_PCT
 
     def _perform(
         self,

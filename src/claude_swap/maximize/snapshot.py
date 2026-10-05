@@ -10,7 +10,13 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 
 from claude_swap.maximize.idle import trim_samples
-from claude_swap.maximize.model import AccountView, Forecast, Sample, Snapshot
+from claude_swap.maximize.model import (
+    AccountView,
+    Forecast,
+    Sample,
+    Snapshot,
+    UsageEstimate,
+)
 from claude_swap.maximize.plan import plan_name, plan_weight
 from claude_swap.maximize.tiers import parse_account_list, tier_for
 from claude_swap.poll_policy import parse_reset_ts
@@ -80,8 +86,16 @@ def build_snapshot(
     ride_point_s: Mapping[str, float] | None = None,
     ride_q: Mapping[str, float] | None = None,
     k7: Mapping[str, float] | None = None,
+    ages: Mapping[str, float | None] | None = None,
+    estimate: UsageEstimate | None = None,
+    local_idle: bool | None = None,
+    fallback_rates: Mapping[str, float] | None = None,
 ) -> Snapshot:
-    """One view per ``records`` entry, in ``records`` order (sequence order)."""
+    """One view per ``records`` entry, in ``records`` order (sequence order).
+
+    ``ages``: how old each account's reading is (seconds), for the stale
+    landing rule; ``estimate``/``local_idle``: the active account's usage is
+    an estimate (``Snapshot.estimate``)."""
     last_resort = parse_account_list(settings.last_resort)
     views: list[AccountView] = []
     for number, record in records.items():
@@ -106,6 +120,7 @@ def build_snapshot(
                 plan=plan_name(
                     rate_limit_tiers.get(number), email, settings.plan_override
                 ),
+                age_s=(ages or {}).get(number),
             )
         )
     return Snapshot(
@@ -124,4 +139,7 @@ def build_snapshot(
         ride_point_s=dict(ride_point_s or {}),
         ride_q=dict(ride_q or {}),
         k7=dict(k7 or {}),
+        estimate=estimate,
+        local_idle=local_idle,
+        fallback_rates=dict(fallback_rates or {}),
     )

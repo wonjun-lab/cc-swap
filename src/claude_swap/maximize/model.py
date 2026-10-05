@@ -50,6 +50,10 @@ class AccountView:
     # ``20x`` / ``5x`` when the plan is known (``plan.plan_name``), else None:
     # the near-reset drain's fallback 7d-per-5h ratio (maximize/drain.py).
     plan: str | None = None
+    # How old the reading behind pct5/pct7 is (seconds; None = unknown). A
+    # non-active account read longer ago than ``policy.STALE_LANDING_S`` is
+    # no landing target unless nothing else can take you.
+    age_s: float | None = None
 
 
 @dataclass(frozen=True)
@@ -79,6 +83,18 @@ class Forecast:
     p_busy_now: float | None          # None: this time slot was never observed
     current: QuietWindow | None       # the quiet window ``now`` is inside
     next: QuietWindow | None          # the first one starting after ``now``
+
+
+@dataclass(frozen=True)
+class UsageEstimate:
+    """The active account's usage is an estimate, not its last reading
+    (maximize/estimate.py): ``projected`` from an old reading at a burn rate,
+    or ``reported`` at 100% by Claude Code's own refusal."""
+
+    kind: str                                  # "projected" | "reported"
+    note: str                                  # "5h ~74% projected — ..."
+    # pct per hour by window ("5h"/"7d") the projection runs at
+    rates: Mapping[str, float] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -115,6 +131,19 @@ class Snapshot:
     # 7d-per-5h ratio k (7d points one 5h point costs; ``drain.learn_k``
     # over the usage history). Absent = not learned: the plan's default.
     k7: Mapping[str, float] = field(default_factory=dict)
+    # The active account's pct5/pct7 are an estimate (None: its reading).
+    estimate: UsageEstimate | None = None
+    # While the active account's usage is projected, the usage samples stop
+    # and cannot show an idle moment: whether no Claude Code transcript on
+    # this machine was written within ``idleWindowMin`` (None: unknown, the
+    # samples decide).
+    local_idle: bool | None = None
+    # The active account's burn rate (pct per hour by window) when its own
+    # samples cannot measure one: what it was learned at while in use, else
+    # a conservative per-plan default (maximize/estimate.py ``burn_rates``).
+    # The ETA-forced hard trigger and the reset-aware wait use it, so above
+    # a soft mark "no samples" never means "no ETA".
+    fallback_rates: Mapping[str, float] = field(default_factory=dict)
 
     def view(self, number: str | None) -> AccountView | None:
         """The account with this slot number, or None."""
