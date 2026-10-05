@@ -381,13 +381,15 @@ def render_detail(
             line.append(f"  {words}", style=p.foreground)
             lines.append(line)
 
-    cloud_line = credits_mod.cloud_credit_summary(
-        acc.usage.last_good if acc is not None else None, ctx.now
-    )
-    if cloud_line:
-        lines.append(
-            Text("    ").append("cloud credit ", style=p.muted).append(cloud_line, style=p.foreground)
-        )
+    last_good = acc.usage.last_good if acc is not None else None
+    for label, words in (
+        ("cloud credit", credits_mod.cloud_credit_summary(last_good, ctx.now)),
+        ("reset coupons", credits_mod.reset_coupons_summary(last_good, ctx.now)),
+    ):
+        if words:
+            lines.append(
+                Text("    ").append(f"{label} ", style=p.muted).append(words, style=p.foreground)
+            )
     credit_line = credits_mod.summary(ctx.credits.get(row.number), ctx.now)
     if credit_line:
         lines.append(

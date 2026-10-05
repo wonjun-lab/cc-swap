@@ -6871,6 +6871,11 @@ class ClaudeAccountSwitcher:
             )
             if cloud_line:
                 print(f"    {muted('cloud credit:')} {cloud_line}")
+            coupon_line = credits_mod.reset_coupons_summary(
+                entries[str(num)].last_good, now
+            )
+            if coupon_line:
+                print(f"    {muted('reset coupons:')} {coupon_line}")
             credit_line = credits_mod.summary(credits.get(str(num)), now)
             if credit_line:
                 print(f"    {muted('credits:')} {credit_line}")

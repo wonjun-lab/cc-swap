@@ -1496,6 +1496,42 @@ def check_idle_pattern(ctx: Context) -> list[Finding]:
     return [Finding("idle-pattern", "info", history.describe(slots, p.now, enabled=enabled))]
 
 
+def check_reset_coupons(ctx: Context) -> list[Finding]:
+    """Usage-reset coupons as the last usage readings report them (info
+    only): why none are offered (``ineligible_reason``, e.g. ``surface``),
+    or what an account holds. Reads ``cache/usage.json``; no request."""
+    from claude_swap import credits
+    from claude_swap.usage_store import UsageStore
+
+    p = ctx.probes
+    identities = {num: (slot.email, slot.org) for num, slot in ctx.slots.items()}
+    entries = UsageStore(p.backup_root / "cache").entries(identities)
+    reasons: dict[str, list[str]] = {}
+    out: list[Finding] = []
+    seen = 0
+    for num in sorted(entries, key=_slot_key):
+        last_good = entries[num].last_good
+        block = last_good.get("reset_coupons") if isinstance(last_good, dict) else None
+        if not isinstance(block, dict):
+            continue
+        seen += 1
+        if block.get("eligible") is not True:
+            reasons.setdefault(block.get("ineligible_reason") or "unknown", []).append(num)
+            continue
+        words = credits.reset_coupons_summary(last_good, p.now)
+        out.append(Finding("reset-coupons", "info", words or "none left", scope=f"#{num}"))
+    for reason, nums in reasons.items():
+        detail = f"not offered to this client ({reason})"
+        if len(nums) == seen:
+            out.append(Finding("reset-coupons", "info", detail, scope="accounts"))
+        else:
+            out.append(Finding(
+                "reset-coupons", "info",
+                f"{detail} on {', '.join('#' + n for n in nums)}", scope="accounts",
+            ))
+    return out
+
+
 def check_learned_ride(ctx: Context) -> list[Finding]:
     """What the learned ride has learned, per window (info only; ``maximize``
     strategy only): the share of the last point each window rides, and how
@@ -1768,6 +1804,7 @@ ENV_CHECKS: tuple[Callable[[Context], list[Finding]], ...] = (
     check_idle_pattern,
     check_learned_ride,
     check_drain,
+    check_reset_coupons,
 )
 
 

@@ -458,6 +458,45 @@ def cloud_credit_summary(usage: dict | None, now: float) -> str | None:
     return text
 
 
+def reset_coupons_summary(usage: dict | None, now: float) -> str | None:
+    """``2 left (5h/7d) · expires Nov 20`` for the usage-reset coupons the
+    usage poll carries (``oauth.parse_reset_coupons``); None unless the
+    account is eligible and holds a coupon that is still usable."""
+    coupons = usage.get("reset_coupons") if isinstance(usage, dict) else None
+    if not isinstance(coupons, dict) or coupons.get("eligible") is not True:
+        return None
+    live = []
+    for grant in coupons.get("grants") or []:
+        if not isinstance(grant, dict) or not isinstance(grant.get("left"), int):
+            continue
+        ends = _parse_ts(grant.get("ends_at"))
+        if grant["left"] > 0 and (ends is None or ends > now):
+            live.append((grant, ends))
+    if not live:
+        return None
+    labels: list[str] = []
+    for grant, _ends in live:
+        for limit in grant.get("clears") or []:
+            label = oauth.RESET_LIMIT_LABELS.get(limit)
+            if label and label not in labels:
+                labels.append(label)
+    text = f"{sum(g['left'] for g, _ in live)} left"
+    if labels:
+        text += f" ({'/'.join(labels)})"
+    ends = [e for _, e in live if e is not None]
+    if ends:
+        text += f" · expires {_day(min(ends))}"
+    if all(g.get("paused") for g, _ in live):
+        text += " · paused"
+    cooldown = _parse_ts(coupons.get("cooldown_until"))
+    if cooldown is not None and cooldown > now:
+        text += " · cooldown until " + oauth.reset_clock_string(
+            datetime.fromtimestamp(cooldown, tz=timezone.utc),
+            datetime.fromtimestamp(now, tz=timezone.utc),
+        )
+    return text
+
+
 def _major(minor: int, currency: str | None) -> float:
     return float(minor) if (currency or "USD").upper() in _ZERO_DECIMAL else minor / 100
 

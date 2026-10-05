@@ -147,6 +147,34 @@ def usage_to_json(usage: dict, fetched_at: float | None = None) -> dict:
             "expiresAt": cloud.get("resets_at"),
             "lockedReason": cloud.get("locked_reason"),
         }
+    coupons = usage.get("reset_coupons")
+    if isinstance(coupons, dict):
+        # Additive, display-only (ineligible blocks included, so a script
+        # can see why none are offered); not read back by usage_from_json.
+        out["resetCoupons"] = {
+            "eligible": coupons.get("eligible"),
+            "ineligibleReason": coupons.get("ineligible_reason"),
+            "atLimit": coupons.get("at_limit"),
+            "exhausted": coupons.get("exhausted") or [],
+            "grants": [
+                {
+                    "id": g.get("id"),
+                    "label": g.get("label"),
+                    "total": g.get("total"),
+                    "left": g.get("left"),
+                    "startsAt": g.get("starts_at"),
+                    "endsAt": g.get("ends_at"),
+                    "clears": g.get("clears") or [],
+                    "paused": g.get("paused"),
+                    "usableNow": g.get("usable_now"),
+                }
+                for g in coupons.get("grants") or []
+                if isinstance(g, dict)
+            ],
+            "nextGrantId": coupons.get("next_grant_id"),
+            "weeklyResetsAt": coupons.get("weekly_resets_at"),
+            "cooldownUntil": coupons.get("cooldown_until"),
+        }
     return out
 
 

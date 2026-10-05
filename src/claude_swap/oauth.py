@@ -612,8 +612,17 @@ def fresh_reset_strings(window: dict) -> tuple[str, str] | None:
 
 
 def request_usage_data(access_token: str) -> dict:
-    """Request raw utilization data from the Anthropic usage API."""
-    url = "https://api.anthropic.com/api/oauth/usage"
+    """Request raw utilization data from the Anthropic usage API.
+
+    ``cedar_ember=1`` fills the response's otherwise-null ``cedar_ember``
+    block (usage-reset coupons, see :func:`parse_reset_coupons`) on the same
+    request. Verified live 2026-10-06: the flagged response has the same
+    top-level keys, and the same keys inside ``five_hour``/``seven_day``/
+    ``extra_usage``/``spend``/``iguana_necktie``, as Claude Code's plain one.
+    ``skip_spend`` (which Claude Code pairs with it) is deliberately absent:
+    it nulls ``extra_usage``, which the spend line reads.
+    """
+    url = "https://api.anthropic.com/api/oauth/usage?cedar_ember=1"
     headers = {
         "Authorization": f"Bearer {access_token}",
         "anthropic-beta": OAUTH_BETA_HEADER,
@@ -756,7 +765,76 @@ def build_usage_result(data: dict) -> dict | None:
     cloud = parse_cloud_credit(data.get("iguana_necktie"))
     if cloud is not None:
         result["cloud_credit"] = cloud
+    coupons = parse_reset_coupons(data.get("cedar_ember"))
+    if coupons is not None:
+        result["reset_coupons"] = coupons
     return result
+
+
+#: Limits a reset coupon can clear, in the words the usage lines use.
+RESET_LIMIT_LABELS = {
+    "five_hour": "5h",
+    "seven_day": "7d",
+    "seven_day_overage_included": "7d",
+    "seven_day_opus": "Opus",
+    "seven_day_sonnet": "Sonnet",
+}
+
+
+def parse_reset_coupons(block: object) -> dict | None:
+    """Usage-reset coupons (``cedar_ember`` in the usage response, asked
+    for with ``?cedar_ember=1``), or None when the response has no block.
+
+    Display only. Tolerant by contract — every field may be absent or
+    malformed (Claude Code's own parser ``.catch()``es each one), and this
+    never raises: a field that does not read is dropped, a grant without
+    ``resets_left`` is skipped. Redeeming one is a POST cc-swap never sends.
+    """
+    if not isinstance(block, dict):
+        return None
+
+    def text(value: object) -> str | None:
+        return value if isinstance(value, str) and value else None
+
+    def count(value: object) -> int | None:
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            return None
+        return max(0, int(value))
+
+    def limits(value: object) -> list[str]:
+        if not isinstance(value, list):
+            return []
+        return [v for v in value if isinstance(v, str)]
+
+    grants: list[dict] = []
+    raw_grants = block.get("grants")
+    for g in raw_grants if isinstance(raw_grants, list) else []:
+        if not isinstance(g, dict):
+            continue
+        left = count(g.get("resets_left"))
+        if left is None:
+            continue
+        grants.append({
+            "id": text(g.get("id")),
+            "label": text(g.get("label")),
+            "total": count(g.get("resets_total")),
+            "left": left,
+            "starts_at": text(g.get("starts_at")),
+            "ends_at": text(g.get("ends_at")),
+            "clears": limits(g.get("clears")),
+            "paused": g.get("paused") is True,
+            "usable_now": g.get("usable_now") is True,
+        })
+    return {
+        "eligible": block.get("eligible") is True,
+        "ineligible_reason": text(block.get("ineligible_reason")),
+        "at_limit": block.get("at_limit") is True,
+        "exhausted": limits(block.get("exhausted")),
+        "grants": grants,
+        "next_grant_id": text(block.get("next_grant_id")),
+        "weekly_resets_at": text(block.get("weekly_resets_at")),
+        "cooldown_until": text(block.get("cooldown_until")),
+    }
 
 
 def parse_cloud_credit(block: object) -> dict | None:
