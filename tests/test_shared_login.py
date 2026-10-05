@@ -150,14 +150,14 @@ def test_live_login_held_by_a_slot_that_is_not_live_is_deferred(temp_home):
 def test_a_switch_landing_during_the_live_read_is_not_sharing(temp_home, monkeypatch):
     """The live account is resolved again right after the live read."""
     s = _switcher(temp_home)
-    real = s._read_active_credentials
+    real = s._store.peek_active_login
 
     def switched_meanwhile():
         _live(temp_home, 2)  # the switch to #2 writes its identity now
         s._write_credentials(_creds("rt-2"))
         return real()
 
-    monkeypatch.setattr(s, "_read_active_credentials", switched_meanwhile)
+    monkeypatch.setattr(s._store, "peek_active_login", switched_meanwhile)
     assert s._live_shares("2", shared_login.refresh_fingerprint(_creds("rt-2"))) is None
 
 
@@ -368,3 +368,72 @@ def test_cswap_run_refuses_to_seed_a_shared_login(temp_home):
         SessionManager(s).setup_session("2", share=False)
     post.assert_not_called()
     assert not session_dir_for(s.backup_dir, "2", _email(2)).exists()
+
+
+
+def test_the_live_peek_does_not_trip_the_keychain_cooldown(temp_home, monkeypatch,
+                                                         block_real_keychain):
+    from claude_swap import macos_keychain
+    from claude_swap.models import Platform
+
+    monkeypatch.setattr(Platform, "detect", classmethod(lambda cls: Platform.MACOS))
+    s = _switcher(temp_home, live=_creds("rt-2"))
+    s._store._host.platform = Platform.MACOS
+
+    def denied(service, account):
+        raise macos_keychain.KEYCHAIN_ERRORS[0]("rc=36")
+
+    monkeypatch.setattr(macos_keychain, "get_password", denied)
+    assert s._store.peek_active_login() is None  # unknown, not the plaintext file
+    assert s._live_shares("2", shared_login.refresh_fingerprint(_creds("rt-2"))) is None
+    assert s._store._keychain_usable_cache is not False
+
+
+def test_cswap_run_explains_a_login_only_the_live_login_holds(temp_home):
+    import pytest
+
+    from claude_swap.exceptions import SessionError
+    from claude_swap.session import SessionManager
+
+    s = _switcher(temp_home, live=_creds("rt-2"))  # #1 is live, with #2's token
+    with (
+        patch("claude_swap.oauth.try_refresh_oauth_credentials") as post,
+        pytest.raises(SessionError) as info,
+    ):
+        SessionManager(s).setup_session("2", share=False)
+    post.assert_not_called()
+    assert "Retry in a moment" in str(info.value) and "cc-swap doctor" in str(info.value)
+    assert "cc-swap login" not in str(info.value)  # no re-login advice for a moment
+
+
+# -- logins that are not one-time use are never "shared" ----------------------------------
+
+
+def _setup_token(token: str = "sk-ant-oat01-same") -> str:
+    return json.dumps({"claudeAiOauth": {"accessToken": token, "expiresAt": EXPIRED}})
+
+
+def test_two_setup_token_slots_with_the_same_bytes_are_not_refused(temp_home):
+    from claude_swap.autoswitch import AutoSwitchEngine
+
+    s = _switcher(temp_home)
+    for n in (2, 3):
+        s._write_account_credentials(str(n), _email(n), _setup_token())
+    assert s.shared_login_places("2", _setup_token(), is_active=False) == []
+    assert s._shared_for_gate("2", _setup_token()) == ([], False)
+    assert s._refuse_shared_target("2", (_email(1), ""), False) is None
+    engine = AutoSwitchEngine.__new__(AutoSwitchEngine)
+    engine.switcher = s
+    engine.clock = lambda: 1_790_000_000.0
+    assert engine._shared_elsewhere("2", _setup_token()) is False
+
+
+def test_two_api_key_slots_with_the_same_key_are_not_refused(temp_home):
+    s = _switcher(temp_home)
+    data = s._get_sequence_data()
+    for n in (2, 3):
+        data["accounts"][str(n)]["kind"] = "api_key"
+        s._write_account_credentials(str(n), _email(n), "sk-ant-api03-same")
+    s._write_json(s.sequence_file, data)
+    assert s.shared_login_places("2", "sk-ant-api03-same", is_active=False) == []
+    assert s._refuse_shared_target("2", (_email(1), ""), False) is None

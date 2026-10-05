@@ -636,6 +636,32 @@ class CredentialStore:
                 return None, True
         return None, False
 
+    def peek_active_login(self) -> str | None:
+        """The live OAuth login for a comparison only (cc-swap fork: the
+        shared-login check). The same items :meth:`_read_active_credentials`
+        reads first — this profile's Keychain item(s), then the plaintext
+        file — but the Keychain is asked directly, never through
+        ``_kc_call``: a transient failure here must not put the process into
+        file mode. None when unknown (the Keychain did not answer, or only a
+        file Claude Code may have left stale was readable) or absent."""
+        if self._host.platform == Platform.MACOS:
+            for service in _active_oauth_keychain_services():
+                try:
+                    value = macos_keychain.get_password(
+                        service, macos_keychain.keychain_account_name()
+                    )
+                except macos_keychain.KEYCHAIN_ERRORS:
+                    return None  # unknown: the file may be a stale generation
+                if value:
+                    return value
+        try:
+            text = get_credentials_path().read_text(encoding="utf-8")
+        except (OSError, ValueError):
+            return None
+        if not text.strip() or holds_only_shared_fields(text):
+            return None
+        return text
+
     def _read_one_oauth_keychain(self, service: str) -> tuple[str | None, bool]:
         """Read one OAuth Keychain item with a bounded retry.
 

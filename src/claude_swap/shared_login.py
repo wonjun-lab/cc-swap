@@ -27,6 +27,9 @@ from claude_swap import oauth
 #: The consume gate's refusal kind (``RefreshOutcome.error`` / usage error).
 SHARED_LOGIN = "shared-login"
 
+#: The place label of the live login (``switcher.shared_login_places``).
+LIVE_LOGIN = "the live login"
+
 #: The remedy every surface shows next to the kind.
 NOTE = (
     "this login's refresh token is also held elsewhere — cc-swap does not "

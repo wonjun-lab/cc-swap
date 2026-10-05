@@ -370,3 +370,18 @@ def test_new_account_never_logs_tokens(temp_home, caplog):
     with caplog.at_level("INFO", logger="claude-swap"):
         assert _run(s, _new_login()).ok
     assert "rt-new" not in caplog.text and oauth.fingerprint8(_creds("rt-new")) in caplog.text
+
+
+
+def test_a_torn_sequence_during_the_relogin_offer_keeps_the_login(temp_home):
+    s = _switcher(temp_home)
+
+    def offer(number, email):
+        s.sequence_file.write_text("{torn")  # current_account_number() now raises
+        s.current_account_number()
+        return True
+
+    outcome = _run(s, FakeLogin(), adopt_existing=offer)
+    assert outcome.status == rl.FAILED and "cc-swap unclaimed" in outcome.message
+    assert _stashed_rts(s) == ["rt-four-new"]
+    assert not _leftover_profiles(s)

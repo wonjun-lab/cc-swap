@@ -736,6 +736,17 @@ class SessionManager:
                 places = []
         if not places and not force:
             return
+        if places and all(label == shared_login.LIVE_LOGIN for label, _slot in places):
+            # Only the live login of another account holds it: what the
+            # consume gate defers on (it may be a switch's moment). Explain;
+            # a re-login is not the remedy for a moment.
+            raise SessionError(
+                f"Not starting a session for Account-{account_num} right now: "
+                "the live login holds its login too (a switch may be in "
+                "progress), and a session would refresh it out from under "
+                "Claude Code. Retry in a moment; if it persists, cc-swap "
+                "doctor explains the live login."
+            )
         where = ", ".join(label for label, _slot in places) or "another place"
         raise SessionError(
             f"Not starting a session for Account-{account_num}: its login is "

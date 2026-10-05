@@ -2772,10 +2772,9 @@ class ClaudeAccountSwitcher:
         not mistaken for sharing. None otherwise, or when unknown."""
         if fp is None:
             return None
-        live = self._read_active_credentials()
-        if not live.value or live.degraded:
-            return None
-        if shared_login.refresh_fingerprint(live.value) != fp:
+        # A peek: a transient Keychain failure here must not switch this
+        # process to file mode (``peek_active_login``); unknown is not shared.
+        if shared_login.refresh_fingerprint(self._store.peek_active_login()) != fp:
             return None
         current = self.current_account_number()
         if current == str(account_num):
@@ -2797,7 +2796,7 @@ class ClaudeAccountSwitcher:
         if not is_active:
             live_slot = self._live_shares(account_num, fp)
             if live_slot is not None:
-                places.append(("the live login", live_slot or None))
+                places.append((shared_login.LIVE_LOGIN, live_slot or None))
         return places
 
     def _shared_for_gate(
@@ -3161,7 +3160,7 @@ class ClaudeAccountSwitcher:
             return oauth.RefreshOutcome(None, shared_login.SHARED_LOGIN)
         if live_shared:
             self._log_shared_refusal(
-                account_num, refresh_input, [("the live login", None)], deferred=True,
+                account_num, refresh_input, [(shared_login.LIVE_LOGIN, None)], deferred=True,
             )
             return oauth.RefreshOutcome(None, "transient")
         result = self._audited_refresh(

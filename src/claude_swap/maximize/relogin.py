@@ -554,9 +554,8 @@ class NewLoginAttempt(LoginAttempt):
         """Store the profile's login as a new account. An account already in
         a slot is refused (DUPLICATE, ``number`` = that slot) unless
         ``adopt_existing(number, email)`` says to keep it as that slot's
-        re-login, which then runs the re-login checks and store."""
-        from claude_swap.exceptions import DuplicateAccountError
-
+        re-login, which then runs the re-login checks and store. A login
+        that is not stored is kept unclaimed whatever went wrong."""
         try:
             creds, account = self.read_login()
         except Exception as e:
@@ -566,6 +565,23 @@ class NewLoginAttempt(LoginAttempt):
             return Outcome(FAILED, "", "claude saved no login; nothing stored")
         if account is None:
             return Outcome(FAILED, "", "the new login names no account; nothing stored")
+        try:
+            return self._place(switcher, creds, account, adopt_existing)
+        except Exception as e:  # e.g. a torn sequence.json: keep the login
+            return Outcome(FAILED, "", _new_not_stored(switcher, creds, e))
+
+    def _place(
+        self,
+        switcher,
+        creds: str,
+        account: Mapping,
+        adopt_existing: Callable[[str, str], bool] | None,
+    ) -> Outcome:
+        """:meth:`finish` once the profile's login is read. Every refusal
+        it returns has kept the login unclaimed; what it raises, ``finish``
+        keeps."""
+        from claude_swap.exceptions import DuplicateAccountError
+
         # ``--email`` only pre-fills the browser form: whoever signed in is
         # the new account (checked against the slots below).
         email = str(account.get("emailAddress") or "").strip()
