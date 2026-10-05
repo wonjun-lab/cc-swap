@@ -5,8 +5,10 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import math
 import sys
 import threading
+import time
 import urllib.error
 import urllib.request
 from collections.abc import Callable, Sequence
@@ -612,8 +614,52 @@ def fresh_reset_strings(window: dict) -> tuple[str, str] | None:
 
 
 def request_usage_data(access_token: str) -> dict:
-    """Request raw utilization data from the Anthropic usage API."""
-    url = "https://api.anthropic.com/api/oauth/usage"
+    """Request raw utilization data from the Anthropic usage API.
+
+    ``cedar_ember=1`` fills the response's otherwise-null ``cedar_ember``
+    block (usage-reset coupons, see :func:`parse_reset_coupons`) on the same
+    request. Verified live 2026-10-06: the flagged response has the same
+    top-level keys, and the same keys inside ``five_hour``/``seven_day``/
+    ``extra_usage``/``spend``/``iguana_necktie``, as Claude Code's plain one.
+    ``skip_spend`` (which Claude Code pairs with it) is deliberately absent:
+    it nulls ``extra_usage``, which the spend line reads.
+
+    The flag is display-only, so it must never cost a usage reading: a
+    400/404/422 on the flagged URL is retried once, immediately, without
+    it, and the flag is dropped for this process for
+    ``COUPON_FLAG_REPROBE_S``. A 5xx is retried the same way; if the
+    flag-less retry succeeds the flag is dropped too, else the original
+    error propagates to the normal backoff. Every other error (401, 429,
+    network) propagates untouched — no retry spends the budget.
+    """
+    global _coupon_flag_off_until
+    if time.time() < _coupon_flag_off_until:
+        return _get_usage(_USAGE_URL, access_token)
+    try:
+        return _get_usage(_USAGE_URL + "?cedar_ember=1", access_token)
+    except urllib.error.HTTPError as e:
+        if e.code in (400, 404, 422):
+            _coupon_flag_off_until = time.time() + COUPON_FLAG_REPROBE_S
+            _logger.info("Usage request refused the coupon flag (http-%s); dropping it", e.code)
+            return _get_usage(_USAGE_URL, access_token)
+        if 500 <= e.code < 600:
+            try:
+                data = _get_usage(_USAGE_URL, access_token)
+            except Exception:
+                raise e from None
+            _coupon_flag_off_until = time.time() + COUPON_FLAG_REPROBE_S
+            _logger.info("Usage request failed only with the coupon flag (http-%s); dropping it", e.code)
+            return data
+        raise
+
+
+_USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
+#: How long the coupon flag stays off after the server refused it.
+COUPON_FLAG_REPROBE_S = 3 * 3600.0
+_coupon_flag_off_until = 0.0
+
+
+def _get_usage(url: str, access_token: str) -> dict:
     headers = {
         "Authorization": f"Bearer {access_token}",
         "anthropic-beta": OAUTH_BETA_HEADER,
@@ -749,7 +795,126 @@ def build_usage_result(data: dict) -> dict | None:
         if scoped:
             result["scoped"] = scoped
 
-    return result if result else None
+    if not result:
+        return None
+    # Display only, added after the emptiness check so a response with no
+    # windows still reads as "no usage" to every decision path.
+    # Display-only blocks: a parse failure drops the block, never the
+    # decision-grade reading above.
+    for key, field, parse in (
+        ("cloud_credit", "iguana_necktie", parse_cloud_credit),
+        ("reset_coupons", "cedar_ember", parse_reset_coupons),
+    ):
+        try:
+            block = parse(data.get(field))
+        except Exception as e:
+            _logger.debug("%s parse failed: %r", field, e)
+            block = None
+        if block is not None:
+            result[key] = block
+    return result
+
+
+def _finite(value: object) -> float | None:
+    """A JSON number as a finite float, else None (bool, NaN, ±Infinity and
+    ints too large for a float all read as None)."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    try:
+        out = float(value)
+    except OverflowError:
+        return None
+    return out if math.isfinite(out) else None
+
+
+#: Limits a reset coupon can clear, in the words the usage lines use.
+RESET_LIMIT_LABELS = {
+    "five_hour": "5h",
+    "seven_day": "7d",
+    "seven_day_overage_included": "7d",
+    "seven_day_opus": "Opus",
+    "seven_day_sonnet": "Sonnet",
+}
+
+
+def parse_reset_coupons(block: object) -> dict | None:
+    """Usage-reset coupons (``cedar_ember`` in the usage response, asked
+    for with ``?cedar_ember=1``), or None when the response has no block.
+
+    Display only. Tolerant by contract — every field may be absent or
+    malformed (Claude Code's own parser ``.catch()``es each one), and this
+    never raises: a field that does not read is dropped, a grant without
+    ``resets_left`` is skipped. Redeeming one is a POST cc-swap never sends.
+    """
+    if not isinstance(block, dict):
+        return None
+
+    def text(value: object) -> str | None:
+        return value if isinstance(value, str) and value else None
+
+    def count(value: object) -> int | None:
+        number = _finite(value)
+        return None if number is None else max(0, int(number))
+
+    def limits(value: object) -> list[str]:
+        if not isinstance(value, list):
+            return []
+        return [v for v in value if isinstance(v, str)]
+
+    grants: list[dict] = []
+    raw_grants = block.get("grants")
+    for g in raw_grants if isinstance(raw_grants, list) else []:
+        if not isinstance(g, dict):
+            continue
+        left = count(g.get("resets_left"))
+        if left is None:
+            continue
+        grants.append({
+            "id": text(g.get("id")),
+            "label": text(g.get("label")),
+            "total": count(g.get("resets_total")),
+            "left": left,
+            "starts_at": text(g.get("starts_at")),
+            "ends_at": text(g.get("ends_at")),
+            "clears": limits(g.get("clears")),
+            "paused": g.get("paused") is True,
+            "usable_now": g.get("usable_now") is True,
+        })
+    return {
+        "eligible": block.get("eligible") is True,
+        "ineligible_reason": text(block.get("ineligible_reason")),
+        "at_limit": block.get("at_limit") is True,
+        "exhausted": limits(block.get("exhausted")),
+        "grants": grants,
+        "next_grant_id": text(block.get("next_grant_id")),
+        "weekly_resets_at": text(block.get("weekly_resets_at")),
+        "cooldown_until": text(block.get("cooldown_until")),
+    }
+
+
+def parse_cloud_credit(block: object) -> dict | None:
+    """The cloud-session credit (``iguana_necktie`` in the usage response):
+    ``{"limit", "used", "remaining", "resets_at", "locked_reason"}`` in
+    dollars, or None when the account has none (the API sends null until
+    the credit is claimed). ``resets_at`` is when the credit expires."""
+    if not isinstance(block, dict):
+        return None
+
+    def num(key: str) -> float | None:
+        return _finite(block.get(key))
+
+    limit = num("limit_dollars")
+    if limit is None:
+        return None
+    resets_at = block.get("resets_at")
+    locked = block.get("locked_reason")
+    return {
+        "limit": limit,
+        "used": num("used_dollars"),
+        "remaining": num("remaining_dollars"),
+        "resets_at": resets_at if isinstance(resets_at, str) and resets_at else None,
+        "locked_reason": locked if isinstance(locked, str) and locked else None,
+    }
 
 
 def relevant_windows(

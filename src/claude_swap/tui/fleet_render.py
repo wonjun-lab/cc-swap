@@ -24,6 +24,7 @@ from datetime import datetime
 
 from rich.text import Text
 
+from claude_swap import credits as credits_mod
 from claude_swap import oauth
 from claude_swap.maximize import fleet as fx
 from claude_swap.maximize import home
@@ -76,6 +77,9 @@ class Ctx:
     forced: frozenset[str] = frozenset()
     #: … dimmed while nothing switches (no engine, auto off, paused, silent).
     live: bool = True
+    #: Slot → prepaid balance / credit grant reading (``credits.py``), for
+    #: the detail panel's ``credits`` line.
+    credits: Mapping[str, dict] = field(default_factory=dict)
 
     def tag(self, row: fx.FleetRow) -> tuple[str, str] | None:
         return home.tag_for(
@@ -376,6 +380,21 @@ def render_detail(
             line.append(f" {pct:3.0f}%", style=f"{color} dim" if dim else color)
             line.append(f"  {words}", style=p.foreground)
             lines.append(line)
+
+    last_good = acc.usage.last_good if acc is not None else None
+    for label, words in (
+        ("cloud credit", credits_mod.cloud_credit_summary(last_good, ctx.now)),
+        ("reset coupons", credits_mod.reset_coupons_summary(last_good, ctx.now)),
+    ):
+        if words:
+            lines.append(
+                Text("    ").append(f"{label} ", style=p.muted).append(words, style=p.foreground)
+            )
+    credit_line = credits_mod.summary(ctx.credits.get(row.number), ctx.now)
+    if credit_line:
+        lines.append(
+            Text("    ").append("credits ", style=p.muted).append(credit_line, style=p.foreground)
+        )
 
     info = Text("    ")
     login, tone = _login_words(row, ctx.now)

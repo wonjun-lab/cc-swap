@@ -92,6 +92,7 @@ from claude_swap.paths import (
 )
 from claude_swap.process_detection import get_running_instances
 from claude_swap import poll_policy
+from claude_swap import credits as credits_mod
 from claude_swap.settings import load_settings, parse_model_names, settings_path
 from claude_swap.usage_store import (
     FetchRecord,
@@ -121,6 +122,10 @@ _FETCH_STAGGER_S = 0.25
 # serve TTL the data is current by design (that is the polling cadence), so
 # an age note there would be permanent noise.
 _USAGE_AGE_NOTE_S = poll_policy.SERVE_TTL_S
+
+# Per-request timeout for the credits reads ``cswap list`` makes (both reads
+# of every due account run concurrently, so this bounds the added latency).
+LIST_CREDITS_TIMEOUT_S = 3.0
 
 
 def _pace_marker(window: dict, fetched_at: float | None) -> str:
@@ -410,6 +415,9 @@ class ClaudeAccountSwitcher:
         self.lock_file = self.backup_dir / ".lock"
         self._logger = setup_logging(self.backup_dir, debug=debug)
         self._usage_store = UsageStore(self.backup_dir / "cache")
+        # Prepaid balance / credit grants: display only, own cadence and
+        # backoff, never the usage endpoint (see credits.py).
+        self._credits_store = credits_mod.CreditsStore(self.backup_dir / "cache")
         # (settings mtime, (threshold, models)) — see _poll_policy_inputs.
         self._poll_inputs_cache: tuple[float | None, tuple[float, tuple[str, ...]]] | None = None
         self._poll_inputs_override: tuple[float, tuple[str, ...]] | None = None
@@ -1928,6 +1936,65 @@ class ClaudeAccountSwitcher:
             num: entry.fetched_at
             for num, entry in self._usage_store.entries(identities).items()
         }
+
+    def credits_by_account(
+        self,
+        accounts_info: list[tuple[int, str, str, str, bool, str, str]] | None = None,
+        *,
+        force: bool = False,
+        fetch: bool = True,
+        timeout: float = 5.0,
+    ) -> dict[str, dict]:
+        """Slot → prepaid balance / credit grant reading (see credits.py).
+
+        Fetches the slots that are due (hourly; ``force`` = an explicit
+        refresh, at most once a minute) unless ``fetch`` is False, then
+        returns every slot's last reading. Display only — nothing here feeds
+        a switch decision, and it never raises: a failure just leaves the
+        previous reading (or none) in place. ``accounts_info`` (the ``list``
+        pass) supplies the slots and the active one; credentials are always
+        re-read at fetch time, only for due slots — the live store for the
+        active one, the backup for the rest — so a token the usage pass just
+        rotated is the one sent. ``timeout`` bounds each request.
+        """
+        try:
+            if accounts_info is not None:
+                identities = {
+                    str(num): (email, org_uuid or "")
+                    for num, email, _n, org_uuid, _a, _c, _al in accounts_info
+                }
+                active = next(
+                    (str(info[0]) for info in accounts_info if info[4]), None
+                )
+            else:
+                data = self._get_sequence_data_migrated() or {}
+                accounts = data.get("accounts", {})
+                identities = {
+                    str(num): (
+                        accounts.get(str(num), {}).get("email", ""),
+                        accounts.get(str(num), {}).get("organizationUuid", "") or "",
+                    )
+                    for num in data.get("sequence", [])
+                }
+                current = self._get_current_account()
+                active = (
+                    self._find_account_slot(data, *current) if current else None
+                )
+
+            def read(num: str) -> str:
+                if num == active:
+                    return self._read_active_credentials().value or ""
+                return self._read_account_credentials(num, identities[num][0])
+
+            if not fetch:
+                return self._credits_store.readings(identities)
+            return credits_mod.refresh(
+                self._credits_store, identities, read, force=force, timeout=timeout,
+                names=self.account_names(),
+            )
+        except Exception as e:
+            self._logger.debug(f"Credits pass failed: {e!r}")
+            return {}
 
     def set_poll_policy_inputs(
         self, threshold: float, models: tuple[str, ...]
@@ -6694,8 +6761,10 @@ class ClaudeAccountSwitcher:
         self,
         accounts_info: list[tuple[int, str, str, str, bool, str, str]],
         entries: dict[str, UsageEntry],
+        credits: dict[str, dict] | None = None,
     ) -> dict:
         """Build the ``--list --json`` payload from gathered account + usage data."""
+        credits = credits or {}
         active_num: int | None = None
         accounts = []
         seq_data = self._get_sequence_data() or {}
@@ -6725,6 +6794,7 @@ class ClaudeAccountSwitcher:
                     login_expires_at=oauth.login_expires_at_iso(creds),
                     login_expired=oauth.is_login_expired(creds),
                     name=name_of(names, num, email),
+                    credits=credits_mod.to_json(credits.get(str(num))),
                 )
             )
         payload = {
@@ -6775,14 +6845,21 @@ class ClaudeAccountSwitcher:
 
         accounts_info = self._build_accounts_info()
         entries = self._collect_usage_entries(accounts_info, fetch=fetch)
+        # After the usage pass (credentials re-read, so a just-rotated token
+        # is used), with a short per-request timeout: once credits are due
+        # this adds at most ~LIST_CREDITS_TIMEOUT_S to the command.
+        credits = self.credits_by_account(
+            accounts_info, fetch=fetch is None, timeout=LIST_CREDITS_TIMEOUT_S
+        )
 
         if json_output:
-            return self._build_list_payload(accounts_info, entries)
+            return self._build_list_payload(accounts_info, entries, credits)
 
         from claude_swap.maximize.names import short_name
 
         seq_data = self._get_sequence_data() or {}
         names = self.account_names(seq_data)
+        now = time.time()
         print(bolded("Accounts:"))
         for i, (num, email, org_name, org_uuid, is_active, _, alias) in enumerate(accounts_info):
             tag = self._get_display_tag(email, org_name, org_uuid)
@@ -6802,6 +6879,19 @@ class ClaudeAccountSwitcher:
             print(f"  {label} {muted(f'[{tag}]')}{markers} {muted(f'#{num}')}")
             for line in _usage_entry_lines(entries[str(num)]):
                 print(f"    {line}")
+            cloud_line = credits_mod.cloud_credit_summary(
+                entries[str(num)].last_good, now
+            )
+            if cloud_line:
+                print(f"    {muted('cloud credit:')} {cloud_line}")
+            coupon_line = credits_mod.reset_coupons_summary(
+                entries[str(num)].last_good, now
+            )
+            if coupon_line:
+                print(f"    {muted('reset coupons:')} {coupon_line}")
+            credit_line = credits_mod.summary(credits.get(str(num)), now)
+            if credit_line:
+                print(f"    {muted('credits:')} {credit_line}")
             expiry_line = login_expiry_warning_line(
                 accounts_info[i][5], entries[str(num)]
             )

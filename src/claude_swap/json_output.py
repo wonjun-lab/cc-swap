@@ -137,6 +137,44 @@ def usage_to_json(usage: dict, fetched_at: float | None = None) -> dict:
         out["spend"] = spend_out
     if "scoped" in usage:
         out["scoped"] = [_scoped_window_to_json(w, fetched_at) for w in usage["scoped"]]
+    cloud = usage.get("cloud_credit")
+    if isinstance(cloud, dict):
+        # Additive, display-only; not read back by usage_from_json.
+        out["cloudCredit"] = {
+            "limit": cloud.get("limit"),
+            "used": cloud.get("used"),
+            "remaining": cloud.get("remaining"),
+            "expiresAt": cloud.get("resets_at"),
+            "lockedReason": cloud.get("locked_reason"),
+        }
+    coupons = usage.get("reset_coupons")
+    if isinstance(coupons, dict):
+        # Additive, display-only (ineligible blocks included, so a script
+        # can see why none are offered); not read back by usage_from_json.
+        out["resetCoupons"] = {
+            "eligible": coupons.get("eligible"),
+            "ineligibleReason": coupons.get("ineligible_reason"),
+            "atLimit": coupons.get("at_limit"),
+            "exhausted": coupons.get("exhausted") or [],
+            "grants": [
+                {
+                    "id": g.get("id"),
+                    "label": g.get("label"),
+                    "total": g.get("total"),
+                    "left": g.get("left"),
+                    "startsAt": g.get("starts_at"),
+                    "endsAt": g.get("ends_at"),
+                    "clears": g.get("clears") or [],
+                    "paused": g.get("paused"),
+                    "usableNow": g.get("usable_now"),
+                }
+                for g in coupons.get("grants") or []
+                if isinstance(g, dict)
+            ],
+            "nextGrantId": coupons.get("next_grant_id"),
+            "weeklyResetsAt": coupons.get("weekly_resets_at"),
+            "cooldownUntil": coupons.get("cooldown_until"),
+        }
     return out
 
 
@@ -335,6 +373,7 @@ def account_row(
     login_expires_at: str | None = None,
     login_expired: bool = False,
     name: str = "",
+    credits: dict | None = None,
 ) -> dict:
     """A full account row for ``--list``. ``backoff_until`` is the live
     backoff only; a lapsed one is the caller's to withhold. ``name``
@@ -371,6 +410,10 @@ def account_row(
     # refresh will be refused, so a script should treat it as due now.
     if login_expired:
         row["loginExpired"] = True
+    # Additive: prepaid balance / credit grant (``credits.to_json``), present
+    # once the slot has a reading.
+    if credits is not None:
+        row["credits"] = credits
     if usage is not None:
         row.update(usage_freshness_fields(usage_fetched_at, usage_age_s))
     else:
