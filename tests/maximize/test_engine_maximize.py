@@ -104,11 +104,11 @@ class TestHook:
         assert no_switch_reasons(h) == ["below-threshold"]
 
     def test_poll_thresholds_follow_the_hard_caps(self, temp_home):
-        # Spec §4.1: escalation AND urgent mode key on min(hard), never soft.
+        # Spec §4.1: escalation AND the poll threshold key on min(hard), never soft.
         h = make(temp_home, maximize={"soft5h": 40, "soft7d": 85, "hard5h": 90})
         h.tick_with_usage({"1": win(10, 10), "2": win(0, 0), "3": win(0, 0)})
         assert h.engine.settings.threshold == 90.0          # escalation: min(hard)
-        assert h.switcher._poll_policy_inputs()[0] == 90.0  # urgent mode: min(hard)
+        assert h.switcher._poll_policy_inputs()[0] == 90.0  # poll threshold: min(hard)
 
     def test_decision_event_carries_scores_and_rows_without_email(self, temp_home):
         h = make(temp_home)
