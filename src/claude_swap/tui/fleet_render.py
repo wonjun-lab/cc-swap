@@ -69,6 +69,13 @@ class Ctx:
     now: float
     next_no: str | None = None
     priming: bool = True
+    #: The engine's landing order (``policy.landing_candidates``) and the
+    #: accounts only a forced move takes (``policy.escape_candidates``), for
+    #: the ``order`` column (``home.order_marks``) …
+    picks: tuple[str, ...] = ()
+    forced: frozenset[str] = frozenset()
+    #: … dimmed while nothing switches (no engine, auto off, paused, silent).
+    live: bool = True
 
     def tag(self, row: fx.FleetRow) -> tuple[str, str] | None:
         return home.tag_for(
@@ -112,10 +119,13 @@ def table_header(plan: home.TablePlan, palette: Palette) -> Text:
 
 
 def _order_cell(mark: str, width: int, ctx: Ctx) -> Text:
+    """The ``order`` mark; every one but ``●`` dim while nothing switches
+    (the order is what switching would do, not what it does)."""
     p = ctx.palette
     style = {
         home.ORDER_ACTIVE: f"bold {p.accent}", home.ORDER_NONE: p.muted,
-    }.get(mark, f"bold {p.foreground}")
+        home.ORDER_FORCED: p.muted,
+    }.get(mark, f"bold {p.foreground}" if ctx.live else p.muted)
     return Text(mark.center(width), style=style)
 
 
@@ -229,7 +239,7 @@ def render_table(
 ) -> Body:
     """One line per account, in ``rows`` order (the header is
     :func:`table_header`, drawn above the scrolling area)."""
-    marks = home.order_marks(rows, ctx.now)
+    marks = home.order_marks(rows, ctx.picks, ctx.forced)
     body = Body()
     for row in rows:
         line = table_row(row, marks.get(row.number, home.ORDER_NONE), plan, ctx)

@@ -42,7 +42,7 @@ from claude_swap.maximize.plan import parse_plan_override
 from claude_swap.maximize.score import days_left, landable
 from claude_swap.models import AccountSnapshot, AccountsSnapshot
 from claude_swap.settings import SETTING_SPECS, MaximizeSettings, PrimeSettings
-from claude_swap.shared_login import SHARED_LOGIN
+from claude_swap.shared_login import SHARED_LOGIN, shared_slots
 from claude_swap.usage_store import STALE_OK_S
 
 LoginState = Literal["ok", "relogin", "expired", "foreign", "keychain", "api"]
@@ -253,6 +253,12 @@ class FleetRow:
     # cc-swap (shared_login.py): its last refresh was refused because the
     # refresh token is also held elsewhere; a re-login resolves it.
     shared: bool = False
+    # The engine decides on this row's reading (``UsageEntry.decision_value``
+    # is not None: at most 5 minutes old, or older on purpose — the
+    # scheduler's own cadence, a failure streak, up to an hour; after a 429
+    # up to the window's reset). False: it counts as unknown — never a
+    # landing target, not counted in the summary; the row still shows it.
+    trusted: bool = True
 
 
 def _seen_resets(acc: AccountSnapshot, now: float) -> tuple[float | None, float | None]:
@@ -273,22 +279,28 @@ def fleet_snapshot(
     *,
     now: float,
     history: UsageHistory | None = None,
+    trusted: bool = True,
 ) -> Snapshot:
     """The policy Snapshot the TUI decides on: :func:`view.snapshot_from_accounts`
     with the published plans, and slots without a usable stored login set
-    aside like the engine does (``engine_hook._unavailable``). ``history``
+    aside like the engine does (``engine_hook.unavailable_slots``), and so are
+    logins also held elsewhere (``shared_login.shared_slots``). ``history``
     (``view.read_history``) gives the decisions Fleet computes itself the
     idle pattern and burn rates the engine's preempt and rebalance deferral
-    read; None decides as if there were no history."""
+    read; None decides as if there were no history.
+
+    ``trusted`` (the default): usage as the engine decides on it
+    (``UsageEntry.decision_value``), so a reading the engine no longer
+    trusts is unknown here too. False: every last good reading, for display."""
     unusable = {
         a.number
         for a in snap.accounts
         if not a.switchable and not a.is_active and not a.disabled
-    }
+    } | shared_slots({a.number: a.usage for a in snap.accounts}, snap.active_number)
     if unusable:
         state = replace(state, quarantined=state.quarantined | unusable)
     return mxview.snapshot_from_accounts(
-        snap, mx, state, now=now, plans=state.plans, history=history
+        snap, mx, state, now=now, plans=state.plans, history=history, decision=trusted,
     )
 
 
@@ -304,8 +316,15 @@ def fleet_rows(
     *,
     now: float,
 ) -> list[FleetRow]:
-    """One row per account in slot order, carrying maximize's rank."""
+    """One row per account in slot order, carrying maximize's rank.
+
+    Two readings of the store: what the rows show (every last good
+    reading, however old) and what maximize decides on (the engine's
+    decision values: a reading it no longer trusts is unknown). Rank,
+    score, ``landable`` and ``land`` come from the second; ``trusted`` says
+    whether the engine still decides on the row's reading."""
     msnap = fleet_snapshot(snap, mx, state, now=now)
+    shown_snap = fleet_snapshot(snap, mx, state, now=now, trusted=False)
     ranked = mxview.rows(msnap, state.primes)
     rank: dict[str, int] = {}
     position = 0
@@ -316,12 +335,15 @@ def fleet_rows(
         if row.score is not None:
             rank[row.number] = position
     by_row = {r.number: r for r in ranked}
-    views = {v.number: v for v in msnap.accounts}
+    shown_rows = {r.number: r for r in mxview.rows(shown_snap, state.primes)}
+    trusted_views = {v.number: v for v in msnap.accounts}
+    views = {v.number: v for v in shown_snap.accounts}
     shown = display_names((a.number, a.email, a.alias) for a in snap.accounts)
     out: list[FleetRow] = []
     for acc in sorted(snap.accounts, key=lambda a: _slot(a.number)):
         v = views[acc.number]
-        r = by_row[acc.number]
+        tv = trusted_views[acc.number]
+        r = shown_rows[acc.number]
         login = login_state(acc)
         raw = state.primes.get(acc.email)
         entry = raw if isinstance(raw, Mapping) else None
@@ -340,11 +362,11 @@ def fleet_rows(
                 pct5=v.pct5,
                 pct7=v.pct7,
                 days7=days_left(v, now) if v.pct7 is not None else None,
-                score=r.score,
+                score=by_row[acc.number].score,
                 landable=(
-                    not active and landable(v, mx) and not policy.login_guarded(v, now, mx)
+                    not active and landable(tv, mx) and not policy.login_guarded(tv, now, mx)
                 ),
-                land=land_note(v, mx, active=active, login=login, now=now),
+                land=land_note(tv, mx, active=active, login=login, now=now),
                 state5=r.state5,
                 reset5=(v.reset5 if r.state5 != "cold" else None) or seen5,
                 prime=prime_cell(v, entry, msnap.active, prime, now),
@@ -359,6 +381,7 @@ def fleet_rows(
                 ),
                 reset7=v.reset7 if v.reset7 is not None else seen7,
                 shared=acc.usage.last_error == SHARED_LOGIN,
+                trusted=acc.usage.decision_value() is not None,
             )
         )
     return out

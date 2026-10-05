@@ -292,22 +292,34 @@ def test_order_rest_is_by_rank_with_unknown_rank_after():
 
 
 def test_the_order_column_numbers_where_switching_goes():
-    """● the active account, 1 2 3 … in the display order (the engine's
-    picks first), – where switching never goes."""
-    _snap, _mx, _state, rows, _msnap, picks = _fleet()
+    """● the active account, 1 2 3 … exactly the engine's landing
+    candidates in its order, · only when forced, – the rest."""
+    _snap, _mx, _state, rows, msnap, picks = _fleet()
     by = _by(rows)
+    # #5 excluded (as the engine's lists would then leave it out).
     rows = [replace(by["5"], tier="excluded", rank=None) if r.number == "5" else r for r in rows]
-    ordered = home.ordered_rows(rows, picks, now=NOW)
-    marks = home.order_marks(ordered, NOW)
+    picks = [n for n in picks if n != "5"]
+    forced = {v.number for v in policy.escape_candidates(msnap)} - set(picks) - {"5"}
+    ordered = home.ordered_rows(rows, picks, now=NOW, forced=forced)
+    marks = home.order_marks(ordered, picks, forced)
     assert ordered[0].number == "1" and marks["1"] == "●"
     assert marks["3"] == "–" and marks["5"] == "–"  # a dead login, an excluded account
-    numbered = [marks[r.number] for r in ordered if marks[r.number] not in ("●", "–")]
-    assert numbered == [str(i) for i in range(1, len(numbered) + 1)]
+    numbered = [r.number for r in ordered if marks[r.number].isdigit()]
+    assert numbered == picks
+    assert [marks[n] for n in numbered] == [str(i) for i in range(1, len(numbered) + 1)]
     assert [r.number for r in ordered[1:1 + len(picks)]] == picks
-    assert all(marks[n] == str(i) for i, n in enumerate(picks, 1))
-    # The never-goes accounts come after every numbered one.
+    # Forced-only next, then the never-goes accounts.
     seq = [marks[r.number] for r in ordered]
-    assert seq.index("–") > max(i for i, m in enumerate(seq) if m not in ("●", "–"))
+    assert all(m in ("●", "·", "–") or m.isdigit() for m in seq)
+    if "–" in seq:
+        assert seq.index("–") > max(i for i, m in enumerate(seq) if m != "–")
+
+
+def test_only_a_forced_move_gets_a_dot():
+    row = _by(_fleet()[3])["2"]
+    marks = home.order_marks([replace(row, number="7"), row], ["7"], {"2"})
+    assert marks == {"7": "1", "2": "·"}
+    assert home.order_marks([row], [], ()) == {"2": "–"}
 
 
 def test_a_login_past_its_deadline_is_never_numbered():
@@ -315,7 +327,7 @@ def test_a_login_past_its_deadline_is_never_numbered():
     assert not home.unusable(row, NOW)
     lapsed = replace(row, login_deadline=NOW - 60)
     assert home.unusable(lapsed, NOW) and not home.unusable(lapsed)  # needs now to tell
-    assert home.order_marks([lapsed], NOW) == {"4": "–"}
+    assert home.order_marks([lapsed], [], ()) == {"4": "–"}
     ordered = home.ordered_rows([lapsed, replace(row, number="7", rank=9)], [], now=NOW)
     assert [r.number for r in ordered] == ["7", "4"]
 
@@ -369,15 +381,19 @@ def test_a_locked_keychain_and_an_old_reading_get_a_tag():
     assert home.tag_for(replace(row, login="keychain"), is_next=True, now=NOW) == (
         "keychain locked (f)", "warn",
     )
+    # Still trusted by the engine (its own cadence, a failure streak): dim,
+    # from 15 minutes on; a few minutes behind is the usual cadence.
     old = replace(row, stale=True, fetched_at=NOW - 25 * 60)
     assert home.tag_for(old, is_next=False, now=NOW) == ("reading 25m old", "dim")
-    older = replace(row, stale=True, fetched_at=NOW - 2 * H)
-    assert home.tag_for(older, is_next=False, now=NOW) == ("reading 2h old", "warn")
-    # A few minutes behind is the usual cadence: no tag.
     assert home.tag_for(replace(row, stale=True, fetched_at=NOW - 6 * 60),
                         is_next=False, now=NOW) is None
-    # Where switching goes next still says so.
-    assert home.tag_for(older, is_next=True, now=NOW) == ("next", "accent")
+    assert home.tag_for(old, is_next=True, now=NOW) == ("next", "accent")
+    # No longer trusted: amber at any age, and never next.
+    untrusted = replace(row, stale=True, fetched_at=NOW - 7 * 60, trusted=False)
+    assert home.tag_for(untrusted, is_next=False, now=NOW) == ("reading 7m old", "warn")
+    assert home.tag_for(untrusted, is_next=True, now=NOW) == ("reading 7m old", "warn")
+    older = replace(row, stale=True, fetched_at=NOW - 2 * H, trusted=False)
+    assert home.tag_for(older, is_next=True, now=NOW) == ("reading 2h old", "warn")
 
 
 def test_the_status_column_gives_way_before_a_name_is_cut():
@@ -926,9 +942,11 @@ def _table(width: int, *, height: int = 40, selected: str | None = None, next_no
            mx: MaximizeSettings | None = None):
     """The mockup fleet as the home screen draws it at ``width``: (plan,
     header line, body, the ordered rows, ctx, accounts by number)."""
-    snap, mock_mx, _state, rows, _msnap, picks = _fleet()
-    ctx = render.Ctx(P, window_ticks(mx or mock_mx), NOW, next_no=next_no)
-    ordered = home.ordered_rows(rows, picks, now=NOW)
+    snap, mock_mx, _state, rows, msnap, picks = _fleet()
+    forced = frozenset(v.number for v in policy.escape_candidates(msnap)) - set(picks)
+    ctx = render.Ctx(P, window_ticks(mx or mock_mx), NOW, next_no=next_no,
+                     picks=tuple(picks), forced=forced)
+    ordered = home.ordered_rows(rows, picks, now=NOW, forced=forced)
     statuses = {r.number: ctx.status(r) for r in ordered}
     by = {a.number: a for a in snap.accounts}
     first = ordered[0]
@@ -983,7 +1001,7 @@ def test_the_table_has_a_dim_header_over_every_column(width):
 def test_every_row_shows_its_order_both_resets_and_its_status_after_them(width):
     plan, _head, body, ordered, ctx, _by_n = _table(width)
     lines = body.text.plain.splitlines()
-    marks = home.order_marks(ordered, NOW)
+    marks = home.order_marks(ordered, ctx.picks, ctx.forced)
     for row, line in zip(ordered, lines):
         assert _cell(plan, line, "order") == marks[row.number]
         assert _cell(plan, line, "account").endswith(f"#{row.number}")

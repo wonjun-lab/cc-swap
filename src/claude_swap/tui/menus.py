@@ -327,9 +327,14 @@ def help_entries(idle_pattern: str | None = None) -> list[tuple[str, str]]:
                     "per account added up as whole accounts — not weighted by plan, so a "
                     "20x and a 5x account count alike. next 7d in: how long until the "
                     "soonest weekly reset, and whose. A short terminal drops it first"),
-        ("order", "● the active account; 1, 2, 3 … where automatic switching goes "
-                  "next, in that order; – never (a dead login, an excluded account). "
-                  "The table lists the accounts in this order"),
+        ("order", "● the active account; 1, 2, 3 … the accounts automatic switching "
+                  "would land on, in the order it would try them (the engine's own "
+                  "list, over the readings it trusts); · only when forced (a hard mark, "
+                  "or every account at its limit); – not now (a dead or expired login, "
+                  "excluded, a locked keychain, a login shared with another place, a "
+                  "reading too old to trust or none, past its hard marks). Dim while "
+                  "nothing is switching. The table "
+                  "lists the accounts in this order"),
         ("account", "the alias, else the part of the address before the @ (two alike "
                     "say where they are from: jordan.lee@uni), then #N: its slot number, "
                     "which the attention line and cc-swap commands use. The panel below "
@@ -353,8 +358,9 @@ def help_entries(idle_pattern: str | None = None) -> list[tuple[str, str]]:
         ("excluded", "never picked automatically (m → x includes it again)"),
         ("next", "where automatic switching goes next"),
         ("login 3d left", "the login reaches its fixed deadline soon: r renews it early"),
-        ("reading 2h old", "its usage was last read that long ago (amber from an hour: "
-                           "the engine no longer trusts it)"),
+        ("reading 2h old", "its usage was last read that long ago. Amber: the engine no "
+                           "longer trusts it and counts the account as unknown (never "
+                           "next, not in the summary); dim: still trusted"),
         ("last resort", "used only when every other account is at its limit (l toggles)"),
         ("prime 19:30", "its 5h window has not started; priming starts it then (now: at "
                         "the next tick; 5h off: priming does not run)"),

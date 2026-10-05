@@ -1275,6 +1275,27 @@ class UsageStore:
         self._mutate(identities, nums, apply)
 
 
+    def clear_error(self, error: str) -> list[str]:
+        """Clear ``lastError`` and ``backoffUntil`` on every row whose
+        ``lastError`` is ``error``, whatever its identity: the next pass
+        fetches it again and re-confirms or clears the error. For a
+        condition one write elsewhere can end (``shared_login.SHARED_LOGIN``:
+        re-logging, adding or removing the partner slot, deleting a session
+        profile). Returns the slots cleared."""
+        cleared: list[str] = []
+        with self._lock():
+            rows = self._read_rows()
+            for num, row in rows.items():
+                if isinstance(row, dict) and row.get("lastError") == error:
+                    row["lastError"] = None
+                    row["backoffUntil"] = None
+                    row["consecutiveFailures"] = 0
+                    cleared.append(str(num))
+            if cleared:
+                self._write_rows(rows)
+        return cleared
+
+
 def _num_or_none(value: object) -> float | None:
     return float(value) if isinstance(value, (int, float)) else None
 

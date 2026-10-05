@@ -49,7 +49,7 @@ from datetime import datetime, timezone
 from typing import Any, Protocol
 
 from claude_swap import autoswitch as aw
-from claude_swap import oauth, poll_policy
+from claude_swap import oauth, poll_policy, shared_login
 from claude_swap.exceptions import ConfigError
 from claude_swap.maximize import history, idle, ledger, notify, pause, policy
 from claude_swap.maximize import hold as account_hold
@@ -396,16 +396,51 @@ def _records(engine: aw.AutoSwitchEngine, current: str) -> dict[str, dict]:
     return out
 
 
-def _unavailable(
-    engine: aw.AutoSwitchEngine, records: Mapping[str, Mapping], current: str
+def unavailable_slots(
+    records: Mapping[str, Mapping], current: str | None, switchable: set[str]
 ) -> set[str]:
-    """Enabled slots without usable stored backups (cannot be activated)."""
-    switchable = set(engine.switcher.switchable_account_numbers())
+    """Enabled slots other than ``current`` not in ``switchable`` (no usable
+    stored backup: they cannot be activated)."""
     return {
         n
         for n, r in records.items()
         if n != current and n not in switchable and not r.get("disabled")
     }
+
+
+def policy_snapshot(
+    *,
+    now: float,
+    current: str | None,
+    entries: Mapping[str, Any],
+    usage: Mapping[str, dict | str | None],
+    records: Mapping[str, Mapping],
+    quarantined: set[str] | frozenset[str],
+    switchable: set[str],
+    **inputs: Any,
+) -> tuple[Snapshot, set[str]]:
+    """The policy's input for one tick, and the slots set aside as shared.
+    Pure: everything read from disk is passed in, so a test (Fleet's
+    parity test) builds exactly what the engine decides on.
+
+    ``usage``: the decision values (``UsageEntry.decision_value``) per slot;
+    ``entries``: the usage entries they came from. Set aside like a dead
+    login (``quarantined``): slots without a usable backup
+    (:func:`unavailable_slots`) and logins also held elsewhere
+    (``shared_login.shared_slots``: a switch onto one is refused, so no
+    decision may target it). ``inputs`` go to ``build_snapshot`` as they are
+    (plans, samples, deadlines, forecast, hold, ride state …)."""
+    shared = shared_login.shared_slots(entries, current) & set(records)
+    snap = build_snapshot(
+        now=now,
+        active=current,
+        usage=usage,
+        records=records,
+        quarantined=set(quarantined) | unavailable_slots(records, current, switchable) | shared,
+        api_key_accounts={n for n, r in records.items() if r.get("kind") == "api_key"},
+        **inputs,
+    )
+    return snap, shared
 
 
 def _rate_limit_tiers(
@@ -994,13 +1029,16 @@ def _publish_decision(
     decision: Decision,
     state: Mapping,
     tiers: Mapping[str, str | None],
+    *,
+    shared: set[str] | frozenset[str] = frozenset(),
 ) -> None:
     """Write this tick's decision to the state file for TUI viewers.
 
     Slot numbers and the policy's own reason only — no emails, no raw
     ``rateLimitTier`` strings; a hold with its own code (``reset-wait``,
     ``preempt``, ``rebalance-deferred``, ``hold``) adds ``code`` so
-    ``cc-swap why`` can name it. Rewritten when the decision changes, or when
+    ``cc-swap why`` can name it, and ``shared`` the slots set aside because
+    their login is also held elsewhere. Rewritten when the decision changes, or when
     the stored one is :data:`PUBLISH_REFRESH_S` old (the TUI's freshness
     clock); never on dry runs, which write nothing."""
     if engine.dry_run:
@@ -1023,6 +1061,8 @@ def _publish_decision(
     }
     if isinstance(decision, Hold) and decision.code is not None:
         record["code"] = decision.code
+    if shared:
+        record["shared"] = sorted(shared, key=lambda n: (len(n), n))
     if isinstance(decision, Hold) and decision.ride_until is not None:
         # A ride's switch time, so a viewer counts its minutes down live.
         record["rideUntil"] = decision.ride_until
@@ -1468,13 +1508,14 @@ def run_maximize_tick(
     )
     last = state.get("lastSwitchAt")
     tiers = _rate_limit_tiers(engine, rt, records, now)
-    snap = build_snapshot(
+    snap, shared = policy_snapshot(
         now=now,
-        active=current,
+        current=current,
+        entries=entries,
         usage=usage,
         records=records,
-        quarantined=set(quarantined) | _unavailable(engine, records, current),
-        api_key_accounts={n for n, r in records.items() if r.get("kind") == "api_key"},
+        quarantined=quarantined,
+        switchable=set(engine.switcher.switchable_account_numbers()),
         rate_limit_tiers=tiers,
         samples=samples,
         last_switch_at=(
@@ -1496,7 +1537,7 @@ def run_maximize_tick(
     decision = policy.decide(snap)
     rt.last_snapshot, rt.last_decision = snap, decision
     engine._emit(_decision_event(snap, decision, engine.dry_run))
-    _publish_decision(engine, snap, decision, state, tiers)
+    _publish_decision(engine, snap, decision, state, tiers, shared=shared)
     # `cc-swap auto off`: the decision is shown and published, but nothing
     # acts on it — no switch, no failover, no prime.
     held = pause.auto_off_hold(engine, state)

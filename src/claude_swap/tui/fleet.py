@@ -60,7 +60,6 @@ from textual.widgets import Static
 from claude_swap.maximize import fleet as fx
 from claude_swap.maximize import hold as account_hold
 from claude_swap.maximize import home
-from claude_swap.maximize import policy
 from claude_swap.maximize import view as mxview
 from claude_swap.maximize.primer import plan_text as mxprimer_plan_text
 from claude_swap.models import AccountsSnapshot
@@ -809,7 +808,8 @@ class FleetScreen(Screen):
         es = self._engine_status()
         msnap = self._msnap(now)
         dv = self._decision(msnap, now)
-        picks = [v.number for v in policy.landing_candidates(msnap)] if msnap else []
+        # The engine's own lists, over the readings it trusts (msnap).
+        picks, forced = home.engine_lists(msnap)
         snap = self.app.snapshot
         published = self._state.decision
         sit = home.situation(
@@ -822,10 +822,15 @@ class FleetScreen(Screen):
             palette=palette,
             ticks=mxview.window_ticks(self._mx),
             now=now,
-            next_no=home.next_number(dv, picks, sit),
+            next_no=home.next_number(
+                dv, picks, sit, home.never_next(self._rows),
+            ),
             priming=self._priming(es, sit),
+            picks=tuple(picks),
+            forced=forced,
+            live=home.switching_live(sit),
         )
-        rows = home.ordered_rows(self._rows, picks, now=now)
+        rows = home.ordered_rows(self._rows, picks, now=now, forced=forced)
         self._order = [r.number for r in rows]
         if self._sel not in self._order:
             self._sel = next((r.number for r in rows if r.active), None) or (

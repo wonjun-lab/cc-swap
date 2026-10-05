@@ -644,6 +644,47 @@ def _published_code(state: Mapping, published) -> str | None:
     return code if published.decision == "hold" and code in REASONS else None
 
 
+def shared_partners(numbers: list[str], switcher=None) -> dict[str, list[list]]:
+    """Slot -> ``[[label, slot to re-login or None], …]``: where else each
+    slot's stored login is held (``switcher.shared_login_places``, as
+    ``cc-swap doctor`` names them). Reads the slots' stored logins, so only
+    ``cc-swap why`` asks, and only for the slots the engine set aside; {}
+    when that cannot be read."""
+    try:
+        if switcher is None:
+            from claude_swap.switcher import ClaudeAccountSwitcher
+
+            switcher = ClaudeAccountSwitcher()
+        data = switcher._get_sequence_data() or {}
+        out: dict[str, list[list]] = {}
+        for number in numbers:
+            email = (data.get("accounts", {}).get(str(number)) or {}).get("email", "")
+            stored = switcher._store.peek_account_credentials(str(number), email)
+            places = (
+                switcher.shared_login_places(str(number), stored, is_active=False)
+                if stored else []
+            )
+            out[str(number)] = [[label, slot] for label, slot in places]
+        return out
+    except Exception:
+        return {}
+
+
+def _published_shared(state: Mapping, published) -> dict:
+    """``{"shared": ["2"]}``: the slots the engine set aside this decision
+    because their login is also held elsewhere (``shared_login.py``), when
+    the record is the one ``published`` was read from; else ``{}``."""
+    from claude_swap.maximize import view as mxview
+
+    raw = state.get(mxview.DECISION_KEY)
+    if not isinstance(raw, Mapping) or raw.get("at") != published.at:
+        return {}
+    shared = raw.get("shared")
+    if not isinstance(shared, list) or not shared:
+        return {}
+    return {"shared": [str(n) for n in shared]}
+
+
 def _engine_why(backup_root, *, now: float, state: Mapping | None = None) -> dict | None:
     """The engine's fresh published decision about the live account, explained."""
     from claude_swap.maximize import view as mxview
@@ -686,6 +727,7 @@ def _engine_why(backup_root, *, now: float, state: Mapping | None = None) -> dic
     else:
         meaning, action = REASONS[code] if code in REASONS else ("", "")
     return {
+        **_published_shared(state or {}, published),
         "source": "engine",
         "decision": "pending" if published.pending else published.decision,
         "pid": published.pid,
@@ -725,6 +767,14 @@ def _why_lines(why: dict) -> list[str]:
         lines.append(f"  meaning  {why['meaning']}")
     if why.get("action"):
         lines.append(f"  do       {why['action']}")
+    if why.get("shared"):
+        from claude_swap.shared_login import skip_text
+
+        partners = {
+            n: [tuple(p) for p in places]
+            for n, places in (why.get("sharedWith") or {}).items()
+        }
+        lines.append(f"  skipped  {skip_text(why['shared'], partners)}")
     would = why.get("wouldDecide")
     if would:
         verdict = would["decision"]
@@ -803,6 +853,8 @@ def why_command(argv: list[str], *, clock: Callable[[], float] = time.time) -> N
     root = paths.get_backup_root()
     now = clock()
     why = published_why(root, now=now)
+    if why is not None and why.get("shared"):
+        why["sharedWith"] = shared_partners(why["shared"])
     if why is not None:
         why["idlePattern"] = idle_pattern(root, now=now)
         why["learnedRide"] = ride_learning(root)

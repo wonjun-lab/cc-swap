@@ -2229,6 +2229,7 @@ class ClaudeAccountSwitcher:
                 self._write_account_credentials(num, rec_email, now_live)
                 self._write_account_config(num, rec_email, config_text)
             self._usage_store.clear_dead_token([num], {num: (rec_email, rec_org)})
+            self._recheck_shared_logins()
             self._logger.info(
                 "adopted new login for #%s (rt %s -> %s)",
                 num, oauth.fingerprint8(backup), oauth.fingerprint8(live),
@@ -2412,6 +2413,7 @@ class ClaudeAccountSwitcher:
                 # login was lost.
                 on_commit({"activated": bool(live_now)})
         self._usage_store.clear_dead_token([num], {num: (rec_email, rec_org)})
+        self._recheck_shared_logins()
         self._logger.info(
             "stored a new login for #%s (rt %s%s)", num, oauth.fingerprint8(credentials),
             "; live login rewritten" if live_now else "",
@@ -2594,6 +2596,7 @@ class ClaudeAccountSwitcher:
             if on_commit is not None:
                 on_commit(num)
         self._usage_store.clear_dead_token([num], {num: (email, org)})
+        self._recheck_shared_logins()
         self._logger.info(
             "stored a new login as #%s (rt %s); the live login untouched",
             num, oauth.fingerprint8(credentials),
@@ -3666,6 +3669,7 @@ class ClaudeAccountSwitcher:
         delete_macos_keychain_entry(session_dir)
         (session_dir / ".credentials.json").unlink(missing_ok=True)
         clear_session_stale(session_dir)
+        self._recheck_shared_logins()
         self._logger.info(
             f"Invalidated session credentials for account {account_num}"
         )
@@ -3759,6 +3763,23 @@ class ClaudeAccountSwitcher:
         )
         return True
 
+    def _recheck_shared_logins(self) -> None:
+        """cc-swap fork (shared_login.py): after a write that can end a
+        shared login — a slot re-logged, stored, added or removed, a session
+        profile deleted or re-seeded — clear the ``shared-login`` error and
+        its backoff on every usage row, so the next pass re-confirms it (the
+        consume gate refuses again) or clears it (the slot fetches and is a
+        candidate again) instead of waiting out the backoff. Best effort."""
+        try:
+            cleared = self._usage_store.clear_error(shared_login.SHARED_LOGIN)
+        except Exception as e:  # a display/scheduling aid: never break the write
+            self._logger.debug("shared-login recheck failed: %s", type(e).__name__)
+            return
+        if cleared:
+            self._logger.info(
+                "shared-login: re-checking #%s after a login change", ", #".join(cleared)
+            )
+
     def _delete_session_profile(self, account_num: str, email: str) -> None:
         """Remove an account's session profile dir and its keychain entry.
 
@@ -3784,6 +3805,9 @@ class ClaudeAccountSwitcher:
         # the missing dir left that marker for the next profile in this slot,
         # which then re-bootstraps on a flag nothing set for it.
         cleared = clear_session_stale(session_dir)
+        # The profile (or the slot it belonged to) may have been one side of
+        # a shared login: let the next pass re-confirm or clear the others.
+        self._recheck_shared_logins()
         if session_dir.exists() or not cleared:
             # Both removals tolerate a denied dir, which is right -- the
             # caller has already deleted the credentials and must reach the
@@ -4484,6 +4508,7 @@ class ClaudeAccountSwitcher:
             self._usage_store.clear_dead_token(
                 [account_num], {account_num: (current_email, current_org_uuid)}
             )
+            self._recheck_shared_logins()
 
             if alias is not None:
                 seq["accounts"][account_num]["alias"] = alias
@@ -4627,6 +4652,7 @@ class ClaudeAccountSwitcher:
         self._usage_store.clear_dead_token(
             [account_num], {account_num: (current_email, organization_uuid)}
         )
+        self._recheck_shared_logins()
 
         # Update sequence.json
         data = self._get_sequence_data()
@@ -4752,6 +4778,7 @@ class ClaudeAccountSwitcher:
             self._usage_store.clear_dead_token(
                 [account_num], {account_num: (email, "")}
             )
+            self._recheck_shared_logins()
             seq["lastUpdated"] = get_timestamp()
             self._write_json(self.sequence_file, seq)
             kind_label = "API key" if is_api_key else "token"
@@ -4834,6 +4861,7 @@ class ClaudeAccountSwitcher:
         self._usage_store.clear_dead_token(
             [account_num], {account_num: (email, "")}
         )
+        self._recheck_shared_logins()
 
         data = self._get_sequence_data()
         record = {

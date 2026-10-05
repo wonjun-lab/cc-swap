@@ -42,16 +42,18 @@ from __future__ import annotations
 import re
 import time
 import unicodedata
-from collections.abc import Mapping, Sequence
+from collections.abc import Collection, Mapping, Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Literal
 
 from claude_swap import oauth
 from claude_swap.maximize import fleet as fx
 from claude_swap.maximize import hold as account_hold
+from claude_swap.maximize import policy
 from claude_swap.settings import MaximizeSettings
 
 if TYPE_CHECKING:
+    from claude_swap.maximize.model import Snapshot
     from claude_swap.maximize.prime_verify import PausedView
 
 Tone = str
@@ -93,44 +95,74 @@ def unusable(row: fx.FleetRow, now: float | None = None) -> bool:
 
 
 def ordered_rows(
-    rows: Sequence[fx.FleetRow], picks: Sequence[str], *, now: float | None = None
+    rows: Sequence[fx.FleetRow],
+    picks: Sequence[str],
+    *,
+    now: float | None = None,
+    forced: Collection[str] = (),
 ) -> list[fx.FleetRow]:
     """The active account, then the engine's pick order (``picks``:
-    ``policy.landing_candidates``), then the rest by rank and slot; the
-    accounts switching never goes to (:func:`unusable`) after those, and
-    excluded accounts last."""
+    ``policy.landing_candidates``), then the accounts only a forced move
+    takes (``forced``: ``policy.escape_candidates``), then the rest by rank
+    and slot; the accounts switching never goes to (:func:`unusable`) after
+    those, and excluded accounts last."""
     by_number = {r.number: r for r in rows}
     out = [r for r in rows if r.active]
     out += [by_number[n] for n in picks if n in by_number and not by_number[n].active]
     seen = {r.number for r in out}
     rest = [r for r in rows if r.number not in seen]
     rest.sort(key=lambda r: (
-        r.tier == "excluded", unusable(r, now), r.rank is None, r.rank or 0,
+        r.tier == "excluded", r.number not in forced, unusable(r, now),
+        r.rank is None, r.rank or 0,
     ))
     return out + rest
 
 
-#: The ``order`` column: the active account, and an account switching never
-#: goes to.
+def engine_lists(msnap: "Snapshot | None") -> tuple[list[str], frozenset[str]]:
+    """``(picks, forced)`` for the ``order`` column and ``next``: the
+    engine's ``policy.landing_candidates`` in its order and the rest of its
+    ``policy.escape_candidates``, over the snapshot the engine decides on
+    (``msnap``: ``fleet.fleet_snapshot`` — trusted readings, slots without a
+    usable backup and logins shared with another place set aside)."""
+    if msnap is None:
+        return [], frozenset()
+    picks = [v.number for v in policy.landing_candidates(msnap)]
+    forced = frozenset(v.number for v in policy.escape_candidates(msnap)) - set(picks)
+    return picks, forced
+
+
+#: The ``order`` column: the active account, an account only a forced move
+#: takes, and one automatic switching does not go to now.
 ORDER_ACTIVE = "●"
+ORDER_FORCED = "·"
 ORDER_NONE = "–"
 
 
-def order_marks(rows: Sequence[fx.FleetRow], now: float) -> dict[str, str]:
-    """The ``order`` column for ``rows`` in display order
-    (:func:`ordered_rows`): ``●`` on the active account, ``1``, ``2``, ``3``
-    … on the others in the order automatic switching would try them, and
-    ``–`` on an account it never goes to (:func:`unusable`)."""
+def order_marks(
+    rows: Sequence[fx.FleetRow], picks: Sequence[str], forced: Collection[str] = ()
+) -> dict[str, str]:
+    """The ``order`` column, the engine's own lists and nothing else:
+    ``●`` on the active account; ``1``, ``2``, ``3`` … on the accounts
+    automatic switching would land on, in the order it would try them
+    (``picks``: ``policy.landing_candidates`` over the readings the engine
+    trusts); a dim ``·`` on one only a forced move takes (``forced``:
+    ``policy.escape_candidates`` — a hard mark, or every account at its
+    limit); ``–`` on the rest: a dead or lapsed login, an excluded account,
+    a locked keychain, a reading too old to trust or none, an account past
+    its hard marks."""
+    numbers = {n: str(i) for i, n in enumerate(
+        (n for n in picks if n in {r.number for r in rows if not r.active}), start=1,
+    )}
     out: dict[str, str] = {}
-    n = 0
     for row in rows:
         if row.active:
             out[row.number] = ORDER_ACTIVE
-        elif unusable(row, now):
-            out[row.number] = ORDER_NONE
+        elif row.number in numbers:
+            out[row.number] = numbers[row.number]
+        elif row.number in forced:
+            out[row.number] = ORDER_FORCED
         else:
-            n += 1
-            out[row.number] = str(n)
+            out[row.number] = ORDER_NONE
     return out
 
 
@@ -145,17 +177,15 @@ def short_left(seconds: float) -> str:
 
 #: The tags in priority order: an account shows only the first that applies.
 TAG_PRIORITY: tuple[str, ...] = (
-    "active", "re-login", "keychain", "excluded", "next", "login", "reading old",
-    "last resort", "prime",
+    "active", "re-login", "keychain", "excluded", "untrusted", "next", "login",
+    "reading old", "last resort", "prime",
 )
 
-#: A reading this old gets a ``reading 25m old`` tag (an account the engine
-#: reads is never this far behind: a candidate is polled every 10 minutes
-#: at most) …
+#: A reading the engine still decides on gets a dim ``reading 25m old`` tag
+#: from this age (an account the engine reads is rarely this far behind: a
+#: candidate is polled every 10 minutes at most); one it no longer trusts
+#: (``FleetRow.trusted``) gets it in amber at any age.
 STALE_TAG_S = 15 * 60.0
-#: … amber from this age on, where the engine no longer trusts it
-#: (``usage_store.TRUST_MAX_AGE_S``: its headroom counts as unknown).
-STALE_WARN_S = 3600.0
 
 
 def reading_age(row: fx.FleetRow, now: float) -> float | None:
@@ -177,15 +207,18 @@ def tag_for(
         return "keychain locked (f)", "warn"
     if row.tier == "excluded":
         return "excluded", "dim"
-    if is_next:
+    age = reading_age(row, now)
+    old = f"reading {ago_text(age or 0.0)} old"
+    if row.login == "ok" and not row.trusted and age is not None:
+        return old, "warn"  # the engine counts it as unknown: never next
+    if is_next and row.trusted and not row.shared:
         return "next", "accent"
     if fx.login_due(row, now):
         left = fx.login_left(row, now) or 0.0
         tone = "crit" if left < fx.LOGIN_URGENT_S else "warn"
         return (f"login {short_left(left)} left" if left > 0 else "login expired"), tone
-    age = reading_age(row, now)
     if row.login == "ok" and row.stale and age is not None and age >= STALE_TAG_S:
-        return f"reading {ago_text(age)} old", "warn" if age >= STALE_WARN_S else "dim"
+        return old, "dim"
     if row.tier == "last_resort":
         return "last resort", "dim"
     if row.state5 == "cold" and row.login == "ok":  # an API key has no 5h window
@@ -586,9 +619,13 @@ class Capacity:
 
 def usable_for_capacity(row: fx.FleetRow, now: float) -> bool:
     """An account the summary counts: one automatic switching may use
-    (not :func:`unusable`), with usage windows (no API key) it can read."""
+    (not :func:`unusable`), with usage windows (no API key) it can read,
+    a reading the engine still decides on (``FleetRow.trusted``), and a
+    login not shared with another place (``FleetRow.shared``)."""
     return (
         not unusable(row, now)
+        and row.trusted
+        and not row.shared
         and row.login != "api"
         and row.pct5 is not None
         and row.pct7 is not None
@@ -735,19 +772,31 @@ def priming_runs(
     return enabled and switching_live(sit) and es.holder != "here-dry" and not guard
 
 
-def next_number(dv: fx.DecisionView, picks: Sequence[str], sit: Situation) -> str | None:
+def next_number(
+    dv: fx.DecisionView,
+    picks: Sequence[str],
+    sit: Situation,
+    never: Collection[str] = (),
+) -> str | None:
     """The account automatic switching goes to next: the decision's target
     while it is moving (a pending switch, a switch, a preempt waiting for
     idle, a rebalance deferred to a quiet time), else the engine's first
-    pick. None while nothing switches or the engine stopped reporting."""
+    pick. None while nothing switches or the engine stopped reporting, and
+    never one of ``never`` (:func:`never_next`: a reading the engine no
+    longer trusts — a published target whose reading has since aged out —
+    or a login shared with another place)."""
     if not switching_live(sit):
         return None
     moving = dv.kind in ("pending", "switch") or (
         dv.kind == "hold" and dv.code in ("preempt", "rebalance-deferred")
     )
-    if moving and dv.target:
-        return dv.target
-    return picks[0] if picks else None
+    out = dv.target if moving and dv.target else (picks[0] if picks else None)
+    return None if out in never else out
+
+
+def never_next(rows: Sequence[fx.FleetRow]) -> set[str]:
+    """Accounts never tagged ``next``: an untrusted reading, a shared login."""
+    return {r.number for r in rows if not r.trusted or r.shared}
 
 
 # -- the status sentence ---------------------------------------------------------------

@@ -104,7 +104,7 @@ Fleet shows, from top to bottom:
 - **One sentence** saying what automatic switching is doing and who runs the engine (`viewer · service pid 4121 is switching`).
 - **Attention lines**, only when something needs you, each with what to do about it: a login that needs renewing, priming paused (Claude Code killed by macOS at launch, an update settling, a new version not verified yet), a login that ends within a week, a locked keychain. One line, up to three when the table leaves rows over.
 - **A capacity summary**: how many accounts still have 5h room, how long until the next account comes back and the next weekly reset, and roughly how many accounts' worth of weekly quota is left.
-- **One row per account**: the order automatic switching would try them in (`●` is the active one), the short name and slot number (`main #1`), plan, 5h and 7d bars with their reset times, and a status such as `next`, `last resort`, `excluded`, `login 3d left`, `re-login (r)`, `keychain locked (f)`, `reading 2h old` or `prime 19:30`. Each bar has an amber tick at the soft threshold and a red tick at the hard one.
+- **One row per account**: the order automatic switching would land on them in, exactly as the engine would (`●` is the active one, `·` only when forced, `–` not now, e.g. a reading too old to trust), the short name and slot number (`main #1`), plan, 5h and 7d bars with their reset times, and a status such as `next`, `last resort`, `excluded`, `login 3d left`, `re-login (r)`, `keychain locked (f)`, `reading 2h old` or `prime 19:30`. Each bar has an amber tick at the soft threshold and a red tick at the hard one.
 - **The selected account in full**: organization, plan, login deadline, priming, and every usage window it has.
 
 Fleet keys:
