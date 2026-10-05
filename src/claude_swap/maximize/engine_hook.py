@@ -51,7 +51,7 @@ from typing import Any, Protocol
 from claude_swap import autoswitch as aw
 from claude_swap import oauth, poll_policy, shared_login
 from claude_swap.exceptions import ConfigError
-from claude_swap.maximize import history, idle, ledger, notify, pause, policy
+from claude_swap.maximize import drain, history, idle, ledger, notify, pause, policy
 from claude_swap.maximize import hold as account_hold
 from claude_swap.maximize import ride as learned_ride
 from claude_swap.maximize.model import (
@@ -130,6 +130,7 @@ _NUMERIC_KEYS: tuple[tuple[str, str], ...] = (
     ("preemptHorizonMaxH", "preempt_horizon_max_h"),
     ("busyRebalanceGap", "busy_rebalance_gap"),
     ("rideMaxMin", "ride_max_min"),
+    ("drainHours", "drain_hours"),
 )
 
 
@@ -661,18 +662,21 @@ def _history_inputs(
     current: str,
     samples: tuple[Sample, ...],
     now: float,
-) -> tuple[Forecast | None, dict[str, float]]:
-    """Record this tick in the usage history; ``(forecast, rates7)`` for the
-    Snapshot.
+) -> tuple[Forecast | None, dict[str, float], dict[str, float]]:
+    """Record this tick in the usage history; ``(forecast, rates7, k7)`` for
+    the Snapshot.
 
     Only readings the tick already has are recorded (no poll, no refresh):
-    usage points while ``preempt`` is on, slot observations while
-    ``learnIdlePattern`` is. Dry runs record in memory only. History is a
-    planning aid: any failure here is logged and decides as if it had none.
+    usage points while ``preempt`` or the near-reset drain
+    (``drainHours``) is on, slot observations while ``learnIdlePattern``
+    is. The drain's k per account (``drain.learn_k``) comes from those
+    points. Dry runs record in memory only. History is a planning aid: any
+    failure here is logged and decides as if it had none.
     """
     s = rt.settings
-    if not (s.preempt or s.learn_idle_pattern):
-        return None, {}
+    drain_on = s.drain_hours > 0
+    if not (s.preempt or s.learn_idle_pattern or drain_on):
+        return None, {}, {}
     try:
         root = engine.switcher.backup_dir
         if rt.history is None or rt.history.root != root:
@@ -687,15 +691,17 @@ def _history_inputs(
                 readings[str(number)] = (float(fetched_at), pct5, pct7)
         rt.history.observe(
             now, current, readings, samples,
-            points=s.preempt, slots=s.learn_idle_pattern, write=not engine.dry_run,
+            points=s.preempt or drain_on, slots=s.learn_idle_pattern,
+            write=not engine.dry_run,
         )
         kept = rt.history.history
         forecast = history.forecast(kept.slots, now) if s.learn_idle_pattern else None
         rates = history.burn_rates(kept.points, now) if s.preempt else {}
-        return forecast, rates
+        k7 = drain.learn_k(kept.points, now) if drain_on else {}
+        return forecast, rates, k7
     except Exception as e:  # a planning aid must never break a tick
         _logger.debug("usage history unavailable: %s", type(e).__name__)
-        return None, {}
+        return None, {}, {}
 
 
 def _recent_429(entry, now: float) -> bool:
@@ -1066,6 +1072,11 @@ def _publish_decision(
     if isinstance(decision, Hold) and decision.ride_until is not None:
         # A ride's switch time, so a viewer counts its minutes down live.
         record["rideUntil"] = decision.ride_until
+    draining = {v.number: v.reset7 for v in snap.accounts if policy.draining(v, snap)}
+    if draining:
+        # The near-reset drain (maximize/drain.py): slot -> its 7d reset, so
+        # ``cc-swap why`` names them (and counts the hours down) live.
+        record["draining"] = draining
     previous = state.get(DECISION_KEY)
     if isinstance(previous, Mapping):
         at = previous.get("at")
@@ -1503,7 +1514,7 @@ def run_maximize_tick(
         engine, rt, state, current, entries.get(current), usage,
         samples, new_sample, prev_ts, now,
     )
-    forecast, rates7 = _history_inputs(
+    forecast, rates7, k7 = _history_inputs(
         engine, rt, entries, usage, current, samples, now
     )
     last = state.get("lastSwitchAt")
@@ -1533,6 +1544,7 @@ def run_maximize_tick(
         ride_armed_at=ride_tick.armed_at,
         ride_point_s=ride_tick.point_s,
         ride_q=ride_tick.q,
+        k7=k7,
     )
     decision = policy.decide(snap)
     rt.last_snapshot, rt.last_decision = snap, decision

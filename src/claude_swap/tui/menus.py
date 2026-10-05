@@ -259,6 +259,10 @@ STRATEGY_FIELDS: tuple[StrategyField, ...] = (
     StrategyField("maximize.rideMaxMin", "ride max", "min",
                   "a ride lasts at most this long (0 = no ride)", 5,
                   "when to leave the active account"),
+    StrategyField("maximize.drainHours", "7d drain", "h",
+                  "this close to a 7d reset, use that account first, up to its hard mark "
+                  "(0 = off)", 6,
+                  "when to leave the active account"),
     StrategyField("maximize.rebalanceCooldownMin", "rebalance cooldown", "min", "", 5,
                   "when to leave the active account"),
     StrategyField("maximize.tieEpsilon", "tie epsilon", "", "scores this close count as a tie",
@@ -361,6 +365,9 @@ def help_entries(idle_pattern: str | None = None) -> list[tuple[str, str]]:
         ("reading 2h old", "its usage was last read that long ago. Amber: the engine no "
                            "longer trusts it and counts the account as unknown (never "
                            "next, not in the summary); dim: still trusted"),
+        ("drain 18h", "its 7d resets in 18h: cc-swap uses it first and up to its hard mark "
+                      "(its 7d soft mark is set aside) so that quota does not expire "
+                      "unused (m → s: 7d drain)"),
         ("last resort", "used only when every other account is at its limit (l toggles)"),
         ("prime 19:30", "its 5h window has not started; priming starts it then (now: at "
                         "the next tick; 5h off: priming does not run)"),

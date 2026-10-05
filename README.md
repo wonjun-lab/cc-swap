@@ -104,7 +104,7 @@ Fleet shows, from top to bottom:
 - **One sentence** saying what automatic switching is doing and who runs the engine (`viewer · service pid 4121 is switching`).
 - **Attention lines**, only when something needs you, each with what to do about it: a login that needs renewing, priming paused (Claude Code killed by macOS at launch, an update settling, a new version not verified yet), a login that ends within a week, a locked keychain. One line, up to three when the table leaves rows over.
 - **A capacity summary**: how many accounts still have 5h room, how long until the next account comes back and the next weekly reset, and roughly how many accounts' worth of weekly quota is left.
-- **One row per account**: the order automatic switching would land on them in, exactly as the engine would (`●` is the active one, `·` only when forced, `–` not now, e.g. a reading too old to trust), the short name and slot number (`main #1`), plan, 5h and 7d bars with their reset times, and a status such as `next`, `last resort`, `excluded`, `login 3d left`, `re-login (r)`, `keychain locked (f)`, `reading 2h old` or `prime 19:30`. Each bar has an amber tick at the soft threshold and a red tick at the hard one.
+- **One row per account**: the order automatic switching would land on them in, exactly as the engine would (`●` is the active one, `·` only when forced, `–` not now, e.g. a reading too old to trust), the short name and slot number (`main #1`), plan, 5h and 7d bars with their reset times, and a status such as `next`, `last resort`, `excluded`, `login 3d left`, `re-login (r)`, `keychain locked (f)`, `reading 2h old`, `drain 18h` or `prime 19:30`. Each bar has an amber tick at the soft threshold and a red tick at the hard one.
 - **The selected account in full**: organization, plan, login deadline, priming, and every usage window it has.
 
 Fleet keys:
@@ -236,6 +236,10 @@ A last-resort account is used only when no normal account can take you. An exclu
 ### Waiting for a reset
 
 If the window that crossed its threshold resets within 15 minutes and your pace won't reach 100% before then, cc-swap waits for the reset instead of switching, because a switch costs a context re-read and the reset is about to fix the problem anyway. Fleet says so: `5h 96% — resets in 8m, waiting it out (switches at once if it hits 100%)`. If you hit 100% it switches immediately.
+
+### Using up a week before it resets
+
+An account near its weekly (7d) reset whose quota would otherwise expire unused is *draining*: within 24 hours of the reset (`maximize.drainHours`; 0 turns it off), cc-swap sets its 7d soft threshold aside and keeps using it up to the 98% hard threshold; while it still has at least a quarter 5h window of room it lands on it up to 93% and tries it first, the soonest reset first. Fleet tags it `drain 18h`, and `cc-swap why` says `#1 7d 86% resets in 18h — draining it first`. Hard thresholds, 100% and holds work as always.
 
 If you raise the 7d hard threshold to 99 or more, cc-swap may keep using the account for a few more minutes once it gets there, because the API reports whole percents and up to a point of quota is still left. It learns how long it can safely ride that last point.
 

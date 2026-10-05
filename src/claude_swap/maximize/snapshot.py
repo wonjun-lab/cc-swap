@@ -11,7 +11,7 @@ from collections.abc import Mapping, Sequence
 
 from claude_swap.maximize.idle import trim_samples
 from claude_swap.maximize.model import AccountView, Forecast, Sample, Snapshot
-from claude_swap.maximize.plan import plan_weight
+from claude_swap.maximize.plan import plan_name, plan_weight
 from claude_swap.maximize.tiers import parse_account_list, tier_for
 from claude_swap.poll_policy import parse_reset_ts
 from claude_swap.settings import MaximizeSettings
@@ -79,6 +79,7 @@ def build_snapshot(
     ride_armed_at: Mapping[str, float] | None = None,
     ride_point_s: Mapping[str, float] | None = None,
     ride_q: Mapping[str, float] | None = None,
+    k7: Mapping[str, float] | None = None,
 ) -> Snapshot:
     """One view per ``records`` entry, in ``records`` order (sequence order)."""
     last_resort = parse_account_list(settings.last_resort)
@@ -102,6 +103,9 @@ def build_snapshot(
                 quarantined=number in quarantined,
                 api_key=number in api_key_accounts,
                 login_deadline=(login_deadlines or {}).get(number),
+                plan=plan_name(
+                    rate_limit_tiers.get(number), email, settings.plan_override
+                ),
             )
         )
     return Snapshot(
@@ -119,4 +123,5 @@ def build_snapshot(
         ride_armed_at=dict(ride_armed_at or {}),
         ride_point_s=dict(ride_point_s or {}),
         ride_q=dict(ride_q or {}),
+        k7=dict(k7 or {}),
     )

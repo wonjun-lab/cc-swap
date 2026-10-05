@@ -632,6 +632,54 @@ def _ride_line(ride: dict) -> str:
     return dimmed(f"  ride     {text}")
 
 
+def drain_status(backup_root, *, now: float, draining: object = None) -> dict:
+    """The near-reset 7d drain (maximize/drain.py) for ``why``: the
+    setting, each account's learned k (``drain.learn_k`` over the usage
+    history) and the accounts the engine's published decision found
+    draining (``draining``: its ``{slot: 7d reset}``). Read-only."""
+    from claude_swap.maximize import drain, history
+    from claude_swap.settings import MaximizeSettings, load_maximize_settings
+
+    try:
+        s = load_maximize_settings(backup_root)
+    except Exception:
+        s = MaximizeSettings()
+    try:
+        k7 = drain.learn_k(history.read(backup_root, now).points, now) if s.drain_hours > 0 else {}
+    except Exception:
+        k7 = {}
+    now_draining: list[tuple[str, float]] = []
+    if isinstance(draining, Mapping):
+        for number, reset in draining.items():
+            if isinstance(reset, (int, float)) and not isinstance(reset, bool) and reset > now:
+                now_draining.append((str(number), (float(reset) - now) / 3600.0))
+    now_draining.sort(key=lambda item: item[1])
+    return {
+        "drainHours": s.drain_hours,
+        "k7": k7,
+        "draining": [{"slot": n, "hoursLeft": round(h, 2)} for n, h in now_draining],
+        "text": drain.describe(s.drain_hours, k7, now_draining),
+    }
+
+
+def _drain_line(status: dict) -> str:
+    text = str(status.get("text") or "").removeprefix("7d drain: ")
+    return dimmed(f"  drain    {text}")
+
+
+def published_draining(backup_root) -> object:
+    """The ``{slot: 7d reset}`` the engine's published decision found
+    draining (``engine_hook._publish_decision``), or None. Read-only."""
+    from claude_swap.maximize import view as mxview
+
+    try:
+        state = json.loads((backup_root / mxview.STATE_FILENAME).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    raw = state.get(mxview.DECISION_KEY) if isinstance(state, dict) else None
+    return raw.get("draining") if isinstance(raw, Mapping) else None
+
+
 def _published_code(state: Mapping, published) -> str | None:
     """The ``code`` a published hold carries (a reset-aware wait), when it
     is the same record ``published`` was read from."""
@@ -789,6 +837,9 @@ def _why_lines(why: dict) -> list[str]:
     ride = why.get("learnedRide")
     if ride:
         lines.append(_ride_line(ride))
+    drain_line = why.get("drain")
+    if drain_line:
+        lines.append(_drain_line(drain_line))
     return lines
 
 
@@ -858,6 +909,7 @@ def why_command(argv: list[str], *, clock: Callable[[], float] = time.time) -> N
     if why is not None:
         why["idlePattern"] = idle_pattern(root, now=now)
         why["learnedRide"] = ride_learning(root)
+        why["drain"] = drain_status(root, now=now, draining=published_draining(root))
     held, hold_line = account_hold_now(root, now=now)
     claude_note = _claude_exec_note(root, now)
     if args.json:
@@ -891,6 +943,7 @@ def why_command(argv: list[str], *, clock: Callable[[], float] = time.time) -> N
     )
     print(_pattern_line(idle_pattern(root, now=now)))
     print(_ride_line(ride_learning(root)))
+    print(_drain_line(drain_status(root, now=now)))
     if args.no_fallback:
         print(dimmed("Run cc-swap auto --once --dry-run to see what one would decide now."))
         sys.exit(0)

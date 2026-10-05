@@ -555,8 +555,11 @@ class AutoScreen(Screen):
         text = Text()
         text.append("Maximize — tier · score · landable · 5h window", style=palette.muted)
         try:
-            state = mxview.read_state(self.app.switcher.backup_dir)
-            msnap = mxfleet.fleet_snapshot(snap, self._mx, state, now=now)
+            root = self.app.switcher.backup_dir
+            state = mxview.read_state(root)
+            msnap = mxfleet.fleet_snapshot(
+                snap, self._mx, state, now=now, history=mxview.read_history(root, now)
+            )
             ranked = mxview.rows(msnap, state.primes)
             waiting = mxview.pending(msnap)
             decided = mxfleet.decision_view(

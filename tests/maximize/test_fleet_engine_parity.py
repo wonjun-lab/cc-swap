@@ -131,6 +131,30 @@ def _fixtures():
         acc(2, usage(60, 30)),
         acc(3, _old(0, 0, age_s=3 * H)),
     ), MX, plain
+    # The near-reset drain (maximize/drain.py): #2 and #3 reset within a
+    # day, so their 7d soft mark is set aside (landable under 93) and they
+    # go first, the sooner reset first; #5 is past 93: forced only.
+    yield "draining", accounts(
+        acc(1, usage(62, 40), active=True),
+        acc(2, usage(0, 88, days7=0.75)),
+        acc(3, usage(0, 91, days7=0.4)),
+        acc(4, usage(0, 30)),
+        acc(5, usage(0, 94, days7=0.5)),
+        acc(6, usage(0, 0, days7=6.0)),
+    ), MX, plain
+    # Draining by its room: a 5x plan (k 0.105) at 40% with 30 h left needs
+    # 58 of the ~63 points six 5h windows give it.
+    yield "draining by room", accounts(
+        acc(1, usage(62, 40), active=True),
+        acc(2, usage(0, 40, days7=1.25)),
+        acc(3, usage(0, 0, days7=6.0)),
+    ), MX, MaximizeState(plans={"2": "5x", "3": "20x"})
+    # The active account is draining at 7d 92%: no soft 7d move.
+    yield "draining active", accounts(
+        acc(1, usage(20, 92, days7=0.75), active=True),
+        acc(2, usage(0, 10)),
+        acc(3, usage(0, 89, days7=0.5)),
+    ), MX, plain
 
 
 FIXTURES = list(_fixtures())
@@ -186,6 +210,27 @@ def test_fleets_next_is_the_engines_target(name, snap, mx, state):
     if nxt is not None:
         row = {r.number: r for r in rows}[nxt]
         assert home.tag_for(row, is_next=True, now=NOW)[0] == "next"
+
+
+def test_the_drain_fixtures_put_draining_accounts_first():
+    by_name = {f[0]: f for f in FIXTURES}
+    # (order, draining slots). #3 in "draining" and in "draining active"
+    # drains with under a quarter 5h window of 7d room: past soft7d - margin
+    # it lands by the normal rule, so not at all.
+    expected = {
+        "draining": (["2", "4", "6"], {"2", "3", "5"}),
+        "draining by room": (["2", "3"], {"2"}),
+        "draining active": (["2"], {"1", "3"}),
+    }
+    for name, (order, draining) in expected.items():
+        _, snap, mx, state = by_name[name]
+        engine = _engine_snapshot(snap, mx, state)
+        assert [v.number for v in policy.landing_candidates(engine)] == order, name
+        rows = {r.number: r for r in fx.fleet_rows(snap, mx, PRIME, state, now=NOW)}
+        assert {n for n, r in rows.items() if r.drain} == draining, name
+    _, snap, mx, state = by_name["draining active"]
+    decision = policy.decide(_engine_snapshot(snap, mx, state))
+    assert isinstance(decision, Hold) and "draining it first" in decision.reason
 
 
 def test_an_untrusted_account_is_never_tagged_next_even_when_published():
