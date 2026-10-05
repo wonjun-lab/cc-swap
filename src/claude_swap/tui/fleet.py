@@ -78,6 +78,7 @@ from claude_swap.tui.fleet_render import tone_style  # noqa: F401 (fleet_account
 from claude_swap.tui.theme import Palette
 
 if TYPE_CHECKING:
+    from claude_swap.maximize.prime_verify import PausedView
     from claude_swap.tui.app import CswapApp
 
 LEASE_PROBE_S = 5.0
@@ -111,7 +112,7 @@ def host_name() -> str:
     return socket.gethostname().split(".")[0] or "this host"
 
 
-def prime_guard(root: Path):
+def prime_guard(root: Path) -> PausedView | None:
     """Why priming is paused (``prime_verify.PausedView``: killed by the OS,
     an update settling, a version not verified yet) or None. No subprocess:
     what the engine last saw, from ``prime_verify.json`` and
@@ -477,7 +478,7 @@ class FleetScreen(Screen):
         self._situation: home.Situation | None = None
         self._hostname = host_name()
         self._fx_timers: list = []
-        self._prime_guard: str | None = None
+        self._prime_guard: PausedView | None = None
 
     # -- composition ------------------------------------------------------------------
 

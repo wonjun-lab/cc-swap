@@ -485,7 +485,11 @@ class PausedView:
     ``kind``: ``killed`` (the OS kills ``claude`` at launch), ``settle``
     (waiting for an update to settle, until ``until``), ``changed`` (a new
     version not verified yet: ``previous`` -> ``version``) or ``failed`` (a
-    verify of ``version`` failed). ``auto``: the engine lifts it by itself."""
+    verify of ``version`` failed). ``auto``: no reminder is due — the
+    engine lifts it by itself (an update settling, a version it
+    re-verifies), or, for ``killed``, you were notified once already (the
+    mark clears only when the ``claude`` path changes or a run of it
+    succeeds: Fleet still asks you to act on it)."""
 
     kind: str
     note: str

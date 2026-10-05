@@ -472,8 +472,13 @@ def test_dry_run_says_would():
 @pytest.mark.parametrize(("sit", "es", "first"), [
     ("auto-off", replace(SERVICE, auto_off=True),
      "Auto OFF — nothing switches automatically (m to turn on)"),
-    ("no-engine", NONE,
+    # No service status (unreadable, or a platform without the service):
+    # the menu's Mode is all there is.
+    ("no-engine", NONE, "Not switching — no engine is running (m to start one)"),
+    ("no-engine", replace(NONE, service={"installed": False}),
      "Not switching — no engine is running (cc-swap service install starts one)"),
+    ("no-engine", replace(NONE, service={"installed": True, "running": True}),
+     "Not switching — the service is not switching (cc-swap service install restarts it)"),
     ("no-engine", replace(NONE, service={"installed": True, "running": False}),
      "Not switching — the service is stopped (cc-swap service install starts it)"),
 ])
@@ -759,8 +764,10 @@ def test_attention_names_dead_logins_first_then_expiring_ones():
     assert _attention(rows, 60) == [
         (dead, "crit"), ("! #4 work login ends in 1d 4h — select it, press r", "warn"),
     ]
-    # One line only: the dead login, and the other when it fits after it.
-    assert _attention(rows, 60, lines=1) == [(dead, "crit")]
+    # One line only: the dead login, the other when it fits after it, else
+    # how many did not (unless saying so would cut the first note).
+    assert _attention(rows, 60, lines=1) == [(f"{dead} (+1 more)", "crit")]
+    assert _attention(rows, 33, lines=1) == [("! #3 old needs re-login (+1 more)", "crit")]
     assert _attention(rows, 30, lines=1) == [("! #3 old needs re-login", "crit")]
     assert _attention(rows, 20, lines=1) == [("! " + fx.clip("#3 old needs re-login", 18),
                                               "crit")]
@@ -819,6 +826,10 @@ def test_a_killed_claude_comes_right_after_a_dead_login_and_keeps_its_remedy():
      "! priming paused: verify failed — run cc-swap prime verify", True),
     (PausedView("failed", "n", True, version="2.1.4"), W80,
      "priming paused: verify of claude 2.1.4 failed, retrying on its own", False),
+    (PausedView("failed", "n", False), W80,
+     "! priming paused: prime verify failed — run cc-swap prime verify", True),
+    (PausedView("failed", "n", True), W80,
+     "priming paused: prime verify failed, retrying on its own", False),
     # Settling: minutes, not seconds, and it resumes by itself.
     (PausedView("settle", "n", True, until=NOW + 412), W80,
      "priming paused: claude update settling, ~7m left, resumes by itself", False),
@@ -854,6 +865,22 @@ def test_attention_lines_take_only_rows_the_table_leaves():
     assert plan.detail and (plan.attention, plan.summary) == (2, False)
     assert home.table_plan(80, 24, NEEDS, attention=False).attention == 0
     assert home.table_plan(80, 24, NEEDS, attention=True).attention == 1
+
+
+@pytest.mark.parametrize("rows", range(13, 22))  # too many for the panel too
+@pytest.mark.parametrize("want", [1, 2, 3])
+def test_neither_attention_lines_nor_the_summary_make_a_fitting_table_scroll(rows, want):
+    """17 accounts at 80x24 (no panel) fit the 18 rows under one attention
+    line; a second line and the summary must not leave the table 16."""
+    plan = home.table_plan(80, 24, replace(NEEDS, rows=rows), attention=want, summary=True)
+    assert not plan.detail
+    rest = 24 - (3 + 2) - plan.attention - int(plan.summary)  # what the table gets
+    if rows <= 24 - (3 + 2) - 1:  # it fits with one attention line
+        assert rest >= rows, (plan.attention, plan.summary)
+    else:  # it scrolls anyway: the summary keeps its place, no extra lines
+        assert plan.attention == 1 and plan.summary
+    plan17 = home.table_plan(80, 24, replace(NEEDS, rows=17), attention=2, summary=True)
+    assert (plan17.attention, plan17.summary) == (2, False)
 
 
 # -- footer --------------------------------------------------------------------------------------------
@@ -1231,6 +1258,28 @@ def test_the_account_named_back_is_one_switching_could_land_on():
     assert cap.back5 == (NOW + 1.5 * H, "3")
 
 
+def test_free_and_back_follow_one_rule():
+    """Free and back never name the same account: 5h 47% is under soft 50
+    but not under soft less the margin, so it is not free — it is back.
+    The active account counts free under its soft marks and is never back;
+    a login inside the expiry guard is neither."""
+    mx = replace(MX, soft_5h=50.0, soft_7d=80.0, hard_7d=98.0, landing_margin=5.0,
+                 login_expiry_guard_min=120)
+    rows = [
+        _cap_row(1, 47, 10, reset5=NOW + 0.2 * H, active=True),            # free (stays)
+        _cap_row(2, 47, 10, reset5=NOW + 0.5 * H),                          # back, not free
+        _cap_row(3, 10, 10, deadline=NOW + 1 * H, reset5=NOW + 0.1 * H),    # guarded
+        _cap_row(4, 10, 10),                                                # free
+        _cap_row(5, 60, 10, reset5=NOW + 0.3 * H, deadline=NOW + 1.5 * H),  # guarded at reset
+    ]
+    cap = home.capacity(rows, mx, NOW)
+    assert cap.free5 == 2                       # #1 and #4
+    assert cap.back5 == (NOW + 0.5 * H, "2")    # not #1 (active), #3/#5 (login guard)
+    active_past = [replace(rows[0], pct5=55.0), rows[3]]
+    cap = home.capacity(active_past, mx, NOW)
+    assert cap.free5 == 1 and cap.back5 is None  # the active one is never named back
+
+
 def test_capacity_with_nothing_to_count_is_none():
     assert home.capacity([_cap_row(5, None, None, login="relogin")], MX, NOW) is None
     assert home.capacity([], MX, NOW) is None
@@ -1271,8 +1320,9 @@ def test_the_summary_says_none_free_in_amber_and_one_account_in_the_singular():
     ((200, 16), True, 6, True, False),    # the panel fits, the summary too would not: it goes
     ((200, 16), False, 6, True, True),    # no attention line: room for both
     ((200, 16), True, 7, False, True),    # no room for the panel anyway: the summary stays
-    ((80, 12), True, 8, False, True),
-    ((80, 11), True, 8, False, False),    # very short: never
+    ((80, 12), True, 8, False, False),    # the table just fits: the summary would scroll it
+    ((80, 12), True, 9, False, True),     # it scrolls anyway: the summary stays over it
+    ((80, 11), True, 9, False, False),    # very short: never
     ((120, 8), True, 6, False, False),
 ])
 def test_the_summary_goes_before_the_panel(size, attention, rows, detail, summary):

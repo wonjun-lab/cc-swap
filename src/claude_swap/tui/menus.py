@@ -320,9 +320,10 @@ def help_entries(idle_pattern: str | None = None) -> list[tuple[str, str]]:
                     "leaves rows over"),
         ("summary", "the line over the table, over the accounts automatic switching can "
                     "use (not a dead, expired or excluded login, not an API key). 5h free: "
-                    "those whose 5h is under its soft mark (the active one included; a "
-                    "spent 7d does not count). next back in: how long until the soonest "
-                    "account only its 5h keeps automatic switching from comes back. 7d left "
+                    "those it could switch to now (both windows under their soft marks "
+                    "less the landing margin, no login about to end), plus the active one "
+                    "while under its soft marks. next back in: how long until another "
+                    "account, kept off only by its 5h, comes back. 7d left "
                     "this week ≈ N accounts: the 7d room left, (100 − 7d%)/100 "
                     "per account added up as whole accounts — not weighted by plan, so a "
                     "20x and a 5x account count alike. next 7d in: how long until the "

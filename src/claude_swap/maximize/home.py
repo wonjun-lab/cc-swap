@@ -44,12 +44,15 @@ import time
 import unicodedata
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from typing import Literal
+from typing import TYPE_CHECKING, Literal
 
 from claude_swap import oauth
 from claude_swap.maximize import fleet as fx
 from claude_swap.maximize import hold as account_hold
 from claude_swap.settings import MaximizeSettings
+
+if TYPE_CHECKING:
+    from claude_swap.maximize.prime_verify import PausedView
 
 Tone = str
 Seg = tuple[str, Tone]
@@ -544,10 +547,13 @@ def table_plan(
     rest = height - fixed_lines
     detail = needs.detail > 0 and needs.rows + needs.detail <= rest
     used = needs.rows + (needs.detail if detail else 0)
-    extra = max(min(want, MAX_ATTENTION) - 1, 0)
-    extra = min(extra, max(rest - used, 0))
+    spare = rest - used  # rows nothing needs (< 0: the table scrolls)
+    extra = min(max(min(want, MAX_ATTENTION) - 1, 0), max(spare, 0))
+    # Neither the extra attention lines nor the summary ever make a table
+    # that fits scroll (or squeeze the panel out); a table that scrolls
+    # anyway (no panel) keeps the summary over it.
     shown = summary and height >= SUMMARY_MIN_ROWS and (
-        not detail or used + extra + 1 <= rest
+        spare - extra >= 1 or (not detail and spare < 0)
     )
     return TablePlan(
         bar=bar, clock=clock, plan=plan, gap=gap, columns=tuple(columns),
@@ -594,25 +600,41 @@ def capacity(
 ) -> Capacity | None:
     """The fleet's capacity right now, or None with no account to count.
 
-    ``free5``: accounts (the active one included) whose 5h is under its
-    soft mark and whose 7d is under its hard mark. ``back5``: the soonest
-    5h reset of an account (the active one included) that only its 5h
-    keeps from being landed on — by the landing rule
-    (``score.landable``: both windows under their soft marks less
-    ``maximize.landingMargin``), so the account named is one automatic
-    switching could go to once that window resets. ``left7``: the 7d room
-    left, as whole accounts. ``next7``: the soonest 7d reset."""
+    Both 5h counts follow the rule automatic switching lands by
+    (``score.landable``, ``policy.login_guarded``): an account it could go
+    to has both windows under their soft marks less
+    ``maximize.landingMargin`` and no login ending within
+    ``maximize.loginExpiryGuardMin``.
+
+    ``free5``: the accounts it could land on now, plus the active one
+    while both its windows are under their soft marks (it stays there).
+    ``back5``: among the others (never the active one, never one already
+    free), the soonest 5h reset of an account that only its 5h keeps from
+    being landed on — so the account named is one automatic switching
+    could go to once that window resets. ``left7``: the 7d room left, as
+    whole accounts. ``next7``: the soonest 7d reset."""
     usable = [r for r in rows if usable_for_capacity(r, now)]
     if not usable:
         return None
-    week_ok = [r for r in usable if (r.pct7 or 0.0) < mx.hard_7d]
-    free = [r for r in week_ok if (r.pct5 or 0.0) < mx.soft_5h]
     margin = mx.landing_margin
+    guard = mx.login_expiry_guard_min * 60.0
+
+    def week_lands(r: fx.FleetRow) -> bool:
+        return (r.pct7 or 0.0) < mx.soft_7d - margin
+
+    def guarded(r: fx.FleetRow, at: float) -> bool:
+        return r.login_deadline is not None and r.login_deadline - at < guard
+
+    def free_now(r: fx.FleetRow) -> bool:
+        if r.active:
+            return (r.pct5 or 0.0) < mx.soft_5h and (r.pct7 or 0.0) < mx.soft_7d
+        return week_lands(r) and (r.pct5 or 0.0) < mx.soft_5h - margin and not guarded(r, now)
+
+    free = [r for r in usable if free_now(r)]
     waiting = [
         (r.reset5, r.number) for r in usable
-        if (r.pct7 or 0.0) < mx.soft_7d - margin
-        and (r.pct5 or 0.0) >= mx.soft_5h - margin
-        and r.reset5 is not None and r.reset5 > now
+        if not r.active and not free_now(r) and week_lands(r)
+        and r.reset5 is not None and r.reset5 > now and not guarded(r, r.reset5)
     ]
     resets7 = [
         (r.reset7, r.number) for r in usable if r.reset7 is not None and r.reset7 > now
@@ -703,7 +725,8 @@ def switching_live(sit: Situation) -> bool:
 
 
 def priming_runs(
-    enabled: bool, es: fx.EngineStatus, sit: Situation, guard: str | None = None
+    enabled: bool, es: fx.EngineStatus, sit: Situation,
+    guard: "PausedView | str | None" = None,
 ) -> bool:
     """Whether an engine primes idle accounts now, so the next prime time is
     worth showing: priming on, switching live, not paused after a Claude
@@ -1053,11 +1076,23 @@ def status_variants(
         ]
     if sit == "no-engine":
         # The remedy is the service: an engine started here (m → mode)
-        # stops when this TUI quits.
-        stopped = bool(es.service and es.service.get("installed"))
-        why = "the service is stopped" if stopped else "no engine is running"
-        verb = "starts it" if stopped else "starts one"
+        # stops when this TUI quits. Without a service status (it could
+        # not be read, or no service on this platform: `service install`
+        # refuses there) the menu's Mode is all there is.
         off: Seg = ("Not switching", "warnb")
+        service = es.service
+        if not service:
+            return [
+                [off, (" — no engine is running ", "plain"), ("(m to start one)", "dim")],
+                [off, (" — no engine ", "plain"), ("(m)", "dim")],
+                [off],
+            ]
+        if not service.get("installed"):
+            why, verb = "no engine is running", "starts one"
+        elif service.get("running"):  # running, but holding no engine lease
+            why, verb = "the service is not switching", "restarts it"
+        else:
+            why, verb = "the service is stopped", "starts it"
         return [
             [off, (f" — {why} ", "plain"), (f"({SERVICE_INSTALL} {verb})", "dim")],
             [off, (f" — {why} ", "plain"), (f"({SERVICE_INSTALL})", "dim")],
@@ -1269,7 +1304,7 @@ def _version_step(previous: str | None, version: str | None) -> str:
     return f"claude {version}" if version else "claude"
 
 
-def guard_notice(guard, now: float) -> Notice:
+def guard_notice(guard: "PausedView | str", now: float) -> Notice:
     """Priming paused (``prime_verify.PausedView``; a bare note string is
     quoted as it is), worded for every width with its remedy kept: killed
     by the OS points at ``cc-swap doctor``, a version only you can verify at
@@ -1312,17 +1347,19 @@ def guard_notice(guard, now: float) -> Notice:
             "priming paused: run cc-swap prime verify",
             "run cc-swap prime verify",
         ))
+    failed = f"prime verify failed for {this}" if version else "prime verify failed"
     if kind == "failed" and guard.auto:
         return Notice((
-            f"priming paused: prime verify failed for {this}, the engine retries it on "
-            "its own (or cc-swap prime verify)",
-            f"priming paused: verify of {this} failed, retrying on its own",
+            f"priming paused: {failed}, the engine retries it on its own "
+            "(or cc-swap prime verify)",
+            f"priming paused: verify of {this} failed, retrying on its own" if version
+            else "priming paused: prime verify failed, retrying on its own",
             "priming paused: verify failed, retrying on its own",
             "priming paused: retrying on its own",
         ), alarm=False)
     if kind == "failed":
         return Notice((
-            f"priming paused: prime verify failed for {this} — run cc-swap prime verify",
+            f"priming paused: {failed} — run cc-swap prime verify",
             "priming paused: verify failed — run cc-swap prime verify",
             "priming paused: run cc-swap prime verify",
             "run cc-swap prime verify",
@@ -1334,7 +1371,7 @@ def attention_notices(
     rows: Sequence[fx.FleetRow],
     *,
     now: float,
-    prime_guard=None,
+    prime_guard: "PausedView | str | None" = None,
     priming: bool = False,
     linger_off: bool = False,
     relogin_paused: bool = False,
@@ -1401,17 +1438,29 @@ def _first_fit(options: Sequence[str], room: int) -> str | None:
 
 def _attention_line(group: Sequence[Notice], width: int) -> tuple[str, Tone]:
     """One line: the first note (its longest wording that fits, else its
-    shortest cut to fit), then as many of the others as fit after it; red
-    when any note on it is, ``!`` when any asks for something."""
+    shortest cut to fit), then as many of the others as fit after it, and
+    ``(+2 more)`` for those that do not; red when any note on it is, ``!``
+    when any asks for something."""
     room = width - (2 if any(n.alarm for n in group) else 0)
     head, *rest = group
-    text = _first_fit(head.variants, room) or fx.clip(head.variants[-1], max(room, 1))
-    shown = [head]
-    for notice in rest:
-        extra = _first_fit(notice.tails, room - cells(text) - 3)
-        if extra is not None:
-            text += " · " + extra
-            shown.append(notice)
+
+    def pack(room: int) -> tuple[str, list[Notice]]:
+        text = _first_fit(head.variants, room) or fx.clip(head.variants[-1], max(room, 1))
+        shown = [head]
+        for notice in rest:
+            extra = _first_fit(notice.tails, room - cells(text) - 3)
+            if extra is not None:
+                text += " · " + extra
+                shown.append(notice)
+        return text, shown
+
+    text, shown = pack(room)
+    more = len(f" (+{len(group)} more)")
+    if len(shown) < len(group) and _first_fit(head.variants, room - more) is not None:
+        # Say how many did not fit, in room kept for it (never by cutting
+        # the first note).
+        text, shown = pack(room - more)
+        text += f" (+{len(group) - len(shown)} more)"
     tone = max((n.tone for n in shown), key=lambda t: _SEVERITY.get(t, 0))
     return ("! " if any(n.alarm for n in shown) else "") + text, tone
 

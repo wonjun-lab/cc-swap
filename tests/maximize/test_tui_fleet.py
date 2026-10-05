@@ -345,10 +345,9 @@ class TestFleetScreen:
             await _open(pilot)
             status = _status(app)
             # A fresh decision in the state file, but no engine: not live.
-            # The remedy is the service: an engine started here stops with the TUI.
-            assert status == (
-                "Not switching — no engine is running (cc-swap service install starts one)"
-            )
+            # No service status read here: the menu's Mode is the way
+            # (with one, the sentence names cc-swap service install).
+            assert status == "Not switching — no engine is running (m to start one)"
             assert "next" not in _body(app)
             assert app._store_only is False
             assert fake_engine.instances == []  # Fleet never takes the lease itself
@@ -1138,22 +1137,44 @@ async def test_the_capacity_summary_sits_over_the_headers(tmp_path, held_by_serv
         screen = app.screen
         summary = _plain(app, "#fx-summary")
         # Usable: #1 (62% 5h, past soft), #2, #3, #4, #6 (#5's login is dead).
-        # Countdowns, as the table's resets count.
+        # Free by the landing rule: #2, #3, #4, #6; no other account waits
+        # on its 5h (the active one is never named back). Countdowns, as
+        # the table's resets count.
         assert summary == (
-            "5h free: 4 accounts · next back in 1h47m (#1) · 7d left this week ≈ 3.5 accounts"
-            " · next 7d in 2d04h (#2)"
+            "5h free: 4 accounts · 7d left this week ≈ 3.5 accounts · next 7d in 2d04h (#2)"
         )
         assert screen.query_one("#fx-head").region.y == screen.query_one(
             "#fx-summary").region.y + 1
         await pilot.resize_terminal(80, 24)
         await _open(pilot)
-        # 80 columns keep both countdowns (the 7d room goes).
-        assert _plain(app, "#fx-summary") == (
-            "5h free: 4 accounts · next back in 1h47m (#1) · next 7d in 2d04h (#2)"
-        )
+        # 80 columns: the 7d room goes first.
+        assert _plain(app, "#fx-summary") == "5h free: 4 accounts · next 7d in 2d04h (#2)"
         await pilot.resize_terminal(80, 10)
         await _open(pilot)
         assert not screen.query_one("#fx-summary").display
+
+
+@pytest.mark.asyncio
+async def test_the_summary_names_the_account_that_comes_back(tmp_path, held_by_service):
+    """#6 at 5h 70%: not free, back when its 5h resets; both countdowns fit
+    at 80 columns."""
+    from dataclasses import replace
+
+    fake = _six(tmp_path)
+    accounts = []
+    for a in fake._accounts:
+        if a.number == "6":
+            last_good = dict(a.usage.last_good)
+            last_good["five_hour"] = {**last_good["five_hour"], "pct": 70.0}
+            a = replace(a, usage=replace(a.usage, last_good=last_good))
+        accounts.append(a)
+    fake._accounts = accounts
+    app = make_app(fake)
+    async with app.run_test(size=(80, 24)) as pilot:
+        await _open(pilot)
+        assert _plain(app, "#fx-summary") == (
+            "5h free: 3 accounts · next back in 3h17m (#6) · next 7d in 2d04h (#2)"
+        )
 
 
 # -- the audit of the 0.5.4 home, at 80x24 and 120x36 -----------------------------------------------
@@ -1211,11 +1232,11 @@ async def test_a_killed_claude_on_a_short_terminal_shares_the_line(tmp_path, hel
     async with app.run_test(size=(120, 10)) as pilot:  # no row to spare
         await _open(pilot)
         assert app.screen._plan.attention == 1
-        # The kill rides along in its shortest wording, remedy first.
+        # The kill rides along in its shortest wording, remedy first; the
+        # login due that did not fit is counted.
         assert _attention(app) == [
             f"! #5 {NAMES[4]} needs re-login — select it, press r · cc-swap doctor: "
-            f"claude 2.1.4 killed by {'macOS' if sys.platform == 'darwin' else 'the OS'}, "
-            "priming paused"
+            "claude killed, priming paused (+1 more)"
         ]
         assert app.screen.query_one("#fx-scroll").region.height == 6  # every row
 
