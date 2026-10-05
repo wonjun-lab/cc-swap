@@ -42,6 +42,8 @@ class ActiveWatch:
     witnessed: bool = False
     logged: set[tuple[float, str]] = field(default_factory=set)
     last_note: str | None = None
+    #: The backup root (the switch ledger and ``cswap run`` profiles).
+    root: Any = None
     #: (slot, {window: pct/hour}, {window: source}) from the last estimate:
     #: the policy's pace when the samples cannot measure one.
     rates: tuple[str, dict[str, float], dict[str, str]] | None = None
@@ -78,23 +80,45 @@ def _num(value: object) -> float | None:
 
 
 def _since(state: Mapping, current: str, watch: ActiveWatch) -> float | None:
-    """When ``current`` became the live account, as far as anyone recorded
-    it: the engine's last switch onto it, the maximize samples' change
-    stamp, or a change this engine witnessed."""
+    """When ``current`` became the live account, as far as anything
+    recorded it — never earlier than it did (a refusal after ``since`` must
+    not be the previous account's): the engine's last switch when it was
+    onto ``current``; the switch ledger's newest entry for this host when it
+    lands on ``current``; the maximize samples' change stamp for
+    ``current``; a change this engine witnessed; and when the samples
+    record still names another account (the login changed while no engine
+    looked), the moment this engine first saw ``current``. None when
+    nothing says."""
+    from claude_swap.maximize import ledger
     from claude_swap.maximize.engine_hook import CHANGED_KEY, SAMPLES_KEY
 
     times: list[float] = []
     last = _num(state.get("lastSwitchAt"))
-    if last is not None:
+    if last is not None and str(state.get("lastSwitchTo")) == current:
         times.append(last)
+    try:
+        newest = ledger.last(engine_root(watch), host=ledger.host_name())
+    except Exception:
+        newest = None
+    if isinstance(newest, Mapping) and str(newest.get("to")) == current:
+        ts = _num(newest.get("ts"))
+        if ts is not None:
+            times.append(ts)
     record = state.get(SAMPLES_KEY)
-    if isinstance(record, Mapping) and str(record.get("account")) == current:
-        changed = _num(record.get(CHANGED_KEY))
-        if changed is not None:
-            times.append(changed)
+    if isinstance(record, Mapping):
+        if str(record.get("account")) == current:
+            changed = _num(record.get(CHANGED_KEY))
+            if changed is not None:
+                times.append(changed)
+        elif watch.seen is not None and watch.seen[0] == current:
+            times.append(watch.seen[1])
     if watch.witnessed and watch.seen is not None and watch.seen[0] == current:
         times.append(watch.seen[1])
     return max(times) if times else None
+
+
+def engine_root(watch: ActiveWatch):
+    return watch.root
 
 
 def _plan_and_idle_window(engine: Any, current: str) -> tuple[str | None, float]:
@@ -131,6 +155,7 @@ def estimate_active(
     from claude_swap.maximize.engine_hook import _stored_samples
 
     watch = watch_for(engine)
+    watch.root = engine.switcher.backup_dir
     watch.note_active(current, now)
     if poll:
         watch.poll(now)
@@ -158,12 +183,21 @@ def estimate_active(
     )
     since = _since(state, current, watch)
     reported = None
-    if watch.hits and not isinstance(value, str):
+    hits = watch.hits
+    if hits:
+        # Refusals from ``cswap run`` sessions on other accounts that share
+        # this transcript directory (--share-history) are theirs.
+        try:
+            others = limit_watch.run_session_ids(watch.root)
+        except Exception:
+            others = set()
+        hits = [h for h in hits if h.session_id is None or h.session_id not in others]
+    if hits and not isinstance(value, str):
         reported = est.reported(
             number=current,
             value=value,
             entry=entry,
-            hits=watch.hits,
+            hits=hits,
             since=None if since is None else since + est.SWITCH_GRACE_S,
             now=now,
             base=projected,
@@ -201,14 +235,22 @@ def _log_once(watch: ActiveWatch, result: est.Estimate | None, current: str) -> 
 
 
 def local_idle(engine: Any, now: float, idle_window_min: float) -> bool | None:
-    """Whether no Claude Code transcript on this machine was written in the
-    last ``idle_window_min`` minutes; None when no transcript was ever seen
-    (the samples decide then)."""
+    """Whether Claude Code on this machine is idle: no running session of
+    this config home in a turn (``sessions/<pid>.json`` says ``busy`` for a
+    whole turn, a long tool call included) and no transcript written in the
+    last ``idle_window_min`` minutes. None (the samples decide) when that
+    cannot be told: no transcript ever seen, or the walk was cut short."""
     watch = getattr(engine, WATCH_ATTR, None)
     if not isinstance(watch, ActiveWatch):
         return None
+    try:
+        busy = limit_watch.busy_sessions(limit_watch.default_root().parent)
+    except Exception:
+        busy = None
+    if busy:
+        return False
     last = watch.watcher.last_write
-    if not watch.watcher.available or last is None:
+    if not watch.watcher.available or not watch.watcher.complete or last is None:
         return None
     return now - last >= idle_window_min * 60.0
 

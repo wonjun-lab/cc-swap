@@ -1695,7 +1695,6 @@ def run_maximize_tick(
             if estimate is not None and estimate.kind == "projected"
             else None
         ),
-        fallback_rates=active_watch.fallback_rates(engine, current)[0],
     )
     decision = policy.decide(snap)
     rt.last_snapshot, rt.last_decision = snap, decision

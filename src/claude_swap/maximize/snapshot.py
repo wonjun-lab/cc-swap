@@ -89,7 +89,6 @@ def build_snapshot(
     ages: Mapping[str, float | None] | None = None,
     estimate: UsageEstimate | None = None,
     local_idle: bool | None = None,
-    fallback_rates: Mapping[str, float] | None = None,
 ) -> Snapshot:
     """One view per ``records`` entry, in ``records`` order (sequence order).
 
@@ -141,5 +140,4 @@ def build_snapshot(
         k7=dict(k7 or {}),
         estimate=estimate,
         local_idle=local_idle,
-        fallback_rates=dict(fallback_rates or {}),
     )

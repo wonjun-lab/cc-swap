@@ -434,13 +434,13 @@ def _per_min(rates: object) -> tuple[float | None, float | None]:
 
 
 def pace(snap: Snapshot) -> tuple[tuple[float | None, float | None], float]:
-    """``((5h, 7d) points per minute, minutes since the pace's reading)``,
-    from the best rate there is: the recent velocity of fresh samples (as
-    old as the newest sample); else, while the usage is projected, the
-    projection's rates (projected to now); else the learned or per-plan
-    rate the engine hands in (``Snapshot.fallback_rates``); else unknown.
-    A velocity the samples did measure is used even when it is 0 (not
-    climbing is evidence too)."""
+    """``((5h, 7d) points per minute, minutes since the pace's reading)``:
+    the recent velocity of fresh samples (as old as the newest sample);
+    else, while the usage is projected, the projection's rates (the learned
+    in-use pace, else the plan's default; projected to now); else unknown.
+    Fresh readings with too few samples for a velocity (the first ticks
+    after a start or a switch) keep "unknown": no ETA from a guess while
+    the readings themselves are current."""
     if _fresh_samples(snap):
         velocity = idle.velocity(snap.samples, snap.settings)
         if velocity != (None, None):
@@ -448,8 +448,6 @@ def pace(snap: Snapshot) -> tuple[tuple[float | None, float | None], float]:
             return velocity, age
     if _projected(snap):
         return _per_min(snap.estimate.rates), 0.0  # type: ignore[union-attr]
-    if snap.fallback_rates:
-        return _per_min(snap.fallback_rates), 0.0
     return (None, None), 0.0
 
 

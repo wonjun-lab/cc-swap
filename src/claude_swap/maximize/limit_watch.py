@@ -29,9 +29,12 @@ is ignored, as are per-model limits ("You've reached your Fable limit").
 
 Cost and safety, per :meth:`TranscriptWatcher.poll`:
 
-* a bounded directory walk (``MAX_ENTRIES`` names, ``MAX_DEPTH`` levels),
-  ``stat`` only; files modified within ``RECENT_S`` are read, the
-  ``MAX_FILES`` newest of them;
+* a bounded directory walk (``MAX_ENTRIES`` names, ``MAX_DEPTH`` levels,
+  ``stat`` only) every ``FULL_WALK_S``; between walks only the recently
+  written files and their directories are looked at again (a new session
+  file moves its directory's mtime). Files modified within ``RECENT_S`` are
+  read, the ``MAX_FILES`` newest of them. A walk cut short by the cap says
+  so (``complete``): the engine then treats local idleness as unknown;
 * only the bytes appended since the last poll (``MAX_READ_BYTES`` at most per
   file and poll; a file first seen is read from ``INITIAL_TAIL_BYTES`` before
   its end), never a whole transcript;
@@ -68,6 +71,9 @@ MAX_READ_BYTES = 256 * 1024
 INITIAL_TAIL_BYTES = 64 * 1024
 #: Files remembered between polls (offsets); the oldest are forgotten.
 MAX_TRACKED = 256
+#: A full directory walk at most this often; in between only the files
+#: written recently (and their directories) are looked at.
+FULL_WALK_S = 300.0
 
 _MARKER = b"isApiErrorMessage"
 _KIND = b"rate_limit"
@@ -85,6 +91,10 @@ class LimitHit:
     ts: float                    # when (the record's timestamp, epoch s)
     window: str                  # "5h" | "7d"
     resets_at: float | None      # quotaLimits.resetsAt, epoch s; None unknown
+    #: The record's ``sessionId`` (an opaque id, never logged): lets the
+    #: engine set aside refusals from ``cswap run`` sessions on other
+    #: accounts whose transcripts share this directory (``--share-history``).
+    session_id: str | None = None
 
 
 def _epoch(value: object) -> float | None:
@@ -118,12 +128,16 @@ def parse_line(line: bytes) -> LimitHit | None:
     ts = _epoch(record.get("timestamp"))
     if ts is None:
         return None
+    sid = record.get("sessionId")
+    sid = sid if isinstance(sid, str) and sid else None
     quota = record.get("quotaLimits")
     if isinstance(quota, dict):
         window = _WINDOWS.get(str(quota.get("rateLimitType")))
         if window is None or quota.get("status") != "rejected":
             return None
-        return LimitHit(ts=ts, window=window, resets_at=_epoch(quota.get("resetsAt")))
+        return LimitHit(
+            ts=ts, window=window, resets_at=_epoch(quota.get("resetsAt")), session_id=sid
+        )
     # Older Claude Code builds wrote the text only.
     message = record.get("message")
     content = message.get("content") if isinstance(message, dict) else None
@@ -133,7 +147,7 @@ def parse_line(line: bytes) -> LimitHit | None:
             continue
         for pattern, window in _TEXT_WINDOWS:
             if pattern.search(text):
-                return LimitHit(ts=ts, window=window, resets_at=None)
+                return LimitHit(ts=ts, window=window, resets_at=None, session_id=sid)
     return None
 
 
@@ -159,41 +173,110 @@ class TranscriptWatcher:
     last_write: float | None = None
     #: Whether the last poll found the projects directory at all.
     available: bool = False
+    #: Whether the last full walk saw every file (a capped walk cannot say
+    #: "nothing was written": idle is then unknown).
+    complete: bool = False
+    #: path -> last seen mtime, and directory -> mtime, from the walk.
+    files: dict[str, float] = field(default_factory=dict)
+    dirs: dict[str, float] = field(default_factory=dict)
+    walked_at: float | None = None
+    top: str | None = None
 
-    def _recent_files(self, now: float) -> list[tuple[float, str, os.stat_result]]:
-        try:
-            top = self.root()
-        except Exception:
-            return []
-        found: list[tuple[float, str, os.stat_result]] = []
+    def _walk(self, top: Path) -> bool:
+        """The full walk: every ``.jsonl`` under ``top`` (bounded), into
+        ``files``/``dirs``. True when it saw everything."""
+        files: dict[str, float] = {}
+        dirs: dict[str, float] = {}
         seen = 0
         stack: list[tuple[str, int]] = [(str(top), 0)]
-        self.available = top.is_dir()
-        newest: float | None = None
-        while stack and seen < MAX_ENTRIES:
+        complete = True
+        while stack:
             path, depth = stack.pop()
             try:
+                dirs[path] = os.stat(path).st_mtime
                 with os.scandir(path) as it:
                     for entry in it:
                         seen += 1
                         if seen > MAX_ENTRIES:
+                            complete = False
                             break
                         try:
                             if entry.is_dir(follow_symlinks=False):
                                 if depth + 1 < MAX_DEPTH:
                                     stack.append((entry.path, depth + 1))
                                 continue
-                            if not entry.name.endswith(".jsonl"):
-                                continue
-                            st = entry.stat(follow_symlinks=False)
+                            if entry.name.endswith(".jsonl"):
+                                files[entry.path] = entry.stat(follow_symlinks=False).st_mtime
                         except OSError:
                             continue
-                        if newest is None or st.st_mtime > newest:
-                            newest = st.st_mtime
-                        if now - st.st_mtime <= RECENT_S:
-                            found.append((st.st_mtime, entry.path, st))
             except OSError:
                 continue
+            if not complete:
+                break
+        self.files, self.dirs = files, dirs
+        return complete
+
+    def _rescan_dir(self, path: str) -> None:
+        """One directory whose mtime moved since the walk: pick up the
+        ``.jsonl`` files (and directories) created in it."""
+        try:
+            self.dirs[path] = os.stat(path).st_mtime
+            with os.scandir(path) as it:
+                for entry in it:
+                    try:
+                        if entry.is_dir(follow_symlinks=False):
+                            self.dirs.setdefault(entry.path, 0.0)
+                        elif entry.name.endswith(".jsonl") and entry.path not in self.files:
+                            self.files[entry.path] = entry.stat(follow_symlinks=False).st_mtime
+                    except OSError:
+                        continue
+        except OSError:
+            self.dirs.pop(path, None)
+
+    def _recent_files(self, now: float) -> list[tuple[float, str, os.stat_result]]:
+        """The ``MAX_FILES`` most recently modified transcripts within
+        ``RECENT_S``. A full (bounded) walk every ``FULL_WALK_S``; between
+        walks only the files written within ``RECENT_S`` and the
+        directories that hold them (a new session file changes its
+        directory's mtime) are looked at again."""
+        try:
+            top = self.root()
+        except Exception:
+            self.available = self.complete = False
+            return []
+        self.available = top.is_dir()
+        if not self.available:
+            self.complete = False
+            return []
+        if self.walked_at is None or now - self.walked_at >= FULL_WALK_S or self.top != str(top):
+            self.complete = self._walk(top)
+            self.walked_at, self.top = now, str(top)
+        else:
+            hot_dirs = {str(top)} | {
+                os.path.dirname(f) for f, m in self.files.items() if now - m <= RECENT_S
+            }
+            for d in hot_dirs:
+                try:
+                    if os.stat(d).st_mtime != self.dirs.get(d):
+                        self._rescan_dir(d)
+                except OSError:
+                    continue
+            for d, m in list(self.dirs.items()):
+                if m == 0.0:  # a directory created since the walk
+                    self._rescan_dir(d)
+        found: list[tuple[float, str, os.stat_result]] = []
+        for path, mtime in list(self.files.items()):
+            if now - mtime > RECENT_S + FULL_WALK_S:
+                continue  # cold: the next full walk looks again
+            try:
+                st = os.stat(path)
+            except OSError:
+                self.files.pop(path, None)
+                continue
+            self.files[path] = st.st_mtime
+            if now - st.st_mtime <= RECENT_S:
+                found.append((st.st_mtime, path, st))
+        newest = max(self.files.values(), default=None)
         if newest is not None:
             self.last_write = newest if self.last_write is None else max(self.last_write, newest)
         found.sort(reverse=True)
@@ -271,3 +354,71 @@ def default_root() -> Path:
     from claude_swap.paths import get_claude_config_home
 
     return get_claude_config_home() / "projects"
+
+
+def busy_sessions(config_home: Path) -> bool | None:
+    """Whether a running Claude Code of this config home is in a turn:
+    ``<config home>/sessions/<pid>.json`` with a live ``pid`` and a
+    ``status`` other than ``idle`` (Claude Code keeps it ``busy`` for the
+    whole turn, a long tool call included). None when there is no sessions
+    directory to ask. Reads only ``pid`` and ``status``."""
+    folder = config_home / "sessions"
+    if not folder.is_dir():
+        return None
+    try:
+        names = [n for n in os.listdir(folder) if n.endswith(".json")]
+    except OSError:
+        return None
+    for name in names[:256]:
+        try:
+            with open(folder / name, "rb") as f:
+                record = json.loads(f.read(64 * 1024))
+        except (OSError, ValueError):
+            continue
+        if not isinstance(record, dict):
+            continue
+        pid, status = record.get("pid"), record.get("status")
+        if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0:
+            continue
+        if status == "idle" or not _alive(pid):
+            continue
+        return True
+    return False
+
+
+def _alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except PermissionError:
+        return True
+    except (OSError, OverflowError):
+        return False
+    return True
+
+
+def run_session_ids(backup_root: Path) -> set[str]:
+    """The ``sessionId`` of every Claude Code session ``cswap run`` started
+    in a per-account profile (``<backup>/sessions/<profile>/sessions/
+    <pid>.json``): those sessions use their own account, so their refusals
+    in a shared transcript directory are not the live login's."""
+    out: set[str] = set()
+    base = backup_root / "sessions"
+    try:
+        profiles = [p for p in base.iterdir() if p.is_dir()]
+    except OSError:
+        return out
+    for profile in profiles[:64]:
+        try:
+            names = [n for n in os.listdir(profile / "sessions") if n.endswith(".json")]
+        except OSError:
+            continue
+        for name in names[:256]:
+            try:
+                with open(profile / "sessions" / name, "rb") as f:
+                    record = json.loads(f.read(64 * 1024))
+            except (OSError, ValueError):
+                continue
+            sid = record.get("sessionId") if isinstance(record, dict) else None
+            if isinstance(sid, str) and sid:
+                out.add(sid)
+    return out

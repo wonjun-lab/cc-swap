@@ -2422,6 +2422,10 @@ class AutoSwitchEngine:
             and (active_pre.poll_interval_s or 0.0)
             > poll_policy.ACTIVE_MAX_INTERVAL_S
             and (binding_pct(active_pre.last_good, self._models) or 0.0) < 100.0
+            # cc-swap: a long plan written after a 429 is congestion control
+            # (poll_policy's AIMD), not a leftover candidate plan: keep it, so
+            # machines sharing the account back off until they fit the budget.
+            and not active_pre.recent_429(now)
         )
         overslept_plan = (
             active_pre is not None

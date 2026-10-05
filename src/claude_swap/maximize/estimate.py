@@ -68,6 +68,10 @@ REPORTED_MAX_AGE_S = 5 * 3600.0
 #: A refusal this soon after the account became the live one may still be
 #: a Claude Code session on the previous login's token.
 SWITCH_GRACE_S = 90.0
+#: A refusal's ``resetsAt`` and the reading's ``resets_at`` for the same
+#: window of the same account agree to the second (both sit on 10-minute
+#: marks); this much slack tolerates rounding without taking a neighbour's.
+RESET_MATCH_S = 120.0
 
 
 @dataclass(frozen=True)
@@ -294,11 +298,24 @@ def reported(
     """The active account at 100% on a window Claude Code refused a request
     for, or None.
 
-    A refusal counts when it came after ``since`` (when this account became
-    the live one, plus a grace for a session still on the old token), its
-    reported reset has not passed, and no reading taken after it shows that
-    window under 100% (the usage endpoint, when it answers, wins). ``base``
-    is the projection to raise (or None: the stored reading)."""
+    The transcripts do not say which account a refusal was for, and they
+    can hold other accounts' (a session still on the previous login's
+    token, a ``cswap run --share-history`` session, a refusal from before a
+    switch the engine did not see). So a refusal counts for the live
+    account only when it is provably its own:
+
+    * its ``resetsAt`` is the live account's own reset for that window, as
+      its last reading reports it (within ``RESET_MATCH_S``; both are on
+      10-minute marks), or
+    * that window of the reading has no future reset (rolled over since,
+      or off) and the refusal came after ``since`` — when this account
+      became the live one, plus a grace for a session still on the old
+      token. A refusal with no reset at all (older text-only records) also
+      needs ``since``. With ``since`` unknown, only a reset match counts.
+
+    Its reported reset must not have passed, and no reading taken after it
+    may show that window under 100% (the usage endpoint, when it answers,
+    wins). ``base`` is the projection to raise (or None: the reading)."""
     latest: dict[str, object] = {}
     fetched_at = _num(getattr(entry, "fetched_at", None))
     current = base.value if base is not None else value
@@ -309,10 +326,20 @@ def reported(
         resets = getattr(hit, "resets_at", None)
         if not isinstance(ts, (int, float)) or window not in ("5h", "7d"):
             continue
-        if since is not None and ts < since:
-            continue
         if ts > now + 300.0:
             continue
+        own_reset = read[window][1] if window in read else None
+        matched = (
+            resets is not None
+            and own_reset is not None
+            and abs(resets - own_reset) <= RESET_MATCH_S
+        )
+        if not matched:
+            after_since = since is not None and ts >= since
+            if resets is not None and own_reset is not None and own_reset > now:
+                continue  # another account's window
+            if not after_since:
+                continue
         if resets is not None and resets <= now:
             continue
         if resets is None and now - ts > REPORTED_MAX_AGE_S:

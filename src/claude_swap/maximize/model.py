@@ -138,12 +138,6 @@ class Snapshot:
     # this machine was written within ``idleWindowMin`` (None: unknown, the
     # samples decide).
     local_idle: bool | None = None
-    # The active account's burn rate (pct per hour by window) when its own
-    # samples cannot measure one: what it was learned at while in use, else
-    # a conservative per-plan default (maximize/estimate.py ``burn_rates``).
-    # The ETA-forced hard trigger and the reset-aware wait use it, so above
-    # a soft mark "no samples" never means "no ETA".
-    fallback_rates: Mapping[str, float] = field(default_factory=dict)
 
     def view(self, number: str | None) -> AccountView | None:
         """The account with this slot number, or None."""

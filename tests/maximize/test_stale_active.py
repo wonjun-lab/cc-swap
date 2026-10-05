@@ -10,7 +10,7 @@ import json
 import logging
 import os
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from unittest.mock import patch
 
@@ -28,7 +28,14 @@ from claude_swap.autoswitch import (
 from claude_swap.maximize import estimate as est
 from claude_swap.maximize import limit_watch, policy
 from claude_swap.maximize.engine_hook import DECISION_KEY, runtime_for
-from claude_swap.maximize.model import AccountView, Hold, Sample, Snapshot, Switch
+from claude_swap.maximize.model import (
+    AccountView,
+    Hold,
+    Sample,
+    Snapshot,
+    Switch,
+    UsageEstimate,
+)
 from claude_swap.settings import MaximizeSettings
 from claude_swap.usage_store import UsageEntry
 from tests.maximize import incident_replay as ir
@@ -150,39 +157,42 @@ def snap(active: AccountView, *others: AccountView, **kw) -> Snapshot:
     )
 
 
-class TestFallbackPace:
-    def test_no_samples_no_rate_keeps_waiting_as_before(self):
-        # The 01:36 situation as the old engine saw it: 88%, no samples.
+PROJECTED = UsageEstimate(kind="projected", note="5h ~88% projected — test",
+                          rates={"5h": 60.0, "7d": 8.0})
+
+
+class TestPace:
+    def test_fresh_readings_without_a_velocity_keep_todays_behaviour(self):
+        # First tick after a start or a switch: a fresh 88% and no samples
+        # yet. No ETA is guessed from a default (S1): soft waits for idle.
         d = policy.decide(snap(view("1", 88, 90), view("2", 0, 70)))
         assert isinstance(d, Hold) and d.pending
 
-    def test_a_learned_rate_gives_the_eta_that_forces_the_switch(self):
-        d = policy.decide(snap(view("1", 88, 90), view("2", 0, 70),
-                               fallback_rates={"5h": 60.0, "7d": 8.0}))
+    def test_a_projection_always_has_a_pace_for_the_eta(self):
+        # The 01:36 situation: 88% (projected), no fresh samples.
+        d = policy.decide(snap(view("1", 88, 90), view("2", 0, 70), estimate=PROJECTED))
         assert isinstance(d, Switch) and d.trigger == "hard"
         assert "reaches a hard cap in ~9.0 min" in d.reason
+        assert "(5h ~88% projected — test)" in d.reason
 
-    def test_measured_samples_win_over_the_fallback(self):
+    def test_measured_samples_win_over_the_projection_rates(self):
         now = 10_000_000.0
         flat = (Sample(now - 600, 88, 90), Sample(now - 300, 88, 90), Sample(now, 88, 90))
         d = policy.decide(snap(view("1", 88, 90), view("2", 0, 70), now=now, samples=flat,
-                               fallback_rates={"5h": 60.0, "7d": 8.0}))
+                               estimate=PROJECTED))
         assert isinstance(d, Switch) and d.trigger == "soft"  # flat = idle, not forced
 
-    def test_far_below_the_hard_cap_the_fallback_changes_nothing(self):
-        d = policy.decide(snap(view("1", 30, 40), view("2", 0, 70),
-                               fallback_rates={"5h": 40.0, "7d": 6.6}))
+    def test_far_below_the_hard_cap_a_projection_changes_nothing(self):
+        d = policy.decide(snap(view("1", 30, 40), view("2", 0, 70), estimate=PROJECTED))
         assert isinstance(d, Hold) and "under soft" in d.reason
 
-    def test_engine_hands_the_plan_default_when_nothing_was_learned(self, temp_home):
-        h = make(temp_home, maximize={"hard5h": 90, "forceEtaMin": 10})
-        # 85% with no samples and nothing learned: 20x default 40 %/h puts
-        # the 90% cap 7.5 min away.
-        assert h.tick_with_usage({"1": win(85, 40), "2": win(0, 10), "3": win(0, 50)}) \
-            is TickOutcome.SWITCHED
-        assert of(h, SwitchEvent)[0].trigger == "hard"
-        snap_ = runtime_for(h.engine).last_snapshot
-        assert snap_.fallback_rates["5h"] == est.DEFAULT_RATE_5H["20x"]
+    def test_first_tick_after_a_switch_on_a_5x_is_not_eta_forced(self, temp_home):
+        # S1 regression: fresh 5h 80% on the first tick, idle-looking.
+        h = make(temp_home, maximize={"hard5h": 90, "forceEtaMin": 10,
+                                      "planOverride": "a@example.com:5x"})
+        assert h.tick_with_usage({"1": win(80, 40), "2": win(0, 10), "3": win(0, 50)}) \
+            is TickOutcome.NO_ACTION
+        assert not of(h, SwitchEvent)
 
 
 # -- the projection (unit) ----------------------------------------------------------------
@@ -302,6 +312,39 @@ class TestProjectionInTheEngine:
         decision = of(h, MaximizeDecisionEvent)[-1]
         assert decision.pending and "Claude Code active here" in decision.reason
 
+    def test_a_busy_claude_code_turn_is_not_idle(self, temp_home):
+        """A long tool call writes no transcript, but Claude Code keeps its
+        session ``busy`` for the whole turn (S3)."""
+        h = make(temp_home)
+        h.clock.now = time.time()
+        now = h.clock.now
+        projects = temp_home / ".claude" / "projects" / "p"
+        projects.mkdir(parents=True)
+        transcript = projects / "s.jsonl"
+        transcript.write_text('{"type":"user"}\n')
+        os.utime(transcript, (now - 3600, now - 3600))
+        sessions = temp_home / ".claude" / "sessions"
+        sessions.mkdir()
+        (sessions / f"{os.getpid()}.json").write_text(
+            json.dumps({"pid": os.getpid(), "status": "busy", "sessionId": "x"})
+        )
+        entries = {
+            "1": UsageEntry(last_good=win(30, 40), fetched_at=now - 3600, age_s=3600.0,
+                            consecutive_failures=5, last_error="http-429",
+                            last_429_at=now, trust_extended=True),
+            "2": UsageEntry(last_good=win(0, 10), fetched_at=now, age_s=0.0),
+            "3": UsageEntry(last_good=win(0, 50), fetched_at=now, age_s=0.0),
+        }
+        assert h.tick_with_entries(entries) is TickOutcome.NO_ACTION
+        assert "Claude Code active here" in of(h, MaximizeDecisionEvent)[-1].reason
+        # The turn ends: idle again (a dead pid or "idle" status counts as idle).
+        (sessions / f"{os.getpid()}.json").write_text(
+            json.dumps({"pid": os.getpid(), "status": "idle", "sessionId": "x"})
+        )
+        h.clock.advance(60)
+        entries["1"] = replace(entries["1"], age_s=3660.0)
+        assert h.tick_with_entries(entries) is TickOutcome.SWITCHED
+
     def test_fresh_readings_change_nothing(self, temp_home):
         """Regression: far below soft with fresh readings, the decision, its
         reason and the poll line are exactly what they were."""
@@ -376,7 +419,9 @@ def limit_record(ts: float, window: str = "five_hour", resets: float | None = No
 class TestParseLine:
     def test_session_and_weekly_limits(self):
         hit = limit_watch.parse_line(limit_record(1000.0, resets=5000.0).encode())
-        assert hit == limit_watch.LimitHit(ts=1000.0, window="5h", resets_at=5000.0)
+        assert hit == limit_watch.LimitHit(
+            ts=1000.0, window="5h", resets_at=5000.0, session_id="redacted"
+        )
         hit = limit_watch.parse_line(limit_record(1000.0, "seven_day").encode())
         assert hit is not None and hit.window == "7d"
 
@@ -489,28 +534,106 @@ class TestWatcher:
         w = self.watcher(tmp_path / "missing")
         assert w.poll(time.time()) == [] and not w.available
 
+    def test_a_capped_walk_says_it_is_incomplete(self, tmp_path, monkeypatch):
+        for i in range(5):
+            (tmp_path / f"s{i}.jsonl").write_text("{}\n")
+        monkeypatch.setattr(limit_watch, "MAX_ENTRIES", 3)
+        w = self.watcher(tmp_path)
+        w.poll(time.time())
+        assert w.available and not w.complete
+        monkeypatch.setattr(limit_watch, "MAX_ENTRIES", 100)
+        w.poll(time.time() + limit_watch.FULL_WALK_S)
+        assert w.complete
+
+    def test_between_full_walks_only_hot_files_and_their_directories(self, tmp_path):
+        project = tmp_path / "p"
+        project.mkdir()
+        (project / "a.jsonl").write_text("{}\n")
+        for i in range(30):
+            cold = tmp_path / f"cold{i}"
+            cold.mkdir()
+            old = cold / "x.jsonl"
+            old.write_text("{}\n")
+            os.utime(old, (1, 1))
+        w = self.watcher(tmp_path)
+        now = time.time()
+        w.poll(now)
+        stats: list[str] = []
+        real_stat = os.stat
+
+        def spy(path, *a, **k):
+            stats.append(str(path))
+            return real_stat(path, *a, **k)
+
+        time.sleep(0.01)
+        (project / "b.jsonl").write_text(limit_record(now) + "\n")   # a new session
+        os.utime(project, None)
+        with patch("os.stat", spy):
+            [hit] = w.poll(now + 60)
+        assert hit.window == "5h"
+        assert not any("cold" in p for p in stats)
+
+    def test_a_new_project_directory_is_found_before_the_next_walk(self, tmp_path):
+        w = self.watcher(tmp_path)
+        now = time.time()
+        w.poll(now)
+        project = tmp_path / "new"
+        project.mkdir()
+        (project / "s.jsonl").write_text(limit_record(now) + "\n")
+        os.utime(tmp_path, (now + 1, now + 1))
+        assert len(w.poll(now + 60)) == 1
+
+
+def ten_min(epoch: float) -> float:
+    """On a 10-minute mark, as both reset fields are."""
+    return float(int(epoch // 600) * 600)
+
 
 class TestReportedLimit:
-    def setup(self, temp_home, *, p5=40.0, record_ts=None, fetched_after=False):
+    """A refusal counts for the live account only when it is provably its
+    own: its resetsAt is the live reading's reset for that window, or (no
+    future reset in the reading, or no reset in the refusal) it came after a
+    known moment the account went live."""
+
+    def setup(self, temp_home, *, record_ts=None, record_reset="own", own_reset="future",
+              session_id="redacted", fetched_after=False, text_only=False):
         h = make(temp_home)
         h.clock.now = time.time()
         now = h.clock.now
+        own = {"future": ten_min(now + 2 * H), "past": ten_min(now - 600), None: None}[own_reset]
+        reset = own if record_reset == "own" else record_reset
         projects = temp_home / ".claude" / "projects" / "-redacted"
-        projects.mkdir(parents=True)
+        projects.mkdir(parents=True, exist_ok=True)
         secret = "TOP SECRET PROMPT TEXT"
+        record = json.loads(limit_record(
+            record_ts if record_ts is not None else now - 30,
+            resets=reset if reset is not None else now + H,
+        ))
+        record["sessionId"] = session_id
+        if text_only:
+            del record["quotaLimits"]
         (projects / "s.jsonl").write_text(
             json.dumps({"type": "user", "message": {"content": secret}}) + "\n"
-            + limit_record(record_ts if record_ts is not None else now - 30) + "\n"
+            + json.dumps(record) + "\n"
         )
         fetched = now if fetched_after else now - 120
+        value = win(40, 40, r5=own) if own is not None else win(40, 40)
         entries = {
-            "1": UsageEntry(last_good=win(p5, 40), fetched_at=fetched, age_s=now - fetched),
+            "1": UsageEntry(last_good=value, fetched_at=fetched, age_s=now - fetched),
             "2": UsageEntry(last_good=win(0, 10), fetched_at=now, age_s=0.0),
             "3": UsageEntry(last_good=win(0, 50), fetched_at=now, age_s=0.0),
         }
         return h, entries, secret
 
-    def test_a_reported_limit_switches_at_once_busy_or_not(self, temp_home, caplog):
+    def went_live(self, h, at: float) -> None:
+        from claude_swap.maximize import ledger
+
+        ledger.append(h.switcher.backup_dir, ledger.make_entry(
+            h.switcher.backup_dir, from_slot=2, to_slot=1, actor="engine",
+            trigger="hard", source="test", now=at,
+        ))
+
+    def test_its_own_window_switches_at_once_busy_or_not(self, temp_home, caplog):
         h, entries, secret = self.setup(temp_home)
         with caplog.at_level(logging.DEBUG, logger="claude-swap"):
             assert h.tick_with_entries(entries) is TickOutcome.SWITCHED
@@ -526,9 +649,77 @@ class TestReportedLimit:
         h, entries, _ = self.setup(temp_home, fetched_after=True, record_ts=time.time() - 120)
         assert h.tick_with_entries(entries) is TickOutcome.NO_ACTION
 
-    def test_a_refusal_before_the_account_went_live_is_not_its(self, temp_home):
-        h, entries, _ = self.setup(temp_home)
-        h.engine._mutate_state(lambda s: s.__setitem__("lastSwitchAt", h.clock.now - 10))
+    def test_a_session_still_on_the_previous_token_after_a_switch(self, temp_home):
+        # Blocker case 2: switched onto #1 5 min ago; a Claude Code still on
+        # the old account's token keeps getting refused after the grace.
+        h, entries, _ = self.setup(temp_home, record_reset=ten_min(time.time() + H))
+        h.engine._mutate_state(lambda s: s.update(lastSwitchAt=h.clock.now - 300,
+                                                  lastSwitchTo="1"))
+        assert h.tick_with_entries(entries) is TickOutcome.NO_ACTION
+
+    def test_a_cswap_run_share_history_session_is_not_the_live_login(self, temp_home):
+        # Blocker case 1: the refusal's session is a `cswap run` profile's,
+        # even if its reset happens to coincide with the live one's.
+        h, entries, _ = self.setup(temp_home, session_id="run-session")
+        sessions = h.switcher.backup_dir / "sessions" / "2-b_example.com" / "sessions"
+        sessions.mkdir(parents=True)
+        (sessions / "4242.json").write_text(json.dumps({"pid": 4242, "sessionId": "run-session"}))
+        assert h.tick_with_entries(entries) is TickOutcome.NO_ACTION
+
+    def test_a_restart_after_a_switch_made_while_down(self, temp_home):
+        # Blocker case 3: the engine was down while the user moved #2 -> #1;
+        # the state still names #2. A refusal from minutes ago is #2's.
+        h, entries, _ = self.setup(temp_home, record_reset=ten_min(time.time() + H),
+                                   record_ts=time.time() - 300)
+        h.engine._mutate_state(lambda s: s.update(
+            lastSwitchAt=h.clock.now - 3 * H, lastSwitchTo="2",
+            maximizeSamples={"account": "2", "samples": []},
+        ))
+        assert h.tick_with_entries(entries) is TickOutcome.NO_ACTION
+
+    def test_a_restart_after_a_switch_made_while_down_window_off(self, temp_home):
+        # ... and with no reset in its own reading either (window off): the
+        # engine only knows the account is live since its first look, now.
+        h, entries, _ = self.setup(temp_home, own_reset=None, record_ts=time.time() - 300)
+        h.engine._mutate_state(lambda s: s.update(
+            lastSwitchTo="2", maximizeSamples={"account": "2", "samples": []},
+        ))
+        assert h.tick_with_entries(entries) is TickOutcome.NO_ACTION
+
+    def test_with_nothing_known_only_a_reset_match_counts(self, temp_home):
+        # Blocker case 4: since unknown. A foreign reset is not taken ...
+        h, entries, _ = self.setup(temp_home, record_reset=ten_min(time.time() + H))
+        assert h.tick_with_entries(entries) is TickOutcome.NO_ACTION
+
+    def test_with_nothing_known_a_text_only_refusal_is_ignored(self, temp_home):
+        h, entries, _ = self.setup(temp_home, text_only=True)
+        assert h.tick_with_entries(entries) is TickOutcome.NO_ACTION
+
+    def test_text_only_after_a_known_switch_counts(self, temp_home):
+        h, entries, _ = self.setup(temp_home, text_only=True)
+        self.went_live(h, h.clock.now - 3600)
+        assert h.tick_with_entries(entries) is TickOutcome.SWITCHED
+
+    def test_a_window_that_rolled_over_counts_after_a_known_switch(self, temp_home):
+        # The reading's 5h reset passed; the refusal names the new window.
+        h, entries, _ = self.setup(temp_home, own_reset="past",
+                                   record_reset=ten_min(time.time() + 4 * H))
+        self.went_live(h, h.clock.now - 3600)                          # the ledger says
+        assert h.tick_with_entries(entries) is TickOutcome.SWITCHED
+
+    def test_a_window_that_rolled_over_needs_a_known_switch(self, temp_home):
+        h, entries, _ = self.setup(temp_home, own_reset="past",
+                                   record_reset=ten_min(time.time() + 4 * H))
+        assert h.tick_with_entries(entries) is TickOutcome.NO_ACTION   # since unknown
+
+    def test_the_ledger_entry_must_land_on_the_live_account(self, temp_home):
+        from claude_swap.maximize import ledger
+
+        h, entries, _ = self.setup(temp_home, text_only=True)
+        ledger.append(h.switcher.backup_dir, ledger.make_entry(
+            h.switcher.backup_dir, from_slot=1, to_slot=2, actor="engine",
+            trigger="hard", source="test", now=h.clock.now - 3600,
+        ))
         assert h.tick_with_entries(entries) is TickOutcome.NO_ACTION
 
 
@@ -609,6 +800,23 @@ class TestEscalation:
         }
         calls = self.fetches(h, entries)   # default 40 %/h: 90% is 15 min away
         assert any(c and {"1", "2", "3"} <= c for c in calls)
+
+    def test_the_active_accounts_post_429_plan_is_kept(self, temp_home):
+        # S4: three machines on one account exceed ~30 reads/h at 180-300 s
+        # each; after a 429 the AIMD plan (here 9 min) must hold on the
+        # active account too, not be overridden as a "leftover candidate
+        # plan" once the reading is 5 minutes old.
+        h = make(temp_home, maximize={"hard5h": 90})
+        now = h.clock.now
+        entries = {
+            "1": UsageEntry(last_good=win(20, 40), fetched_at=now - 400, age_s=400.0,
+                            last_429_at=now - 900, poll_interval_s=540.0,
+                            next_poll_at=now + 140, trust_extended=True),
+            "2": UsageEntry(last_good=win(0, 76), fetched_at=now, age_s=0.0),
+            "3": UsageEntry(last_good=win(0, 72), fetched_at=now, age_s=0.0),
+        }
+        calls = self.fetches(h, entries)
+        assert not any(c and "1" in c for c in calls)
 
     def test_escalation_keeps_a_recent_429_plan(self, temp_home):
         h = make(temp_home, maximize={"hard5h": 90, "forceEtaMin": 0})

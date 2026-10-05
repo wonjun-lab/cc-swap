@@ -201,7 +201,7 @@ Each window (5-hour and 7-day) has two thresholds on the active account:
 | Soft | 50% | 90% | Switch at the next moment you are idle |
 | Hard | 95% | 98% | Switch now |
 
-"Idle" means your usage barely moved over the last 10 minutes (at most 1 percentage point in both windows). Switching while you pause means no turn of yours is interrupted. At 100% it switches at once, whatever else is going on. It also switches if the hard threshold is less than 10 minutes away at your pace — the recent one, else the one it learned for that account, else a fast default for the plan, so a gap in the readings never means "no idea, keep waiting".
+"Idle" means your usage barely moved over the last 10 minutes (at most 1 percentage point in both windows). Switching while you pause means no turn of yours is interrupted. At 100% it switches at once, whatever else is going on. It also switches if the hard threshold is less than 10 minutes away at your recent pace (and, while the readings are stale, at the pace it learned for that account, else a fast default for the plan, so a gap in the readings never means "no idea, keep waiting").
 
 When the usage endpoint stops answering for the account you are using (several machines polling one login spend its ~30 reads an hour, and then every read returns 429), cc-swap does not keep deciding on the last reading: it projects it forward at the account's pace and says so (`5h ~74% projected — usage reads rate-limited for 52m` in `cc-swap why` and Fleet). If Claude Code itself reports the usage limit in a session transcript, cc-swap switches at once. The [reference](docs/reference.md#the-maximize-strategy) has the details, including how often each account is read.
 
@@ -304,7 +304,7 @@ Two places holding the same login (two slots, or a slot and another slot's `cswa
 
 Each machine keeps its own logins. Log in and `cc-swap add` on every machine separately, and renew logins on each machine that needs it rather than copying one login between machines. Usage from all machines counts against the same quota, and cc-swap only trusts what the server reports, so the engines don't need to coordinate. With priming on, each machine waits a random 45 to 300 seconds after a reset before priming, and a machine skips an account whose window another machine already opened.
 
-If two machines share logins (moved with export/import) they also share one usage-reading budget. You can let one machine poll and hand its readings to the other:
+If two machines share logins (moved with export/import), or use the same account at the same time, they also share one usage-reading budget (about 30 reads an hour): three machines reading it every few minutes exceed it, and every read then returns 429 until they back off. cc-swap backs off by itself and projects the usage meanwhile, but you can let one machine poll and hand its readings to the other:
 
 ```bash
 cc-swap list --json | ssh laptop cc-swap import-usage - --hold 600
