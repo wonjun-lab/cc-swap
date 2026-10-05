@@ -215,12 +215,12 @@ def test_fleets_next_is_the_engines_target(name, snap, mx, state):
 def test_the_drain_fixtures_put_draining_accounts_first():
     by_name = {f[0]: f for f in FIXTURES}
     # (order, draining slots). #3 in "draining" and in "draining active"
-    # drains with under a quarter 5h window of 7d room: it is landable but
-    # competes on its score.
+    # drains with under a quarter 5h window of 7d room: past soft7d - margin
+    # it lands by the normal rule, so not at all.
     expected = {
-        "draining": (["2", "3", "4", "6"], {"2", "3", "5"}),
+        "draining": (["2", "4", "6"], {"2", "3", "5"}),
         "draining by room": (["2", "3"], {"2"}),
-        "draining active": (["2", "3"], {"1", "3"}),
+        "draining active": (["2"], {"1", "3"}),
     }
     for name, (order, draining) in expected.items():
         _, snap, mx, state = by_name[name]

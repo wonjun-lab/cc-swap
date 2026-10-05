@@ -30,15 +30,16 @@ def score(view: AccountView, now: float) -> float:
     return (100.0 - view.pct7) / (days_left(view, now) * 100.0 / 7.0)
 
 
-def landable(view: AccountView, s: MaximizeSettings, *, draining: bool = False) -> bool:
-    """Spec §5.2: a healthy, known, eligible place to land. A ``draining``
-    account (near its 7d reset, maximize/drain.py) has its 7d soft mark set
-    aside: its 7d need only be under the hard cap less the margin."""
+def landable(view: AccountView, s: MaximizeSettings, *, drain_room: bool = False) -> bool:
+    """Spec §5.2: a healthy, known, eligible place to land. ``drain_room``:
+    a draining account with useful room (``drain.preferred``, near its 7d
+    reset) has its 7d soft mark set aside: its 7d need only be under the
+    hard cap less the margin."""
     if view.tier == "excluded" or view.quarantined or view.api_key:
         return False
     if view.pct5 is None or view.pct7 is None:
         return False
-    soft7 = s.hard_7d if draining else s.soft_7d
+    soft7 = s.hard_7d if drain_room else s.soft_7d
     return (
         view.pct5 < s.soft_5h - s.landing_margin
         and view.pct7 < soft7 - s.landing_margin

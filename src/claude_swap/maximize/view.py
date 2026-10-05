@@ -450,7 +450,7 @@ def rows(snap: Snapshot, primes: Mapping[str, Mapping]) -> list[RowView]:
                 active=account.number == snap.active,
                 score=value if math.isfinite(value) else None,
                 landable=landable(
-                    account, snap.settings, draining=drain.draining(account, snap)
+                    account, snap.settings, drain_room=drain.preferred(account, snap)
                 ),
                 state5=state5(account, primes.get(account.email), snap.now),
                 reset5=account.reset5,

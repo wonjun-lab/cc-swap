@@ -43,7 +43,7 @@ def decision_rows(snap: Snapshot) -> list[dict]:
             "days7": round(days_left(v, snap.now), 2) if v.pct7 is not None else None,
             "score": round(value, 3) if math.isfinite(value) else None,
             "landable": v.number != snap.active and landable(
-                v, snap.settings, draining=draining
+                v, snap.settings, drain_room=drain.preferred(v, snap)
             ),
             "idle": state if v.number == snap.active else "",
             "flags": ",".join(flags),

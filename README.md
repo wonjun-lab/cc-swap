@@ -239,7 +239,7 @@ If the window that crossed its threshold resets within 15 minutes and your pace 
 
 ### Using up a week before it resets
 
-An account near its weekly (7d) reset whose quota would otherwise expire unused is *draining*: within 24 hours of the reset (`maximize.drainHours`; 0 turns it off), cc-swap sets its 7d soft threshold aside, lands on it up to 93% and keeps using it up to the 98% hard threshold, trying draining accounts that still have at least a quarter 5h window of room first, the soonest reset first. Fleet tags it `drain 18h`, and `cc-swap why` says `#1 7d 86% resets in 18h — draining it first`. Hard thresholds, 100% and holds work as always.
+An account near its weekly (7d) reset whose quota would otherwise expire unused is *draining*: within 24 hours of the reset (`maximize.drainHours`; 0 turns it off), cc-swap sets its 7d soft threshold aside and keeps using it up to the 98% hard threshold; while it still has at least a quarter 5h window of room it lands on it up to 93% and tries it first, the soonest reset first. Fleet tags it `drain 18h`, and `cc-swap why` says `#1 7d 86% resets in 18h — draining it first`. Hard thresholds, 100% and holds work as always.
 
 If you raise the 7d hard threshold to 99 or more, cc-swap may keep using the account for a few more minutes once it gets there, because the API reports whole percents and up to a point of quota is still left. It learns how long it can safely ride that last point.
 

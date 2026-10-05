@@ -663,7 +663,7 @@ def capacity(
     guard = mx.login_expiry_guard_min * 60.0
 
     def week_lands(r: fx.FleetRow) -> bool:
-        return (r.pct7 or 0.0) < (mx.hard_7d if r.drain else mx.soft_7d) - margin
+        return (r.pct7 or 0.0) < (mx.hard_7d if r.drain_room else mx.soft_7d) - margin
 
     def guarded(r: fx.FleetRow, at: float) -> bool:
         return r.login_deadline is not None and r.login_deadline - at < guard

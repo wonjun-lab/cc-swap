@@ -32,7 +32,7 @@ from claude_swap.json_output import (
     USAGE_RELOGIN_REQUIRED,
     USAGE_TOKEN_EXPIRED,
 )
-from claude_swap.maximize import idle, pause, policy
+from claude_swap.maximize import drain, idle, pause, policy
 from claude_swap.maximize import primer as mxprimer
 from claude_swap.maximize import view as mxview
 from claude_swap.maximize.history import History as UsageHistory
@@ -134,11 +134,12 @@ def land_note(
     active: bool,
     login: LoginState,
     now: float | None = None,
-    draining: bool = False,
+    drain_room: bool = False,
 ) -> str:
     """Whether maximize could land on this account, and if not, why. A
-    ``draining`` account (maximize/drain.py) has its 7d soft mark set
-    aside: its 7d limit is the hard cap less the margin."""
+    draining account with useful room (``drain_room``, ``drain.preferred``)
+    has its 7d soft mark set aside: its 7d limit is the hard cap less the
+    margin."""
     if login == "relogin":
         return "re-login"
     if active:
@@ -153,7 +154,7 @@ def land_note(
         return "usage ?"
     if view.pct5 >= s.soft_5h - s.landing_margin:
         return f"5h≥{s.soft_5h - s.landing_margin:g}"
-    limit7 = (s.hard_7d if draining else s.soft_7d) - s.landing_margin
+    limit7 = (s.hard_7d if drain_room else s.soft_7d) - s.landing_margin
     if view.pct7 >= limit7:
         return f"7d≥{limit7:g}"
     if now is not None and policy.login_guarded(view, now, s):
@@ -264,8 +265,11 @@ class FleetRow:
     # landing target, not counted in the summary; the row still shows it.
     trusted: bool = True
     # The near-reset drain (maximize/drain.py): the engine sets this
-    # account's 7d soft mark aside and uses it first until its 7d reset.
+    # account's 7d soft mark aside until its 7d reset (``drain``), and
+    # lands on it up to hard7d - margin when it has useful room
+    # (``drain_room``, ``drain.preferred``).
     drain: bool = False
+    drain_room: bool = False
 
 
 def _seen_resets(acc: AccountSnapshot, now: float) -> tuple[float | None, float | None]:
@@ -360,6 +364,7 @@ def fleet_rows(
         active = acc.number == msnap.active
         seen5, seen7 = _seen_resets(acc, now)
         draining = policy.draining(tv, msnap)
+        drain_room = drain.preferred(tv, msnap)
         out.append(
             FleetRow(
                 number=acc.number,
@@ -376,11 +381,11 @@ def fleet_rows(
                 score=by_row[acc.number].score,
                 landable=(
                     not active
-                    and landable(tv, mx, draining=draining)
+                    and landable(tv, mx, drain_room=drain_room)
                     and not policy.login_guarded(tv, now, mx)
                 ),
                 land=land_note(
-                    tv, mx, active=active, login=login, now=now, draining=draining
+                    tv, mx, active=active, login=login, now=now, drain_room=drain_room
                 ),
                 state5=r.state5,
                 reset5=(v.reset5 if r.state5 != "cold" else None) or seen5,
@@ -398,6 +403,7 @@ def fleet_rows(
                 shared=acc.usage.last_error == SHARED_LOGIN,
                 trusted=acc.usage.decision_value() is not None,
                 drain=draining,
+                drain_room=drain_room,
             )
         )
     return out
