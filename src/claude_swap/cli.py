@@ -1468,47 +1468,63 @@ menu bar only display. Re-run `cc-swap service install` after upgrading.
 
 
 def _login_command(argv: list[str]) -> None:
-    """Handle `cc-swap login NUM|EMAIL|ALIAS` and `cc-swap login --new`.
+    """Handle `cc-swap login`, `cc-swap login NUM|EMAIL|ALIAS` and
+    `cc-swap login --new`.
 
-    Runs ``claude auth login --email <the account's email>`` in a throwaway
-    profile, checks the new login is that account, and stores it into its
-    slot (maximize/relogin.py). The live login is untouched unless the
-    account IS the live one; then it gets the new login too. With ``--new``
-    the login (``--email`` only pre-fills it) is added as a new account —
-    the next free slot or ``--slot N`` — and the live login is never
-    touched; an account already in a slot is refused. Without a usable
-    claude it prints the manual steps instead (exit 1).
+    Bare: runs ``claude auth login`` in a throwaway profile (``--email``
+    only pre-fills it) and decides by who signed in (maximize/relogin.py
+    ``match_login``): an account a slot holds is renewed like
+    ``cc-swap login N``, one cc-swap does not have is added (the next free
+    slot or ``--slot N``), and a partial match stores nothing and says what
+    to run. Never asks.
+
+    NUM|EMAIL|ALIAS: runs ``claude auth login --email <the account's
+    email>``, checks the new login is that account, and stores it into its
+    slot. The live login is untouched unless the account IS the live one;
+    then it gets the new login too (the bare form does the same when it
+    renews). With ``--new`` the login is added as a new account and the
+    live login is never touched; an account already in a slot is refused
+    (a terminal is offered its re-login). Without a usable claude it prints
+    the manual steps instead (exit 1).
     """
     parser = argparse.ArgumentParser(
         prog="cc-swap login",
         description=(
-            "Re-login an account: launches Claude Code's own login for it "
-            "(sign in in the browser; over SSH paste the code), checks the new "
-            "login is that account and stores it into its slot. With --new, "
-            "signs in an account cc-swap does not have yet and adds it, "
-            "without touching the live login."
+            "Sign in through Claude Code's own login (in the browser; over SSH\n"
+            "paste the code) and store it: an account cc-swap already has gets\n"
+            "its login renewed, a new one is added to the next free slot. The\n"
+            "live login changes only when you sign in as the account it is\n"
+            "logged in as (it stays the same account). A login that matches an\n"
+            "account only in part (same email, other organization; same account,\n"
+            "new email) is not stored: it is kept in `cc-swap unclaimed` and the\n"
+            "commands that resolve it are printed.\n"
+            "\n"
+            "For scripts: NUM|EMAIL|ALIAS re-logins that one account and refuses\n"
+            "any other; --new only adds."
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  cc-swap login 4
-  cc-swap login team@example.com
-  cc-swap login --new
-  cc-swap login --new --slot 6 --email new@example.com
+  cc-swap login                           # add or renew: whoever you sign in as
+  cc-swap login --email team@example.com  # the same, the browser pre-filled
+  cc-swap login --slot 6                  # a new account goes to slot 6
+  cc-swap login 4                         # re-login #4 only
+  cc-swap login --new                     # add only; refuses one cc-swap has
 
 Logins expire about a month after they were made; a fresh login starts a
 new deadline. Other machines keep their own logins: run this there too.
         """,
     )
-    parser.add_argument("account", metavar="NUM|EMAIL|ALIAS", nargs="?")
+    parser.add_argument("account", metavar="NUM|EMAIL|ALIAS", nargs="?",
+                        help="re-login this account only (omit it: add or renew)")
     parser.add_argument(
         "--new", action="store_true",
-        help="sign in a new account and add it (the live login is not touched)",
+        help="only add a new account; refuse one cc-swap already has",
     )
     parser.add_argument("--slot", metavar="N", default=None,
-                        help="with --new: the free slot to store it in (default: the next)")
+                        help="a free slot for a new account (default: the next)")
     parser.add_argument("--email", metavar="EMAIL", default=None,
-                        help="with --new: pre-fill the sign-in with this email")
+                        help="pre-fill the sign-in with this email")
     parser.add_argument(
         "--claude-path", metavar="PATH", default=None,
         help="claude executable (default: prime.claudePath, else ~/.local/bin/claude)",
@@ -1517,10 +1533,12 @@ new deadline. Other machines keep their own logins: run this there too.
     args = parser.parse_args(argv)
     if args.new and args.account:
         parser.error("--new adds an account: drop NUM|EMAIL|ALIAS (or drop --new to re-login it)")
-    if not args.new and not args.account:
-        parser.error("name the account to re-login (NUM|EMAIL|ALIAS), or pass --new")
-    if not args.new and (args.slot is not None or args.email is not None):
-        parser.error("--slot and --email go with --new")
+    if args.account and (args.slot is not None or args.email is not None):
+        parser.error(
+            "--slot and --email go with a bare `cc-swap login` or --new "
+            "(NUM|EMAIL|ALIAS already names the account)"
+        )
+    bare = not args.new and not args.account
 
     from claude_swap.maximize import relogin as rl
     from claude_swap.maximize.primer import resolve_claude_path
@@ -1530,7 +1548,7 @@ new deadline. Other machines keep their own logins: run this there too.
     try:
         switcher = ClaudeAccountSwitcher(debug=args.debug)
         _guard_root(switcher)
-        if args.new:
+        if args.new or bare:
             if args.email is not None and not switcher._validate_email(args.email):
                 raise ValidationError(f"Invalid email format: {args.email}")
             new = rl.NewAccount(slot=args.slot, email=(args.email or "").strip())
@@ -1548,7 +1566,8 @@ new deadline. Other machines keep their own logins: run this there too.
         from claude_swap.maximize import claude_exec
 
         steps = (
-            (lambda c: rl.guided_new_steps(c)) if args.new
+            (lambda c: rl.guided_signin_steps(c)) if bare
+            else (lambda c: rl.guided_new_steps(c)) if args.new
             else (lambda c: rl.guided_steps(num, email, c))
         )
         # The user's own run: a just-updated claude runs with a warning.
@@ -1562,7 +1581,9 @@ new deadline. Other machines keep their own logins: run this there too.
                 for line in steps(claude):
                     print(line)
                 sys.exit(1)
-            if args.new:
+            if bare:
+                outcome = rl.sign_in(switcher, new, claude=claude)
+            elif args.new:
                 outcome = rl.login_new(
                     switcher, new, claude=claude,
                     adopt_existing=lambda n, e: _ask_adopt_existing(
@@ -1580,6 +1601,10 @@ new deadline. Other machines keep their own logins: run this there too.
     except Exception as e:  # e.g. OSError: say so, never a traceback
         error(f"Error: login failed ({type(e).__name__}: {e}); nothing was changed")
         sys.exit(1)
+    if outcome.ok and bare:  # "updated #3 dev.master (...)" / "added #7 new@example.com [...]"
+        head, _, rest = outcome.message.partition(" ")
+        print(f"{accent(head)} {rest}")
+        sys.exit(0)
     if outcome.ok:
         print(f"{accent('Stored')} {outcome.message}")
         sys.exit(0)
@@ -1591,7 +1616,11 @@ new deadline. Other machines keep their own logins: run this there too.
     if outcome.status == rl.CANCELLED:
         print(dimmed(outcome.message))
         sys.exit(130)
-    if args.new:
+    if bare and outcome.status == rl.AMBIGUOUS:
+        warning(outcome.message)
+    elif bare:
+        error(f"Sign-in: {outcome.message}")
+    elif args.new:
         error(f"New account: {outcome.message}")
     else:
         error(f"Re-login #{num}: {outcome.message}")
@@ -1733,8 +1762,9 @@ cc-swap:
   %(prog)s last-resort list           list last-resort accounts
   %(prog)s prime [N ...] [--dry-run]  open idle accounts' 5h windows now
   %(prog)s prime verify [--live]      re-check priming isolation after Claude Code changed
-  %(prog)s login <num|email>          re-login an account (launches claude's login)
-  %(prog)s login --new [--slot N]     sign in a new account and add it
+  %(prog)s login                      sign in: renews an account cc-swap has, adds a new one
+  %(prog)s login <num|email>          re-login that account only (for scripts)
+  %(prog)s login --new [--slot N]     add a new account only (for scripts)
   %(prog)s repair-live [--yes]        fix a /login saved in plaintext while the Keychain was locked
   %(prog)s service install            run auto-switch as a background service
   %(prog)s doctor [--json]            check logins, Keychain, service; say what to fix

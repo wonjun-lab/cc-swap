@@ -248,12 +248,17 @@ def deadline_text(epoch_s: float, now_s: float | None = None) -> str:
     return f"{local_clock(epoch_s)} ({login_countdown(now - epoch_s)} ago)"
 
 
-#: How to re-login an account, the same words on every surface.
-RELOGIN_STEPS = "cc-swap login <N>, or Fleet → select → r"
+#: How to re-login an account, the same words on every surface: a bare
+#: ``cc-swap login`` renews whichever account you sign in as.
+RELOGIN_STEPS = "cc-swap login, or Fleet → select → r"
 
 
 def relogin_fix(number: str | int) -> str:
-    """The one re-login instruction every surface prints for slot ``number``."""
+    """The one re-login instruction every surface prints for slot ``number``.
+
+    Names the slot (``cc-swap login N``: it pre-fills that account's email
+    and refuses any other) rather than the email, so the line is safe in
+    logs and notifications; a bare ``cc-swap login`` renews it too."""
     return f"re-login #{number}: cc-swap login {number}, or Fleet → select → r"
 
 

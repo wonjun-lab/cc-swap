@@ -1,6 +1,6 @@
-"""Account settings: add a login, sign in a new account in the browser, a
-token or API key, re-login, alias, delete, and inspect every login
-(``cc-swap doctor`` in a modal).
+"""Account settings: add a login, sign in in the browser (add or renew, as
+bare ``cc-swap login``), a token or API key, re-login the selected account,
+alias, delete, and inspect every login (``cc-swap doctor`` in a modal).
 
 codex-swap's ``manage`` screen shape: an account table, then the items,
 then the key hints. Row keys act on the highlighted account; choosing an
@@ -171,9 +171,9 @@ class AccountsScreen(Screen):
         if action == "add":
             app.action_add_current()
         elif action == "new":
-            from claude_swap.tui.fleet import open_new_login
+            from claude_swap.tui.fleet import open_sign_in
 
-            open_new_login(app)
+            open_sign_in(app)
         elif action == "token":
             app.action_add_token()
         elif action == "verify":

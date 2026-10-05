@@ -337,14 +337,15 @@ def _relogin_launched(app: "CswapApp", outcome) -> None:
         app.notify(outcome.message, title=title, severity="error", timeout=15)
 
 
-NEW_LOGIN_TITLE = "New account"
+SIGN_IN_TITLE = "Sign in"
 
 
-def open_new_login(app: "CswapApp") -> None:
-    """Sign in a new account (``cc-swap login --new``): ``claude auth login``
-    in a throwaway profile, then store it in the next free slot. The live
-    login is not touched; an account already in a slot is refused (its
-    re-login is ``r``). Without claude's ``auth login``: the manual steps."""
+def open_sign_in(app: "CswapApp") -> None:
+    """Sign in (add or renew), bare ``cc-swap login``: ``claude auth login``
+    in a throwaway profile, then by who signed in renew the slot that holds
+    that account (the live login too only when it IS that account) or add
+    it to the next free slot; a partial match stores nothing and says what
+    to run. Without claude's ``auth login``: the manual steps."""
     from claude_swap.maximize import relogin as rl
 
     if app.busy:
@@ -352,7 +353,7 @@ def open_new_login(app: "CswapApp") -> None:
         return
     claude = _resolve_claude(app)
     if claude is None:
-        _new_login_unavailable(app, None)
+        _sign_in_unavailable(app, None)
         return
     app.busy = True
 
@@ -361,24 +362,24 @@ def open_new_login(app: "CswapApp") -> None:
             supported = rl.login_supported(claude)
         except Exception:
             supported = False
-        app.call_from_thread(_launch_new_login, app, claude, supported)
+        app.call_from_thread(_launch_sign_in, app, claude, supported)
 
     app.run_worker(
-        probe, thread=True, group="fleet-new-login-probe", exit_on_error=False,
-        name="fleet-new-login-probe",
+        probe, thread=True, group="fleet-sign-in-probe", exit_on_error=False,
+        name="fleet-sign-in-probe",
     )
 
 
-def _new_login_unavailable(app: "CswapApp", claude: str | None) -> None:
+def _sign_in_unavailable(app: "CswapApp", claude: str | None) -> None:
     from claude_swap.maximize import relogin as rl
 
     app.notify(
-        "\n".join(rl.guided_new_steps(claude)), title=NEW_LOGIN_TITLE,
+        "\n".join(rl.guided_signin_steps(claude)), title=SIGN_IN_TITLE,
         severity="warning", timeout=20,
     )
 
 
-def _launch_new_login(app: "CswapApp", claude: str, supported: bool) -> None:
+def _launch_sign_in(app: "CswapApp", claude: str, supported: bool) -> None:
     """On the UI thread: hand the terminal to ``claude auth login`` (the TUI
     is suspended meanwhile), then store off the UI thread."""
     from textual.app import SuspendNotSupported
@@ -387,15 +388,15 @@ def _launch_new_login(app: "CswapApp", claude: str, supported: bool) -> None:
 
     app.busy = False
     if not supported:
-        _new_login_unavailable(app, claude)
+        _sign_in_unavailable(app, claude)
         return
     try:
         refuse = getattr(app.switcher, "_refuse_session_shell", None)
         if refuse is not None:
             refuse()  # inside a `cswap run` shell: refuse before the browser
-        attempt = rl.NewLoginAttempt(app.switcher.backup_dir, rl.NewAccount(), claude)
+        attempt = rl.SignInAttempt(app.switcher.backup_dir, rl.NewAccount(), claude)
     except Exception as e:
-        app.notify(f"{e}", title=NEW_LOGIN_TITLE, severity="error", timeout=10)
+        app.notify(f"{e}", title=SIGN_IN_TITLE, severity="error", timeout=10)
         return
     try:
         with rl.terminate_as_interrupt(), app.suspend():
@@ -403,50 +404,47 @@ def _launch_new_login(app: "CswapApp", claude: str, supported: bool) -> None:
             early = attempt.launch(_run_login)
     except SuspendNotSupported:
         attempt.cleanup()
-        _new_login_unavailable(app, claude)
+        _sign_in_unavailable(app, claude)
         return
     except BaseException:
         attempt.cleanup()
         raise
     if early is not None and early.status == rl.UNAVAILABLE:
         attempt.cleanup()
-        _new_login_unavailable(app, claude)
+        _sign_in_unavailable(app, claude)
         return
     app.busy = True
     if early is None:
-        app.notify("storing the new account…", title=NEW_LOGIN_TITLE, timeout=3)
+        app.notify("storing the new login…", title=SIGN_IN_TITLE, timeout=3)
 
     def finish() -> None:
         try:
-            outcome = early if early is not None else attempt.finish(app.switcher)
+            outcome = early if early is not None else ledger_tagged(attempt.finish)(app.switcher)
         except Exception as e:  # report, never crash the UI
             outcome = rl.Outcome(rl.FAILED, "", f"{type(e).__name__}: {e}")
         finally:
             attempt.cleanup()
-        app.call_from_thread(_new_login_done, app, outcome)
+        app.call_from_thread(_sign_in_done, app, outcome)
 
     app.run_worker(
-        finish, thread=True, group="fleet-new-login", exit_on_error=False,
-        name="fleet-new-login",
+        finish, thread=True, group="fleet-sign-in", exit_on_error=False,
+        name="fleet-sign-in",
     )
 
 
-def _new_login_done(app: "CswapApp", outcome) -> None:
+def _sign_in_done(app: "CswapApp", outcome) -> None:
     from claude_swap.maximize import relogin as rl
 
     app.busy = False
     app.request_refresh(full=True)
     if outcome.ok:
-        app.notify(outcome.message, title=NEW_LOGIN_TITLE, timeout=8)
+        app.notify(outcome.message, title=SIGN_IN_TITLE, timeout=8)
     elif outcome.status == rl.CANCELLED:
-        app.notify(outcome.message, title=NEW_LOGIN_TITLE, timeout=5)
-    elif outcome.status == rl.DUPLICATE:
-        app.notify(
-            f"{outcome.message} (or select #{outcome.number} and press r)",
-            title=NEW_LOGIN_TITLE, severity="warning", timeout=15,
-        )
+        app.notify(outcome.message, title=SIGN_IN_TITLE, timeout=5)
+    elif outcome.status == rl.AMBIGUOUS:
+        app.notify(outcome.message, title=SIGN_IN_TITLE, severity="warning", timeout=30)
     else:
-        app.notify(outcome.message, title=NEW_LOGIN_TITLE, severity="error", timeout=15)
+        app.notify(outcome.message, title=SIGN_IN_TITLE, severity="error", timeout=15)
 
 
 def open_guided_relogin(app: "CswapApp", number: str) -> None:

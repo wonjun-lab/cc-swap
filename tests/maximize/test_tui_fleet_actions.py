@@ -802,7 +802,7 @@ class TestLaunchedRelogin:
         assert not list(tmp_path.glob("relogin-*"))
 
 
-# -- m → a → s signs in a new account (maximize/relogin.py, login --new) -----------------
+# -- m → a → s: Sign in (add or renew), bare `cc-swap login` (maximize/relogin.py) -------
 
 
 class NewAccountSwitcher(StoringSwitcher):
@@ -836,8 +836,8 @@ async def _press_s_in_account_settings(pilot) -> None:
 
 
 @pytest.mark.asyncio
-class TestNewAccountLogin:
-    async def test_s_signs_in_and_stores_a_new_account(self, tmp_path, monkeypatch):
+class TestSignIn:
+    async def test_s_signs_in_and_adds_a_new_account(self, tmp_path, monkeypatch):
         _settings(tmp_path)
         fake = NewAccountSwitcher(_accounts(), tmp_path)
         app = make_app(fake)
@@ -852,24 +852,41 @@ class TestNewAccountLogin:
             assert suspended == [True]
             assert fake.added == [("brand@example.com", "None")]
             assert fake.stored == []  # not a re-login
-            assert any("new account #5 stored" in t[0] for t in toasts)
+            assert ("added #5 brand@example.com [personal]", "information") in toasts
             assert not app.busy
         argv, profile = seen[0]
         assert argv[1:] == ["auth", "login", "--claudeai"]
         assert not profile.exists() and not list(tmp_path.glob("relogin-*"))
         assert not any(c[0] == "switch_to" for c in fake.calls)
 
-    async def test_an_account_already_in_a_slot_is_refused(self, tmp_path, monkeypatch):
+    async def test_an_account_already_in_a_slot_is_renewed(self, tmp_path, monkeypatch):
         _settings(tmp_path)
         fake = NewAccountSwitcher(_accounts(), tmp_path)
         app = make_app(fake)
         async with app.run_test(size=(140, 40)) as pilot:
+            _launchable(monkeypatch, app, _fake_claude_login("user3@example.com", uuid="uuid-3"))
+            toasts = _toasts(app)
+            await _press_s_in_account_settings(pilot)
+            assert fake.added == []
+            assert fake.stored == [("3", "user3@example.com", "rt-new")]
+            [(message, severity)] = [t for t in toasts if t[0].startswith("updated #3 ")]
+            assert severity == "information" and "token renewed" in message
+        assert not list(tmp_path.glob("relogin-*"))
+        assert not any(c[0] == "switch_to" for c in fake.calls)
+
+    async def test_a_partial_match_stores_nothing_and_says_what_to_run(self, tmp_path,
+                                                                     monkeypatch):
+        _settings(tmp_path)
+        fake = NewAccountSwitcher(_accounts(), tmp_path)
+        app = make_app(fake)
+        async with app.run_test(size=(140, 40)) as pilot:
+            # #3's email and organization, another account id: not guessed at.
             _launchable(monkeypatch, app, _fake_claude_login("user3@example.com", uuid="u3"))
             toasts = _toasts(app)
             await _press_s_in_account_settings(pilot)
             assert fake.added == [] and fake.stored == []
-            [(message, severity)] = [t for t in toasts if "already #3" in t[0]]
-            assert severity == "warning" and "press r" in message
+            [(message, severity)] = [t for t in toasts if "only in part" in t[0]]
+            assert severity == "warning" and "cc-swap remove 3; cc-swap login" in message
         assert not list(tmp_path.glob("relogin-*"))
 
     async def test_without_auth_login_it_says_how_by_hand(self, tmp_path, monkeypatch):
@@ -883,4 +900,4 @@ class TestNewAccountLogin:
             toasts = _toasts(app)
             await _press_s_in_account_settings(pilot)
             assert suspended == [] and fake.added == []
-            assert any("Add a new account by hand" in t[0] for t in toasts)
+            assert any("Sign in by hand" in t[0] for t in toasts)

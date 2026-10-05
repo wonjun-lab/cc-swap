@@ -60,7 +60,7 @@ RESERVED_KEYS: tuple[str, ...] = ("w", "?", "j", "k", "b", "g")
 
 ACCOUNT_ITEMS: tuple[tuple[str, str, str], ...] = (
     ("a", "Add current login", "add"),
-    ("s", "Sign in a new account…", "new"),
+    ("s", "Sign in (add or renew)…", "new"),
     ("t", "Token or API key…", "token"),
     ("r", "Re-login…", "relogin"),
     ("n", "Name (alias)…", "alias"),
@@ -68,7 +68,7 @@ ACCOUNT_ITEMS: tuple[tuple[str, str, str], ...] = (
     ("i", "Inspect all logins (doctor)", "verify"),
 )
 #: One line within 80 columns: ``enter`` selects and ``q`` quits everywhere.
-ACCOUNT_KEYS = "a add · s new · t token · r re-login · n name · d delete · i inspect · b back"
+ACCOUNT_KEYS = "a add · s login · t token · r re-login · n name · d del · i inspect · b back"
 MENU_KEYS = "letter or ↑↓ enter · esc close"
 
 

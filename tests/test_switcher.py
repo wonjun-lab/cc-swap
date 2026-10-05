@@ -12914,7 +12914,7 @@ class TestLoginExpiry:
         output = capsys.readouterr().out
         assert output.count("login expires ") == 1
         assert (
-            "re-login before then: cc-swap login <N>, or Fleet → select → r"
+            "re-login before then: cc-swap login, or Fleet → select → r"
             in output
         )
 
