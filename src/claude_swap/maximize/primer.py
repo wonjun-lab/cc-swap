@@ -1216,6 +1216,11 @@ class Primer:
         if status == "skip-live-session":
             return self._skip_live(target, entry, now), False, None
         if token is None:
+            if status == "shared-login":  # cc-swap: shared_login.py, never refreshed
+                return self._held_back(
+                    num, "its refresh token is also held elsewhere; not refreshed "
+                    "until one is re-logged (cc-swap doctor)",
+                )
             return self._held_back(num, f"access token not ready ({status})")
         # The checks above can take a while (usage fetch, token refresh). The
         # launch instant is read here, guarded here, and recorded as the

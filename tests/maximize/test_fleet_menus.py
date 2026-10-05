@@ -108,6 +108,9 @@ def test_the_0_3_0_keys_mean_one_thing_across_fleet():
 def test_account_key_hints_name_every_item():
     for key, _title, _action in menus.ACCOUNT_ITEMS:
         assert f" {key} " in f" {menus.ACCOUNT_KEYS} "
+    from claude_swap.maximize import home
+
+    assert len(menus.ACCOUNT_KEYS) <= home.text_width(80)  # one line in 80 columns
 
 
 def test_help_explains_the_jargon_and_lists_every_key():

@@ -309,8 +309,86 @@ def test_missing_stored_login(world):
 def test_duplicate_lineage_names_both_slots(world):
     world.healthy()
     world.store(3, creds(2))
-    [f] = find(run(world), "duplicate", "error")
+    [f] = find(run(world), "shared-login", "error")
     assert "#2 and #3 hold the same login" in f.detail
+    assert "does not refresh #2 or #3" in f.detail
+    assert f.fix == "re-login one of them: cc-swap login 3 or cc-swap login 2"
+
+
+def test_duplicate_setup_token_stays_a_duplicate(world):
+    """No refresh token, nothing one-time-use: the old duplicate finding."""
+    world.healthy()
+    token = json.dumps({"claudeAiOauth": {"accessToken": "at-SECRET-setup"}})
+    world.store(2, token)
+    world.store(3, token)
+    findings = run(world)
+    assert find(findings, "duplicate", "error") and not find(findings, "shared-login")
+
+
+def _profile(world, n, value, *, slug=None):
+    path = world.root / "sessions" / f"{n}-{slug or email(n).replace('@', '_')}"
+    path.mkdir(parents=True, exist_ok=True)
+    (path / ".credentials.json").write_text(value)
+    return path
+
+
+def test_slot_sharing_another_slots_cswap_run_profile(world):
+    world.healthy()
+    _profile(world, 2, creds(3))  # #2's profile holds #3's login
+    [f] = find(run(world), "shared-login", "error", "#3")
+    assert "#3 holds the same login as #2's cswap run profile" in f.detail
+    assert f.fix == "re-login one of them: cc-swap login 3 or cc-swap login 2"
+
+
+def test_own_cswap_run_profile_is_not_sharing(world):
+    world.healthy()
+    _profile(world, 2, creds(2))
+    findings = run(world)
+    assert not find(findings, "shared-login") and problems(findings) == []
+
+
+def test_macos_profile_keychain_item_is_read(world):
+    from claude_swap.session import keychain_service_name
+
+    world.healthy()
+    path = _profile(world, 2, creds(2))  # the plaintext seed is #2's own...
+    world.keychain[(keychain_service_name(str(path)), USER)] = creds(3)  # ...the item is not
+    [f] = find(run(world), "shared-login", "error", "#3")
+    assert "#2's cswap run profile" in f.detail
+
+
+def test_leftover_profile_is_named_by_slot_number_only(world):
+    world.healthy()
+    _profile(world, 2, creds(3), slug="old_example.com")
+    [f] = find(run(world), "shared-login", "error", "#3")
+    assert "a leftover cswap run profile made for #2" in f.detail
+    assert f.fix == "re-login one of them: cc-swap login 3"
+
+
+def test_a_stale_marked_profile_is_not_a_sharer(world):
+    world.healthy()
+    path = _profile(world, 2, creds(3))
+    (path.parent / f".{path.name}.cswap-stale-credentials").write_text("")
+    assert not find(run(world), "shared-login")
+
+
+def test_a_live_setup_token_under_another_name_is_not_called_shared(world):
+    world.healthy()
+    token = json.dumps({"claudeAiOauth": {"accessToken": "at-SECRET-setup"}})
+    world.store(2, token)
+    world.login(1, token)
+    [f] = find(run(world), "live-login", "error")
+    assert "does not refresh" not in f.detail
+    assert "re-login one of them" not in f.fix
+
+
+def test_live_login_sharing_a_non_live_slot(world):
+    world.healthy()
+    world.login(1, creds(2))  # ~/.claude.json names #1, the token is #2's
+    [f] = find(run(world), "live-login", "error")
+    assert "names #1 but the live token is #2's login" in f.detail
+    assert "does not refresh #1 or #2" in f.detail
+    assert f.fix == "re-login one of them: cc-swap login 2 or cc-swap login 1"
 
 
 # -- upstream -------------------------------------------------------------------------------

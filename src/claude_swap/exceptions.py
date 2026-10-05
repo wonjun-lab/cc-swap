@@ -54,6 +54,15 @@ class SwitchRefusedError(SwitchError):
         self.reason = reason
 
 
+class DuplicateAccountError(ConfigError):
+    """The account is already in a slot (``number``); cc-swap fork:
+    ``cc-swap login --new`` refuses to add it twice."""
+
+    def __init__(self, message: str, *, number: str) -> None:
+        super().__init__(message)
+        self.number = number
+
+
 class SessionError(ClaudeSwitchError):
     """Error setting up or launching a session-mode profile."""
 

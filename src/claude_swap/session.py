@@ -717,6 +717,44 @@ class SessionManager:
         os.execvpe(claude_bin, argv, env)
         raise AssertionError("unreachable")  # pragma: no cover
 
+    def _refuse_shared_login(
+        self, account_num: str, credentials: str, *, force: bool = False
+    ) -> None:
+        """``SessionError`` when another slot, another slot's profile or —
+        unless this slot is the live account — the live login holds this
+        slot's refresh token too (``switcher.shared_login_places``)."""
+        from claude_swap import shared_login
+
+        places: list = []
+        check = getattr(self.switcher, "shared_login_places", None)
+        if check is not None:
+            try:
+                live = self.switcher.current_account_number() == str(account_num)
+                found = check(account_num, credentials, is_active=live)
+                places = found if isinstance(found, list) else []
+            except Exception:
+                places = []
+        if not places and not force:
+            return
+        if places and all(label == shared_login.LIVE_LOGIN for label, _slot in places):
+            # Only the live login of another account holds it: what the
+            # consume gate defers on (it may be a switch's moment). Explain;
+            # a re-login is not the remedy for a moment.
+            raise SessionError(
+                f"Not starting a session for Account-{account_num} right now: "
+                "the live login holds its login too (a switch may be in "
+                "progress), and a session would refresh it out from under "
+                "Claude Code. Retry in a moment; if it persists, cc-swap "
+                "doctor explains the live login."
+            )
+        where = ", ".join(label for label, _slot in places) or "another place"
+        raise SessionError(
+            f"Not starting a session for Account-{account_num}: its login is "
+            f"also held by {where}. {shared_login.NOTE[0].upper()}"
+            f"{shared_login.NOTE[1:]}. Fix: "
+            f"{shared_login.fix([str(account_num), *(s for _l, s in places if s)])}"
+        )
+
     def _ensure_not_api_key(self, account_num: str, email: str) -> None:
         """Reject API-key accounts in session mode (not supported yet).
 
@@ -764,10 +802,17 @@ class SessionManager:
         # accounts (--add-token) have no refresh token by design — skip
         # silently instead of warning about a flow that can't happen.
         pre_creds = self.switcher.read_account_credentials(account_num, email)
+        if pre_creds:
+            # cc-swap (shared_login.py): a profile seeded from a login held
+            # elsewhere too would run a claude that refreshes it, logging the
+            # other copy out. Refused before anything is seeded.
+            self._refuse_shared_login(account_num, pre_creds)
         if pre_creds and self._has_refresh_token(pre_creds):
             outcome = self.switcher.consume_backup_grant(
                 account_num, email, pre_creds
             )
+            if outcome.error == "shared-login":  # raced in since the check
+                self._refuse_shared_login(account_num, pre_creds, force=True)
             if outcome.error is not None and outcome.credentials:
                 # `error is None` is the gate's own "the slot is freshened
                 # and safe to activate" signal, and it is NOT implied by

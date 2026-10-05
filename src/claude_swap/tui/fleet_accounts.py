@@ -1,5 +1,6 @@
-"""Account settings: add a login, a token or API key, re-login, alias,
-delete, and inspect every login (``cc-swap doctor`` in a modal).
+"""Account settings: add a login, sign in a new account in the browser, a
+token or API key, re-login, alias, delete, and inspect every login
+(``cc-swap doctor`` in a modal).
 
 codex-swap's ``manage`` screen shape: an account table, then the items,
 then the key hints. Row keys act on the highlighted account; choosing an
@@ -40,6 +41,7 @@ class AccountsScreen(Screen):
     CSS_PATH = "fleet.tcss"
     BINDINGS = [
         Binding("a", "item('add')", show=False),
+        Binding("s", "item('new')", show=False),
         Binding("t", "item('token')", show=False),
         Binding("r", "row('relogin')", show=False),
         Binding("n", "row('alias')", show=False),
@@ -168,6 +170,10 @@ class AccountsScreen(Screen):
         app = self.app
         if action == "add":
             app.action_add_current()
+        elif action == "new":
+            from claude_swap.tui.fleet import open_new_login
+
+            open_new_login(app)
         elif action == "token":
             app.action_add_token()
         elif action == "verify":

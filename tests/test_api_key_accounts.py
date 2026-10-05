@@ -46,6 +46,17 @@ OAUTH_JSON = json.dumps(
 )
 
 
+
+def _slot_oauth(num: int) -> str:
+    """Slot ``num``'s own login: #1's is OAUTH_JSON, the others their own
+    refresh token (two slots holding one are a shared login, which a switch
+    refuses: shared_login.py)."""
+    if num == 1:
+        return OAUTH_JSON
+    return json.dumps({"claudeAiOauth": {
+        "accessToken": f"tok-{num}", "refreshToken": f"rtok-{num}", "expiresAt": 9,
+    }})
+
 def _linux_switcher() -> ClaudeAccountSwitcher:
     s = ClaudeAccountSwitcher()
     s.platform = Platform.LINUX
@@ -532,7 +543,7 @@ class TestATornConfigSurvivesAnOrdinarySwitch:
         """
         s = _linux_switcher()
         for num, email in ((1, "a@example.com"), (2, "b@example.com")):
-            s._write_account_credentials(str(num), email, OAUTH_JSON)
+            s._write_account_credentials(str(num), email, _slot_oauth(num))
             s._write_account_config(str(num), email, json.dumps({
                 "oauthAccount": {"emailAddress": email,
                                  "accountUuid": f"uuid-{num}"}}))
@@ -607,7 +618,7 @@ class TestATornConfigSurvivesAnOrdinarySwitch:
         """
         s = _linux_switcher()
         for num, email in ((1, "a@example.com"), (2, "b@example.com")):
-            s._write_account_credentials(str(num), email, OAUTH_JSON)
+            s._write_account_credentials(str(num), email, _slot_oauth(num))
             s._write_account_config(str(num), email, json.dumps({
                 "oauthAccount": {"emailAddress": email,
                                  "accountUuid": f"uuid-{num}"}}))
@@ -717,7 +728,7 @@ class TestATornConfigSurvivesAnOrdinarySwitch:
         """
         s = _linux_switcher()
         for num, email in ((1, "a@example.com"), (2, "b@example.com")):
-            s._write_account_credentials(str(num), email, OAUTH_JSON)
+            s._write_account_credentials(str(num), email, _slot_oauth(num))
             s._write_account_config(str(num), email, json.dumps({
                 "oauthAccount": {"emailAddress": email,
                                  "accountUuid": f"uuid-{num}"}}))
@@ -790,7 +801,7 @@ class TestATornConfigSurvivesAnOrdinarySwitch:
         """
         s = _linux_switcher()
         for num, email in ((1, "a@example.com"), (2, "b@example.com")):
-            s._write_account_credentials(str(num), email, OAUTH_JSON)
+            s._write_account_credentials(str(num), email, _slot_oauth(num))
             s._write_account_config(str(num), email, json.dumps({
                 "oauthAccount": {"emailAddress": email,
                                  "accountUuid": f"uuid-{num}"}}))
@@ -917,7 +928,7 @@ class TestTheSalvageKeepsItsPromise:
 
     def _seed_two(self, s):
         for num, email in ((1, "a@example.com"), (2, "b@example.com")):
-            s._write_account_credentials(str(num), email, OAUTH_JSON)
+            s._write_account_credentials(str(num), email, _slot_oauth(num))
             s._write_account_config(str(num), email, json.dumps({
                 "oauthAccount": {"emailAddress": email,
                                  "accountUuid": f"uuid-{num}"}}))

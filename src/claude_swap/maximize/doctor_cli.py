@@ -98,9 +98,9 @@ def doctor_command(argv: list[str]) -> None:
         description=(
             "Check this machine and every stored login, read-only: Keychain, "
             "live login, upstream claude-swap, service, engine lease, login "
-            "deadlines, quarantine, priming and settings. Each problem comes "
-            "with one line saying what to do. Never refreshes a token, never "
-            "writes anything, runs no claude but `claude --version`."
+            "deadlines, quarantine, shared logins, priming and settings. Each "
+            "problem comes with one line saying what to do. Never refreshes a "
+            "token, never writes anything, runs no claude but `claude --version`."
         ),
         epilog="Exit status: 0 all good, 1 warnings, 2 errors.",
     )
