@@ -42,7 +42,7 @@ from claude_swap.maximize.plan import parse_plan_override
 from claude_swap.maximize.score import days_left, landable
 from claude_swap.models import AccountSnapshot, AccountsSnapshot
 from claude_swap.settings import SETTING_SPECS, MaximizeSettings, PrimeSettings
-from claude_swap.shared_login import SHARED_LOGIN
+from claude_swap.shared_login import SHARED_LOGIN, shared_slots
 from claude_swap.usage_store import STALE_OK_S
 
 LoginState = Literal["ok", "relogin", "expired", "foreign", "keychain", "api"]
@@ -283,7 +283,8 @@ def fleet_snapshot(
 ) -> Snapshot:
     """The policy Snapshot the TUI decides on: :func:`view.snapshot_from_accounts`
     with the published plans, and slots without a usable stored login set
-    aside like the engine does (``engine_hook._unavailable``). ``history``
+    aside like the engine does (``engine_hook._unavailable``), and so are
+    logins also held elsewhere (``shared_login.shared_slots``). ``history``
     (``view.read_history``) gives the decisions Fleet computes itself the
     idle pattern and burn rates the engine's preempt and rebalance deferral
     read; None decides as if there were no history.
@@ -295,7 +296,7 @@ def fleet_snapshot(
         a.number
         for a in snap.accounts
         if not a.switchable and not a.is_active and not a.disabled
-    }
+    } | shared_slots({a.number: a.usage for a in snap.accounts}, snap.active_number)
     if unusable:
         state = replace(state, quarantined=state.quarantined | unusable)
     return mxview.snapshot_from_accounts(

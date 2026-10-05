@@ -20,6 +20,7 @@ token) are compared or logged — never a token.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from pathlib import Path
 
 from claude_swap import oauth
@@ -69,6 +70,28 @@ def session_profiles(backup_dir: Path) -> list[tuple[str, Path]]:
 
 def profile_label(number: str) -> str:
     return f"#{number}'s cswap run profile"
+
+
+def shared_slots(entries: Mapping[str, object], active: str | None) -> set[str]:
+    """Slots whose last refresh the consume gate refused as
+    :data:`SHARED_LOGIN` (``UsageEntry.last_error``, already in hand: no
+    Keychain read), the active one aside. Automatic switching sets them
+    aside like a dead login — a switch onto one is refused anyway — so no
+    decision names one as its target."""
+    return {
+        str(number)
+        for number, entry in entries.items()
+        if str(number) != active and getattr(entry, "last_error", None) == SHARED_LOGIN
+    }
+
+
+def skip_text(numbers: list[str]) -> str:
+    """``#2 shares its login — re-login one of them`` (``cc-swap why``)."""
+    if not numbers:
+        return ""
+    who = ", ".join(f"#{n}" for n in numbers)
+    verb = "shares its" if len(numbers) == 1 else "share their"
+    return f"{who} {verb} login — re-login one of them ({fix(numbers).split(': ', 1)[1]})"
 
 
 def fix(numbers: list[str]) -> str:

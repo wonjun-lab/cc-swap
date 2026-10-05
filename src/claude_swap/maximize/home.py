@@ -118,22 +118,16 @@ def ordered_rows(
     return out + rest
 
 
-def engine_lists(
-    msnap: "Snapshot | None", rows: Sequence[fx.FleetRow]
-) -> tuple[list[str], frozenset[str]]:
+def engine_lists(msnap: "Snapshot | None") -> tuple[list[str], frozenset[str]]:
     """``(picks, forced)`` for the ``order`` column and ``next``: the
     engine's ``policy.landing_candidates`` in its order and the rest of its
-    ``policy.escape_candidates``, over the readings it trusts (``msnap``:
-    ``fleet.fleet_snapshot``) — less a login shared with another place
-    (``FleetRow.shared``: a switch onto it is refused, and refreshing it
-    would log the other copy out)."""
+    ``policy.escape_candidates``, over the snapshot the engine decides on
+    (``msnap``: ``fleet.fleet_snapshot`` — trusted readings, slots without a
+    usable backup and logins shared with another place set aside)."""
     if msnap is None:
         return [], frozenset()
-    shared = {r.number for r in rows if r.shared}
-    picks = [v.number for v in policy.landing_candidates(msnap) if v.number not in shared]
-    forced = frozenset(
-        v.number for v in policy.escape_candidates(msnap) if v.number not in shared
-    ) - set(picks)
+    picks = [v.number for v in policy.landing_candidates(msnap)]
+    forced = frozenset(v.number for v in policy.escape_candidates(msnap)) - set(picks)
     return picks, forced
 
 

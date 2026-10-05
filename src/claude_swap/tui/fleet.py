@@ -809,7 +809,7 @@ class FleetScreen(Screen):
         msnap = self._msnap(now)
         dv = self._decision(msnap, now)
         # The engine's own lists, over the readings it trusts (msnap).
-        picks, forced = home.engine_lists(msnap, self._rows)
+        picks, forced = home.engine_lists(msnap)
         snap = self.app.snapshot
         published = self._state.decision
         sit = home.situation(

@@ -49,7 +49,7 @@ from datetime import datetime, timezone
 from typing import Any, Protocol
 
 from claude_swap import autoswitch as aw
-from claude_swap import oauth, poll_policy
+from claude_swap import oauth, poll_policy, shared_login
 from claude_swap.exceptions import ConfigError
 from claude_swap.maximize import history, idle, ledger, notify, pause, policy
 from claude_swap.maximize import hold as account_hold
@@ -994,13 +994,16 @@ def _publish_decision(
     decision: Decision,
     state: Mapping,
     tiers: Mapping[str, str | None],
+    *,
+    shared: set[str] | frozenset[str] = frozenset(),
 ) -> None:
     """Write this tick's decision to the state file for TUI viewers.
 
     Slot numbers and the policy's own reason only — no emails, no raw
     ``rateLimitTier`` strings; a hold with its own code (``reset-wait``,
     ``preempt``, ``rebalance-deferred``, ``hold``) adds ``code`` so
-    ``cc-swap why`` can name it. Rewritten when the decision changes, or when
+    ``cc-swap why`` can name it, and ``shared`` the slots set aside because
+    their login is also held elsewhere. Rewritten when the decision changes, or when
     the stored one is :data:`PUBLISH_REFRESH_S` old (the TUI's freshness
     clock); never on dry runs, which write nothing."""
     if engine.dry_run:
@@ -1023,6 +1026,8 @@ def _publish_decision(
     }
     if isinstance(decision, Hold) and decision.code is not None:
         record["code"] = decision.code
+    if shared:
+        record["shared"] = sorted(shared, key=lambda n: (len(n), n))
     if isinstance(decision, Hold) and decision.ride_until is not None:
         # A ride's switch time, so a viewer counts its minutes down live.
         record["rideUntil"] = decision.ride_until
@@ -1468,12 +1473,15 @@ def run_maximize_tick(
     )
     last = state.get("lastSwitchAt")
     tiers = _rate_limit_tiers(engine, rt, records, now)
+    # A login also held elsewhere (shared_login.py): a switch onto it is
+    # refused, so the policy never targets it (from the entries in hand).
+    shared = shared_login.shared_slots(entries, current) & set(records)
     snap = build_snapshot(
         now=now,
         active=current,
         usage=usage,
         records=records,
-        quarantined=set(quarantined) | _unavailable(engine, records, current),
+        quarantined=set(quarantined) | _unavailable(engine, records, current) | shared,
         api_key_accounts={n for n, r in records.items() if r.get("kind") == "api_key"},
         rate_limit_tiers=tiers,
         samples=samples,
@@ -1496,7 +1504,7 @@ def run_maximize_tick(
     decision = policy.decide(snap)
     rt.last_snapshot, rt.last_decision = snap, decision
     engine._emit(_decision_event(snap, decision, engine.dry_run))
-    _publish_decision(engine, snap, decision, state, tiers)
+    _publish_decision(engine, snap, decision, state, tiers, shared=shared)
     # `cc-swap auto off`: the decision is shown and published, but nothing
     # acts on it — no switch, no failover, no prime.
     held = pause.auto_off_hold(engine, state)

@@ -976,3 +976,52 @@ def test_combined_soft_idle_last_resort_excluded_and_priming(temp_home):
     assert all(e.to_ref["number"] != 4 for e in of(h, SwitchEvent))
     assert len(primer.calls) == len(of(h, MaximizeDecisionEvent))
     assert primer.calls[-1] == "2"
+
+
+class TestSharedLogin:
+    """A login also held elsewhere (shared_login.py): a switch onto it is
+    refused, so the policy never targets it, and ``cc-swap why`` says so."""
+
+    @staticmethod
+    def _entries(h, usage: dict, shared: set[str]) -> dict:
+        from dataclasses import replace
+
+        from claude_swap.shared_login import SHARED_LOGIN
+        from tests.test_autoswitch import _entry_for
+
+        out = {}
+        for num, value in usage.items():
+            entry = _entry_for(value, h.clock.now)
+            out[num] = replace(entry, last_error=SHARED_LOGIN) if num in shared else entry
+        return out
+
+    def test_a_shared_slot_is_never_the_published_target(self, temp_home):
+        h = make(temp_home)
+        usage = {"1": win(62, 40), "2": win(0, 10), "3": win(0, 50)}
+        h.tick_with_entries(self._entries(h, usage, {"2"}))
+        record = h.state()[DECISION_KEY]
+        assert (record["decision"], record["pending"], record["target"]) == ("hold", True, "3")
+        assert record["shared"] == ["2"]
+
+    def test_a_hard_switch_goes_past_a_shared_slot(self, temp_home):
+        h = make(temp_home)
+        usage = {"1": win(96, 40), "2": win(0, 10), "3": win(0, 50)}
+        assert h.tick_with_entries(self._entries(h, usage, {"2"})) is TickOutcome.SWITCHED
+        assert h.active_number() == 3
+        assert h.state()[DECISION_KEY]["target"] == "3"
+
+    def test_why_names_the_skip(self, temp_home):
+        from claude_swap.maximize.doctor_cli import _why_lines, published_why
+
+        h = make(temp_home)
+        usage = {"1": win(62, 40), "2": win(0, 10), "3": win(0, 50)}
+        h.tick_with_entries(self._entries(h, usage, {"2"}))
+        why = published_why(h.switcher.backup_dir, now=h.clock.now)
+        assert why is not None and why["shared"] == ["2"] and why["target"] == "3"
+        lines = "\n".join(_why_lines(why))
+        assert "skipped  #2 shares its login — re-login one of them (cc-swap login 2)" in lines
+
+    def test_no_shared_slot_publishes_no_shared_key(self, temp_home):
+        h = make(temp_home)
+        h.tick_with_usage({"1": win(62, 40), "2": win(0, 10), "3": win(0, 50)})
+        assert "shared" not in h.state()[DECISION_KEY]
