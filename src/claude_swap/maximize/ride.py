@@ -19,8 +19,8 @@ in the state file:
   timed, :func:`point_seconds` reads it). The engine and the policy prefer
   it to the recent velocity over ``idleWindowMin``, which takes over only
   when no step was timed or when it shows a burst (:func:`point_estimate`).
-* **Learning** (``LEARN_KEY``): ``q`` per window, a target-hit-rate
-  controller. A ride that switched before 100% adds :data:`Q_UP`
+* **Learning** (``LEARN_KEY``): ``q`` per window (and ``t``, the 5h
+  measure's target, below), a target-hit-rate controller. A ride that switched before 100% adds :data:`Q_UP`
   (:data:`Q_UP_FIRST` until the window's first hit); one that saw 100% —
   read, or a limit refusal Claude Code reported — first takes
   :data:`Q_DOWN` off. A ride an idle switch ended early, one ``rideMaxMin``
@@ -43,6 +43,23 @@ lognormal σ 0.12 with a 3% drift per point, 2-minute polling, 60 s engine
 ticks) q settles at a mean of ~0.88 with ~9% hits and a ride uses ~0.81 of
 its last point; +0.02/−0.18 settles at ~0.85, ~8% and ~0.79, and from 0.6
 reaches 0.85 in 13 clean rides where the slow start takes 5.
+
+**The 7d measured on the 5h** (:func:`phase_5h`, :func:`rise_5h`,
+:func:`fraction_5h`). Timing the last point from the points before it
+leaves the pace's noise in every ride (the ~0.8 above). The 5h counts the
+same use about six times as fast on a 20x plan (``k`` = Δ7d/Δ5h ≈ 0.165,
+learned per account, maximize/drain.py), so its whole-percent steps cut
+the 7d's last point into sixths and the time since its last step reads
+between them: ``k × (5h points risen since the arm time + the 5h's phase
+now − its phase at the 7d's estimated crossing)`` is the share used. The
+policy switches once it reaches a learned target ``t`` (``"t"`` per window
+in ``rideLearning``): the same controller, +:data:`T_UP` clean,
+−:data:`T_DOWN` on a hit, from :data:`T_START` in [T_MIN, T_MAX], so ~10%
+of rides hit. In the simulation of tests/maximize/test_ride_controller.py
+(5h read in whole percents every 2 minutes, k off by ±3% per ride, a 5h
+reset in one ride in five) t settles at ~0.88 with ~10% hits and a ride
+uses ~0.91 of its last point (99.9%); with k off by ±5%, ~0.89. Without a
+learned k, or the readings it needs, the time rule rides.
 
 Records the halving rule wrote (no ``"v"``: before :data:`LEARN_VERSION`)
 keep their q when it is at least :data:`Q_START` and start from Q_START
@@ -84,6 +101,23 @@ TARGET_HIT_RATE = Q_UP / (Q_UP + Q_DOWN)
 TARGET_SHARE = 0.9
 #: ``rideLearning`` records written by this controller say so (``"v"``).
 LEARN_VERSION = 2
+
+#: The 5h-measured ride (7d only, :func:`fraction_5h`): it switches once the
+#: estimated share of the last point used reaches a learned target ``t``,
+#: the same target-hit-rate controller as q (+T_UP clean, −T_DOWN on a hit:
+#: ~10% hits). No slow start: the estimate is a share of the point, so the
+#: start value is already close.
+T_START = 0.85
+T_MIN = 0.5
+T_MAX = 0.97
+T_UP = Q_UP
+T_DOWN = Q_DOWN
+#: The 5h's fraction of a point between two whole-percent steps is read off
+#: the time since its last step, never past this (a slow point must not
+#: read as the next one).
+PHASE_MAX = 0.95
+#: ... averaged over this many of its last steps (:func:`phase_5h`).
+PHASE_STEPS = 6
 
 #: Step intervals kept per account and window; T1 is their pace.
 KEEP_INTERVALS = 6
@@ -134,13 +168,17 @@ def clamp_q(q: float) -> float:
     return min(Q_MAX, max(Q_MIN, q))
 
 
+def clamp_t(t: float) -> float:
+    return min(T_MAX, max(T_MIN, t))
+
+
 # -- learning ---------------------------------------------------------------------------
 
 
 def learned(raw: object) -> dict[Window, dict]:
     """The ``rideLearning`` record, leniently: each window's
-    ``{"q", "n_ok", "n_hit", "settled", "v", "updatedAt"}`` with ``q``
-    clamped, defaults for anything missing or malformed. A window the
+    ``{"q", "t", "n_ok", "n_hit", "settled", "v", "updatedAt"}`` with ``q``
+    and ``t`` clamped, defaults for anything missing or malformed. A window the
     halving rule wrote (no ``"v"``) is migrated: its q is at least
     :data:`Q_START`, and it is not ``settled`` (the slow start is ahead)."""
     src = raw if isinstance(raw, Mapping) else {}
@@ -154,8 +192,10 @@ def learned(raw: object) -> dict[Window, dict]:
         elif not current:
             q = max(q, Q_START)
         counts = {k: _num(item.get(k)) for k in ("n_ok", "n_hit")}
+        t = _num(item.get("t"))
         out[w] = {
             "q": clamp_q(q),
+            "t": clamp_t(t if t is not None else T_START),
             "n_ok": int(counts["n_ok"]) if counts["n_ok"] and counts["n_ok"] > 0 else 0,
             "n_hit": int(counts["n_hit"]) if counts["n_hit"] and counts["n_hit"] > 0 else 0,
             "settled": current and item.get("settled") is True,
@@ -170,15 +210,33 @@ def q_values(raw: object) -> dict[Window, float]:
     return {w: item["q"] for w, item in learned(raw).items()}
 
 
-def learn(raw: object, window: Window, outcome: Outcome, now: float) -> dict:
+def t_values(raw: object) -> dict[Window, float]:
+    """``{window: t}``, the 5h-measured ride's targets, from the record."""
+    return {w: item["t"] for w, item in learned(raw).items()}
+
+
+def learn(
+    raw: object, window: Window, outcome: Outcome, now: float, *, by_5h: bool = False
+) -> dict:
     """The ``rideLearning`` record after one ride on ``window`` ended in
     ``outcome``: ``ok`` (switched before 100%) adds :data:`Q_UP`
     (:data:`Q_UP_FIRST` while the window has not hit since this controller
     took over), ``hit`` (100% came first) takes :data:`Q_DOWN` off and
-    settles the window; q stays in [Q_MIN, Q_MAX]."""
+    settles the window; q stays in [Q_MIN, Q_MAX].
+
+    ``by_5h``: the ride ran on the 5h-measured estimate (:func:`fraction_5h`)
+    and teaches its target ``t`` instead: +:data:`T_UP` / −:data:`T_DOWN`,
+    in [T_MIN, T_MAX]. q is left as it is."""
     out = learned(raw)
     item = dict(out[window])
-    if outcome == "ok":
+    if by_5h:
+        if outcome == "ok":
+            item["t"] = round(min(T_MAX, item["t"] + T_UP), 4)
+            item["n_ok"] += 1
+        else:
+            item["t"] = round(max(T_MIN, item["t"] - T_DOWN), 4)
+            item["n_hit"] += 1
+    elif outcome == "ok":
         step = Q_UP if item["settled"] else Q_UP_FIRST
         item["q"] = round(min(Q_MAX, item["q"] + step), 4)
         item["n_ok"] += 1
@@ -193,20 +251,24 @@ def learn(raw: object, window: Window, outcome: Outcome, now: float) -> dict:
 
 def describe(raw: object, windows: tuple[str, ...], off: str | None = None) -> str:
     """The doctor and ``cc-swap why`` line: ``learned ride: 5h off
-    (rideWindows; learned 0.60) · 7d rides 0.62 of the last point (target
-    ~0.9, 5 ok, 1 hit)``. ``windows`` are the ones that ride; ``off`` says
-    why none does when the ride is off altogether."""
+    (rideWindows; learned 0.60) · 7d rides to 0.88 of the last point by
+    its 5h, else 0.62 of its time (target ~0.9, 5 ok, 1 hit)``. ``windows``
+    are the ones that ride; ``off`` says why none does when the ride is off
+    altogether."""
     if off:
         return f"learned ride: off ({off})"
     data = learned(raw)
     parts = []
     for w in WINDOWS:
         item = data[w]
-        if w in windows:
+        counts = f"(target ~{TARGET_SHARE:g}, {item['n_ok']} ok, {item['n_hit']} hit)"
+        if w in windows and w == "7d":
             parts.append(
-                f"{w} rides {item['q']:.2f} of the last point "
-                f"(target ~{TARGET_SHARE:g}, {item['n_ok']} ok, {item['n_hit']} hit)"
+                f"{w} rides to {item['t']:.2f} of the last point by its 5h, "
+                f"else {item['q']:.2f} of its time {counts}"
             )
+        elif w in windows:
+            parts.append(f"{w} rides {item['q']:.2f} of the last point {counts}")
         else:
             parts.append(f"{w} off (rideWindows; learned {item['q']:.2f})")
     return "learned ride: " + " · ".join(parts)
@@ -368,3 +430,89 @@ def point_seconds(
     middle = statistics.median(seconds for seconds, _ in recent)
     kept = [(s, p) for s, p in recent if s <= SLOW_OUTLIER * middle]
     return float(sum(s * p for s, p in kept) / sum(p for _, p in kept))
+
+
+# -- the 7d's last point, measured on the 5h ---------------------------------------------
+
+
+def phase_5h(
+    samples, at: float, point5_s: float | None, *, limit: float | None = PHASE_MAX
+) -> float:
+    """How far the 5h is into its current whole point at ``at`` (0 to
+    :data:`PHASE_MAX`), from ``samples`` (``Sample``: ``ts``, ``pct5``;
+    oldest first) up to ``at`` and the 5h's seconds per point.
+
+    Each whole-point step lands between two readings: with ``r`` points
+    risen across them, the ``i``-th of them ``(i − ½)/r`` of the way (a
+    uniform pace); a 5h reset is a step to 0 halfway between its two
+    readings. A line through the last :data:`PHASE_STEPS` steps of the
+    current 5h window (at least three; else the last step, carried forward
+    at ``point5_s``) says where the 5h is at ``at``, so one step's polling
+    error counts a fraction and the pace is the one of these steps. With
+    no step seen, the first reading at the current value stands for it (a
+    lower bound). 0 when the pace is unknown or nothing was read by
+    ``at``. ``limit`` None: past the next whole point too (the old
+    window's last stretch before a 5h reset, read after the fact)."""
+    if point5_s is None or not math.isfinite(point5_s) or point5_s <= 0:
+        return 0.0
+    seen = [x for x in samples if x.ts <= at]
+    if not seen:
+        return 0.0
+    value = seen[-1].pct5
+    steps: list[tuple[float, float]] = []  # (the value stepped to, when)
+    for before, x in zip(seen, seen[1:]):
+        gap = x.ts - before.ts
+        start, start_at = before.pct5, before.ts
+        if x.pct5 < before.pct5:
+            # A 5h reset: the window before says nothing, and the new one
+            # started from 0 between the two readings.
+            steps = [(0.0, before.ts + gap / 2.0)] if 0 < gap <= STEP_MAX_GAP_S else []
+            start, start_at = 0.0, before.ts + gap / 2.0
+        if x.pct5 == start or not 0 < gap <= STEP_MAX_GAP_S:
+            continue
+        risen, span = x.pct5 - start, x.ts - start_at
+        r = math.ceil(risen)
+        for i in range(1, r + 1):
+            steps.append((start + risen * i / r, start_at + span * (i - 0.5) / r))
+    steps = steps[-PHASE_STEPS:]
+    if len(steps) >= 3 and steps[-1][1] > steps[0][1]:
+        # A line through these last steps: the 5h's level and pace now,
+        # each step's polling error averaged down.
+        mv = statistics.fmean(v for v, _ in steps)
+        mt = statistics.fmean(ts for _, ts in steps)
+        var = sum((ts - mt) ** 2 for _, ts in steps)
+        slope = sum((ts - mt) * (v - mv) for v, ts in steps) / var if var > 0 else 0.0
+        level = mv + (at - mt) * (slope if slope > 0 else 1.0 / point5_s)
+    elif steps:
+        v, ts = steps[-1]
+        level = v + (at - ts) / point5_s
+    else:
+        i = len(seen) - 1
+        while i > 0 and seen[i - 1].pct5 == value:
+            i -= 1
+        level = value + (at - seen[i].ts) / point5_s
+    phase = max(0.0, level - value)
+    return phase if limit is None else min(limit, phase)
+
+
+def rise_5h(rise: float, last: float, pct5: float, carry: float = 0.0) -> float:
+    """5h points risen since the arm time after a new reading ``pct5``,
+    from ``rise`` so far and the previous reading ``last``: a rise adds
+    itself; a drop is a 5h reset and adds what the new window reads plus
+    ``carry``, how far the old window had gone past ``last`` by its reset
+    (:func:`phase_5h` at the reset; whole points up to ``last`` were
+    already counted)."""
+    if pct5 >= last:
+        return rise + pct5 - last
+    return rise + max(carry, 0.0) + max(pct5, 0.0)
+
+
+def fraction_5h(
+    rise: float, phase_armed: float, phase_now: float, k: float
+) -> float:
+    """The share of the 7d's last point used since the arm time, from the
+    5h: ``k × (whole 5h points risen + the 5h's phase now − its phase at
+    the arm time)``, in [0, 1]. ``k`` is the account's 7d points per 5h
+    point (maximize/drain.py), so on a 20x plan (k ≈ 0.165) a 5h point is
+    a sixth of a 7d point, and the phases read between them."""
+    return min(1.0, max(0.0, k * (rise + phase_now - phase_armed)))

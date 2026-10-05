@@ -1,6 +1,6 @@
-"""The learned ride's controller in simulation (maximize/ride.py).
+"""The learned ride's controllers in simulation (maximize/ride.py).
 
-Each ride: an account busy on its 7d from 92% to 100%, every point taking
+The time rule (q). Each ride: an account busy on its 7d from 92% to 100%, every point taking
 its own time (lognormal around a pace that drifts from point to point), read
 every 2 minutes (±10% jitter, as poll_policy's high-usage cadence), the
 engine ticking every 60 s. The real pieces decide: ``ride.observe`` /
@@ -11,6 +11,15 @@ a capped ride teaches nothing), and ``ride.learn`` learns from it. A hit is
 the 7d crossing 100.0 before the switch; whether it is read at 100% or
 refused by Claude Code first, it counts the same.
 
+The 5h measure (t), at the end of the file: the same account and 7d, its 5h
+climbing ``1/k`` times as fast in whole percents (k off from the learned
+one by a few percent per ride, a 5h reset in one ride in five), read every
+2 minutes. The engine's own helpers fold the readings in
+(``engine_hook._arm_five_h`` / ``_fold_five_h``) and the policy's
+``ride_used_5h`` reads the share of the last point used each 60 s tick; it
+switches once that reaches t (``ride.learn(..., by_5h=True)`` learns it),
+at ``rideMaxMin`` at the latest.
+
 Pure and seeded: no clock, no I/O.
 """
 
@@ -19,12 +28,13 @@ from __future__ import annotations
 import math
 import random
 import statistics
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from types import SimpleNamespace
 
 import pytest
 
-from claude_swap.maximize import idle, policy, ride
-from claude_swap.maximize.model import Sample
+from claude_swap.maximize import engine_hook, idle, policy, ride
+from claude_swap.maximize.model import RideFiveH, Sample, Snapshot
 from claude_swap.settings import MaximizeSettings
 
 POLL_S = 120.0          # poll_policy.ACTIVE_HIGH_USAGE_INTERVAL_S
@@ -167,3 +177,160 @@ def test_t1_is_close_to_the_real_point_where_it_used_to_be_a_third_of_it():
     # One 7d step in the 10-minute velocity span read as 10 minutes a point.
     assert ratio_old < 0.5, ratio_old
     assert statistics.mean(r.share for r in old) < 0.4
+
+
+# -- the 5h measure -----------------------------------------------------------------------
+
+K_NOISE = 0.03          # the ride's real k off from the learned one (lognormal σ)
+RESET_SHARE = 0.2       # rides with a 5h reset somewhere near their end
+ACCOUNT = SimpleNamespace(number="1")
+
+
+@dataclass
+class Ride5:
+    hit: bool
+    share: float        # of the last point used before the switch (1 on a hit)
+    capped: bool        # rideMaxMin ended it (teaches nothing)
+    reset: bool         # the 5h reset during the ride
+
+
+def _ride_5h(rng: random.Random, t: float) -> Ride5:
+    pace = math.log(rng.uniform(15, 45) * 60.0)
+    start7 = 92.0 + rng.random()
+    durations, crossings, total = [], [], 0.0
+    for p in range(93, 101):
+        pace += rng.gauss(0.0, DRIFT)
+        d = math.exp(pace + rng.gauss(0.0, SIGMA))
+        if p == 93:
+            d *= 93.0 - start7
+        total += d
+        durations.append(d)
+        crossings.append(total)
+
+    def level7(at: float) -> float:  # the 7d's true level, past 100 too
+        if at <= 0:
+            return start7
+        for i, c in enumerate(crossings):
+            if at < c:
+                before = crossings[i - 1] if i else 0.0
+                base = 92.0 + i if i else start7
+                return base + (at - before) / durations[i] * (93.0 + i - base)
+        return 100.0 + (at - crossings[-1]) / durations[-1]
+
+    k_true = K7 * math.exp(rng.gauss(0.0, K_NOISE))
+    base5 = rng.uniform(0.0, 40.0)
+    reset_at = (
+        rng.uniform(crossings[-3], crossings[-1] + 600.0)
+        if rng.random() < RESET_SHARE else None
+    )
+
+    def level5(at: float) -> float:
+        if reset_at is not None and at >= reset_at:
+            return (level7(at) - level7(reset_at)) / k_true
+        return base5 + (level7(at) - start7) / k_true
+
+    def read(at: float) -> Sample:
+        return Sample(at, float(math.floor(level5(at))),
+                      float(math.floor(min(level7(at), 100.0))))
+
+    def next_poll(at: float) -> float:
+        return at + POLL_S * (1.0 + rng.uniform(-JITTER, JITTER))
+
+    steps: dict = {}
+    samples: list[Sample] = []
+    at, prev = -rng.uniform(0.0, POLL_S), None
+    while True:
+        x = read(at)
+        steps = ride.observe(steps, "1", x.pct5, x.pct7, at, prev)
+        samples = list(idle.trim_samples([*samples, x], at))
+        if x.pct7 >= 99.0:
+            break
+        prev, at = at, next_poll(at)
+    armed = ride.arm_time(at, prev)
+    five = engine_hook._arm_five_h(steps, tuple(samples), SETTINGS, "1", armed, at, prev, at)
+    assert five is not None
+    engine_hook._fold_five_h(five, tuple(samples))
+    base = Snapshot(
+        now=at, active="1", accounts=(), samples=(), last_switch_at=None,
+        settings=SETTINGS, k7={"1": K7},
+    )
+    cap_at = armed + SETTINGS.ride_max_min * 60.0
+    poll, tick = next_poll(at), at + rng.uniform(0.0, TICK_S)
+    capped = False
+    while True:
+        while poll <= tick:
+            samples = list(idle.trim_samples([*samples, read(poll)], poll))
+            poll = next_poll(poll)
+        engine_hook._fold_five_h(five, tuple(samples))
+        if samples[-1].pct7 >= 100.0:
+            break  # read at 100%: the at-limit switch, a hit
+        snap = replace(
+            base, now=tick, samples=tuple(samples),
+            ride_5h={"7d": RideFiveH(five["rise"], five["phase"], five["pointS"])},
+        )
+        used = policy.ride_used_5h(snap, ACCOUNT, "7d")
+        assert used is not None
+        if used >= t:
+            break
+        if tick >= cap_at:
+            capped = True
+            break
+        tick += TICK_S
+    hit = crossings[-1] < tick
+    share = 1.0 if hit else max(0.0, (tick - crossings[-2]) / durations[-1])
+    reset = reset_at is not None and armed < reset_at <= tick
+    return Ride5(hit, share, capped, reset)
+
+
+def simulate_5h(seed: int, rides: int) -> tuple[list[float], list[Ride5]]:
+    """``(t before each ride, the rides)`` from a fresh record."""
+    rng = random.Random(seed)
+    data: object = None
+    ts, out = [], []
+    for _ in range(rides):
+        t = ride.t_values(data)["7d"]
+        r = _ride_5h(rng, t)
+        ts.append(t)
+        out.append(r)
+        if not r.capped:
+            data = ride.learn(data, "7d", "hit" if r.hit else "ok", 0.0, by_5h=True)
+    return ts, out
+
+
+BURN_IN_5H = 200
+
+
+@pytest.fixture(scope="module")
+def runs_5h() -> dict[int, tuple[list[float], list[Ride5]]]:
+    return {seed: simulate_5h(seed, BURN_IN_5H + 800) for seed in (1, 2, 3)}
+
+
+@pytest.mark.parametrize("seed", [1, 2, 3])
+def test_the_5h_measure_uses_nine_tenths_of_the_last_point_at_a_tenth_hits(runs_5h, seed):
+    ts, rides = runs_5h[seed]
+    settled = rides[BURN_IN_5H:]
+    hit_rate = sum(r.hit for r in settled) / len(settled)
+    share = statistics.mean(r.share for r in settled)
+    assert 0.08 <= hit_rate <= 0.12, hit_rate
+    assert share >= 0.9, share
+    # t settles well inside its range, nowhere near the cap.
+    assert 0.8 <= statistics.mean(ts[BURN_IN_5H:]) <= 0.95
+    # rideMaxMin (60) is a backstop: the slowest points (45 min) fit in it.
+    assert sum(r.capped for r in settled) <= len(settled) * 0.01
+
+
+def test_a_5h_reset_mid_ride_is_summed_across(runs_5h):
+    rides = [r for _, rs in runs_5h.values() for r in rs[BURN_IN_5H:]]
+    across = [r for r in rides if r.reset]
+    assert len(across) > 100
+    # Not a hit factory: the old window's points and its phase at the
+    # reset are carried into the new one.
+    assert sum(r.hit for r in across) / len(across) <= 0.16
+    assert statistics.mean(r.share for r in across) >= 0.88
+
+
+def test_the_5h_measure_beats_the_time_rule(runs_5h):
+    _, timed = simulate(1, BURN_IN + 800)
+    by_time = statistics.mean(r.share for r in timed[BURN_IN:])
+    by_5h = statistics.mean(r.share for _, rs in runs_5h.values() for r in rs[BURN_IN_5H:])
+    assert by_5h >= by_time + 0.05, (by_time, by_5h)

@@ -63,7 +63,18 @@ and still under 100%, the hard switch waits until
 
     t_switch = arm time + q × T1 − ``RIDE_MARGIN_S``
 
-(at most ``rideMaxMin`` after the arm time). The arm time is the reading
+(the time rule; at most ``rideMaxMin`` after the arm time). On 7d, with
+the active account's k learned (``Snapshot.k7``) and the engine's 5h
+measure (``Snapshot.ride_5h``) and fresh samples, the ride is measured
+instead (:func:`ride_used_5h`, ``ride.fraction_5h``)::
+
+    used = k × (5h points risen since the arm time
+                + the 5h's phase now − its phase at the 7d's crossing)
+
+and the switch is due once ``used`` reaches the learned target ``t``
+(``Snapshot.ride_t``), or at ``rideMaxMin`` (``Switch.ride_by_5h`` /
+``Hold.ride_by_5h`` say which windows rode so: they teach ``t``, not q).
+The arm time is the reading
 before the first one at the mark (the crossing may have come right after
 it), else ``ride.ARM_UNKNOWN_GAP_S`` before that first one
 (``ride.arm_time``, ``Snapshot.ride_armed_at``). ``T1`` is the time one
@@ -587,28 +598,99 @@ def ride_armed_at(snap: Snapshot, window: Window) -> float:
     return learned_ride.arm_time(first, None)
 
 
+def ride_k(snap: Snapshot, a: AccountView | None) -> float | None:
+    """Account ``a``'s learned 7d-per-5h ratio (``Snapshot.k7``), or None
+    when nothing is learned for it: the 5h-measured ride needs the
+    account's own k, a plan default is too coarse to read a last point by."""
+    k = snap.k7.get(a.number) if a is not None else None
+    if isinstance(k, (int, float)) and not isinstance(k, bool) and math.isfinite(k) and k > 0:
+        return float(k)
+    return None
+
+
 @dataclass(frozen=True)
 class RidePlan:
-    """One window's ride: until when (``t_switch``), and from what."""
+    """One window's ride: whether it is over now (``due``), until when it
+    is expected to last (``until``), and from what."""
 
     until: float
+    due: bool
     capped: bool          # ``rideMaxMin`` ends it before the learned share
     q: float
-    point_s: float
+    point_s: float | None
     armed_at: float
+    # Measured on the 5h (7d only): the share of the last point used and
+    # the learned share it switches at. None under the time rule.
+    used: float | None = None
+    target: float | None = None
+
+    @property
+    def by_5h(self) -> bool:
+        return self.used is not None
 
 
-def ride_plan(snap: Snapshot, window: Window) -> RidePlan | None:
-    """``window``'s ride, or None when ``T1`` is unknown (no ride)."""
-    point = ride_point_s(snap, window)
-    if point is None:
+def ride_used_5h(snap: Snapshot, a: AccountView | None, window: Window) -> float | None:
+    """The share of ``window``'s last point used since the arm time,
+    measured on the 5h (``ride.fraction_5h``), or None when it cannot be:
+    not the 7d, nothing folded in (``Snapshot.ride_5h``), the account's k
+    not learned, or the readings not fresh."""
+    if window != "7d" or not _fresh_samples(snap):
         return None
+    five = snap.ride_5h.get(window)
+    k = ride_k(snap, a)
+    if five is None or k is None:
+        return None
+    now_phase = learned_ride.phase_5h(snap.samples, snap.now, five.point_s)
+    return learned_ride.fraction_5h(five.rise, five.phase_armed, now_phase, k)
+
+
+def ride_plan(
+    snap: Snapshot, window: Window, a: AccountView | None = None
+) -> RidePlan | None:
+    """``window``'s ride on account ``a`` (default: the active one), or None
+    when it has no measure: not on the 5h (:func:`ride_used_5h`) and
+    ``T1`` unknown.
+
+    On the 5h it is due once the share used reaches the learned target
+    ``t`` (``Snapshot.ride_t``), or at ``rideMaxMin``; ``until`` is when
+    the rest of the target is expected at ``T1`` (the cap with ``T1``
+    unknown), for the countdown and the poll cadence only. Under the time
+    rule it is due at ``arm + q × T1 − RIDE_MARGIN_S``, or at
+    ``rideMaxMin``."""
+    if a is None:
+        a = snap.view(snap.active)
+    point = ride_point_s(snap, window)
     q = learned_ride.clamp_q(float(snap.ride_q.get(window, learned_ride.Q_DEFAULT)))
     armed = ride_armed_at(snap, window)
-    learned_until = armed + q * point - RIDE_MARGIN_S
     cap_until = armed + snap.settings.ride_max_min * 60.0
+    used = ride_used_5h(snap, a, window)
+    if used is not None:
+        target = learned_ride.clamp_t(
+            float(snap.ride_t.get(window, learned_ride.T_START))
+        )
+        reached = used >= target
+        five = snap.ride_5h[window]
+        k = ride_k(snap, a)
+        if point is None and five.point_s is not None and k:
+            point = five.point_s / k  # the 7d's pace, read off the 5h's
+        expected = snap.now + (target - used) * point if point is not None else cap_until
+        return RidePlan(
+            until=snap.now if reached else max(snap.now, min(expected, cap_until)),
+            due=reached or snap.now >= cap_until,
+            capped=not reached and cap_until <= max(snap.now, expected),
+            q=q,
+            point_s=point,
+            armed_at=armed,
+            used=used,
+            target=target,
+        )
+    if point is None:
+        return None
+    learned_until = armed + q * point - RIDE_MARGIN_S
+    until = min(learned_until, cap_until)
     return RidePlan(
-        until=min(learned_until, cap_until),
+        until=until,
+        due=snap.now >= until,
         capped=cap_until < learned_until,
         q=q,
         point_s=point,
@@ -653,36 +735,52 @@ def _hard_or_ride(
         return replace(base, reason=f"{base.reason}; no ride after a recent 429")
     if snap.estimate is not None:
         return replace(base, reason=f"{base.reason}; no ride on estimated usage")
-    plans = [ride_plan(snap, w) for w in windows]
+    plans = [ride_plan(snap, w, a) for w in windows]
     if any(p is None for p in plans):
         return replace(base, reason=f"{base.reason}; no ride (pace unknown)")
-    until = min(p.until for p in plans if p is not None)
-    # ``rideMaxMin`` ends the ride before its learned share: the switch
-    # then says nothing about q (``Switch.ride_capped``, nothing learned).
-    capped = any(p.capped and p.until == until for p in plans if p is not None)
-    if snap.now >= until:
-        over = "capped by rideMaxMin" if capped else "over"
+    ridden = [p for p in plans if p is not None]
+    by_5h = tuple(w for w, p in zip(windows, ridden) if p.by_5h)
+    until = min(p.until for p in ridden)
+    due = [p for p in ridden if p.due]
+    if due:
+        # ``rideMaxMin`` ends the ride before its learned share: the switch
+        # then says nothing about q or t (``Switch.ride_capped``, nothing
+        # learned).
+        capped = all(p.capped for p in due)
+        if capped:
+            over = "capped by rideMaxMin"
+        elif any(p.by_5h for p in due):
+            used = max(p.used for p in due if p.used is not None)
+            over = f"over ({used:.2f} of the last point used, measured on the 5h)"
+        else:
+            over = "over"
         return replace(
             base, reason=f"{base.reason}; learned ride {over}",
-            ride="due", ride_windows=windows, ride_capped=capped,
+            ride="due", ride_windows=windows, ride_capped=capped, ride_by_5h=by_5h,
         )
+    capped = any(p.capped and p.until == until for p in ridden)
     waited = _ride_reset_wait(snap, a, windows, until)
     if waited is not None:
         return waited
     if is_idle(snap):
         return replace(
             base, reason=f"{base.reason}; idle during the learned ride",
-            ride="idle", ride_windows=windows,
+            ride="idle", ride_windows=windows, ride_by_5h=by_5h,
         )
     label = " / ".join(f"{w} {_pct(_window_pct(a, w))}" for w in windows)
+    measured = "".join(
+        f", {p.used:.2f} of the last point used (switching at {p.target:.2f}, on the 5h)"
+        for p in ridden if p.by_5h
+    )
     return Hold(
-        f"{view_name(a)} {label} — riding to the limit, switching in "
+        f"{view_name(a)} {label} — riding to the limit{measured}, switching in "
         f"~{max(1, round((until - snap.now) / 60.0))}m "
         f"({'capped' if capped else 'learned'}) or at your next pause",
         pending=False,
         code="ride",
         ride_until=until,
         ride_windows=windows,
+        ride_by_5h=by_5h,
     )
 
 

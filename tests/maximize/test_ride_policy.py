@@ -11,7 +11,7 @@ from dataclasses import replace
 import pytest
 
 from claude_swap.maximize import policy
-from claude_swap.maximize.model import Hold, Snapshot, Switch
+from claude_swap.maximize.model import Hold, RideFiveH, Snapshot, Switch
 from claude_swap.maximize.policy import RIDE_MARGIN_S, decide
 from tests.maximize.test_policy import NOW, acct, resets, rows, snap
 
@@ -248,3 +248,90 @@ class TestResetAndHold:
         due = replace(ride_snap(armed=3600), hold_until=NOW + 3600)
         d = decide(due)
         assert isinstance(d, Switch) and d.ride == "due" and d.trigger == "hard"
+
+
+# -- the 7d's last point, measured on the 5h ----------------------------------------------
+
+
+def five_snap(rise: float, *, k: float | None = 0.165, t: float | None = None,
+              point5_s: float | None = None, **kw) -> Snapshot:
+    """``ride_snap`` with a 5h measure: ``rise`` 5h points since the arm
+    time, phase 0.2 at it, the 5h's phase now 0 (``point5_s`` None), so
+    the share used is ``k × (rise − 0.2)``."""
+    s = ride_snap(**kw)
+    return replace(
+        s,
+        ride_5h={"7d": RideFiveH(rise, 0.2, point5_s)},
+        k7={} if k is None else {"1": k},
+        ride_t={} if t is None else {"7d": t},
+    )
+
+
+class TestMeasuredOnThe5h:
+    def test_rides_until_the_share_used_reaches_t(self):
+        d = decide(five_snap(4.0))
+        used = 0.165 * 3.8
+        assert isinstance(d, Hold) and d.code == "ride"
+        assert d.ride_by_5h == ("7d",)
+        # The rest of t at T1 (30 min): the countdown and the poll cadence.
+        assert d.ride_until == pytest.approx(NOW + (0.85 - used) * 1800)
+        assert d.reason == (
+            "1 7d 99% — riding to the limit, 0.63 of the last point used "
+            "(switching at 0.85, on the 5h), switching in ~7m (learned) "
+            "or at your next pause"
+        )
+
+    def test_switches_once_it_does_whatever_the_time_rule_says(self):
+        # The time rule would ride 0.6 x 30 min; the 5h says 0.87 is used.
+        d = decide(five_snap(5.5, armed=60))
+        assert isinstance(d, Switch) and d.trigger == "hard"
+        assert (d.ride, d.ride_windows, d.ride_by_5h, d.ride_capped) == (
+            "due", ("7d",), ("7d",), False
+        )
+        assert d.reason.endswith(
+            "; learned ride over (0.87 of the last point used, measured on the 5h)"
+        )
+
+    def test_the_learned_target_decides(self):
+        assert isinstance(decide(five_snap(5.5, t=0.9)), Hold)
+        assert isinstance(decide(five_snap(5.5, t=0.8)), Switch)
+        assert isinstance(decide(five_snap(5.5, t=5.0)), Hold)    # clamped to 0.97
+
+    def test_the_5h_phase_now_counts(self):
+        # Samples a minute apart, the 5h a point a minute: its line puts
+        # the 5h half a point past its last reading at NOW.
+        samples = rows((180, 37, 99), (120, 38, 99), (60, 39, 99), (0, 40, 99))
+        snap = five_snap(5.0, samples=samples, point5_s=60.0)
+        assert policy.ride_used_5h(snap, snap.view("1"), "7d") == pytest.approx(0.165 * 5.3)
+
+    def test_without_a_learned_k_the_time_rule_rides(self):
+        d = decide(five_snap(5.5, k=None))
+        assert isinstance(d, Hold) and d.ride_by_5h == ()
+        assert d.ride_until == pytest.approx(NOW + 0.6 * 1800 - RIDE_MARGIN_S)
+
+    def test_without_fresh_readings_the_time_rule_rides(self):
+        stale = rows((1500, 37, 99), (1200, 40, 99))
+        d = decide(five_snap(5.5, samples=stale))
+        assert isinstance(d, Hold) and d.ride_by_5h == ()
+
+    def test_the_5h_window_itself_never_rides_by_it(self):
+        snap = five_snap(9.0, window="5h", hard_5h=99.0)
+        assert policy.ride_used_5h(snap, snap.view("1"), "5h") is None
+
+    def test_t1_unknown_still_rides_on_the_5h(self):
+        d = decide(five_snap(4.0, point_s=None))
+        assert policy.ride_point_s(five_snap(4.0, point_s=None), "7d") is None
+        assert isinstance(d, Hold) and d.ride_by_5h == ("7d",)
+
+    def test_ride_max_min_still_ends_it(self):
+        d = decide(five_snap(4.0, armed=3600))
+        assert isinstance(d, Switch) and d.ride == "due" and d.ride_capped
+        assert d.reason.endswith("; learned ride capped by rideMaxMin")
+
+    def test_an_idle_moment_switches_at_once(self):
+        d = decide(five_snap(4.0, samples=IDLE))
+        assert isinstance(d, Switch) and d.ride == "idle" and d.ride_by_5h == ("7d",)
+
+    def test_100_switches_at_once(self):
+        d = decide(five_snap(4.0, p7=100))
+        assert isinstance(d, Switch) and d.trigger == "at-limit"

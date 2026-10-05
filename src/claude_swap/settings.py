@@ -116,8 +116,10 @@ class MaximizeSettings:
     learned_ride: bool = True
     # Which windows ride: "7d", "5h", "5h,7d", or "" for none.
     ride_windows: str = "7d"
-    # A ride never lasts longer than this many minutes (0 = no ride).
-    ride_max_min: int = 30
+    # A ride never lasts longer than this many minutes (0 = no ride). A
+    # backstop: a busy 20x account's 7d point takes 15-45 min or more, and
+    # a capped ride teaches nothing, so 30 cut off the slow last points.
+    ride_max_min: int = 60
     # Near-reset 7d drain (maximize/drain.py): within this many hours of an
     # account's 7d reset (or sooner when its 7d room needs most of the time
     # left), its 7d soft mark is set aside and it is used first, so the

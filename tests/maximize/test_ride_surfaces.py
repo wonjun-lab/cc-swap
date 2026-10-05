@@ -41,7 +41,7 @@ SERVICE = fx.EngineStatus("service", 4121, {"running": True, "pid": 4121})
 class TestSettings:
     def test_defaults(self):
         s = MaximizeSettings()
-        assert (s.learned_ride, s.ride_windows, s.ride_max_min) == (True, "7d", 30)
+        assert (s.learned_ride, s.ride_windows, s.ride_max_min) == (True, "7d", 60)
 
     def test_lenient_load_reports_each_repair(self, tmp_path: Path):
         settings_path(tmp_path).write_text(json.dumps({"maximize": {
@@ -247,7 +247,8 @@ def test_why_explains_a_ride_and_shows_what_was_learned(tmp_path, monkeypatch, c
     assert "code     ride" in out
     assert (
         "ride     5h off (rideWindows; learned 0.60) · "
-        "7d rides 0.62 of the last point (target ~0.9, 5 ok, 1 hit)"
+        "7d rides to 0.85 of the last point by its 5h, else 0.62 of its time "
+        "(target ~0.9, 5 ok, 1 hit)"
     ) in out
 
 
@@ -264,7 +265,8 @@ def test_doctor_reports_the_learned_share_per_window(tmp_path):
     assert f.severity == "info"
     assert f.detail == (
         "learned ride: 5h off (rideWindows; learned 0.60) · "
-        "7d rides 0.60 of the last point (target ~0.9, 4 ok, 2 hit)"
+        "7d rides to 0.85 of the last point by its 5h, else 0.60 of its time "
+        "(target ~0.9, 4 ok, 2 hit)"
     )
     world.settings(maximize={"learnedRide": False})
     [f] = [f for f in dr.run_checks(world.probes()) if f.check == "learned-ride"]

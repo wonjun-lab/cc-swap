@@ -553,7 +553,10 @@ class TestSurfaces:
                   *window("1", 12 * H, (0, 50), (16, 24)))
         h = History(points=points)
         assert mxview.drain_k7(h, MaximizeSettings(), 18 * H) == {"1": 0.16}
-        assert mxview.drain_k7(h, MaximizeSettings(drain_hours=0), 18 * H) == {}
+        # The 7d learned ride reads its last point on the 5h at k too.
+        assert mxview.drain_k7(h, MaximizeSettings(drain_hours=0), 18 * H) == {"1": 0.16}
+        off = MaximizeSettings(drain_hours=0, ride_windows="5h")
+        assert mxview.drain_k7(h, off, 18 * H) == {}
         assert mxview.drain_k7(None, MaximizeSettings(), 18 * H) == {}
 
 

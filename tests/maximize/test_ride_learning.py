@@ -11,6 +11,7 @@ import pytest
 from claude_swap.autoswitch import MaximizeDecisionEvent, NoSwitchEvent, SwitchEvent, TickOutcome
 from claude_swap.maximize import ride
 from claude_swap.maximize.engine_hook import DECISION_KEY, RIDE_KEY, runtime_for
+from claude_swap.maximize.model import Sample
 from tests.maximize.test_engine_maximize import EMAILS, make, no_switch_reasons, of, win
 
 # -- the controller ----------------------------------------------------------------------
@@ -18,8 +19,8 @@ from tests.maximize.test_engine_maximize import EMAILS, make, no_switch_reasons,
 
 def fresh(q: float, **kw) -> dict:
     """One window's record as this controller writes it."""
-    return {"q": q, "n_ok": 0, "n_hit": 0, "settled": False, "v": ride.LEARN_VERSION,
-            "updatedAt": None, **kw}
+    return {"q": q, "t": ride.T_START, "n_ok": 0, "n_hit": 0, "settled": False,
+            "v": ride.LEARN_VERSION, "updatedAt": None, **kw}
 
 
 class TestLearn:
@@ -65,7 +66,8 @@ class TestLearn:
         data = ride.learn(None, "7d", "ok", 1.0)
         assert ride.describe(data, ("7d",)) == (
             "learned ride: 5h off (rideWindows; learned 0.60) · "
-            "7d rides 0.65 of the last point (target ~0.9, 1 ok, 0 hit)"
+            "7d rides to 0.85 of the last point by its 5h, else 0.65 of its time "
+            "(target ~0.9, 1 ok, 0 hit)"
         )
         assert ride.describe(data, (), "maximize.learnedRide is false") == (
             "learned ride: off (maximize.learnedRide is false)"
@@ -655,3 +657,164 @@ class TestRefusalIsAHit:
         assert c.tick(1, 99, advance=URGENT) is TickOutcome.SWITCHED
         data = learning(h)["7d"]
         assert (data["n_ok"], data["n_hit"]) == (0, 0)
+
+
+# -- the 7d's last point, measured on the 5h ----------------------------------------------
+
+
+def s5(*rows: tuple[float, float]) -> list[Sample]:
+    """Samples ``(ts, pct5)`` (the 7d at 99)."""
+    return [Sample(ts, p5, 99.0) for ts, p5 in rows]
+
+
+class TestFiveHMeasure:
+    def test_learning_t_leaves_q_alone(self):
+        out = ride.learn(None, "7d", "ok", 1.0, by_5h=True)
+        assert (out["7d"]["t"], out["7d"]["q"], out["7d"]["n_ok"]) == (0.86, 0.6, 1)
+        out = ride.learn(out, "7d", "hit", 2.0, by_5h=True)
+        assert (out["7d"]["t"], out["7d"]["n_hit"]) == (pytest.approx(0.77), 1)
+        # The time rule's slow start is still ahead: a 5h hit settles nothing.
+        assert out["7d"]["settled"] is False and out["7d"]["q"] == 0.6
+
+    def test_t_stays_between_05_and_097(self):
+        assert (ride.T_START, ride.T_MIN, ride.T_MAX) == (0.85, 0.5, 0.97)
+        assert ride.T_UP / (ride.T_UP + ride.T_DOWN) == pytest.approx(0.1)
+        data: object = None
+        for _ in range(30):
+            data = ride.learn(data, "7d", "ok", 0.0, by_5h=True)
+        assert ride.t_values(data)["7d"] == 0.97
+        for _ in range(10):
+            data = ride.learn(data, "7d", "hit", 0.0, by_5h=True)
+        assert ride.t_values(data)["7d"] == 0.5
+        assert ride.t_values({"7d": {"t": 3}})["7d"] == 0.97
+        assert ride.t_values({"7d": {"t": "x"}})["7d"] == 0.85
+
+    def test_the_phase_is_read_off_a_line_through_the_last_steps(self):
+        # A step per 120 s reading, each placed halfway between readings.
+        samples = s5((0, 10), (120, 11), (240, 12), (360, 13))
+        assert ride.phase_5h(samples, 390, 120.0) == pytest.approx(0.75)
+        assert ride.phase_5h(samples, 420, 120.0) == ride.PHASE_MAX
+        assert ride.phase_5h(samples, 420, 120.0, limit=None) == pytest.approx(1.0)
+        # The line's own pace wins over a stale one.
+        assert ride.phase_5h(samples, 390, 600.0) == pytest.approx(0.75)
+        assert ride.phase_5h(samples, 390, None) == 0.0
+        assert ride.phase_5h([], 390, 120.0) == 0.0
+
+    def test_a_jump_of_several_points_spreads_its_steps_over_the_gap(self):
+        samples = s5((0, 10), (120, 12))
+        # The steps to 11 and 12 at 30 and 90 s: from the last one.
+        assert ride.phase_5h(samples, 120, 120.0) == pytest.approx(0.25)
+
+    def test_with_no_step_seen_the_first_reading_is_a_lower_bound(self):
+        samples = s5((0, 10), (120, 10))
+        assert ride.phase_5h(samples, 180, 600.0) == pytest.approx(0.3)
+
+    def test_a_5h_reset_is_a_step_to_zero_halfway_between_its_readings(self):
+        samples = s5((0, 90), (120, 91), (240, 0))
+        assert ride.phase_5h(samples, 240, 240.0) == pytest.approx(0.25)
+
+    def test_the_rise_is_summed_across_a_5h_reset(self):
+        assert ride.rise_5h(0.0, 10.0, 12.0) == 2.0
+        # 95 -> reset -> 3: what was risen, the old window's last stretch
+        # past 95 (0.4), and the new window's 3.
+        assert ride.rise_5h(2.0, 95.0, 3.0, 0.4) == pytest.approx(5.4)
+
+    def test_the_fraction_is_k_times_the_5h_points_and_capped(self):
+        assert ride.fraction_5h(5.0, 0.2, 0.7, 0.165) == pytest.approx(0.165 * 5.5)
+        assert ride.fraction_5h(9.0, 0.0, 0.0, 0.165) == 1.0
+        assert ride.fraction_5h(0.0, 0.9, 0.0, 0.165) == 0.0
+
+
+class TestFiveHBookkeeping:
+    def test_armed_from_the_reading_before_the_first_99(self):
+        from claude_swap.maximize import engine_hook as eh
+        from claude_swap.settings import MaximizeSettings
+
+        samples = tuple(Sample(ts, p5, 98.0) for ts, p5 in
+                        ((0, 10), (120, 11), (240, 12), (360, 13))) + (Sample(480, 14, 99),)
+        five = eh._arm_five_h({}, samples, MaximizeSettings(), "1", 360, 480, 360, 480)
+        assert five is not None
+        assert (five["p5"], five["readAt"], five["rise"]) == (13, 360, 0.0)
+        # The 5h's pace from the readings (120 s), its phase at 360 (0.5)
+        # plus half the gap to the first 99 (60 s): the 7d's crossing.
+        assert five["pointS"] == pytest.approx(120.0)
+        assert five["phase"] == pytest.approx(1.0)
+        eh._fold_five_h(five, samples)
+        assert (five["p5"], five["readAt"], five["rise"]) == (14, 480, 1.0)
+        # No reading before the first 99: no 5h measure (the time rule).
+        assert eh._arm_five_h({}, samples, MaximizeSettings(), "1", 180, 480, None, 480) is None
+
+    def test_folding_carries_the_old_window_across_a_5h_reset(self):
+        from claude_swap.maximize import engine_hook as eh
+
+        five = {"p5": 91.0, "readAt": 120.0, "rise": 4.0, "phase": 0.5, "pointS": 240.0}
+        samples = (Sample(0, 90, 99), Sample(120, 91, 99), Sample(240, 0, 99), Sample(360, 1, 99))
+        eh._fold_five_h(five, samples)
+        # The old window's line (one step at 60 s) carried to the reset at
+        # 180 s: 0.5 past 91; then the new window's 0 and its step to 1.
+        assert five["rise"] == pytest.approx(4.0 + 0.5 + 0.0 + 1.0)
+        assert (five["p5"], five["readAt"]) == (1, 360)
+        eh._fold_five_h(five, samples)                  # idempotent
+        assert five["rise"] == pytest.approx(5.5)
+
+    def test_the_record_keeps_the_measure_and_which_windows_rode_by_it(self):
+        from claude_swap.maximize import engine_hook as eh
+
+        five = {"p5": 40.0, "readAt": 9.0, "rise": 2.0, "phase": 0.3, "pointS": None}
+        raw = {"account": "1", "riding": ["7d"], "by5h": ["7d", "5h"],
+               "accounts": {"1": {"7d": {"at": 5.0, "pointS": 600.0, "fiveH": five}}}}
+        record = eh._ride_record(json.loads(json.dumps(raw)), "1")
+        assert record["by5h"] == ["7d"]
+        assert record["accounts"]["1"]["7d"]["fiveH"] == five
+        assert eh._ride_record(raw, "2")["by5h"] == []      # another account's ride
+        broken = {**raw, "accounts": {"1": {"7d": {"at": 5.0, "fiveH": {"p5": "x"}}}}}
+        assert "fiveH" not in eh._ride_record(broken, "1")["accounts"]["1"]["7d"]
+
+
+def test_a_7d_ride_measured_on_the_5h_switches_at_t_and_learns_it(temp_home, monkeypatch):
+    from claude_swap.maximize import drain
+
+    # The 5h climbs half a point a reading, the 7d a point every 10
+    # readings: 5 points of 5h per 7d point, k 0.2, learned for #1.
+    monkeypatch.setattr(drain, "learn_k", lambda points, now=None: {"1": 0.2})
+    h = make(temp_home, maximize=MARKS)
+    c = Climb(h, {"2": win(0, 10), "3": win(0, 50)}, step5=0.5)
+    assert approach(c, 1) is TickOutcome.NO_ACTION
+    assert RIDE_KEY in h.state() and h.state()[RIDE_KEY]["by5h"] == ["7d"]
+    reason = of(h, MaximizeDecisionEvent)[-1].reason
+    assert "of the last point used (switching at 0.85, on the 5h)" in reason
+    out = [c.tick(1, 99, advance=URGENT)]
+    while out[-1] is TickOutcome.NO_ACTION and len(out) < 20:
+        out.append(c.tick(1, 99, advance=URGENT))
+    # 0.85 of a point is 4.25 points of 5h, at half a point a reading.
+    assert len(out) in (7, 8, 9), out
+    assert out[-1] is TickOutcome.SWITCHED
+    assert of(h, MaximizeDecisionEvent)[-1].reason.endswith(
+        "of the last point used, measured on the 5h)"
+    )
+    data = learning(h)["7d"]
+    assert (data["t"], data["q"], data["n_ok"], data["n_hit"]) == (0.86, 0.6, 1, 0)
+
+
+def test_100_while_riding_on_the_5h_lowers_t(temp_home, monkeypatch):
+    from claude_swap.maximize import drain
+
+    monkeypatch.setattr(drain, "learn_k", lambda points, now=None: {"1": 0.2})
+    h = make(temp_home, maximize=MARKS)
+    c = Climb(h, {"2": win(0, 10), "3": win(0, 50)}, step5=0.5)
+    assert approach(c, 1) is TickOutcome.NO_ACTION
+    assert c.tick(1, 100, advance=URGENT) is TickOutcome.SWITCHED
+    assert of(h, SwitchEvent)[-1].trigger == "at-limit"
+    data = learning(h)["7d"]
+    assert (data["t"], data["q"], data["n_hit"]) == (pytest.approx(0.76), 0.6, 1)
+
+
+def test_without_a_learned_k_the_7d_rides_by_the_time_rule(temp_home, monkeypatch):
+    from claude_swap.maximize import drain
+
+    monkeypatch.setattr(drain, "learn_k", lambda points, now=None: {"2": 0.2})
+    h = make(temp_home, maximize=MARKS)
+    c = Climb(h, {"2": win(0, 10), "3": win(0, 50)}, step5=0.5)
+    assert approach(c, 1) is TickOutcome.NO_ACTION
+    assert h.state()[RIDE_KEY]["by5h"] == []
+    assert "on the 5h" not in of(h, MaximizeDecisionEvent)[-1].reason
