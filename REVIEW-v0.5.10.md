@@ -220,3 +220,89 @@ Comment and test-comment wording only:
 There are no code changes. The tests touched show only the root-environment failures that main also has. "urgent" legitimately remains in `engine_hook` (`RESET_WAIT_URGENT_S`, `urgent=`), where it names the reset-wait cadence, so leaving those alone is right.
 
 **Mergeable: yes.**
+
+---
+
+## Fix round
+
+`feat/ride-to-99-9` @ `04e222e` (`04e222e1578c64ed0ae49c50eda89f02a7acc254`), one commit on top of `710f4b8`. It fixes R1–R5 and R10. R6–R9 and R11 are unchanged.
+
+### What changed
+
+- **R1, the pre-arm gap.** `engine_hook._arm_five_h` credits the midpoint only when `read_at - at <= ride.MIDPOINT_MAX_GAP_S`. That constant is 240 s, twice `ACTIVE_HIGH_USAGE_INTERVAL_S`. Over a longer gap the count starts from `at`, the same way the time rule counts.
+- **R2, both fixes from the review.**
+  - **Per-account learning.** `rideLearning["accounts"][slot][window]` now holds only the fields that account learned itself: `t` from a ride measured on the 5h, `q`/`settled` from a timed ride, plus the account's own counts. Every other field falls back to the window's record. Each ride teaches both the account and the window. The window record is what an account with no record of its own uses. The new helpers are `ride.learned_for` and `ride.learned_accounts`. `q_values` and `t_values` take an optional slot. The engine (`_ride_track`, `_ride_commit`) and Fleet (`view._own`) read and write per account. Doctor and `why` list each account's own t.
+  - **Stricter k for the 5h path.** A new function, `drain.ride_k`, accepts k only from at least 5 windows (`K_RIDE_MIN_WINDOWS`) with IQR/median of at most 10% (`K_RIDE_MAX_SPREAD`). It lands in the new `Snapshot.ride_k7`. `policy.ride_k` also requires k to be within ±35% (`K_RIDE_PLAN_BAND`) of `drain.fallback_k(plan)`: 0.165 for 20x and unknown plans, 0.105 for 5x. If any check fails, the time rule rides. `learn_k` (3 windows) still feeds the drain unchanged.
+- **R3, multi-window attribution.** A new field, `Switch.ride_ok`, lists the windows where `p.due and not p.capped`. The engine teaches `ok` and `ok_5h` only for those windows.
+- **R4, legacy records.** A halving-era record (no `"v"`) now migrates to `Q_START` whatever its q, with the slow start still ahead.
+- **R5, 5h reset detection.** The 5h measure stores the 5h `resets_at` of the last reading (`fiveH.r5`), but only when it is ahead of that reading. `_fold_five_h` counts a 5h reset when a reading is taken at or after it, or when the value drops. The carry is taken at the old window's `resets_at` when that is known, otherwise at the midpoint. `ride.rise_5h` takes an explicit `reset=` argument.
+- **R10, docs.**
+  - README and `docs/reference.md` now say that a hit stops the turn Claude Code was running.
+  - They say the ride "aims for ~1 hit in 10" (roughly one interrupted turn per account every ten weeks on 7d).
+  - They point to `maximize.learnedRide false` or `maximize.rideWindows ""` for users who want never to be interrupted.
+  - The doctor/why line says `(aims for ~1 hit in 10, …)` instead of `target ~0.9`. `TARGET_SHARE` is removed.
+  - The `ride` row in `doctor_cli.REASONS` matches the reference table.
+- **Docs for R1, R2, R4 and R5.** The reference describes the stricter k, the 4-minute midpoint gate, detection by `resets_at`, per-account t/q and the new migration.
+
+### Simulation (`tests/maximize/test_ride_controller.py`, seeded)
+
+| Scenario | Hits | Share of last point | Settled value |
+|---|---|---|---|
+| 5h measure, single account (seeds 1/2/3) | 9.6% / 9.8% / 9.8% | 0.915 / 0.913 / 0.914 | t 0.890 / 0.888 / 0.887 |
+| Time rule, q (seeds 1/2/3) | 8.9% / 8.8% / 9.4% | 0.808 / 0.813 / 0.803 | q 0.874 / 0.877 / 0.866 |
+| Legacy q 0.9 record (seed 6) | 1 hit in the first 10 rides | | starts at 0.60, settles at q 0.884 |
+
+**Persistent per-account k bias.** Learned k is off from the real k by a fixed bias per account, with ±3% noise per ride on top. Seed 5, 200 burn-in rides, then 500 rides per account:
+
+| Biases | Account (bias) | Own t: hits / share / t | One shared t: hits / share / t |
+|---|---|---|---|
+| −8%, +5% | 1 (−8%) | **10.0%** / 0.911 / 0.816 | 19.6% / 0.931 / 0.840 |
+| | 2 (+5%) | **7.2%** / 0.915 / 0.933 | 0.4% / 0.817 / 0.830 |
+| −8%, 0, +6% | 1 (−8%) | **9.8%** / 0.907 / 0.810 | 26.6% / 0.943 / 0.851 |
+| | 2 (0) | **10.2%** / 0.912 / 0.882 | 2.6% / 0.862 / 0.835 |
+| | 3 (+6%) | **6.4%** / 0.906 / 0.934 | 0.6% / 0.826 / 0.842 |
+
+With its own t, every account stays at or below about 10% hits (the test bound is ≤ 15%) and uses about 0.91 of the point. With one shared t, the account whose k reads low hits on 20–27% of its rides.
+
+**R1, pre-arm gap.** 300 rides at t fixed to 0.88, a 7d pace of 30–45 minutes per point, and the 7d crossing 99 uniformly within the gap:
+
+| Gap | Before: midpoint always credited | After: gated at 240 s |
+|---|---|---|
+| 10 min | 25.3% hits, share 0.911 | **1.0%** hits, share 0.772 |
+| 20 min | 34.3% hits, share 0.886 | **2.7%** hits, share 0.659 |
+
+A ride after a long gap now gives up part of the point instead of riding into 100%.
+
+### Tests
+
+- **`test_ride_controller.py`.** It went from 12 to 32 tests. The new ones cover:
+  - persistent per-account k bias with 2 and 3 accounts, asserting each account's hit rate is ≤ 15% and its share ≥ 0.88;
+  - a shared-t contrast case, where one account exceeds 15%;
+  - fallback from account to window;
+  - `drain.ride_k` window count and spread, and the plan band (8 cases);
+  - the 240 s midpoint gate, and pre-arm gaps of 10 and 20 minutes (≤ 5% hits now, ≥ 20% with the old rule patched back in);
+  - multi-window `ride_ok` when the other window is not due, is due only by the cap, or both are capped;
+  - migration from a legacy q of 0.9;
+  - a 5h reset near 0% with no drop, caught by `resets_at`. Value-only detection counts nothing there.
+
+  The existing simulations now feed `ride_k7` and the 5h `resets_at`.
+- **Updated tests.**
+  - `test_ride_learning.py`: migration is parametrised over legacy q 0.85, 0.9 and 0.95; `fiveH` gains `r5`; the engine test asserts the per-account record; `drain.ride_k` is monkeypatched.
+  - `test_ride_policy.py`: `ride_k7`.
+  - `test_ride_surfaces.py`: the "aims for" wording.
+- **Results of `uv run pytest -q` as root.**
+
+  | Branch | Failed | Passed | Skipped |
+  |---|---|---|---|
+  | `04e222e` | 38 | 5651 | 31 |
+  | `710f4b8` (before) | 38 | 5629 | 31 |
+  | main | 38 | 5584 | 31 |
+
+  The failing set is identical on all three, and every failure is the CLI's "Do not run this script as root" refusal: `test_login_new` (5), `test_login_upsert` (8), `test_names` (1), `test_prime_auto_verify` (1), `test_prime_cli` (7), `test_prime_verify` (2), `test_relogin` (4), `test_cli` (5), `test_switch_degraded_read` (1), `test_switcher` (2) and `test_tui` (2).
+
+  `tests/maximize` alone: 28 failed and 2866 passed, against 28 failed and 2799 passed on main.
+- **Lint.** `ruff check` on `src/claude_swap/maximize` reports only the 2 findings already on the base, in `live_repair.py` and `policy.py` (an unused `poll_policy` import).
+
+### Verdict update
+
+R1 and R2 are fixed and covered by simulation, and R3–R5 and R10 are in. **`feat/ride-to-99-9` @ `04e222e` is mergeable** from this review's side. R6 (a parked return reads the phase as a lower bound), R7 (the reset-wait label and learning), R8 (freezing the measure kind at arm time), R9 (an effective cap for time-rule rides) and R11 (documenting the history writes) remain open as follow-ups.
