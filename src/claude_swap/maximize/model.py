@@ -149,8 +149,12 @@ class Snapshot:
     # The near-reset drain (maximize/drain.py): each account's learned
     # 7d-per-5h ratio k (7d points one 5h point costs; ``drain.learn_k``
     # over the usage history). Absent = not learned: the plan's default for
-    # the drain, the time rule for the learned ride.
+    # the drain.
     k7: Mapping[str, float] = field(default_factory=dict)
+    # The k the 7d ride may read its last point by (``drain.ride_k``: more
+    # windows, a bounded spread; ``policy.ride_k`` adds the plan check).
+    # Absent = the time rule for the learned ride.
+    ride_k7: Mapping[str, float] = field(default_factory=dict)
     # The active account's pct5/pct7 are an estimate (None: its reading).
     estimate: UsageEstimate | None = None
     # While the active account's usage is projected, the usage samples stop
@@ -182,6 +186,11 @@ class Switch:
     ride_capped: bool = False
     # The ride window(s) measured on the 5h (they teach ``t``, not q).
     ride_by_5h: tuple[str, ...] = ()
+    # The ride window(s) that reached their learned share (due, and not
+    # capped by ``rideMaxMin``): only they learn from a ``due`` switch. With
+    # ``rideWindows = "5h,7d"`` one window can end the ride while the other
+    # was neither due nor capped, or due only by the cap.
+    ride_ok: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)

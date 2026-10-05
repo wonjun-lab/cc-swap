@@ -495,7 +495,7 @@ REASONS: dict[str, tuple[str, str]] = {
     ),
     "ride": (
         "A window listed in maximize.rideWindows reached a hard mark of 99% or more but is under 100%. Usage is reported in whole percents, so up to one point is left: maximize keeps using it until a learned share of that point is used, then switches (at once if the account goes idle first, if it hits 100%, or if Claude Code reports the limit). On 7d the share is measured on the 5h, which rises about six times as fast, at the account's learned 7d-per-5h ratio; without one it is a learned share of the time one point takes.",
-        "Nothing; cc-swap doctor shows what has been learned. Set maximize.learnedRide to false (or maximize.rideWindows to \"\") to switch at the hard mark, or lower maximize.rideMaxMin (default 60) to cap the ride.",
+        "Nothing; cc-swap doctor shows what has been learned. It aims for about 1 hit in 10 rides, and a hit stops the turn Claude Code was running. Set maximize.learnedRide to false (or maximize.rideWindows to \"\") to never be interrupted (it switches at the hard mark), or lower maximize.rideMaxMin (default 60) to cap the ride.",
     ),
     "hold": (
         "You asked to stay on the active account (cc-swap hold, or Fleet: h) so a long task keeps its context: until the hold ends, maximize skips its soft, preempt and rebalance moves. A hard mark, 100% and a reset-wait still switch.",

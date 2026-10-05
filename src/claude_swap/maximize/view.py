@@ -116,7 +116,10 @@ class MaximizeState:
     hold: account_hold.AccountHold | None = None
     # The learned ride (maximize/ride.py): q per window, and each account's
     # armed windows (``maximizeRide``: slot -> window -> arm time, and
-    # seconds per point) so Fleet decides a ride as the engine does.
+    # seconds per point) so Fleet decides a ride as the engine does. The
+    # ``rideLearning`` record as read: the active account's own q and t
+    # (``ride.learned_for``) come from it.
+    ride_learning: object = None
     ride_q: Mapping[str, float] = field(default_factory=dict)
     ride_armed_at: Mapping[str, Mapping[str, float]] = field(default_factory=dict)
     ride_point_s: Mapping[str, Mapping[str, float]] = field(default_factory=dict)
@@ -272,6 +275,7 @@ def read_state(backup_root: Path) -> MaximizeState:
     off_by = off_map.get("by")
     ride_armed_at, ride_point_s, ride_5h = _ride_armed(raw.get("maximizeRide"))
     return MaximizeState(
+        ride_learning=raw.get(learned_ride.LEARN_KEY),
         ride_q=learned_ride.q_values(raw.get(learned_ride.LEARN_KEY)),
         ride_t=learned_ride.t_values(raw.get(learned_ride.LEARN_KEY)),
         ride_armed_at=ride_armed_at,
@@ -361,6 +365,29 @@ def drain_k7(
         return {}
 
 
+def _own(state: MaximizeState, number: str | None, key: str) -> dict[str, float]:
+    """The active account's own learned ``q`` or ``t`` per window, where it
+    has one (``ride.learned_accounts``); the window's stands otherwise."""
+    if number is None:
+        return {}
+    mine = learned_ride.learned_accounts(state.ride_learning).get(str(number), {})
+    return {w: item[key] for w, item in mine.items()}
+
+
+def ride_k7(
+    h: usage_history.History | None, settings: MaximizeSettings, now: float
+) -> dict[str, float]:
+    """Each account's k the 7d ride may read its last point by, the way the
+    engine derives it (``engine_hook._history_inputs``: ``drain.ride_k``
+    while the 7d ride is on). No history, or any failure, is none."""
+    if h is None or "7d" not in policy.ride_windows(settings):
+        return {}
+    try:
+        return drain.ride_k(h.points, now)
+    except Exception:
+        return {}
+
+
 def idle_pattern_text(
     h: usage_history.History | None, settings: MaximizeSettings, now: float
 ) -> str:
@@ -433,12 +460,13 @@ def snapshot_from_accounts(
         forecast=forecast,
         rates7=rates7,
         hold_until=pinned.until if pinned is not None else None,
-        ride_q=state.ride_q,
+        ride_q={**state.ride_q, **_own(state, snap.active_number, "q")},
         ride_armed_at=state.ride_armed_at.get(snap.active_number or "", {}),
         ride_point_s=state.ride_point_s.get(snap.active_number or "", {}),
         ride_5h=state.ride_5h.get(snap.active_number or "", {}),
-        ride_t=state.ride_t,
+        ride_t={**state.ride_t, **_own(state, snap.active_number, "t")},
         k7=drain_k7(history, settings, now),
+        ride_k7=ride_k7(history, settings, now),
         # How old each reading is: the policy's stale landing rule, as the
         # engine applies it (engine_hook.reading_ages).
         ages={

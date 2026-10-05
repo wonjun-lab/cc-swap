@@ -67,7 +67,7 @@ class TestLearn:
         assert ride.describe(data, ("7d",)) == (
             "learned ride: 5h off (rideWindows; learned 0.60) · "
             "7d rides to 0.85 of the last point by its 5h, else 0.65 of its time "
-            "(target ~0.9, 1 ok, 0 hit)"
+            "(aims for ~1 hit in 10, 1 ok, 0 hit)"
         )
         assert ride.describe(data, (), "maximize.learnedRide is false") == (
             "learned ride: off (maximize.learnedRide is false)"
@@ -82,17 +82,23 @@ class TestMigration:
         data = ride.learned(old)
         assert data["7d"] == fresh(0.6, n_ok=3, n_hit=2, updatedAt=9.0)
 
-    def test_a_q_earned_by_clean_rides_is_kept(self):
-        old = {"7d": {"q": 0.85, "n_ok": 12, "n_hit": 1}}
-        assert ride.q_values(old)["7d"] == 0.85
+    @pytest.mark.parametrize("q", [0.85, 0.9, 0.95])
+    def test_a_high_legacy_q_starts_over_too(self, q):
+        # Learned against the old, much shorter T1 (a fifth of the point):
+        # on an accurate T1 a legacy 0.9 would ride into 100%, and its next
+        # clean ride would lift it to the cap.
+        old = {"7d": {"q": q, "n_ok": 12, "n_hit": 1}}
+        assert ride.q_values(old)["7d"] == 0.6
         assert ride.learned(old)["7d"]["settled"] is False
+        out = ride.learn(old, "7d", "ok", 1.0)
+        assert out["7d"]["q"] == pytest.approx(0.65)  # the slow start, from 0.6
 
     def test_a_migrated_window_gets_the_slow_start_then_settles(self):
-        old = {"7d": {"q": 0.85, "n_ok": 12, "n_hit": 1}, "5h": {"q": 0.1}}
+        old = {"7d": {"q": 0.9, "n_ok": 12, "n_hit": 1}, "5h": {"q": 0.1}}
         out = ride.learn(old, "7d", "ok", 1.0)
-        assert out["7d"]["q"] == pytest.approx(0.9)
+        assert out["7d"]["q"] == pytest.approx(0.65)
         out = ride.learn(out, "7d", "hit", 2.0)
-        assert out["7d"] == fresh(0.81, n_ok=13, n_hit=2, settled=True, updatedAt=2.0)
+        assert out["7d"] == fresh(0.56, n_ok=13, n_hit=2, settled=True, updatedAt=2.0)
         # The untouched window is written migrated, and stays so.
         assert out["5h"] == fresh(0.6)
         assert ride.learned(out) == out
@@ -765,7 +771,7 @@ class TestFiveHBookkeeping:
                "accounts": {"1": {"7d": {"at": 5.0, "pointS": 600.0, "fiveH": five}}}}
         record = eh._ride_record(json.loads(json.dumps(raw)), "1")
         assert record["by5h"] == ["7d"]
-        assert record["accounts"]["1"]["7d"]["fiveH"] == five
+        assert record["accounts"]["1"]["7d"]["fiveH"] == {**five, "r5": None}
         assert eh._ride_record(raw, "2")["by5h"] == []      # another account's ride
         broken = {**raw, "accounts": {"1": {"7d": {"at": 5.0, "fiveH": {"p5": "x"}}}}}
         assert "fiveH" not in eh._ride_record(broken, "1")["accounts"]["1"]["7d"]
@@ -776,7 +782,7 @@ def test_a_7d_ride_measured_on_the_5h_switches_at_t_and_learns_it(temp_home, mon
 
     # The 5h climbs half a point a reading, the 7d a point every 10
     # readings: 5 points of 5h per 7d point, k 0.2, learned for #1.
-    monkeypatch.setattr(drain, "learn_k", lambda points, now=None: {"1": 0.2})
+    monkeypatch.setattr(drain, "ride_k", lambda points, now=None: {"1": 0.2})
     h = make(temp_home, maximize=MARKS)
     c = Climb(h, {"2": win(0, 10), "3": win(0, 50)}, step5=0.5)
     assert approach(c, 1) is TickOutcome.NO_ACTION
@@ -794,12 +800,15 @@ def test_a_7d_ride_measured_on_the_5h_switches_at_t_and_learns_it(temp_home, mon
     )
     data = learning(h)["7d"]
     assert (data["t"], data["q"], data["n_ok"], data["n_hit"]) == (0.86, 0.6, 1, 0)
+    # #1's own t learned the same step; its q is still the window's.
+    own = h.state()[ride.LEARN_KEY]["accounts"]["1"]["7d"]
+    assert own["t"] == 0.86 and "q" not in own
 
 
 def test_100_while_riding_on_the_5h_lowers_t(temp_home, monkeypatch):
     from claude_swap.maximize import drain
 
-    monkeypatch.setattr(drain, "learn_k", lambda points, now=None: {"1": 0.2})
+    monkeypatch.setattr(drain, "ride_k", lambda points, now=None: {"1": 0.2})
     h = make(temp_home, maximize=MARKS)
     c = Climb(h, {"2": win(0, 10), "3": win(0, 50)}, step5=0.5)
     assert approach(c, 1) is TickOutcome.NO_ACTION
@@ -812,7 +821,7 @@ def test_100_while_riding_on_the_5h_lowers_t(temp_home, monkeypatch):
 def test_without_a_learned_k_the_7d_rides_by_the_time_rule(temp_home, monkeypatch):
     from claude_swap.maximize import drain
 
-    monkeypatch.setattr(drain, "learn_k", lambda points, now=None: {"2": 0.2})
+    monkeypatch.setattr(drain, "ride_k", lambda points, now=None: {"2": 0.2})
     h = make(temp_home, maximize=MARKS)
     c = Climb(h, {"2": win(0, 10), "3": win(0, 50)}, step5=0.5)
     assert approach(c, 1) is TickOutcome.NO_ACTION

@@ -64,7 +64,7 @@ and still under 100%, the hard switch waits until
     t_switch = arm time + q × T1 − ``RIDE_MARGIN_S``
 
 (the time rule; at most ``rideMaxMin`` after the arm time). On 7d, with
-the active account's k learned (``Snapshot.k7``) and the engine's 5h
+the active account's k trusted (:func:`ride_k`, ``Snapshot.ride_k7``) and the engine's 5h
 measure (``Snapshot.ride_5h``) and fresh samples, the ride is measured
 instead (:func:`ride_used_5h`, ``ride.fraction_5h``)::
 
@@ -73,7 +73,10 @@ instead (:func:`ride_used_5h`, ``ride.fraction_5h``)::
 
 and the switch is due once ``used`` reaches the learned target ``t``
 (``Snapshot.ride_t``), or at ``rideMaxMin`` (``Switch.ride_by_5h`` /
-``Hold.ride_by_5h`` say which windows rode so: they teach ``t``, not q).
+``Hold.ride_by_5h`` say which windows rode so: they teach ``t``, not q;
+``Switch.ride_ok`` the ones that reached their share, the only ones a
+``due`` switch teaches). q and t are the active account's own where it
+learned them, else the window's (``ride.learned_for``).
 The arm time is the reading
 before the first one at the mark (the crossing may have come right after
 it), else ``ride.ARM_UNKNOWN_GAP_S`` before that first one
@@ -599,13 +602,22 @@ def ride_armed_at(snap: Snapshot, window: Window) -> float:
 
 
 def ride_k(snap: Snapshot, a: AccountView | None) -> float | None:
-    """Account ``a``'s learned 7d-per-5h ratio (``Snapshot.k7``), or None
-    when nothing is learned for it: the 5h-measured ride needs the
-    account's own k, a plan default is too coarse to read a last point by."""
-    k = snap.k7.get(a.number) if a is not None else None
-    if isinstance(k, (int, float)) and not isinstance(k, bool) and math.isfinite(k) and k > 0:
-        return float(k)
-    return None
+    """Account ``a``'s 7d-per-5h ratio the 7d ride may read its last point
+    by, or None (the time rule rides): a k learned for it under the ride's
+    stricter rule (``Snapshot.ride_k7``, ``drain.ride_k``: enough windows
+    that agree) and within ``drain.K_RIDE_PLAN_BAND`` of its plan's default
+    (``drain.fallback_k``; outside it the history still mixes another plan
+    or login in). ``used`` scales with k, so a k x% off moves the switch
+    by about x% of the point; a plan default alone is too coarse."""
+    k = snap.ride_k7.get(a.number) if a is not None else None
+    if not (
+        isinstance(k, (int, float)) and not isinstance(k, bool) and math.isfinite(k) and k > 0
+    ):
+        return None
+    default = drain.fallback_k(a.plan if a is not None else None)
+    if abs(float(k) - default) > drain.K_RIDE_PLAN_BAND * default:
+        return None
+    return float(k)
 
 
 @dataclass(frozen=True)
@@ -747,6 +759,9 @@ def _hard_or_ride(
         # then says nothing about q or t (``Switch.ride_capped``, nothing
         # learned).
         capped = all(p.capped for p in due)
+        # Only a window that reached its learned share learns from the
+        # switch: one not due, or due only by the cap, says nothing.
+        ok = tuple(w for w, p in zip(windows, ridden) if p.due and not p.capped)
         if capped:
             over = "capped by rideMaxMin"
         elif any(p.by_5h for p in due):
@@ -757,6 +772,7 @@ def _hard_or_ride(
         return replace(
             base, reason=f"{base.reason}; learned ride {over}",
             ride="due", ride_windows=windows, ride_capped=capped, ride_by_5h=by_5h,
+            ride_ok=ok,
         )
     capped = any(p.capped and p.until == until for p in ridden)
     waited = _ride_reset_wait(snap, a, windows, until)

@@ -90,6 +90,7 @@ def build_snapshot(
     ride_5h: Mapping[str, RideFiveH] | None = None,
     ride_t: Mapping[str, float] | None = None,
     k7: Mapping[str, float] | None = None,
+    ride_k7: Mapping[str, float] | None = None,
     ages: Mapping[str, float | None] | None = None,
     estimate: UsageEstimate | None = None,
     local_idle: bool | None = None,
@@ -146,6 +147,7 @@ def build_snapshot(
         ride_5h=dict(ride_5h or {}),
         ride_t=dict(ride_t or {}),
         k7=dict(k7 or {}),
+        ride_k7=dict(ride_k7 or {}),
         estimate=estimate,
         local_idle=local_idle,
     )

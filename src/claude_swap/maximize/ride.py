@@ -19,8 +19,8 @@ in the state file:
   timed, :func:`point_seconds` reads it). The engine and the policy prefer
   it to the recent velocity over ``idleWindowMin``, which takes over only
   when no step was timed or when it shows a burst (:func:`point_estimate`).
-* **Learning** (``LEARN_KEY``): ``q`` per window (and ``t``, the 5h
-  measure's target, below), a target-hit-rate controller. A ride that switched before 100% adds :data:`Q_UP`
+* **Learning** (``LEARN_KEY``): ``q`` per window and per account (and
+  ``t``, the 5h measure's target, below), a target-hit-rate controller. A ride that switched before 100% adds :data:`Q_UP`
   (:data:`Q_UP_FIRST` until the window's first hit); one that saw 100% —
   read, or a limit refusal Claude Code reported — first takes
   :data:`Q_DOWN` off. A ride an idle switch ended early, one ``rideMaxMin``
@@ -52,19 +52,34 @@ learned per account, maximize/drain.py), so its whole-percent steps cut
 the 7d's last point into sixths and the time since its last step reads
 between them: ``k × (5h points risen since the arm time + the 5h's phase
 now − its phase at the 7d's estimated crossing)`` is the share used. The
-policy switches once it reaches a learned target ``t`` (``"t"`` per window
-in ``rideLearning``): the same controller, +:data:`T_UP` clean,
+policy switches once it reaches a learned target ``t`` (``"t"`` per account
+and window in ``rideLearning``, below): the same controller, +:data:`T_UP` clean,
 −:data:`T_DOWN` on a hit, from :data:`T_START` in [T_MIN, T_MAX], so ~10%
 of rides hit. In the simulation of tests/maximize/test_ride_controller.py
 (5h read in whole percents every 2 minutes, k off by ±3% per ride, a 5h
 reset in one ride in five) t settles at ~0.88 with ~10% hits and a ride
-uses ~0.91 of its last point (99.9%); with k off by ±5%, ~0.89. Without a
-learned k, or the readings it needs, the time rule rides.
+uses ~0.91 of its last point (99.9%); with k off by ±5%, ~0.89. With a
+persistent per-account k bias of up to ±8% each account's own t absorbs
+it and each keeps to about one hit in ten. Without a trusted k, or the
+readings it needs, the time rule rides.
 
 Records the halving rule wrote (no ``"v"``: before :data:`LEARN_VERSION`)
-keep their q when it is at least :data:`Q_START` and start from Q_START
-when lower (a halved q says where a hit was, not where the edge is), with
-the slow start still to come.
+start over from :data:`Q_START`, with the slow start still to come: their q
+was learned against the old, much shorter T1 (a fifth of the point), so a
+high one (0.9 after many clean rides) would ride an accurate T1 into 100%,
+and a halved one says where a hit was, not where the edge is.
+
+**Per account.** q and t are kept per window (``rideLearning["5h"]``,
+``["7d"]``) and per account and window (``rideLearning["accounts"][slot]``):
+an account rides by its own once it has one, else by the window's, and
+every ride teaches both. The 5h measure's error is mostly the account's
+k (a median of a few quantized windows, or one that still mixes an old
+plan in), a bias of its own: one shared t would settle on the mix of
+accounts and let the one whose k reads low hit on most rides. The
+5h measure also needs a k it can trust (``policy.ride_k``: at least
+``drain.K_RIDE_MIN_WINDOWS`` windows that agree within
+``drain.K_RIDE_MAX_SPREAD``, and within ``drain.K_RIDE_PLAN_BAND`` of the
+plan's default), else the time rule rides.
 
 Slot numbers and percentages only — never an email or a token.
 """
@@ -83,8 +98,10 @@ Outcome = Literal["ok", "hit"]
 #: State-file keys (``autoswitch_state.json``).
 STEPS_KEY = "rideSteps"
 LEARN_KEY = "rideLearning"
+#: ``rideLearning``'s per-account part: ``{slot: {window: record}}``.
+ACCOUNTS_KEY = "accounts"
 
-#: q for a window with no history (and the floor a halving-era q migrates to).
+#: q for a window with no history (and what a halving-era q migrates to).
 Q_START = 0.6
 #: Kept for callers that ask for "the q of a window nothing was learned for".
 Q_DEFAULT = Q_START
@@ -97,8 +114,6 @@ Q_DOWN = 0.09
 Q_UP_FIRST = 0.05
 #: The hit rate the controller settles at below the cap: Q_UP/(Q_UP+Q_DOWN).
 TARGET_HIT_RATE = Q_UP / (Q_UP + Q_DOWN)
-#: The share of the last point it aims for (~99.9%), as the surfaces say it.
-TARGET_SHARE = 0.9
 #: ``rideLearning`` records written by this controller say so (``"v"``).
 LEARN_VERSION = 2
 
@@ -146,6 +161,13 @@ DEFAULT_QUIET_S = 600.0
 #: before the first one — ``poll_policy.ACTIVE_MAX_INTERVAL_S``, the
 #: longest the active account's normal cadence leaves between readings.
 ARM_UNKNOWN_GAP_S = 300.0
+#: The 5h measure credits the 7d's crossing at the middle of the two
+#: readings around it only when they are at most this far apart (twice
+#: ``poll_policy.ACTIVE_HIGH_USAGE_INTERVAL_S``): across a longer gap (a
+#: sleep, a restart, the post-429 cadence) other use may have carried the 7d
+#: over its mark early in it, and half the gap credited as unused rides into
+#: 100%. It then counts from the arm time, as the time rule does.
+MIDPOINT_MAX_GAP_S = 240.0
 
 
 def arm_time(read_at: float, previous_at: float | None) -> float:
@@ -175,60 +197,107 @@ def clamp_t(t: float) -> float:
 # -- learning ---------------------------------------------------------------------------
 
 
+def _item(item: Mapping, base: dict | None = None) -> dict:
+    """One window's learning record, leniently. ``base`` (an account's
+    record): what it falls back to field by field, the window's record."""
+    current = _num(item.get("v")) == LEARN_VERSION
+    q = _num(item.get("q"))
+    if q is None or not current:
+        # Nothing learned, or a halving-era q: learned against the old,
+        # much shorter T1, it says nothing about a share of the real one.
+        q = base["q"] if base is not None and q is None else Q_START
+    t = _num(item.get("t"))
+    if t is None:
+        t = base["t"] if base is not None else T_START
+    counts = {k: _num(item.get(k)) for k in ("n_ok", "n_hit")}
+    settled = item.get("settled")
+    return {
+        "q": clamp_q(q),
+        "t": clamp_t(t),
+        "n_ok": int(counts["n_ok"]) if counts["n_ok"] and counts["n_ok"] > 0 else 0,
+        "n_hit": int(counts["n_hit"]) if counts["n_hit"] and counts["n_hit"] > 0 else 0,
+        "settled": (
+            current and settled is True
+            if base is None or "settled" in item else base["settled"]
+        ),
+        "v": LEARN_VERSION,
+        "updatedAt": _num(item.get("updatedAt")),
+    }
+
+
 def learned(raw: object) -> dict[Window, dict]:
-    """The ``rideLearning`` record, leniently: each window's
-    ``{"q", "t", "n_ok", "n_hit", "settled", "v", "updatedAt"}`` with ``q``
-    and ``t`` clamped, defaults for anything missing or malformed. A window the
-    halving rule wrote (no ``"v"``) is migrated: its q is at least
-    :data:`Q_START`, and it is not ``settled`` (the slow start is ahead)."""
+    """The ``rideLearning`` record's per-window part, leniently: each
+    window's ``{"q", "t", "n_ok", "n_hit", "settled", "v", "updatedAt"}``
+    with ``q`` and ``t`` clamped, defaults for anything missing or
+    malformed. A window the halving rule wrote (no ``"v"``) is migrated: its
+    q starts over from :data:`Q_START` (it was learned against the old,
+    much shorter T1), and it is not ``settled`` (the slow start is ahead)."""
     src = raw if isinstance(raw, Mapping) else {}
     out: dict[Window, dict] = {}
     for w in WINDOWS:
         item = src.get(w) if isinstance(src.get(w), Mapping) else {}
-        q = _num(item.get("q"))
-        current = _num(item.get("v")) == LEARN_VERSION
-        if q is None:
-            q = Q_START
-        elif not current:
-            q = max(q, Q_START)
-        counts = {k: _num(item.get(k)) for k in ("n_ok", "n_hit")}
-        t = _num(item.get("t"))
-        out[w] = {
-            "q": clamp_q(q),
-            "t": clamp_t(t if t is not None else T_START),
-            "n_ok": int(counts["n_ok"]) if counts["n_ok"] and counts["n_ok"] > 0 else 0,
-            "n_hit": int(counts["n_hit"]) if counts["n_hit"] and counts["n_hit"] > 0 else 0,
-            "settled": current and item.get("settled") is True,
-            "v": LEARN_VERSION,
-            "updatedAt": _num(item.get("updatedAt")),
-        }
+        out[w] = _item(item)
     return out
 
 
-def q_values(raw: object) -> dict[Window, float]:
-    """``{window: q}`` from the ``rideLearning`` record."""
-    return {w: item["q"] for w, item in learned(raw).items()}
+_FIELDS = ("q", "t", "n_ok", "n_hit", "settled", "v", "updatedAt")
 
 
-def t_values(raw: object) -> dict[Window, float]:
-    """``{window: t}``, the 5h-measured ride's targets, from the record."""
-    return {w: item["t"] for w, item in learned(raw).items()}
+def _own(raw: object) -> dict[str, dict[Window, dict]]:
+    """``rideLearning["accounts"]`` as stored: per slot and window only the
+    fields that account learned itself (a 5h-measured ride writes ``t``,
+    a timed one ``q``), the rest left to the window's record."""
+    src = raw if isinstance(raw, Mapping) else {}
+    accounts = src.get(ACCOUNTS_KEY)
+    out: dict[str, dict[Window, dict]] = {}
+    for number, items in (accounts.items() if isinstance(accounts, Mapping) else ()):
+        if not isinstance(items, Mapping):
+            continue
+        mine = {
+            w: {k: items[w][k] for k in _FIELDS if k in items[w]}
+            for w in WINDOWS
+            if isinstance(items.get(w), Mapping)
+        }
+        if mine:
+            out[str(number)] = mine
+    return out
 
 
-def learn(
-    raw: object, window: Window, outcome: Outcome, now: float, *, by_5h: bool = False
-) -> dict:
-    """The ``rideLearning`` record after one ride on ``window`` ended in
-    ``outcome``: ``ok`` (switched before 100%) adds :data:`Q_UP`
-    (:data:`Q_UP_FIRST` while the window has not hit since this controller
-    took over), ``hit`` (100% came first) takes :data:`Q_DOWN` off and
-    settles the window; q stays in [Q_MIN, Q_MAX].
+def learned_accounts(raw: object) -> dict[str, dict[Window, dict]]:
+    """The per-account part (``rideLearning["accounts"]``), leniently:
+    ``{slot: {window: record}}``, only the windows an account learned for,
+    each falling back field by field to the window's record (its counts
+    are its own)."""
+    windows = learned(raw)
+    return {
+        number: {w: _item(item, windows[w]) for w, item in items.items()}
+        for number, items in _own(raw).items()
+    }
 
-    ``by_5h``: the ride ran on the 5h-measured estimate (:func:`fraction_5h`)
-    and teaches its target ``t`` instead: +:data:`T_UP` / −:data:`T_DOWN`,
-    in [T_MIN, T_MAX]. q is left as it is."""
+
+def learned_for(raw: object, account: str | None) -> dict[Window, dict]:
+    """Each window's record as account ``account`` rides it: its own where
+    it learned one, else the window's (None: the window's)."""
     out = learned(raw)
-    item = dict(out[window])
+    if account is not None:
+        out.update(learned_accounts(raw).get(str(account), {}))
+    return out
+
+
+def q_values(raw: object, account: str | None = None) -> dict[Window, float]:
+    """``{window: q}`` from the ``rideLearning`` record, account
+    ``account``'s own where it has one."""
+    return {w: item["q"] for w, item in learned_for(raw, account).items()}
+
+
+def t_values(raw: object, account: str | None = None) -> dict[Window, float]:
+    """``{window: t}``, the 5h-measured ride's targets, from the record,
+    account ``account``'s own where it has one."""
+    return {w: item["t"] for w, item in learned_for(raw, account).items()}
+
+
+def _step(item: dict, outcome: Outcome, now: float, by_5h: bool) -> dict:
+    item = dict(item)
     if by_5h:
         if outcome == "ok":
             item["t"] = round(min(T_MAX, item["t"] + T_UP), 4)
@@ -245,30 +314,85 @@ def learn(
         item["n_hit"] += 1
         item["settled"] = True
     item["updatedAt"] = now
-    out[window] = item
-    return {w: dict(v) for w, v in out.items()}
+    return item
+
+
+def learn(
+    raw: object,
+    window: Window,
+    outcome: Outcome,
+    now: float,
+    *,
+    by_5h: bool = False,
+    account: str | None = None,
+) -> dict:
+    """The ``rideLearning`` record after one ride on ``window`` ended in
+    ``outcome``: ``ok`` (switched before 100%) adds :data:`Q_UP`
+    (:data:`Q_UP_FIRST` while the window has not hit since this controller
+    took over), ``hit`` (100% came first) takes :data:`Q_DOWN` off and
+    settles the window; q stays in [Q_MIN, Q_MAX].
+
+    ``by_5h``: the ride ran on the 5h-measured estimate (:func:`fraction_5h`)
+    and teaches its target ``t`` instead: +:data:`T_UP` / −:data:`T_DOWN`,
+    in [T_MIN, T_MAX]. q is left as it is.
+
+    ``account``: the slot that rode. Its own record (``"accounts"``, from
+    the window's when it has none yet) learns the same step: the 5h
+    measure's error is the account's k, a bias of its own that one shared
+    t cannot absorb. The window's record learns too: it is what an account
+    with nothing of its own rides by."""
+    windows = learned(raw)
+    own = _own(raw)
+    if account is not None:
+        number = str(account)
+        merged = learned_accounts(raw).get(number, {}).get(window)
+        if merged is None:
+            merged = {**windows[window], "n_ok": 0, "n_hit": 0}
+        stepped = _step(merged, outcome, now, by_5h)
+        keys = ("t",) if by_5h else ("q", "settled")
+        entry = own.setdefault(number, {}).setdefault(window, {})
+        entry.update({k: stepped[k] for k in (*keys, "n_ok", "n_hit", "updatedAt")})
+        entry["v"] = LEARN_VERSION
+    windows[window] = _step(windows[window], outcome, now, by_5h)
+    out: dict = {w: dict(v) for w, v in windows.items()}
+    if own:
+        out[ACCOUNTS_KEY] = own
+    return out
 
 
 def describe(raw: object, windows: tuple[str, ...], off: str | None = None) -> str:
     """The doctor and ``cc-swap why`` line: ``learned ride: 5h off
     (rideWindows; learned 0.60) · 7d rides to 0.88 of the last point by
-    its 5h, else 0.62 of its time (target ~0.9, 5 ok, 1 hit)``. ``windows``
-    are the ones that ride; ``off`` says why none does when the ride is off
-    altogether."""
+    its 5h, else 0.62 of its time (aims for ~1 hit in 10, 5 ok, 1 hit;
+    per account: 1 0.86, 2 0.90)``. ``windows`` are the ones that ride;
+    ``off`` says why none does when the ride is off altogether."""
     if off:
         return f"learned ride: off ({off})"
     data = learned(raw)
+    accounts = learned_accounts(raw)
+    aim = f"aims for ~1 hit in {round(1 / TARGET_HIT_RATE)}"
     parts = []
     for w in WINDOWS:
         item = data[w]
-        counts = f"(target ~{TARGET_SHARE:g}, {item['n_ok']} ok, {item['n_hit']} hit)"
+        own = [
+            (number, items[w]) for number, items in sorted(accounts.items()) if w in items
+        ]
+        counts = f"({aim}, {item['n_ok']} ok, {item['n_hit']} hit"
         if w in windows and w == "7d":
+            if own:
+                counts += "; per account: " + ", ".join(
+                    f"{number} {mine['t']:.2f}" for number, mine in own
+                )
             parts.append(
                 f"{w} rides to {item['t']:.2f} of the last point by its 5h, "
-                f"else {item['q']:.2f} of its time {counts}"
+                f"else {item['q']:.2f} of its time {counts})"
             )
         elif w in windows:
-            parts.append(f"{w} rides {item['q']:.2f} of the last point {counts}")
+            if own:
+                counts += "; per account: " + ", ".join(
+                    f"{number} {mine['q']:.2f}" for number, mine in own
+                )
+            parts.append(f"{w} rides {item['q']:.2f} of the last point {counts})")
         else:
             parts.append(f"{w} off (rideWindows; learned {item['q']:.2f})")
     return "learned ride: " + " · ".join(parts)
@@ -495,15 +619,28 @@ def phase_5h(
     return phase if limit is None else min(limit, phase)
 
 
-def rise_5h(rise: float, last: float, pct5: float, carry: float = 0.0) -> float:
+def rise_5h(
+    rise: float,
+    last: float,
+    pct5: float,
+    carry: float = 0.0,
+    *,
+    reset: bool | None = None,
+) -> float:
     """5h points risen since the arm time after a new reading ``pct5``,
     from ``rise`` so far and the previous reading ``last``: a rise adds
-    itself; a drop is a 5h reset and adds what the new window reads plus
-    ``carry``, how far the old window had gone past ``last`` by its reset
-    (:func:`phase_5h` at the reset; whole points up to ``last`` were
-    already counted)."""
-    if pct5 >= last:
-        return rise + pct5 - last
+    itself; a 5h reset adds what the new window reads plus ``carry``, how
+    far the old window had gone past ``last`` by its reset (:func:`phase_5h`
+    at the reset; whole points up to ``last`` were already counted).
+
+    ``reset``: whether the 5h reset between the two readings (the old
+    reading's ``resets_at`` passed); None reads it off the values, a drop.
+    A window at 0-1% that resets into one reading as much or more shows no
+    drop, so the caller says so when it knows."""
+    if reset is None:
+        reset = pct5 < last
+    if not reset:
+        return rise + max(pct5 - last, 0.0)
     return rise + max(carry, 0.0) + max(pct5, 0.0)
 
 

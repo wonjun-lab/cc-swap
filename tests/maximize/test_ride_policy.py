@@ -262,7 +262,7 @@ def five_snap(rise: float, *, k: float | None = 0.165, t: float | None = None,
     return replace(
         s,
         ride_5h={"7d": RideFiveH(rise, 0.2, point5_s)},
-        k7={} if k is None else {"1": k},
+        ride_k7={} if k is None else {"1": k},
         ride_t={} if t is None else {"7d": t},
     )
 

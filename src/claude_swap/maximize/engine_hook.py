@@ -769,23 +769,25 @@ def _history_inputs(
     current: str,
     samples: tuple[Sample, ...],
     now: float,
-) -> tuple[Forecast | None, dict[str, float], dict[str, float]]:
-    """Record this tick in the usage history; ``(forecast, rates7, k7)`` for
-    the Snapshot.
+) -> tuple[Forecast | None, dict[str, float], dict[str, float], dict[str, float]]:
+    """Record this tick in the usage history; ``(forecast, rates7, k7,
+    ride_k7)`` for the Snapshot.
 
     Only readings the tick already has are recorded (no poll, no refresh):
     usage points while ``preempt``, the near-reset drain (``drainHours``)
     or the 7d learned ride is on, slot observations while
-    ``learnIdlePattern`` is. The k per account (``drain.learn_k``: the
-    drain's, and the 7d ride's 5h measure) comes from those points. Dry runs record in memory only. History is a planning aid: any
+    ``learnIdlePattern`` is. The k per account (``drain.learn_k``, the
+    drain's; ``drain.ride_k``, the stricter one the 7d ride's 5h measure
+    takes) comes from those points. Dry runs record in memory only. History is a planning aid: any
     failure here is logged and decides as if it had none.
     """
     s = rt.settings
     drain_on = s.drain_hours > 0
     # The 7d ride reads its last point on the 5h at the account's own k.
     need_k = drain_on or "7d" in policy.ride_windows(s)
+    ride_on = "7d" in policy.ride_windows(s)
     if not (s.preempt or s.learn_idle_pattern or need_k):
-        return None, {}, {}
+        return None, {}, {}, {}
     try:
         root = engine.switcher.backup_dir
         if rt.history is None or rt.history.root != root:
@@ -807,10 +809,11 @@ def _history_inputs(
         forecast = history.forecast(kept.slots, now) if s.learn_idle_pattern else None
         rates = history.burn_rates(kept.points, now) if s.preempt else {}
         k7 = drain.learn_k(kept.points, now) if need_k else {}
-        return forecast, rates, k7
+        ride_k7 = drain.ride_k(kept.points, now) if ride_on else {}
+        return forecast, rates, k7, ride_k7
     except Exception as e:  # a planning aid must never break a tick
         _logger.debug("usage history unavailable: %s", type(e).__name__)
-        return None, {}, {}
+        return None, {}, {}, {}
 
 
 #: Where ``AutoSwitchEngine`` keeps this tick's active-usage estimate
@@ -900,16 +903,20 @@ def _armed_windows(raw: object) -> dict:
 
 def _five_h(raw: object) -> dict | None:
     """An armed 7d window's 5h measure, leniently: ``{"p5", "readAt",
-    "rise", "phase", "pointS"}`` (the last 5h reading folded in and when it
-    was read, the 5h points risen since the arm time, the 5h's phase at the
-    7d's estimated crossing, the 5h's seconds per point), or None."""
+    "rise", "phase", "pointS", "r5"}`` (the last 5h reading folded in and
+    when it was read, the 5h points risen since the arm time, the 5h's phase
+    at the 7d's estimated crossing, the 5h's seconds per point, the 5h's
+    ``resets_at`` as last read), or None."""
     if not isinstance(raw, Mapping):
         return None
     values = {k: _finite(raw.get(k)) for k in ("p5", "readAt", "rise", "phase")}
     if any(v is None for v in values.values()):
         return None
     point = _finite(raw.get("pointS"))
-    return {**values, "pointS": point if point and point > 0 else None}
+    return {
+        **values, "pointS": point if point and point > 0 else None,
+        "r5": _finite(raw.get("r5")),
+    }
 
 
 def _ride_record(raw: object, current: str) -> dict:
@@ -981,13 +988,17 @@ def _arm_five_h(
     read_at: float,
     previous: float | None,
     now: float,
+    reset5: float | None = None,
 ) -> dict | None:
     """The 5h measure of a 7d ride armed at ``at`` (the reading before the
     first one at the mark, ``previous``; that first one read at
     ``read_at``), or None without that reading: the 5h it read, the 5h's
     pace (``ride.point_estimate`` on the 5h), and its phase at the 7d's
-    estimated crossing, the middle of the two readings (the 7d crossed
-    somewhere between them)."""
+    estimated crossing: the middle of the two readings (the 7d crossed
+    somewhere between them) when they are at most
+    ``ride.MIDPOINT_MAX_GAP_S`` apart, else the arm time itself (across a
+    longer gap other use may have carried the 7d over early in it: half
+    the gap credited as unused would ride into 100%)."""
     before = next((x for x in samples if x.ts == previous), None) if previous == at else None
     if before is None:
         return None
@@ -996,26 +1007,44 @@ def _arm_five_h(
         *_velocity_point_s(samples, s, now, "5h"),
     )
     phase = learned_ride.phase_5h(samples, at, point)
-    if point is not None:
+    if point is not None and read_at - at <= learned_ride.MIDPOINT_MAX_GAP_S:
         phase += (read_at - at) / 2.0 / point
-    return {"p5": before.pct5, "readAt": at, "rise": 0.0, "phase": phase, "pointS": point}
+    return {
+        "p5": before.pct5, "readAt": at, "rise": 0.0, "phase": phase, "pointS": point,
+        "r5": reset5 if reset5 is not None and reset5 > read_at else None,
+    }
 
 
-def _fold_five_h(five: dict, samples: tuple[Sample, ...]) -> None:
+def _fold_five_h(
+    five: dict, samples: tuple[Sample, ...], reset5: float | None = None
+) -> None:
     """Fold the readings since the last one counted into a 7d ride's 5h
-    measure (``ride.rise_5h``); across a 5h reset, the old window's phase
-    at the reset (the middle of the two readings) is carried."""
+    measure (``ride.rise_5h``). A 5h reset is a reading taken at or after
+    the 5h's ``resets_at`` as last read (``five["r5"]``), or a drop: a
+    window at 0-1% that resets into one reading as much shows no drop.
+    Across it the old window's phase at the reset (its ``resets_at`` when
+    known, else the middle of the two readings) is carried. ``reset5``: the
+    5h's ``resets_at`` in this tick's reading, kept for the next fold."""
     seen = list(samples)
     for i, x in enumerate(seen):
         if x.ts <= five["readAt"]:
             continue
+        old = five.get("r5")
+        reset = x.pct5 < five["p5"] or (old is not None and x.ts >= old)
         carry = 0.0
-        if x.pct5 < five["p5"]:
-            carry = learned_ride.phase_5h(
-                seen[:i], (five["readAt"] + x.ts) / 2.0, five["pointS"], limit=None
+        if reset:
+            at = (
+                old if old is not None and five["readAt"] < old <= x.ts
+                else (five["readAt"] + x.ts) / 2.0
             )
-        five["rise"] = learned_ride.rise_5h(five["rise"], five["p5"], x.pct5, carry)
+            carry = learned_ride.phase_5h(seen[:i], at, five["pointS"], limit=None)
+            five["r5"] = None  # the new window's comes with its reading
+        five["rise"] = learned_ride.rise_5h(
+            five["rise"], five["p5"], x.pct5, carry, reset=reset
+        )
         five["p5"], five["readAt"] = x.pct5, x.ts
+    if reset5 is not None and seen and reset5 > seen[-1].ts:
+        five["r5"] = reset5
 
 
 @dataclass
@@ -1123,7 +1152,9 @@ def _ride_track(
                 at = learned_ride.arm_time(read_at, previous)
                 item = armed[w] = {"at": at, "pointS": None, "reset": None}
                 if w == "7d":
-                    five = _arm_five_h(steps, samples, s, current, at, read_at, previous, now)
+                    five = _arm_five_h(
+                        steps, samples, s, current, at, read_at, previous, now, reset5
+                    )
                     if five is not None:
                         item["fiveH"] = five
             # When this window resets (it drops the arm time even while
@@ -1134,7 +1165,7 @@ def _ride_track(
             # would count from "now" on every tick and never end.
             item["at"] = min(item["at"], now)
             if item.get("fiveH") is not None:
-                _fold_five_h(item["fiveH"], samples)
+                _fold_five_h(item["fiveH"], samples, reset5)
             if item["pointS"] is None:
                 item["pointS"] = learned_ride.point_estimate(
                     learned_ride.point_seconds(steps, current, w, now),
@@ -1153,8 +1184,8 @@ def _ride_track(
         hits_5h=tuple(hits_5h),
         stored_steps=stored_steps,
         stored_record=stored_record,
-        q=learned_ride.q_values(source.get(learned_ride.LEARN_KEY)),
-        t=learned_ride.t_values(source.get(learned_ride.LEARN_KEY)),
+        q=learned_ride.q_values(source.get(learned_ride.LEARN_KEY), current),
+        t=learned_ride.t_values(source.get(learned_ride.LEARN_KEY), current),
     )
 
 
@@ -1201,7 +1232,7 @@ def _ride_commit(
             data: object = st.get(learned_ride.LEARN_KEY)
             for w, outcome, five in outcomes:
                 data = learned_ride.learn(  # type: ignore[arg-type]
-                    data, w, outcome, now, by_5h=five
+                    data, w, outcome, now, by_5h=five, account=record["account"]
                 )
             st[learned_ride.LEARN_KEY] = data
 
@@ -1773,7 +1804,7 @@ def run_maximize_tick(
         samples, new_sample, prev_ts, now,
         refused=estimate.refused if estimate is not None else (),
     )
-    forecast, rates7, k7 = _history_inputs(
+    forecast, rates7, k7, ride_k7 = _history_inputs(
         engine, rt, entries, usage, current, samples, now
     )
     last = state.get("lastSwitchAt")
@@ -1807,6 +1838,7 @@ def run_maximize_tick(
         ride_5h=ride_tick.five_h,
         ride_t=ride_tick.t,
         k7=k7,
+        ride_k7=ride_k7,
         ages=reading_ages(entries),
         estimate=estimate.for_snapshot() if estimate is not None else None,
         local_idle=(
@@ -1847,8 +1879,9 @@ def run_maximize_tick(
         )
         if landed:
             _end_hold_after_switch(engine, held_until, current, landed)
-            if decision.ride == "due" and not decision.ride_capped:
-                ok, ok_5h = decision.ride_windows, decision.ride_by_5h
+            if decision.ride == "due":
+                ok = decision.ride_ok
+                ok_5h = tuple(w for w in ok if w in decision.ride_by_5h)
     elif isinstance(decision, Hold):
         outcome = _hold(engine, rt, decision, current, entries.get(current), now)
         if decision.code == "ride":
