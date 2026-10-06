@@ -451,6 +451,14 @@ class DecisionView:
     target_name: str = ""
 
 
+#: ``rebalance waits for idle (…): main is normal and work (preferred) can
+#: land`` / ``rebalance cooldown (12 min left): …`` (``policy._rebalance``
+#: (a)): a move up a tier, waiting for a pause or the cooldown.
+TIER_MOVE_RE = re.compile(
+    r"^rebalance (?:waits for idle \(.*\)|cooldown \((?P<cool>\d+) min left\)): "
+    r".+ is (?P<from>[a-z ]+) and .+ \((?P<to>[a-z ]+)\) can land"
+)
+
 _SLOT_RE = re.compile(r"#(\w+)")  # a reason from before names (``#3``)
 #: One waited-out window in a reset-wait reason (``policy._reset_wait``):
 #: ``5h 96% — resets in 8m``.
@@ -539,10 +547,13 @@ def _enrich(dv: DecisionView, msnap: Snapshot) -> DecisionView:
 def _hold_target(
     code: str | None, reason: str, active: str | None, msnap: Snapshot | None = None
 ) -> str | None:
-    """Where a coded hold is headed: a preempt waiting for idle and a
-    deferred rebalance name their target in the reason; a reset-wait goes
-    nowhere."""
+    """Where a hold is headed: a preempt waiting for idle, a deferred
+    rebalance and a move up a tier waiting for idle or the cooldown
+    (:data:`TIER_MOVE_RE`) name their target in the reason; a reset-wait
+    goes nowhere."""
     if code in ("preempt", "rebalance-deferred"):
+        return _target_in(reason, active, msnap)
+    if code is None and TIER_MOVE_RE.search(reason or ""):
         return _target_in(reason, active, msnap)
     return None
 

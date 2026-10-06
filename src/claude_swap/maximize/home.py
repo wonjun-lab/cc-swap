@@ -942,6 +942,31 @@ def _preempt_hold_variants(
     ]
 
 
+def _tier_move_variants(
+    head: Seg, act: fx.FleetRow, dv: fx.DecisionView, name, dry: bool,
+    m: re.Match,
+) -> list[list[Seg]]:
+    """A move up a tier (to a preferred account, or off a last-resort one)
+    that waits for a pause or the rebalance cooldown: worded as such, never
+    as "all fine", and naming where it goes."""
+    target = name(dv.target) if dv.target else f"a {m.group('to')} account"
+    tier = m.group("to")
+    move = "would move" if dry else "will move"
+    if m.group("cool"):
+        when = f"when you pause after the cooldown ({m.group('cool')}m left)"
+        short_when = "after the cooldown"
+    else:
+        when, short_when = "when you pause", "on pause"
+    return [
+        [head, (f" · using {name(act.number)} ({m.group('from')}) — {move} up to "
+                f"{target} ({tier}) {when}", "plain")],
+        [head, (f" · {act.name} — up to {target} ({tier}) {when}", "plain")],
+        [head, (f" · {act.name} — up to {target} ({tier}) {short_when}", "plain")],
+        [head, (f" · up to {target} {short_when}", "plain")],
+        [head],
+    ]
+
+
 def _deferred_variants(
     head: Seg, act: fx.FleetRow, dv: fx.DecisionView, name
 ) -> list[list[Seg]]:
@@ -1241,6 +1266,9 @@ def status_variants(
             return _hard_stay_variants(head, act, dv, name)
         if dv.code == "ride":
             return _ride_variants(head, act, dv, name, now)
+        tier_move = fx.TIER_MOVE_RE.search(dv.reason or "") if dv.code is None else None
+        if tier_move is not None:
+            return _tier_move_variants(head, act, dv, name, dry, tier_move)
     if dv.kind == "switch":
         trigger = f" ({dv.trigger})" if dv.trigger else ""
         verb = "would switch" if dry else "switching"

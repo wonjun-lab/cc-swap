@@ -696,6 +696,48 @@ def test_a_deferred_rebalance_says_it_waits_for_your_quiet_time():
     assert home.next_number(dv, ["2"], "live") == "2"
 
 
+def _tier_decided(state, mx, *, p7=30, other7=20):
+    snap = accounts(
+        acc(1, usage(30, p7, days7=3), active=True, alias="main"),
+        acc(2, usage(10, other7, days7=3), alias="side"),
+    )
+    msnap = fx.fleet_snapshot(snap, mx, state, now=NOW)
+    dv = replace(fx.preview_decision(msnap, mx), source="engine", at=NOW - 20)
+    rows = fx.fleet_rows(snap, mx, PRIME, state, now=NOW)
+    return dv, rows, [_plain(v) for v in home.status_variants(
+        SERVICE, dv, rows, mx, "live", now=NOW)]
+
+
+def test_a_pending_tier_move_names_where_it_goes():
+    busy = _code_fleet(30, 30, 20)[1]
+    mx = replace(MX, preferred="side")
+    dv, rows, said = _tier_decided(busy, mx)
+    assert (dv.kind, dv.code, dv.target) == ("hold", None, "2")
+    assert said[0] == (
+        "Auto ON · using main (normal) — will move up to side (preferred) when you pause"
+    )
+    assert "Auto ON · up to side on pause" in said
+    assert not any("all fine" in s for s in said)
+    # In the cooldown: it says it waits for that too.
+    cool = replace(busy, last_switch_at=NOW - 600)
+    dv, rows, said = _tier_decided(cool, mx)
+    assert dv.target == "2"
+    assert said[0].endswith(
+        "will move up to side (preferred) when you pause after the cooldown (20m left)"
+    )
+    # A draining active account: not "draining it first" either.
+    dv, rows, said = _tier_decided(busy, replace(mx, drain_hours=24 * 4), p7=88)
+    assert rows[0].drain and dv.target == "2"
+    assert said[0].startswith("Auto ON · using main (normal) — will move up to side")
+    # Off a last-resort account to a normal one: the same words.
+    dv, rows, said = _tier_decided(busy, replace(MX, last_resort="main"))
+    assert said[0] == (
+        "Auto ON · using main (last resort) — will move up to side (normal) when you pause"
+    )
+    # Never a slot number.
+    assert not any("#" in s for s in said)
+
+
 def test_every_hold_code_has_its_own_words():
     """Parity with ``cc-swap why``: every code a hold can carry
     (``model.HoldCode``, doctor_cli.REASONS) is worded on the home screen,
