@@ -18,7 +18,7 @@ switching doing, and is anything wrong":
   bars carrying the soft and hard marks; when both windows reset, for every
   account; and one tag each, right after the resets;
 * under the table, when there are rows to spare, the selected account in
-  full (organization, plan, login deadline, priming, every usage window
+  full (organization, plan, tier, login deadline, priming, every usage window
   with its exact reset);
 * a footer of eight keys; everything else is in the ``m`` menu popup.
 

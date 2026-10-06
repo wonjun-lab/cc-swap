@@ -183,6 +183,10 @@ TAG_PRIORITY: tuple[str, ...] = (
     "reading old", "drain", "preferred", "last resort", "prime",
 )
 
+#: The tiers the detail panel names among the selected account's facts
+#: (normal is the default; excluded is its status tag).
+TIER_FACTS: dict[str, str] = {"preferred": "preferred", "last_resort": "last resort"}
+
 #: A reading the engine still decides on gets a dim ``reading 25m old`` tag
 #: from this age (an account the engine reads is rarely this far behind: a
 #: candidate is polled every 10 minutes at most); one it no longer trusts

@@ -435,6 +435,39 @@ class TestSurfaces:
         assert "preferred" in home.TAG_PRIORITY
         assert home.TAG_PRIORITY.index("drain") < home.TAG_PRIORITY.index("preferred")
 
+    def test_the_detail_panel_names_the_tier(self):
+        from claude_swap.maximize import fleet as fx
+        from claude_swap.maximize import home
+        from claude_swap.maximize.view import MaximizeState, TIER_LABELS, window_ticks
+        from claude_swap.settings import MaximizeSettings
+        from claude_swap.tui import fleet_render as render
+        from claude_swap.tui.theme import Palette
+        from tests.maximize.test_fleet import NOW as FNOW
+        from tests.maximize.test_fleet import PRIME, acc, accounts, usage
+
+        snap_ = accounts(
+            replace(acc(1, usage(10, 10), active=True), email="a@example.com"),
+            replace(acc(2, usage(20, 70)), email="b@example.com"),
+            replace(acc(3, usage(0, 0)), email="c@example.com"),
+            replace(acc(4, usage(0, 0)), email="d@example.com"),
+        )
+        mx = MaximizeSettings(preferred="a@example.com,b@example.com",
+                              last_resort="c@example.com")
+        rows = {r.number: r for r in fx.fleet_rows(snap_, mx, PRIME, MaximizeState(), now=FNOW)}
+        by_n = {a.number: a for a in snap_.accounts}
+        ctx = render.Ctx(Palette.DARK, window_ticks(mx), FNOW, next_no="2")
+
+        def head(n: str) -> str:
+            return render.render_detail(rows[n], by_n[n], 117, ctx).plain.splitlines()[1]
+
+        # Active and next: the tag says "● active" / "next", the facts the tier.
+        assert "● active" in head("1") and "· preferred" in head("1")
+        assert head("2").rstrip().endswith("next") and "· preferred" in head("2")
+        # Where the tag already says it, it is not said twice.
+        assert head("3").count("last resort") == 1
+        assert "preferred" not in head("4") and "last resort" not in head("4")
+        assert set(home.TIER_FACTS.items()) <= set(TIER_LABELS.items())
+
     def test_why_rows_and_json_carry_the_tier(self):
         from claude_swap.maximize.report import decision_rows, render_rows
 
