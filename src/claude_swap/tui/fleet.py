@@ -1306,21 +1306,18 @@ class FleetScreen(Screen):
 
     def _tier_blocking(self, accounts: dict, number: str, tier: str) -> None:
         from claude_swap.exceptions import ClaudeSwitchError
-        from claude_swap.maximize.fleet_actions import toggle_tier_setting
+        from claude_swap.maximize.fleet_actions import toggle_message, toggle_tier_setting
         from claude_swap.maximize.tiers import LAST_RESORT, PREFERRED
 
         tl = LAST_RESORT if tier == "last_resort" else PREFERRED
         try:
-            marked, moved = toggle_tier_setting(self._root, accounts, number, tl)
+            result = toggle_tier_setting(self._root, accounts, number, tl)
         except ClaudeSwitchError as e:
             self.app.call_from_thread(self.notify, str(e), severity="error", timeout=8)
             return
-        who = self._account_name(number)
-        what = mxview.TIER_LABELS[tl.tier]
-        message = f"{who} is {what}" if marked else f"{who} is back to normal"
-        if moved:
-            other = mxview.TIER_LABELS["preferred" if tier == "last_resort" else "last_resort"]
-            message += f" (no longer {other})"
+        message = toggle_message(
+            result, tl, self._account_name(number), name=self._account_name
+        )
         self.app.call_from_thread(self._after_setting, message)
 
     def _after_setting(self, message: str) -> None:
