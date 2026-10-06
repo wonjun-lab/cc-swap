@@ -31,6 +31,11 @@ RideEnd = Literal["due", "idle"]
 # normal above last resort. ``excluded`` is listed only so every tier has an
 # order; an excluded account is never landable (score.landable).
 TIER_ORDER: dict[str, int] = {"preferred": 0, "normal": 1, "last_resort": 2, "excluded": 3}
+# How every surface (reasons, Fleet, why) names a tier.
+TIER_LABELS: dict[str, str] = {
+    "preferred": "preferred", "normal": "normal", "last_resort": "last resort",
+    "excluded": "excluded",
+}
 
 
 @dataclass(frozen=True)

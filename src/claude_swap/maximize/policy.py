@@ -163,6 +163,7 @@ from claude_swap.maximize import ride as learned_ride
 from claude_swap.maximize.history import QUIET_P
 from claude_swap.maximize.names import view_name
 from claude_swap.maximize.model import (
+    TIER_LABELS,
     TIER_ORDER,
     AccountView,
     Decision,
@@ -1103,6 +1104,10 @@ def _preempt(
         return None
     if draining(a, snap):
         return None  # its 7d soft mark is set aside: nothing to pre-empt
+    if TIER_ORDER[landing[0].tier] < TIER_ORDER[a.tier]:
+        # A higher tier can land: rebalance (a) moves straight there, not
+        # via a same-tier account it would move off again.
+        return None
     horizon, when = preempt_horizon(snap)
     hours = soft7_eta_h(a, rate, snap)
     if hours is None or hours > horizon:
@@ -1203,7 +1208,10 @@ def _rebalance(
         # A higher tier (preferred over normal, normal over last resort,
         # anything over excluded) is the user's rule: never skipped for a
         # 7d pace, and taken off a draining active account too.
-        why = f"{view_name(a)} is {a.tier} and {view_name(top)} ({top.tier}) can land"
+        why = (
+            f"{view_name(a)} is {TIER_LABELS[a.tier]} and {view_name(top)} "
+            f"({TIER_LABELS[top.tier]}) can land"
+        )
     else:
         skipped = _preempt_would_leave(snap, a, landing)
         pool = [v for v in landing if v.number not in skipped]

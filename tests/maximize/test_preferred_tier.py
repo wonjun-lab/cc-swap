@@ -15,7 +15,7 @@ from dataclasses import replace
 import pytest
 
 from claude_swap.exceptions import ConfigError
-from claude_swap.maximize import policy, score
+from claude_swap.maximize import policy
 from claude_swap.maximize.model import TIER_ORDER, Hold, Switch
 from claude_swap.maximize.policy import decide, landing_candidates
 from claude_swap.maximize.tiers import (
@@ -30,7 +30,6 @@ from claude_swap.maximize.tiers import (
     toggle_preferred,
     without_account,
 )
-from tests.maximize import test_drain as td
 from tests.maximize import test_policy as tp
 from tests.maximize.test_policy import NOW, acct, snap
 
@@ -223,6 +222,35 @@ class TestRebalanceUp:
         got = decide(up)
         assert isinstance(got, Switch) and got.target == "2"
 
+    def test_preempt_leaves_a_tier_move_to_rebalance(self):
+        # #1 normal climbs to soft7d; preferred #2 is landable but would
+        # cross soft7d itself within the horizon, so preempt would skip it
+        # for normal #3, and rebalance would move up to #2 a decision later:
+        # one wasted switch. Rebalance (a) takes #2 straight away.
+        s = tp.preempt_snap(candidate=pref("2", 10, 81, reset7_d=6))
+        s = replace(s, accounts=(*s.accounts, acct("3", 10, 10, reset7_d=6)))
+        assert [v.number for v in landing_candidates(s)] == ["2", "3"]
+        got = decide(s)
+        assert isinstance(got, Switch) and got.trigger == "rebalance" and got.target == "2"
+        assert got.reason == "1 is normal and 2 (preferred) can land; idle"
+        # Not idle / in the cooldown: rebalance's hold, never preempt's.
+        busy = decide(replace(s, samples=tp.BUSY5))
+        assert isinstance(busy, Hold) and busy.code is None
+        assert "1 is normal and 2 (preferred) can land" in busy.reason
+
+    def test_preempt_from_a_preferred_account_is_unchanged(self):
+        # No higher tier exists: preempt still moves within the tier.
+        s = tp.preempt_snap(active=pref("1", 30, 84),
+                            candidate=pref("2", 10, 10, reset7_d=6))
+        got = decide(s)
+        assert isinstance(got, Switch) and got.trigger == "preempt" and got.target == "2"
+
+    def test_the_reason_names_the_tier_by_its_label(self):
+        got = decide(snap("1", acct("1", 10, 10, tier="last_resort"), pref("2", 30, 80),
+                          samples="idle"))
+        assert got.reason == "1 is last resort and 2 (preferred) can land; idle"
+        assert "last_resort" not in got.reason
+
 
 # -- no flapping: left at a mark, re-entered only once it can land ----------------------
 
@@ -254,24 +282,123 @@ def test_a_preferred_account_left_at_soft_stays_off_until_its_window_resets():
     assert isinstance(got, Hold) and got.reason.startswith("rebalance cooldown")
 
 
+def test_a_preferred_account_left_at_soft7d_stays_off_inside_the_landing_margin():
+    def walk(active: str, p7: float, **kw):
+        return decide(snap(active, pref("1", 10, p7, reset7_d=3),
+                           acct("2", 10, 20), samples="idle", **kw))
+
+    got = walk("1", 91)  # past soft7d 90: the soft move off it at idle
+    assert isinstance(got, Switch) and got.trigger == "soft" and got.target == "2"
+    # 90 and 85 (soft 90 less the 5-point margin) cannot land: no move back.
+    for p7 in (91, 90, 85):
+        got = walk("2", p7)
+        assert isinstance(got, Hold), p7
+        assert got.reason.endswith("nothing else landable"), p7
+    # Under the margin it can land again: the tier moves back.
+    got = walk("2", 84)
+    assert isinstance(got, Switch) and got.trigger == "rebalance" and got.target == "1"
+
+
+def test_a_preferred_account_left_at_its_hard_mark_stays_off_until_it_can_land():
+    def walk(active: str, p5: float, samples="idle", **kw):
+        return decide(snap(active, pref("1", p5, 30, reset5_h=2.0),
+                           acct("2", 10, 20), samples=samples, **kw))
+
+    got = walk("1", 96, samples="busy")  # past hard 95 while busy: forced
+    assert isinstance(got, Switch) and got.trigger == "hard" and got.target == "2"
+    for p5 in (96, 70, 45):
+        got = walk("2", p5)
+        assert isinstance(got, Hold), p5
+        assert got.reason.endswith("nothing else landable"), p5
+    got = walk("2", 0)  # its 5h window reset
+    assert isinstance(got, Switch) and got.trigger == "rebalance" and got.target == "1"
+
+
+class TestForcedPools:
+    """At-limit and hard with nothing landable still switch, and their
+    fallback orders are the old ones: the at-limit escape pool ranks by
+    tier first (``rank``), so a preferred account under the hard caps wins
+    there; the hard fallback goes by room alone, the at-limit last pool by
+    binding room alone."""
+
+    def test_at_limit_takes_the_preferred_account_under_the_hard_caps(self):
+        got = decide(snap("1", acct("1", 100, 40), acct("2", 50, 10), pref("3", 60, 10)))
+        assert isinstance(got, Switch) and got.trigger == "at-limit" and got.target == "3"
+        assert "nothing landable, 3 is under the hard caps" in got.reason
+
+    def test_at_limit_past_the_hard_caps_goes_by_binding_room(self):
+        got = decide(snap("1", acct("1", 100, 40), acct("2", 97, 10), pref("3", 98, 10)))
+        assert isinstance(got, Switch) and got.trigger == "at-limit" and got.target == "2"
+
+    def test_hard_goes_by_room_whatever_the_tier(self):
+        got = decide(snap("1", acct("1", 96, 40), acct("2", 50, 10), pref("3", 60, 10),
+                          samples="busy"))
+        assert isinstance(got, Switch) and got.trigger == "hard" and got.target == "2"
+        got = decide(snap("1", acct("1", 96, 40), acct("2", 60, 10), pref("3", 50, 10),
+                          samples="busy"))
+        assert isinstance(got, Switch) and got.trigger == "hard" and got.target == "3"
+
+    def test_a_preferred_active_account_at_its_limit_still_switches(self):
+        got = decide(snap("1", pref("1", 100, 40), acct("2", 50, 10), pref("3", 60, 10)))
+        assert isinstance(got, Switch) and got.trigger == "at-limit" and got.target == "3"
+        got = decide(snap("1", pref("1", 100, 40), acct("2", 50, 10)))
+        assert isinstance(got, Switch) and got.trigger == "at-limit" and got.target == "2"
+
+
 # -- unset: every decision as before ----------------------------------------------------
 
 
-OLD_ORDER = {"normal": 0, "last_resort": 1, "excluded": 2}
-REGRESSION = list(td._regression_snaps())
+def _from_settings(s, preferred: str | None):
+    """``s`` rebuilt the way build_snapshot sets tiers: each account's tier
+    from its record (``disabled``) and the two list settings, with
+    ``maximize.preferred`` = ``preferred`` and ``maximize.lastResort`` naming
+    the case's last-resort accounts."""
+    from claude_swap.maximize.tiers import parse_account_list
+
+    last_resort = ",".join(v.email for v in s.accounts if v.tier == "last_resort") or None
+    settings = replace(s.settings, last_resort=last_resort, preferred=preferred)
+    lists = (parse_account_list(settings.last_resort), parse_account_list(settings.preferred))
+    accounts = tuple(
+        replace(v, tier=tier_for({"disabled": v.tier == "excluded"}, v.email, *lists))
+        for v in s.accounts
+    )
+    return replace(s, accounts=accounts, settings=settings)
 
 
-def test_the_regression_set_has_no_preferred_account():
-    assert len(REGRESSION) >= 60
-    assert not any(v.tier == "preferred" for _n, s in REGRESSION for v in s.accounts)
+def test_the_policy_table_has_every_tier_but_preferred():
+    tiers = {v.tier for c in tp.CASES for v in c.snap.accounts}
+    assert tiers == {"normal", "last_resort", "excluded"}
+    assert all(c.snap.settings.preferred is None for c in tp.CASES)
 
 
-@pytest.mark.parametrize(("name", "s"), REGRESSION, ids=[n for n, _ in REGRESSION])
-def test_without_a_preferred_account_decides_as_the_old_tier_order(name, s, monkeypatch):
-    new = (decide(s), landing_candidates(s), policy.escape_candidates(s))
-    monkeypatch.setattr(policy, "TIER_ORDER", OLD_ORDER)
-    monkeypatch.setattr(score, "TIER_ORDER", OLD_ORDER)
-    assert (decide(s), landing_candidates(s), policy.escape_candidates(s)) == new
+# Unset, and set to an entry naming no account: nothing is preferred.
+@pytest.mark.parametrize("preferred", [None, "nobody@example.com"])
+@pytest.mark.parametrize("case", tp.CASES, ids=lambda c: c.id)
+def test_without_a_preferred_account_every_case_decides_as_its_table_says(case, preferred):
+    s = _from_settings(case.snap, preferred)
+    assert [v.tier for v in s.accounts] == [v.tier for v in case.snap.accounts]
+    tp.test_decide(replace(case, snap=s))
+
+
+@pytest.mark.parametrize("preferred", [None, "nobody@example.com"])
+def test_without_a_preferred_account_preempt_and_rebalance_are_unchanged(preferred):
+    def decided(s):
+        return decide(_from_settings(s, preferred))
+
+    # TestPreempt's expectations, a last-resort and an excluded account added.
+    extra = (acct("8", 0, 0, tier="last_resort"), acct("9", 0, 0, tier="excluded"))
+    s = tp.preempt_snap()
+    got = decided(replace(s, accounts=(*s.accounts, *extra)))
+    assert isinstance(got, Switch) and got.trigger == "preempt" and got.target == "2"
+    got = decided(replace(tp.preempt_snap(samples=tp.BUSY5),
+                          accounts=(*s.accounts, *extra)))
+    assert isinstance(got, Hold) and got.code == "preempt"
+    got = decided(tp.preempt_snap(candidate=acct("2", 10, 10, reset7_d=6, tier="last_resort")))
+    assert not (isinstance(got, Switch) and got.trigger == "preempt")
+    # A last-resort active account with a landable normal one: the same
+    # target, by rebalance (a)'s tier rule (preempt leaves a tier move to it).
+    got = decided(tp.preempt_snap(active=acct("1", 30, 84, tier="last_resort")))
+    assert isinstance(got, Switch) and got.trigger == "rebalance" and got.target == "2"
 
 
 # -- surfaces ---------------------------------------------------------------------------
