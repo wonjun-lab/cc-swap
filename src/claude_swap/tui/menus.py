@@ -417,9 +417,9 @@ def help_entries(idle_pattern: str | None = None) -> list[tuple[str, str]]:
         ("↑ ↓ / j k", "select an account (a click selects too)"),
         ("enter", "switch to it (asks first when switching would not land there)"),
         ("r", "re-login it (guided; cc-swap launches nothing)"),
-        ("l", "last resort on/off"),
-        ("u", "preferred on/off: used before every normal account (l and u exclude "
-              "each other)"),
+        ("l", "last resort on/off: used last (the footer's \"l last\")"),
+        ("u", "preferred on/off: used first, before every normal account (the "
+              "footer's \"u first\"; l and u exclude each other)"),
         ("n", "name the selected account: an alias shown instead of its short name "
               "(enter saves, an empty name brings the short name back, esc cancels; the "
               "rules of cc-swap alias). Account settings (m → a) has it too"),

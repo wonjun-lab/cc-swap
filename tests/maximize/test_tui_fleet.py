@@ -30,11 +30,7 @@ from tests.test_tui import (  # noqa: F401 (fake_engine is a fixture)
     settle,
 )
 
-FOOTER = (
-    "enter switch · r re-login · l last resort · u preferred · h hold · m menu · ? help · q quit"
-)
-#: At 80 columns the two tier toggles drop their words (? help has them).
-FOOTER_80 = "enter switch · r re-login · l · u · h hold · m menu · ? help · q quit"
+FOOTER = "enter switch · r login · l last · u first · h hold · m menu · ? help · q quit"
 
 
 def _settings(root, **maximize) -> None:
@@ -601,7 +597,7 @@ async def test_every_size_shows_the_table_with_headers_and_both_resets(
         assert _plain(app, "#fx-attention").startswith(
             f"! {NAMES[4]} needs re-login — select it, press r"
         )
-        assert _plain(app, "#fx-keys") == (FOOTER_80 if width < 100 else FOOTER)
+        assert _plain(app, "#fx-keys") == FOOTER
         # The headers, each over its column (plan only when it fits).
         header = _plain(app, "#fx-head")
         for word in HEADERS:
@@ -740,7 +736,7 @@ async def test_80x24_with_many_accounts_scrolls_the_table_but_never_the_header(t
         assert top <= first < top + scroll.scrollable_content_region.height
         assert screen.query_one("#fx-status").region.y == 1
         assert head.region.y == head_y and "order" in _plain(app, "#fx-head")
-        assert _plain(app, "#fx-keys") == FOOTER_80
+        assert _plain(app, "#fx-keys") == FOOTER
         assert screen.query_one("#fx-keys").region.y == 23
         assert not screen.query_one("#fx-detail").display  # 25 rows: no room for it
 

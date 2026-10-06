@@ -1596,8 +1596,11 @@ def attention_want(notices: Sequence[Notice], width: int) -> int:
 # -- the footer ----------------------------------------------------------------------------
 
 
+#: Worded to fit an 80-column terminal whole (``text_width(80)``): ``l last``
+#: (last resort) and ``u first`` (preferred) are the two tier toggles, which
+#: ``?`` spells out.
 KEY_HINTS: tuple[tuple[str, str], ...] = (
-    ("enter", "switch"), ("r", "re-login"), ("l", "last resort"), ("u", "preferred"),
+    ("enter", "switch"), ("r", "login"), ("l", "last"), ("u", "first"),
     ("h", "hold"), ("m", "menu"), ("?", "help"), ("q", "quit"),
 )
 #: The footer while no account is managed yet: the account keys would do
@@ -1609,9 +1612,8 @@ EMPTY_KEY_HINTS: tuple[tuple[str, str], ...] = (
 
 def key_hints(width: int, *, empty: bool = False) -> list[tuple[str, str]]:
     """The footer's ``(key, what)`` pairs: every word when it fits
-    (``enter switch · r re-login · …``), else every word but the two tier
-    toggles' (``l · u``, which ``?`` explains: the 80-column footer), else
-    the keys with only menu, help and quit spelled out, else the keys alone.
+    (``enter switch · r login · …``, an 80-column terminal), else the keys
+    with only menu, help and quit spelled out, else the keys alone.
     ``empty``: no account yet (:data:`EMPTY_KEY_HINTS`)."""
     def text(pairs) -> str:
         return " · ".join(f"{k} {w}" if w else k for k, w in pairs)
@@ -1619,9 +1621,6 @@ def key_hints(width: int, *, empty: bool = False) -> list[tuple[str, str]]:
     hints = EMPTY_KEY_HINTS if empty else KEY_HINTS
     if len(text(hints)) <= width:
         return list(hints)
-    tiers = [(k, "" if k in ("l", "u") else w) for k, w in hints]
-    if len(text(tiers)) <= width:
-        return tiers
     short = [(k, w if k in ("a", "m", "?", "q") else "") for k, w in hints]
     if len(text(short)) <= width:
         return short
