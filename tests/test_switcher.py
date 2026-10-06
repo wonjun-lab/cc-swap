@@ -8798,13 +8798,19 @@ class TestRemoveAccountPrunesPreferred:
         from claude_swap.settings import set_setting
 
         s = self._switcher(temp_home)
+        # Account 3 is in both lists (written by hand): removing it prunes
+        # each, keeping the other accounts' entries.
         set_setting(s.backup_dir, "maximize.preferred", "b@example.com,C@example.com")
+        set_setting(s.backup_dir, "maximize.lastResort", "c@example.com,a@example.com")
         s.remove_account("3", assume_yes=True)
-        assert self._lists(s) == ("b@example.com", None)
-        assert "from maximize.preferred" in capsys.readouterr().out
-        set_setting(s.backup_dir, "maximize.lastResort", "a@example.com")
+        assert self._lists(s) == ("b@example.com", "a@example.com")
+        out = capsys.readouterr().out
+        assert "Removed C@example.com from maximize.preferred" in out
+        assert "Removed c@example.com from maximize.lastResort" in out
+        # The last entry of each: both keys unset, not "".
+        set_setting(s.backup_dir, "maximize.lastResort", "b@example.com")
         s.remove_account("2", assume_yes=True)
-        assert self._lists(s) == (None, "a@example.com")  # key unset, not ""
+        assert self._lists(s) == (None, None)
 
     def test_an_entry_that_still_names_another_account_stays(self, temp_home):
         from claude_swap.settings import set_setting

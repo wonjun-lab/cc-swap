@@ -430,6 +430,32 @@ class TestPrefer:
         assert "team@example.com → team" in out
         assert "ghost@example.com → (no matching account)" in out
 
+    def test_list_shows_an_account_in_both_lists_under_last_resort_only(
+        self, temp_home, capsys
+    ):
+        self._seed()
+        set_setting(_backup_root(), "maximize.preferred", "team@example.com,work@example.com")
+        set_setting(_backup_root(), "maximize.lastResort", "team@example.com")
+        assert self._cmd(["list"]) == 0
+        out = capsys.readouterr().out
+        assert "work@example.com → work" in out
+        assert "team@example.com" not in out.split("Note:")[0]
+        notes = [line for line in out.splitlines() if "both lists" in line]
+        assert notes == [
+            "Note: team is in both lists, so it is last resort; settle it with cc-swap "
+            "prefer remove team (keep it last resort) or cc-swap prefer add team (make "
+            "it preferred)."
+        ]
+        assert self._cmd(["list"], cli._last_resort_command) == 0
+        out = capsys.readouterr().out
+        assert "team@example.com → team" in out and "both lists" in out
+        # Only in both: no preferred account is left to list.
+        set_setting(_backup_root(), "maximize.preferred", "team@example.com")
+        self._cmd(["list"])
+        out = capsys.readouterr().out
+        assert "No preferred accounts" in out and "Preferred accounts:" not in out
+        assert "both lists" in out
+
     def test_shared_email_stores_the_alias(self, temp_home):
         self._seed(shared_email=True)
         self._cmd(["add", "team"])

@@ -1187,17 +1187,41 @@ def _tier_list_command(argv: list[str], tl: "_mx_tiers.TierList") -> None:
             data = switcher._get_sequence_data() or {}
             accounts = data.get("accounts", {})
             names = switcher.account_names(data)
-            if not entries:
-                print(dimmed(f"No {label} accounts"))
-                return
-            print(bolded(heading))
+            # An account in both lists (written by hand) is last resort
+            # (tiers.tier_for): `prefer list` leaves it out, both lists
+            # say how to settle it.
+            lr_entries = parse_model_names(mx.last_resort)
+            pref_entries = parse_model_names(mx.preferred)
+            both = sorted(
+                {n for e in lr_entries for n in _last_resort_matches(accounts, e)}
+                & {n for e in pref_entries for n in _last_resort_matches(accounts, e)},
+                key=int,
+            )
+            lines = []
             for entry in entries:
                 nums = _last_resort_matches(accounts, entry)
+                if tl is _mx_tiers.PREFERRED and nums:
+                    nums = [n for n in nums if n not in both]
+                    if not nums:
+                        continue
                 where = (
                     ", ".join(name_of(names, n) for n in nums)
                     if nums else muted("(no matching account)")
                 )
-                print(f"  {entry} → {where}")
+                lines.append(f"  {entry} → {where}")
+            if lines:
+                print(bolded(heading))
+                for line in lines:
+                    print(line)
+            else:
+                print(dimmed(f"No {label} accounts"))
+            for n in both:
+                arg = cli_arg(name_of(names, n))
+                warning(
+                    f"Note: {name_of(names, n)} is in both lists, so it is last resort; "
+                    f"settle it with cc-swap prefer remove {arg} (keep it last resort) "
+                    f"or cc-swap prefer add {arg} (make it preferred)."
+                )
             return
 
         data = switcher._get_sequence_data() or {}
