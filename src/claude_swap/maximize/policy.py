@@ -9,9 +9,26 @@ Triggers, first match wins:
 4. preempt    the active 7d is on pace to pass soft7d
               before the next quiet window, and a
               landable account is not                   idle + cooldown
-5. rebalance  (a) active is excluded/last_resort and a
-              higher tier can land, or (b) the same
+5. rebalance  (a) a landable account is in a higher tier
+              than the active (preferred > normal >
+              last_resort > excluded), or (b) the same
               tier's best beats the active by > eps     idle + cooldown
+
+Tiers (``model.TIER_ORDER``; ``maximize.preferred``, ``maximize.lastResort``,
+maximize/tiers.py) come first, everything else inside a tier: a landable
+preferred-tier account is always the destination before any normal one,
+and the drain order (:func:`drain_first`) and the score rank only within a
+tier. Rebalance (a) is the tier rule: it moves off the active account
+whenever a landable account of a higher tier exists, whatever the active's
+score or pace, and also off a draining active account (the tier wins over
+the drain's "never move off a draining account" below). Preempt never
+moves to a lower tier, and does not fire while a higher tier than the
+active can land: rebalance (a) makes that move directly, not after a
+detour through a same-tier account. Leaving a preferred-tier account by a soft or hard
+move cannot flap back: rebalance (a) only re-enters it once it is landable
+by the usual rule (under soft minus ``landingMargin``), as for any account.
+With ``maximize.preferred`` unset nothing is in that tier and every
+decision is what it was without it.
 
 Preempt and rebalance (b) read the usage history (``Snapshot.rates7``,
 ``Snapshot.forecast``; maximize/history.py). Preempt projects at each
@@ -107,7 +124,8 @@ on its score. Preempt takes a draining target only when its 7d would not
 reach ``hard7d`` within the horizon either. Rebalance (b) tries the first
 such draining candidate before the best other one, and never moves off a
 draining active account except to such a one whose 7d resets sooner (so it
-cannot bounce back). Hard caps, at-limit, the login-expiry guard, last resort,
+cannot bounce back), except rebalance (a): a landable account of a higher
+tier always wins. Hard caps, at-limit, the login-expiry guard, the tiers,
 quarantine and holds are unchanged. With no draining account every decision
 is what it was without the drain.
 
@@ -147,6 +165,7 @@ from claude_swap.maximize import ride as learned_ride
 from claude_swap.maximize.history import QUIET_P
 from claude_swap.maximize.names import view_name
 from claude_swap.maximize.model import (
+    TIER_LABELS,
     TIER_ORDER,
     AccountView,
     Decision,
@@ -1079,7 +1098,9 @@ def _preempt(
 
     The active's 7d must reach soft7d within the horizon at its burn rate,
     and a landable account of no worse a tier must not
-    (:func:`crosses_soft7_within`). The rebalance cooldown applies.
+    (:func:`crosses_soft7_within`). The rebalance cooldown applies. None
+    when the best landing candidate is in a higher tier than the active:
+    rebalance (a) moves there.
     """
     s = snap.settings
     rate = snap.rates7.get(a.number)
@@ -1087,6 +1108,10 @@ def _preempt(
         return None
     if draining(a, snap):
         return None  # its 7d soft mark is set aside: nothing to pre-empt
+    if TIER_ORDER[landing[0].tier] < TIER_ORDER[a.tier]:
+        # A higher tier can land: rebalance (a) moves straight there, not
+        # via a same-tier account it would move off again.
+        return None
     horizon, when = preempt_horizon(snap)
     hours = soft7_eta_h(a, rate, snap)
     if hours is None or hours > horizon:
@@ -1184,9 +1209,13 @@ def _rebalance(
     a_score = score(a, snap.now)
     gain: float | None = None
     if TIER_ORDER[top.tier] < TIER_ORDER[a.tier]:
-        # Leaving an excluded or last-resort account is the user's rule:
-        # never skipped for a 7d pace.
-        why = f"{view_name(a)} is {a.tier} and {view_name(top)} ({top.tier}) can land"
+        # A higher tier (preferred over normal, normal over last resort,
+        # anything over excluded) is the user's rule: never skipped for a
+        # 7d pace, and taken off a draining active account too.
+        why = (
+            f"{view_name(a)} is {TIER_LABELS[a.tier]} and {view_name(top)} "
+            f"({TIER_LABELS[top.tier]}) can land"
+        )
     else:
         skipped = _preempt_would_leave(snap, a, landing)
         pool = [v for v in landing if v.number not in skipped]

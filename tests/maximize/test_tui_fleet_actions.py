@@ -150,6 +150,83 @@ class TestRowKeys:
             await _open(pilot)
             assert _maximize(tmp_path) == {}
 
+    async def test_u_toggles_the_preferred_tier_in_settings_json(self, tmp_path):
+        _settings(tmp_path)
+        app = make_app(_fleet(tmp_path))
+        async with app.run_test(size=(140, 40)) as pilot:
+            await _open(pilot)
+            await _to_row(pilot, "2")
+            await pilot.press("u")
+            await _open(pilot)
+            assert _maximize(tmp_path) == {"preferred": "user2@example.com"}
+            assert _tag(app, "2") == "preferred"
+            await pilot.press("u")
+            await _open(pilot)
+            assert _maximize(tmp_path) == {}
+
+    async def test_u_and_l_exclude_each_other(self, tmp_path):
+        _settings(tmp_path)
+        app = make_app(_fleet(tmp_path))
+        seen = _toasts(app)
+        async with app.run_test(size=(140, 40)) as pilot:
+            await _open(pilot)
+            await _to_row(pilot, "2")
+            await pilot.press("l")
+            await _open(pilot)
+            assert _maximize(tmp_path) == {"lastResort": "user2@example.com"}
+            await pilot.press("u")
+            await _open(pilot)
+            assert _maximize(tmp_path) == {"preferred": "user2@example.com"}
+            assert any("is preferred (no longer last resort)" in m for m, _ in seen)
+            await pilot.press("l")
+            await _open(pilot)
+            assert _maximize(tmp_path) == {"lastResort": "user2@example.com"}
+            assert any("is last resort (no longer preferred)" in m for m, _ in seen)
+
+    async def test_toasts_name_the_tier_an_account_in_both_lists_ends_up_in(self, tmp_path):
+        # In both lists, last resort wins: l leaves it preferred, u leaves it
+        # last resort. Neither is "back to normal".
+        both = {"lastResort": "user2@example.com", "preferred": "user2@example.com"}
+        _settings(tmp_path, **both)
+        app = make_app(_fleet(tmp_path))
+        seen = _toasts(app)
+        async with app.run_test(size=(140, 40)) as pilot:
+            await _open(pilot)
+            await _to_row(pilot, "2")
+            await pilot.press("l")
+            await _open(pilot)
+            assert _maximize(tmp_path) == {"preferred": "user2@example.com"}
+            assert seen[-1][0] == "user2 is preferred (no longer last resort)"
+        _settings(tmp_path, **both)
+        app = make_app(_fleet(tmp_path))
+        seen = _toasts(app)
+        async with app.run_test(size=(140, 40)) as pilot:
+            await _open(pilot)
+            await _to_row(pilot, "2")
+            await pilot.press("u")
+            await _open(pilot)
+            assert _maximize(tmp_path) == {"lastResort": "user2@example.com"}
+            assert seen[-1][0] == "user2 is still last resort (no longer preferred)"
+        assert not any("back to normal" in m for m, _ in seen)
+
+    async def test_a_dropped_shared_entry_names_the_sibling_it_took_along(self, tmp_path):
+        _settings(tmp_path, lastResort="shared@example.com")
+        accounts = _accounts()
+        accounts[1] = dataclasses.replace(accounts[1], email="shared@example.com", alias="work")
+        accounts[2] = dataclasses.replace(accounts[2], email="shared@example.com")
+        app = make_app(IdentitySwitcher(accounts, tmp_path))
+        seen = _toasts(app)
+        async with app.run_test(size=(140, 40)) as pilot:
+            await _open(pilot)
+            await _to_row(pilot, "2")
+            await pilot.press("u")
+            await _open(pilot)
+            assert _maximize(tmp_path) == {"preferred": "work"}
+            assert seen[-1][0] == (
+                "work is preferred (no longer last resort); also took shared off last "
+                "resort (the removed entry named them too)"
+            )
+
     async def test_l_on_shared_email_without_alias_shows_error_toast(self, tmp_path):
         _settings(tmp_path)
         accounts = _accounts()

@@ -180,8 +180,12 @@ def short_left(seconds: float) -> str:
 #: The tags in priority order: an account shows only the first that applies.
 TAG_PRIORITY: tuple[str, ...] = (
     "active", "re-login", "keychain", "excluded", "untrusted", "next", "login",
-    "reading old", "drain", "last resort", "prime",
+    "reading old", "drain", "preferred", "last resort", "prime",
 )
+
+#: The tiers the detail panel names among the selected account's facts
+#: (normal is the default; excluded is its status tag).
+TIER_FACTS: dict[str, str] = {"preferred": "preferred", "last_resort": "last resort"}
 
 #: A reading the engine still decides on gets a dim ``reading 25m old`` tag
 #: from this age (an account the engine reads is rarely this far behind: a
@@ -226,6 +230,8 @@ def tag_for(
         # (maximize/drain.py). ``drain 18h``: the time to that reset.
         left = (row.reset7 - now) / 3600.0 if row.reset7 is not None else None
         return (drain.tag(left) if left is not None and left > 0 else "drain"), "ok"
+    if row.tier == "preferred":
+        return "preferred", "dim"
     if row.tier == "last_resort":
         return "last resort", "dim"
     if row.state5 == "cold" and row.login == "ok":  # an API key has no 5h window
@@ -936,6 +942,31 @@ def _preempt_hold_variants(
     ]
 
 
+def _tier_move_variants(
+    head: Seg, act: fx.FleetRow, dv: fx.DecisionView, name, dry: bool,
+    m: re.Match,
+) -> list[list[Seg]]:
+    """A move up a tier (to a preferred account, or off a last-resort one)
+    that waits for a pause or the rebalance cooldown: worded as such, never
+    as "all fine", and naming where it goes."""
+    target = name(dv.target) if dv.target else f"a {m.group('to')} account"
+    tier = m.group("to")
+    move = "would move" if dry else "will move"
+    if m.group("cool"):
+        when = f"when you pause after the cooldown ({m.group('cool')}m left)"
+        short_when = "after the cooldown"
+    else:
+        when, short_when = "when you pause", "on pause"
+    return [
+        [head, (f" · using {name(act.number)} ({m.group('from')}) — {move} up to "
+                f"{target} ({tier}) {when}", "plain")],
+        [head, (f" · {act.name} — up to {target} ({tier}) {when}", "plain")],
+        [head, (f" · {act.name} — up to {target} ({tier}) {short_when}", "plain")],
+        [head, (f" · up to {target} {short_when}", "plain")],
+        [head],
+    ]
+
+
 def _deferred_variants(
     head: Seg, act: fx.FleetRow, dv: fx.DecisionView, name
 ) -> list[list[Seg]]:
@@ -1235,6 +1266,9 @@ def status_variants(
             return _hard_stay_variants(head, act, dv, name)
         if dv.code == "ride":
             return _ride_variants(head, act, dv, name, now)
+        tier_move = fx.TIER_MOVE_RE.search(dv.reason or "") if dv.code is None else None
+        if tier_move is not None:
+            return _tier_move_variants(head, act, dv, name, dry, tier_move)
     if dv.kind == "switch":
         trigger = f" ({dv.trigger})" if dv.trigger else ""
         verb = "would switch" if dry else "switching"
@@ -1594,9 +1628,12 @@ def attention_want(notices: Sequence[Notice], width: int) -> int:
 # -- the footer ----------------------------------------------------------------------------
 
 
+#: Worded to fit an 80-column terminal whole (``text_width(80)``): ``l last``
+#: (last resort) and ``u first`` (preferred) are the two tier toggles, which
+#: ``?`` spells out.
 KEY_HINTS: tuple[tuple[str, str], ...] = (
-    ("enter", "switch"), ("r", "re-login"), ("l", "last resort"), ("h", "hold"),
-    ("m", "menu"), ("?", "help"), ("q", "quit"),
+    ("enter", "switch"), ("r", "login"), ("l", "last"), ("u", "first"),
+    ("h", "hold"), ("m", "menu"), ("?", "help"), ("q", "quit"),
 )
 #: The footer while no account is managed yet: the account keys would do
 #: nothing, ``a`` adds the login claude has now.
@@ -1607,9 +1644,9 @@ EMPTY_KEY_HINTS: tuple[tuple[str, str], ...] = (
 
 def key_hints(width: int, *, empty: bool = False) -> list[tuple[str, str]]:
     """The footer's ``(key, what)`` pairs: every word when it fits
-    (``enter switch · r re-login · …``), else the keys with only menu, help
-    and quit spelled out, else the keys alone. ``empty``: no account yet
-    (:data:`EMPTY_KEY_HINTS`)."""
+    (``enter switch · r login · …``, an 80-column terminal), else the keys
+    with only menu, help and quit spelled out, else the keys alone.
+    ``empty``: no account yet (:data:`EMPTY_KEY_HINTS`)."""
     def text(pairs) -> str:
         return " · ".join(f"{k} {w}" if w else k for k, w in pairs)
 

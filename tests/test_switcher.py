@@ -8783,6 +8783,47 @@ class TestRemoveAccountPrunesLastResort:
         assert self._last_resort(s) == "c@example.com"
 
 
+class TestRemoveAccountPrunesPreferred:
+    """`remove N` prunes maximize.preferred exactly like maximize.lastResort."""
+
+    _switcher = TestRemoveAccountPrunesLastResort._switcher
+
+    def _lists(self, s):
+        from claude_swap.settings import load_maximize_settings
+
+        mx = load_maximize_settings(s.backup_dir)
+        return mx.preferred, mx.last_resort
+
+    def test_both_lists_lose_the_removed_account(self, temp_home, capsys):
+        from claude_swap.settings import set_setting
+
+        s = self._switcher(temp_home)
+        # Account 3 is in both lists (written by hand): removing it prunes
+        # each, keeping the other accounts' entries.
+        set_setting(s.backup_dir, "maximize.preferred", "b@example.com,C@example.com")
+        set_setting(s.backup_dir, "maximize.lastResort", "c@example.com,a@example.com")
+        s.remove_account("3", assume_yes=True)
+        assert self._lists(s) == ("b@example.com", "a@example.com")
+        out = capsys.readouterr().out
+        assert "Removed C@example.com from maximize.preferred" in out
+        assert "Removed c@example.com from maximize.lastResort" in out
+        # The last entry of each: both keys unset, not "".
+        set_setting(s.backup_dir, "maximize.lastResort", "b@example.com")
+        s.remove_account("2", assume_yes=True)
+        assert self._lists(s) == (None, None)
+
+    def test_an_entry_that_still_names_another_account_stays(self, temp_home):
+        from claude_swap.settings import set_setting
+
+        s = self._switcher(temp_home)
+        data = s._get_sequence_data()
+        data["accounts"]["2"]["email"] = "c@example.com"
+        s._write_json(s.sequence_file, data)
+        set_setting(s.backup_dir, "maximize.preferred", "c@example.com")
+        s.remove_account("3", assume_yes=True)
+        assert self._lists(s) == ("c@example.com", None)
+
+
 class TestRemoveAccountPrunesMappings:
     """Removing an account drops any directory mappings pointing at it."""
 

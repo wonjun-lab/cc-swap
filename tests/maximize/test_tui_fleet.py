@@ -30,7 +30,7 @@ from tests.test_tui import (  # noqa: F401 (fake_engine is a fixture)
     settle,
 )
 
-FOOTER = "enter switch · r re-login · l last resort · h hold · m menu · ? help · q quit"
+FOOTER = "enter switch · r login · l last · u first · h hold · m menu · ? help · q quit"
 
 
 def _settings(root, **maximize) -> None:

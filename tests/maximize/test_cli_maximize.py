@@ -1,4 +1,4 @@
-"""cc-swap CLI surface: `auto --strategy maximize` flags and `last-resort`."""
+"""cc-swap CLI surface: `auto --strategy maximize` flags, `last-resort` and `prefer`."""
 
 from __future__ import annotations
 
@@ -341,3 +341,199 @@ class TestLastResort:
             with pytest.raises(SystemExit) as exc:
                 cli._last_resort_command(["add", "3"])
         assert exc.value.code == 1
+
+
+class TestPrefer:
+    """`cc-swap prefer`: `last-resort`'s twin over maximize.preferred, and the
+    two lists exclude each other."""
+
+    def _seed(self, *, shared_email: bool = False):
+        switcher = ClaudeAccountSwitcher()
+        switcher._setup_directories()
+        switcher._init_sequence_file()
+        data = switcher._get_sequence_data()
+        team_email = "work@example.com" if shared_email else "team@example.com"
+        data["accounts"]["2"] = {
+            "email": "work@example.com", "uuid": "u2", "organizationUuid": "",
+            "organizationName": "", "added": "2024-01-01T00:00:00Z",
+        }
+        data["accounts"]["3"] = {
+            "email": team_email, "uuid": "u3", "organizationUuid": "org-3",
+            "organizationName": "Team", "added": "2024-01-01T00:00:00Z",
+            "alias": "team",
+        }
+        data["sequence"] = [2, 3]
+        switcher._write_json(switcher.sequence_file, data)
+        return switcher
+
+    def _cmd(self, argv: list[str], fn=None) -> int:
+        with patch("os.geteuid", return_value=1000, create=True):
+            try:
+                (fn or cli._prefer_command)(argv)
+            except SystemExit as e:
+                return e.code or 0
+        return 0
+
+    def _stored(self):
+        mx = load_maximize_settings(_backup_root())
+        return mx.preferred, mx.last_resort
+
+    def test_add_by_alias_or_email_stores_the_email(self, temp_home, capsys):
+        self._seed()
+        assert self._cmd(["add", "team"]) == 0
+        assert self._stored() == ("team@example.com", None)
+        assert "Marked team preferred" in capsys.readouterr().out
+        self._cmd(["add", "work@example.com"])
+        assert self._stored() == ("team@example.com,work@example.com", None)
+
+    def test_add_twice_says_already(self, temp_home, capsys):
+        self._seed()
+        self._cmd(["add", "team"])
+        capsys.readouterr()
+        assert self._cmd(["add", "team@example.com"]) == 0
+        assert "team is already preferred." in capsys.readouterr().out
+        assert self._stored() == ("team@example.com", None)
+
+    def test_add_hints_when_strategy_is_not_maximize(self, temp_home, capsys):
+        self._seed()
+        self._cmd(["add", "team"])
+        assert "Takes effect with the maximize strategy (now best)" in capsys.readouterr().out
+
+    def test_remove_unsets_the_key_and_says_so(self, temp_home, capsys):
+        self._seed()
+        self._cmd(["add", "team"])
+        assert self._cmd(["remove", "team"]) == 0
+        assert "Removed team from preferred" in capsys.readouterr().out
+        raw = json.loads(settings_path(_backup_root()).read_text())
+        assert "maximize" not in raw
+
+    def test_remove_unmarked_account_is_a_noop(self, temp_home, capsys):
+        self._seed()
+        assert self._cmd(["remove", "team"]) == 0
+        assert "team is not preferred." in capsys.readouterr().out
+
+    def test_remove_clears_an_entry_that_names_no_account(self, temp_home, capsys):
+        self._seed()
+        set_setting(_backup_root(), "maximize.preferred", "team@example.com,ghost@example.com")
+        assert self._cmd(["remove", "ghost@example.com"]) == 0
+        assert self._stored() == ("team@example.com", None)
+        assert "from preferred (it named no account)" in capsys.readouterr().out
+
+    def test_list(self, temp_home, capsys):
+        self._seed()
+        assert self._cmd([]) == 0
+        assert "No preferred accounts" in capsys.readouterr().out
+        set_setting(_backup_root(), "maximize.preferred", "team@example.com,ghost@example.com")
+        assert self._cmd(["list"]) == 0
+        out = capsys.readouterr().out
+        assert "Preferred accounts:" in out
+        assert "team@example.com → team" in out
+        assert "ghost@example.com → (no matching account)" in out
+
+    def test_list_shows_an_account_in_both_lists_under_last_resort_only(
+        self, temp_home, capsys
+    ):
+        self._seed()
+        set_setting(_backup_root(), "maximize.preferred", "team@example.com,work@example.com")
+        set_setting(_backup_root(), "maximize.lastResort", "team@example.com")
+        assert self._cmd(["list"]) == 0
+        out = capsys.readouterr().out
+        assert "work@example.com → work" in out
+        assert "team@example.com" not in out.split("Note:")[0]
+        notes = [line for line in out.splitlines() if "both lists" in line]
+        assert notes == [
+            "Note: team is in both lists, so it is last resort; settle it with cc-swap "
+            "prefer remove team (keep it last resort) or cc-swap prefer add team (make "
+            "it preferred)."
+        ]
+        assert self._cmd(["list"], cli._last_resort_command) == 0
+        out = capsys.readouterr().out
+        assert "team@example.com → team" in out and "both lists" in out
+        # Only in both: no preferred account is left to list.
+        set_setting(_backup_root(), "maximize.preferred", "team@example.com")
+        self._cmd(["list"])
+        out = capsys.readouterr().out
+        assert "No preferred accounts" in out and "Preferred accounts:" not in out
+        assert "both lists" in out
+
+    def test_shared_email_stores_the_alias(self, temp_home):
+        self._seed(shared_email=True)
+        self._cmd(["add", "team"])
+        assert self._stored() == ("team", None)
+
+    def test_shared_email_without_alias_is_refused(self, temp_home, capsys):
+        switcher = self._seed(shared_email=True)
+        data = switcher._get_sequence_data()
+        del data["accounts"]["3"]["alias"]
+        switcher._write_json(switcher.sequence_file, data)
+        assert self._cmd(["add", "3"]) == 1
+        err = capsys.readouterr().err
+        assert "give work·Team an alias first (cc-swap alias work·Team NAME)" in err
+        assert "so preferred names only that account" in err
+        assert self._stored() == (None, None)
+
+    def test_remove_shared_email_entry_warns_about_the_other_account(self, temp_home, capsys):
+        self._seed(shared_email=True)
+        set_setting(_backup_root(), "maximize.preferred", "work@example.com")
+        self._cmd(["remove", "work"])
+        assert self._stored() == (None, None)
+        assert "Also returned team" in capsys.readouterr().out
+
+    def test_prefer_add_takes_it_off_last_resort(self, temp_home, capsys):
+        self._seed()
+        set_setting(_backup_root(), "maximize.lastResort", "team@example.com,work@example.com")
+        assert self._cmd(["add", "team"]) == 0
+        assert self._stored() == ("team@example.com", "work@example.com")
+        out = capsys.readouterr().out
+        assert "Marked team preferred" in out
+        assert "Removed team from last-resort (it is preferred now)" in out
+
+    def test_last_resort_add_takes_it_off_preferred(self, temp_home, capsys):
+        self._seed()
+        set_setting(_backup_root(), "maximize.preferred", "TEAM")
+        assert self._cmd(["add", "team@example.com"], cli._last_resort_command) == 0
+        assert self._stored() == (None, "team@example.com")
+        out = capsys.readouterr().out
+        assert "Marked team last-resort" in out
+        assert "Removed team from preferred (it is last-resort now)" in out
+
+    def test_already_listed_still_leaves_the_other_list(self, temp_home, capsys):
+        # Written into both by hand (last resort wins): `prefer add` settles it.
+        self._seed()
+        set_setting(_backup_root(), "maximize.preferred", "team@example.com")
+        set_setting(_backup_root(), "maximize.lastResort", "team@example.com")
+        self._cmd(["add", "team"])
+        assert self._stored() == ("team@example.com", None)
+        out = capsys.readouterr().out
+        assert "already preferred" in out and "Removed team from last-resort" in out
+
+    def test_moving_a_shared_email_entry_warns_about_the_other_account(
+        self, temp_home, capsys
+    ):
+        self._seed(shared_email=True)
+        set_setting(_backup_root(), "maximize.lastResort", "work@example.com")
+        self._cmd(["add", "team"])
+        assert self._stored() == ("team", None)
+        assert "Also returned work" in capsys.readouterr().out
+
+    def test_dispatched_from_main_and_listed_in_help(self, temp_home, capsys):
+        with patch("claude_swap.cli._prefer_command") as fn, \
+             patch.object(sys, "argv", ["cc-swap", "prefer", "add", "team"]):
+            cli.main()
+        fn.assert_called_once_with(["add", "team"])
+        with patch.object(sys, "argv", ["cc-swap", "--help"]):
+            with pytest.raises(SystemExit):
+                cli.main()
+        assert "prefer add|remove <a>" in capsys.readouterr().out
+
+    def test_own_help_names_accounts_not_slots(self, capsys):
+        with pytest.raises(SystemExit):
+            cli._prefer_command(["--help"])
+        out = capsys.readouterr().out
+        assert "maximize.preferred" in out and "cc-swap prefer add work" in out
+        assert "prefer add 3" not in out
+
+    def test_unknown_account_exits_1(self, temp_home, capsys):
+        self._seed()
+        assert self._cmd(["add", "9"]) == 1
+        assert "Error" in capsys.readouterr().err

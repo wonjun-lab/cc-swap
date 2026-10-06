@@ -101,6 +101,7 @@ def build_snapshot(
     landing rule; ``estimate``/``local_idle``: the active account's usage is
     an estimate (``Snapshot.estimate``)."""
     last_resort = parse_account_list(settings.last_resort)
+    preferred = parse_account_list(settings.preferred)
     shown = record_names(records)
     views: list[AccountView] = []
     for number, record in records.items():
@@ -111,7 +112,7 @@ def build_snapshot(
             AccountView(
                 number=number,
                 email=email,
-                tier=tier_for(record, email, last_resort),
+                tier=tier_for(record, email, last_resort, preferred),
                 plan_weight=plan_weight(
                     rate_limit_tiers.get(number), email, settings.plan_override
                 ),

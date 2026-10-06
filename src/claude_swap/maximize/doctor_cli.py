@@ -509,7 +509,7 @@ TRIGGERS: dict[str, str] = {
     "hard": "a hard ceiling is reached (or the pace reaches one within forceEtaMin)",
     "soft": "a soft mark is crossed and the account went idle",
     "preempt": "the active 7d is on pace to pass soft7d before your next quiet time; moved while idle",
-    "rebalance": "a better-scored account exists, or the active one is excluded / last resort",
+    "rebalance": "a better-scored account exists, or one in a higher tier can land (preferred over normal over last resort)",
     "failover": "the active account's usage could not be read several times in a row",
     "proactive": "the active account reached autoswitch.threshold",
     "consume-first": "another account's weekly window resets sooner",

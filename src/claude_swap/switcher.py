@@ -5172,12 +5172,13 @@ class ClaudeAccountSwitcher:
         forget_slots(self.backup_dir, [str(account_num)])
 
     def _prune_last_resort(self, accounts_before: dict, account_num: str) -> None:
-        """Drop the ``maximize.lastResort`` entries that named only the removed
-        account in slot ``account_num`` (its email or alias). Left behind, such an
-        entry no longer resolves (``last-resort remove`` cannot clear it) and
-        silently marks the same login last-resort again once it is re-added.
-        An entry that still names another account (a shared email) stays."""
-        from claude_swap.maximize.tiers import last_resort_matches
+        """Drop the ``maximize.lastResort`` and ``maximize.preferred`` entries
+        that named only the removed account in slot ``account_num`` (its email
+        or alias). Left behind, such an entry no longer resolves (``last-resort
+        remove`` / ``prefer remove`` cannot clear it) and silently puts the
+        same login back in that tier once it is re-added. An entry that still
+        names another account (a shared email) stays."""
+        from claude_swap.maximize.tiers import LAST_RESORT, PREFERRED, account_matches
         from claude_swap.settings import (
             load_maximize_settings,
             parse_model_names,
@@ -5185,25 +5186,27 @@ class ClaudeAccountSwitcher:
             unset_setting,
         )
 
-        try:
-            entries = list(parse_model_names(load_maximize_settings(self.backup_dir).last_resort))
-        except Exception:
-            return
-        dropped = [
-            e for e in entries if last_resort_matches(accounts_before, e) == [account_num]
-        ]
-        if not dropped:
-            return
-        kept = [e for e in entries if e not in dropped]
-        try:
-            if kept:
-                set_setting(self.backup_dir, "maximize.lastResort", ",".join(kept))
-            else:
-                unset_setting(self.backup_dir, "maximize.lastResort")
-        except (ConfigError, OSError) as e:
-            warning(f"Could not update maximize.lastResort ({e}); remove {', '.join(dropped)} by hand")
-            return
-        print(dimmed(f"Removed {', '.join(dropped)} from maximize.lastResort"))
+        for tl in (LAST_RESORT, PREFERRED):
+            try:
+                current = getattr(load_maximize_settings(self.backup_dir), tl.field)
+                entries = list(parse_model_names(current))
+            except Exception:
+                return
+            dropped = [
+                e for e in entries if account_matches(accounts_before, e) == [account_num]
+            ]
+            if not dropped:
+                continue
+            kept = [e for e in entries if e not in dropped]
+            try:
+                if kept:
+                    set_setting(self.backup_dir, tl.key, ",".join(kept))
+                else:
+                    unset_setting(self.backup_dir, tl.key)
+            except (ConfigError, OSError) as e:
+                warning(f"Could not update {tl.key} ({e}); remove {', '.join(dropped)} by hand")
+                continue
+            print(dimmed(f"Removed {', '.join(dropped)} from {tl.key}"))
 
     def _build_accounts_info(self) -> list[tuple[int, str, str, str, bool, str, str]]:
         """Build per-account (num, email, org_name, org_uuid, is_active, creds, alias).

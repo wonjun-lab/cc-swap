@@ -1,5 +1,5 @@
 """Blocking Fleet actions (thread workers only): the re-login store step and
-the last-resort toggle.
+the last-resort and preferred-tier toggles.
 
 ``relogin_store`` is the half of a re-login cc-swap does itself: the user
 ran ``claude`` and ``/login`` (cc-swap launches nothing); this checks that
@@ -12,15 +12,23 @@ never overwrite a slot. Results name accounts by slot number only.
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
+from dataclasses import dataclass
 from pathlib import Path
 
 from claude_swap import oauth
 from claude_swap.exceptions import CredentialReadError
+from claude_swap.maximize.model import TIER_LABELS, Tier
 from claude_swap.maximize.tiers import (
-    last_resort_matches,
+    LAST_RESORT,
+    OTHER,
+    PREFERRED,
+    TierList,
+    account_matches,
     parse_account_list,
-    toggle_last_resort,
+    tier_for,
+    toggle_entry,
+    without_account,
 )
 from claude_swap.settings import load_maximize_settings, set_setting, unset_setting
 
@@ -125,17 +133,112 @@ def relogin_store(
     return out
 
 
+@dataclass(frozen=True)
+class TierToggle:
+    """What a Fleet tier toggle did (:func:`toggle_tier_setting`)."""
+
+    marked: bool    # the account is in the toggled list afterwards
+    moved: bool     # marking it dropped it from the other list
+    before: Tier    # its tier before the write (``tier_for``) ...
+    after: Tier     # ... and after it
+    # Per list the write dropped entries from: the other accounts those
+    # entries named too (a shared email), which left that list with it.
+    also: tuple[tuple[TierList, tuple[str, ...]], ...] = ()
+
+
+def _tier_of(accounts: Mapping[str, Mapping], number: str, mx) -> Tier:
+    record = accounts.get(number, {})
+    return tier_for(
+        {"alias": record.get("alias")},
+        str(record.get("email") or ""),
+        parse_account_list(mx.last_resort),
+        parse_account_list(mx.preferred),
+    )
+
+
+def toggle_tier_setting(
+    backup_root: Path, accounts: Mapping[str, Mapping], number: str, tl: TierList
+) -> TierToggle:
+    """Toggle slot ``number``'s account in tier list ``tl``
+    (``maximize.lastResort`` / ``maximize.preferred``). Marking it also
+    drops it from the other list (the two exclude each other).
+    ``ConfigError`` for a shared email without an alias (the entry would
+    mark both accounts)."""
+
+    def store(key: str, value: str) -> None:
+        if value:
+            set_setting(backup_root, key, value)
+        else:
+            unset_setting(backup_root, key)
+
+    mx = load_maximize_settings(backup_root)
+    before = _tier_of(accounts, number, mx)
+    current = getattr(mx, tl.field)
+    _rest, unmarking = without_account(accounts, current, number)
+    store(tl.key, toggle_entry(accounts, current, number, tl))
+    marked_by = parse_account_list(getattr(load_maximize_settings(backup_root), tl.field))
+    marked = any(number in account_matches(accounts, e) for e in marked_by)
+    dropped: list[tuple[TierList, list[str]]] = [(tl, unmarking)] if unmarking else []
+    moved = False
+    if marked:
+        other = OTHER[tl.key]
+        rest, gone = without_account(
+            accounts, getattr(load_maximize_settings(backup_root), other.field), number
+        )
+        if gone:
+            store(other.key, rest)
+            dropped.append((other, gone))
+            moved = True
+    also = []
+    for lst, entries in dropped:
+        others = sorted(
+            {n for e in entries for n in account_matches(accounts, e)} - {number}, key=int
+        )
+        if others:
+            also.append((lst, tuple(others)))
+    after = _tier_of(accounts, number, load_maximize_settings(backup_root))
+    return TierToggle(marked, moved, before, after, tuple(also))
+
+
+def toggle_message(
+    result: TierToggle, tl: TierList, who: str, name: Callable[[str], str] = str
+) -> str:
+    """The toast for a tier toggle, worded from the account's actual tier
+    after the write: an account in both lists (last resort wins) is named
+    by what it is now, and a dropped shared entry names the other accounts
+    it took off its list too (``cc-swap last-resort``/``prefer`` warn the
+    same). ``name`` turns a slot into a display name."""
+    label = TIER_LABELS
+    lists = {LAST_RESORT.key: label["last_resort"], PREFERRED.key: label["preferred"]}
+    if result.marked:
+        message = f"{who} is {label[result.after]}"
+        if result.moved:
+            message += f" (no longer {lists[OTHER[tl.key].key]})"
+    elif result.after == "normal":
+        message = f"{who} is back to normal"
+    else:
+        still = "still " if result.after == result.before else ""
+        message = f"{who} is {still}{label[result.after]} (no longer {lists[tl.key]})"
+    for lst, numbers in result.also:
+        message += (
+            f"; also took {', '.join(name(n) for n in numbers)} off {lists[lst.key]} "
+            "(the removed entry named them too)"
+        )
+    return message
+
+
 def toggle_last_resort_setting(
     backup_root: Path, accounts: Mapping[str, Mapping], number: str
 ) -> bool:
     """Toggle slot ``number``'s account in ``maximize.lastResort``; True when it is
-    last-resort afterwards. ``ConfigError`` for a shared email without an
-    alias (the entry would mark both accounts)."""
-    current = load_maximize_settings(backup_root).last_resort
-    value = toggle_last_resort(accounts, current, number)
-    if value:
-        set_setting(backup_root, "maximize.lastResort", value)
-    else:
-        unset_setting(backup_root, "maximize.lastResort")
-    marked = parse_account_list(load_maximize_settings(backup_root).last_resort)
-    return any(number in last_resort_matches(accounts, e) for e in marked)
+    last-resort afterwards (:func:`toggle_tier_setting`)."""
+    return toggle_tier_setting(backup_root, accounts, number, LAST_RESORT).marked
+
+
+def toggle_preferred_setting(
+    backup_root: Path, accounts: Mapping[str, Mapping], number: str
+) -> bool:
+    """Toggle slot ``number``'s account in ``maximize.preferred`` (the
+    preferred tier); True when it is preferred afterwards
+    (:func:`toggle_tier_setting`)."""
+    return toggle_tier_setting(backup_root, accounts, number, PREFERRED).marked

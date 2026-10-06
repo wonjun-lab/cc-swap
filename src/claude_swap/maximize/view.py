@@ -35,6 +35,7 @@ from claude_swap.maximize.model import (
     Sample,
     Snapshot,
 )
+from claude_swap.maximize.model import TIER_LABELS as model_tier_labels
 from claude_swap.maximize.score import landable, rank, score
 from claude_swap.maximize.snapshot import build_snapshot
 from claude_swap.models import AccountsSnapshot
@@ -61,7 +62,7 @@ KNOB_LABELS = {
     "soft_5h": "5h soft", "hard_5h": "5h hard", "soft_7d": "7d soft", "hard_7d": "7d hard",
 }
 _PAIRS = (("soft_5h", "hard_5h"), ("soft_7d", "hard_7d"))
-TIER_LABELS = {"normal": "normal", "last_resort": "last resort", "excluded": "excluded"}
+TIER_LABELS = model_tier_labels  # model.TIER_LABELS
 
 
 #: ``engine_hook.DECISION_KEY`` (pinned by a test, like STATE_FILENAME).

@@ -331,7 +331,7 @@ def render_detail(
     row: fx.FleetRow | None, acc: AccountSnapshot | None, width: int, ctx: Ctx
 ) -> Text:
     """A rule, then the selected account in full: its name, organization,
-    plan and tag; a long bar per usage window with the exact reset; the
+    plan, tier (preferred or last resort) and tag; a long bar per usage window with the exact reset; the
     login deadline and priming."""
     p = ctx.palette
     text = Text("─" * width, style=p.track, no_wrap=True)
@@ -345,8 +345,13 @@ def render_detail(
     if alias:
         head.append(f" ({row.email})", style=p.foreground)
     facts = [row.org] + ([home.plan_text(row)] if row.plan != "?" else [])
-    head.append("  " + " · ".join(facts), style=p.muted)
     status = ctx.status(row)
+    # The tier, which the status tag shows only when nothing outranks it
+    # (an active or next preferred account reads "● active" / "next").
+    tier = home.TIER_FACTS.get(row.tier)
+    if tier and not (status and status[0] == tier):
+        facts.append(tier)
+    head.append("  " + " · ".join(facts), style=p.muted)
     if status:
         head.append("  ")
         head.append(status[0], style=tone_style(status[1], p))
@@ -458,7 +463,7 @@ def attention_text(
 
 
 def keys_text(width: int, palette: Palette, *, empty: bool = False) -> Text:
-    """``enter switch · r re-login · l last resort · h hold · m menu · ? help
+    """``enter switch · r login · l last · u first · h hold · m menu · ? help
     · q quit`` (``a add · m menu · ? help · q quit`` with no account yet)."""
     keys = Text(no_wrap=True, overflow="ellipsis")
     for i, (key, what) in enumerate(home.key_hints(width, empty=empty)):
