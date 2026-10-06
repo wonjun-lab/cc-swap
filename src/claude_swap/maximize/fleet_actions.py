@@ -1,5 +1,5 @@
 """Blocking Fleet actions (thread workers only): the re-login store step and
-the last-resort toggle.
+the last-resort and preferred-tier toggles.
 
 ``relogin_store`` is the half of a re-login cc-swap does itself: the user
 ran ``claude`` and ``/login`` (cc-swap launches nothing); this checks that
@@ -18,9 +18,14 @@ from pathlib import Path
 from claude_swap import oauth
 from claude_swap.exceptions import CredentialReadError
 from claude_swap.maximize.tiers import (
-    last_resort_matches,
+    LAST_RESORT,
+    OTHER,
+    PREFERRED,
+    TierList,
+    account_matches,
     parse_account_list,
-    toggle_last_resort,
+    toggle_entry,
+    without_account,
 )
 from claude_swap.settings import load_maximize_settings, set_setting, unset_setting
 
@@ -125,17 +130,50 @@ def relogin_store(
     return out
 
 
+def toggle_tier_setting(
+    backup_root: Path, accounts: Mapping[str, Mapping], number: str, tl: TierList
+) -> tuple[bool, bool]:
+    """Toggle slot ``number``'s account in tier list ``tl``
+    (``maximize.lastResort`` / ``maximize.preferred``): ``(marked, moved)``,
+    ``marked`` True when it is in ``tl`` afterwards, ``moved`` True when
+    marking it dropped it from the other list (the two exclude each other).
+    ``ConfigError`` for a shared email without an alias (the entry would mark
+    both accounts)."""
+    current = getattr(load_maximize_settings(backup_root), tl.field)
+    value = toggle_entry(accounts, current, number, tl)
+    if value:
+        set_setting(backup_root, tl.key, value)
+    else:
+        unset_setting(backup_root, tl.key)
+    marked_by = parse_account_list(getattr(load_maximize_settings(backup_root), tl.field))
+    marked = any(number in account_matches(accounts, e) for e in marked_by)
+    moved = False
+    if marked:
+        other = OTHER[tl.key]
+        rest, dropped = without_account(
+            accounts, getattr(load_maximize_settings(backup_root), other.field), number
+        )
+        if dropped:
+            if rest:
+                set_setting(backup_root, other.key, rest)
+            else:
+                unset_setting(backup_root, other.key)
+            moved = True
+    return marked, moved
+
+
 def toggle_last_resort_setting(
     backup_root: Path, accounts: Mapping[str, Mapping], number: str
 ) -> bool:
     """Toggle slot ``number``'s account in ``maximize.lastResort``; True when it is
-    last-resort afterwards. ``ConfigError`` for a shared email without an
-    alias (the entry would mark both accounts)."""
-    current = load_maximize_settings(backup_root).last_resort
-    value = toggle_last_resort(accounts, current, number)
-    if value:
-        set_setting(backup_root, "maximize.lastResort", value)
-    else:
-        unset_setting(backup_root, "maximize.lastResort")
-    marked = parse_account_list(load_maximize_settings(backup_root).last_resort)
-    return any(number in last_resort_matches(accounts, e) for e in marked)
+    last-resort afterwards (:func:`toggle_tier_setting`)."""
+    return toggle_tier_setting(backup_root, accounts, number, LAST_RESORT)[0]
+
+
+def toggle_preferred_setting(
+    backup_root: Path, accounts: Mapping[str, Mapping], number: str
+) -> bool:
+    """Toggle slot ``number``'s account in ``maximize.preferred`` (the
+    preferred tier); True when it is preferred afterwards
+    (:func:`toggle_tier_setting`)."""
+    return toggle_tier_setting(backup_root, accounts, number, PREFERRED)[0]

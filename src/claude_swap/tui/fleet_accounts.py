@@ -124,7 +124,8 @@ class AccountsScreen(Screen):
                          else "bold" if row.active else "plain", palette)),
                 Text(login, style=tone_style(tone, palette)),
                 Text(fx.TIER_CELLS.get(row.tier, row.tier),
-                     style=tone_style("plain" if row.tier == "normal" else "dim", palette)),
+                     style=tone_style(
+                         "plain" if row.tier in ("preferred", "normal") else "dim", palette)),
                 key=row.number,
             )
         self._numbers = [r.number for r in rows]

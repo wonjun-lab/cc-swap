@@ -32,7 +32,7 @@ def test_the_menu_holds_every_former_fleet_menu_action():
 
 
 def test_home_keys_are_the_footer_and_do_not_collide():
-    assert menus.HOME_KEYS == ("enter", "r", "l", "h", "m", "?", "q")
+    assert menus.HOME_KEYS == ("enter", "r", "l", "u", "h", "m", "?", "q")
     # x (exclude) is a menu item too; n (name) is a row key the footer does
     # not list: it would not fit 80 columns (? help and Account settings do).
     assert set(menus.ROW_KEYS) - {"x", "n"} <= set(menus.HOME_KEYS)

@@ -458,8 +458,8 @@ def attention_text(
 
 
 def keys_text(width: int, palette: Palette, *, empty: bool = False) -> Text:
-    """``enter switch · r re-login · l last resort · h hold · m menu · ? help
-    · q quit`` (``a add · m menu · ? help · q quit`` with no account yet)."""
+    """``enter switch · r re-login · l last resort · u preferred · h hold · m
+    menu · ? help · q quit`` (``a add · m menu · ? help · q quit`` with no account yet)."""
     keys = Text(no_wrap=True, overflow="ellipsis")
     for i, (key, what) in enumerate(home.key_hints(width, empty=empty)):
         if i:

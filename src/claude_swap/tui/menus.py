@@ -1,7 +1,7 @@
 """Fleet's menus, keys and help text (pure, no Textual).
 
-The home screen has seven keys, all in its footer: ``enter`` switch, ``r``
-re-login, ``l`` last resort, ``h`` hold (stay on the active account: a small
+The home screen has eight keys, all in its footer: ``enter`` switch, ``r``
+re-login, ``l`` last resort, ``u`` preferred tier, ``h`` hold (stay on the active account: a small
 picker, :func:`hold_rows`), ``m`` menu, ``?`` help, ``q`` quit. Everything
 else is an item of the ``m`` menu (a popup), one letter each, shown in a key
 column with a short note on what it does. The menu's letters also work
@@ -48,11 +48,11 @@ MAIN_KEYS: tuple[str, ...] = tuple(e.key for e in MAIN_MENU)
 BY_ACTION: dict[str, MenuEntry] = {e.action: e for e in MAIN_MENU}
 
 #: The home screen's own keys: exactly its footer.
-HOME_KEYS: tuple[str, ...] = ("enter", "r", "l", "h", "m", "?", "q")
+HOME_KEYS: tuple[str, ...] = ("enter", "r", "l", "u", "h", "m", "?", "q")
 #: Keys that act on the selected account. ``n`` (name it) is not in the
 #: footer, which would no longer fit 80 columns: ``?`` help lists it, and
 #: Account settings (m → a) has the same ``n``.
-ROW_KEYS: tuple[str, ...] = ("enter", "l", "x", "r", "n")
+ROW_KEYS: tuple[str, ...] = ("enter", "l", "u", "x", "r", "n")
 #: Menu letters that also work from the home screen without the menu.
 SHORTCUT_KEYS: tuple[str, ...] = tuple(k for k in MAIN_KEYS if k not in ("o", "m", "q"))
 #: Keys that are deliberately not menu items (navigation, help, theme).
@@ -368,6 +368,8 @@ def help_entries(idle_pattern: str | None = None) -> list[tuple[str, str]]:
         ("drain 18h", "its 7d resets in 18h: cc-swap uses it first and up to its hard mark "
                       "(its 7d soft mark is set aside) so that quota does not expire "
                       "unused (m → s: 7d drain)"),
+        ("preferred", "used before every normal account; left only at a mark, and "
+                      "taken back once it can land again (u toggles)"),
         ("last resort", "used only when every other account is at its limit (l toggles)"),
         ("prime 19:30", "its 5h window has not started; priming starts it then (now: at "
                         "the next tick; 5h off: priming does not run)"),
@@ -416,6 +418,8 @@ def help_entries(idle_pattern: str | None = None) -> list[tuple[str, str]]:
         ("enter", "switch to it (asks first when switching would not land there)"),
         ("r", "re-login it (guided; cc-swap launches nothing)"),
         ("l", "last resort on/off"),
+        ("u", "preferred on/off: used before every normal account (l and u exclude "
+              "each other)"),
         ("n", "name the selected account: an alias shown instead of its short name "
               "(enter saves, an empty name brings the short name back, esc cancels; the "
               "rules of cc-swap alias). Account settings (m → a) has it too"),

@@ -908,19 +908,23 @@ def test_neither_attention_lines_nor_the_summary_make_a_fitting_table_scroll(row
 # -- footer --------------------------------------------------------------------------------------------
 
 
-def test_footer_is_seven_keys():
+def test_footer_is_eight_keys():
     full = home.key_hints(120)
     assert " · ".join(f"{k} {w}" for k, w in full) == (
-        "enter switch · r re-login · l last resort · h hold · m menu · ? help · q quit"
+        "enter switch · r re-login · l last resort · u preferred · h hold · m menu "
+        "· ? help · q quit"
     )
     short = home.key_hints(50)
-    assert [k for k, _ in short] == ["enter", "r", "l", "h", "m", "?", "q"]
-    assert render.keys_text(50, P).plain == "enter · r · l · h · m menu · ? help · q quit"
-    assert render.keys_text(40, P).plain == "enter · r · l · h · m · ? · q"
+    assert [k for k, _ in short] == ["enter", "r", "l", "u", "h", "m", "?", "q"]
+    assert render.keys_text(50, P).plain == "enter · r · l · u · h · m menu · ? help · q quit"
+    assert render.keys_text(40, P).plain == "enter · r · l · u · h · m · ? · q"
     for width in (40, 50, 77):
         assert render.keys_text(width, P).cell_len <= width
-    # The whole footer still fits an 80-column terminal.
-    assert home.key_hints(home.text_width(80)) == list(home.KEY_HINTS)
+    # An 80-column terminal keeps every word but the two tier toggles' (? has them).
+    assert render.keys_text(home.text_width(80), P).plain == (
+        "enter switch · r re-login · l · u · h hold · m menu · ? help · q quit"
+    )
+    assert home.key_hints(92) == list(home.KEY_HINTS)
 
 
 # -- colours -------------------------------------------------------------------------------------------

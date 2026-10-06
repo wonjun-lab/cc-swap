@@ -20,7 +20,7 @@ switching doing, and is anything wrong":
 * under the table, when there are rows to spare, the selected account in
   full (organization, plan, login deadline, priming, every usage window
   with its exact reset);
-* a footer of seven keys; everything else is in the ``m`` menu popup.
+* a footer of eight keys; everything else is in the ``m`` menu popup.
 
 The table is used at every terminal size; ``home.table_plan`` fits its
 columns to the width (shorter bars, then no reset clocks, no plan column,
@@ -564,6 +564,7 @@ class FleetScreen(Screen):
         Binding("enter", "switch_selected", "Switch", show=False),
         Binding("r", "relogin", "Re-login", show=False),
         Binding("l", "last_resort", "Last resort", show=False),
+        Binding("u", "preferred", "Preferred", show=False),
         Binding("h", "hold", "Hold", show=False),
         Binding("n", "rename", "Name", show=False),  # a row key, not in the footer
         Binding("m", "open_menu", "Menu", show=False),
@@ -1282,6 +1283,13 @@ class FleetScreen(Screen):
         )
 
     def action_last_resort(self) -> None:
+        self._toggle_tier("last_resort")
+
+    def action_preferred(self) -> None:
+        """u: the preferred tier on/off for the selected account (l's twin)."""
+        self._toggle_tier("preferred")
+
+    def _toggle_tier(self, tier: str) -> None:
         row = self.current_row()
         if row is None:
             return
@@ -1291,21 +1299,28 @@ class FleetScreen(Screen):
             for a in (snap.accounts if snap else ())
         }
         self.run_worker(
-            partial(self._last_resort_blocking, accounts, row.number), thread=True,
-            group="fleet-action", exit_on_error=False, name="fleet-last-resort",
+            partial(self._tier_blocking, accounts, row.number, tier), thread=True,
+            group="fleet-action", exit_on_error=False,
+            name="fleet-last-resort" if tier == "last_resort" else "fleet-preferred",
         )
 
-    def _last_resort_blocking(self, accounts: dict, number: str) -> None:
+    def _tier_blocking(self, accounts: dict, number: str, tier: str) -> None:
         from claude_swap.exceptions import ClaudeSwitchError
-        from claude_swap.maximize.fleet_actions import toggle_last_resort_setting
+        from claude_swap.maximize.fleet_actions import toggle_tier_setting
+        from claude_swap.maximize.tiers import LAST_RESORT, PREFERRED
 
+        tl = LAST_RESORT if tier == "last_resort" else PREFERRED
         try:
-            marked = toggle_last_resort_setting(self._root, accounts, number)
+            marked, moved = toggle_tier_setting(self._root, accounts, number, tl)
         except ClaudeSwitchError as e:
             self.app.call_from_thread(self.notify, str(e), severity="error", timeout=8)
             return
         who = self._account_name(number)
-        message = f"{who} is last resort" if marked else f"{who} is back to normal"
+        what = mxview.TIER_LABELS[tl.tier]
+        message = f"{who} is {what}" if marked else f"{who} is back to normal"
+        if moved:
+            other = mxview.TIER_LABELS["preferred" if tier == "last_resort" else "last_resort"]
+            message += f" (no longer {other})"
         self.app.call_from_thread(self._after_setting, message)
 
     def _after_setting(self, message: str) -> None:

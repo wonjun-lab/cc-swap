@@ -92,6 +92,8 @@ class MaximizeSettings:
     rebalance_cooldown_min: int = 30
     tie_epsilon: float = 0.1
     last_resort: str | None = None  # comma-separated emails/aliases
+    # The preferred tier: used before every normal account (same format).
+    preferred: str | None = None
     plan_override: str | None = None  # "email:20x,email:5x"
     # A soft/rebalance switch never lands on an account whose login expires
     # within this many minutes (at-limit/hard fallbacks still may).
@@ -345,6 +347,10 @@ SETTING_SPECS: dict[str, SettingSpec] = {
         SettingSpec(
             "maximize", "lastResort", "last_resort", "string",
             help="maximize: last-resort accounts (emails/aliases, comma-separated)",
+        ),
+        SettingSpec(
+            "maximize", "preferred", "preferred", "string",
+            help="maximize: preferred-tier accounts, used before normal ones (emails/aliases, comma-separated)",
         ),
         SettingSpec(
             "maximize", "planOverride", "plan_override", "string",

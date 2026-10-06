@@ -12,7 +12,7 @@ from typing import Literal
 
 from claude_swap.settings import MaximizeSettings
 
-Tier = Literal["normal", "last_resort", "excluded"]
+Tier = Literal["preferred", "normal", "last_resort", "excluded"]
 Trigger = Literal["at-limit", "hard", "soft", "preempt", "rebalance"]
 # A hold's reason code beyond pending/plain (engine NoSwitchEvent reason).
 # ``hold``: an account hold (``cc-swap hold``, maximize/hold.py) set aside a
@@ -27,9 +27,10 @@ HoldCode = Literal[
 # idle moment came first (``idle``; nothing is learned from it).
 RideEnd = Literal["due", "idle"]
 
-# Lower sorts first. ``excluded`` is listed only so every tier has an order;
-# an excluded account is never landable (score.landable).
-TIER_ORDER: dict[str, int] = {"normal": 0, "last_resort": 1, "excluded": 2}
+# Lower sorts first: the preferred tier (``maximize.preferred``) above normal,
+# normal above last resort. ``excluded`` is listed only so every tier has an
+# order; an excluded account is never landable (score.landable).
+TIER_ORDER: dict[str, int] = {"preferred": 0, "normal": 1, "last_resort": 2, "excluded": 3}
 
 
 @dataclass(frozen=True)

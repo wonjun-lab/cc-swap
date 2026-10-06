@@ -180,7 +180,7 @@ def short_left(seconds: float) -> str:
 #: The tags in priority order: an account shows only the first that applies.
 TAG_PRIORITY: tuple[str, ...] = (
     "active", "re-login", "keychain", "excluded", "untrusted", "next", "login",
-    "reading old", "drain", "last resort", "prime",
+    "reading old", "drain", "preferred", "last resort", "prime",
 )
 
 #: A reading the engine still decides on gets a dim ``reading 25m old`` tag
@@ -226,6 +226,8 @@ def tag_for(
         # (maximize/drain.py). ``drain 18h``: the time to that reset.
         left = (row.reset7 - now) / 3600.0 if row.reset7 is not None else None
         return (drain.tag(left) if left is not None and left > 0 else "drain"), "ok"
+    if row.tier == "preferred":
+        return "preferred", "dim"
     if row.tier == "last_resort":
         return "last resort", "dim"
     if row.state5 == "cold" and row.login == "ok":  # an API key has no 5h window
@@ -1595,8 +1597,8 @@ def attention_want(notices: Sequence[Notice], width: int) -> int:
 
 
 KEY_HINTS: tuple[tuple[str, str], ...] = (
-    ("enter", "switch"), ("r", "re-login"), ("l", "last resort"), ("h", "hold"),
-    ("m", "menu"), ("?", "help"), ("q", "quit"),
+    ("enter", "switch"), ("r", "re-login"), ("l", "last resort"), ("u", "preferred"),
+    ("h", "hold"), ("m", "menu"), ("?", "help"), ("q", "quit"),
 )
 #: The footer while no account is managed yet: the account keys would do
 #: nothing, ``a`` adds the login claude has now.
@@ -1607,15 +1609,19 @@ EMPTY_KEY_HINTS: tuple[tuple[str, str], ...] = (
 
 def key_hints(width: int, *, empty: bool = False) -> list[tuple[str, str]]:
     """The footer's ``(key, what)`` pairs: every word when it fits
-    (``enter switch · r re-login · …``), else the keys with only menu, help
-    and quit spelled out, else the keys alone. ``empty``: no account yet
-    (:data:`EMPTY_KEY_HINTS`)."""
+    (``enter switch · r re-login · …``), else every word but the two tier
+    toggles' (``l · u``, which ``?`` explains: the 80-column footer), else
+    the keys with only menu, help and quit spelled out, else the keys alone.
+    ``empty``: no account yet (:data:`EMPTY_KEY_HINTS`)."""
     def text(pairs) -> str:
         return " · ".join(f"{k} {w}" if w else k for k, w in pairs)
 
     hints = EMPTY_KEY_HINTS if empty else KEY_HINTS
     if len(text(hints)) <= width:
         return list(hints)
+    tiers = [(k, "" if k in ("l", "u") else w) for k, w in hints]
+    if len(text(tiers)) <= width:
+        return tiers
     short = [(k, w if k in ("a", "m", "?", "q") else "") for k, w in hints]
     if len(text(short)) <= width:
         return short

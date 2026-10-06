@@ -150,6 +150,39 @@ class TestRowKeys:
             await _open(pilot)
             assert _maximize(tmp_path) == {}
 
+    async def test_u_toggles_the_preferred_tier_in_settings_json(self, tmp_path):
+        _settings(tmp_path)
+        app = make_app(_fleet(tmp_path))
+        async with app.run_test(size=(140, 40)) as pilot:
+            await _open(pilot)
+            await _to_row(pilot, "2")
+            await pilot.press("u")
+            await _open(pilot)
+            assert _maximize(tmp_path) == {"preferred": "user2@example.com"}
+            assert _tag(app, "2") == "preferred"
+            await pilot.press("u")
+            await _open(pilot)
+            assert _maximize(tmp_path) == {}
+
+    async def test_u_and_l_exclude_each_other(self, tmp_path):
+        _settings(tmp_path)
+        app = make_app(_fleet(tmp_path))
+        seen = _toasts(app)
+        async with app.run_test(size=(140, 40)) as pilot:
+            await _open(pilot)
+            await _to_row(pilot, "2")
+            await pilot.press("l")
+            await _open(pilot)
+            assert _maximize(tmp_path) == {"lastResort": "user2@example.com"}
+            await pilot.press("u")
+            await _open(pilot)
+            assert _maximize(tmp_path) == {"preferred": "user2@example.com"}
+            assert any("is preferred (no longer last resort)" in m for m, _ in seen)
+            await pilot.press("l")
+            await _open(pilot)
+            assert _maximize(tmp_path) == {"lastResort": "user2@example.com"}
+            assert any("is last resort (no longer preferred)" in m for m, _ in seen)
+
     async def test_l_on_shared_email_without_alias_shows_error_toast(self, tmp_path):
         _settings(tmp_path)
         accounts = _accounts()

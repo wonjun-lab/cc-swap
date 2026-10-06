@@ -68,7 +68,9 @@ _SENTINEL_LOGIN: dict[str, LoginState] = {
     USAGE_KEYCHAIN_UNAVAILABLE: "keychain",
     USAGE_API_KEY: "api",
 }
-TIER_CELLS = {"normal": "normal", "last_resort": "last-r", "excluded": "excl"}
+TIER_CELLS = {
+    "preferred": "pref", "normal": "normal", "last_resort": "last-r", "excluded": "excl",
+}
 
 
 # -- time ---------------------------------------------------------------------------
@@ -232,7 +234,7 @@ class FleetRow:
     active: bool
     rank: int | None     # maximize pick order among non-excluded; None = score unknown
     plan: str
-    tier: str            # normal | last_resort | excluded
+    tier: str            # preferred | normal | last_resort | excluded
     pct5: float | None
     pct7: float | None
     days7: float | None

@@ -78,6 +78,7 @@ _SUBCOMMAND_FLAGS = {
 # commands (prime, service) register here; main() has a single hook for all.
 _FORK_COMMANDS: dict[str, str] = {
     "last-resort": "_last_resort_command",
+    "prefer": "_prefer_command",
     "prime": "_prime_command",
     "service": "_service_command",
     "doctor": "_doctor_command",
@@ -1090,6 +1091,55 @@ def _last_resort_command(argv: list[str]) -> None:
     the switch. Writes go through `set_setting`/`unset_setting`, so the file
     keeps its other keys and the 0600 mode.
     """
+    _tier_list_command(argv, _mx_tiers.LAST_RESORT)
+
+
+def _prefer_command(argv: list[str]) -> None:
+    """Handle `cc-swap prefer add|remove|list [NUM|EMAIL|ALIAS]`.
+
+    `last-resort`'s twin over ``maximize.preferred``: the preferred tier, whose
+    landable accounts are switched to before any normal one.
+    """
+    _tier_list_command(argv, _mx_tiers.PREFERRED)
+
+
+# Per tier list: (description, examples, add help, list help, list heading).
+_TIER_LIST_TEXT: dict[str, tuple[str, str, str, str, str]] = {
+    "last-resort": (
+        "Mark accounts the maximize strategy uses only when no other "
+        "account can take the switch (edits maximize.lastResort).",
+        """
+Examples:
+  cc-swap last-resort add 3
+  cc-swap last-resort add team@example.com
+  cc-swap last-resort remove dev
+  cc-swap last-resort list
+        """,
+        "Use an account only as a last resort",
+        "Show last-resort accounts (the default)",
+        "Last-resort accounts:",
+    ),
+    "prefer": (
+        "Mark preferred-tier accounts: the maximize strategy uses them before "
+        "any normal account (edits maximize.preferred).",
+        """
+Examples:
+  cc-swap prefer add work
+  cc-swap prefer add work@example.com
+  cc-swap prefer remove work
+  cc-swap prefer list
+        """,
+        "Use an account before every normal one",
+        "Show preferred-tier accounts (the default)",
+        "Preferred accounts:",
+    ),
+}
+
+
+def _tier_list_command(argv: list[str], tl: "_mx_tiers.TierList") -> None:
+    """`cc-swap last-resort` / `cc-swap prefer`: add, remove or list the
+    accounts of tier list ``tl``. The two lists exclude each other: adding an
+    account to one drops it from the other, and says so."""
     from claude_swap.settings import (
         load_maximize_settings,
         load_settings,
@@ -1098,32 +1148,31 @@ def _last_resort_command(argv: list[str]) -> None:
         unset_setting,
     )
 
+    description, epilog, add_help, list_help, heading = _TIER_LIST_TEXT[tl.command]
+    label = tl.label
     parser = argparse.ArgumentParser(
-        prog=f"{_prog_name()} last-resort",
-        description=(
-            "Mark accounts the maximize strategy uses only when no other "
-            "account can take the switch (edits maximize.lastResort)."
-        ),
+        prog=f"{_prog_name()} {tl.command}",
+        description=description,
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-Examples:
-  cc-swap last-resort add 3
-  cc-swap last-resort add team@example.com
-  cc-swap last-resort remove dev
-  cc-swap last-resort list
-        """,
+        epilog=epilog,
     )
     parser.add_argument("--debug", action="store_true", help="Enable debug logging")
     sub = parser.add_subparsers(dest="action", metavar="{add,remove,list}")
     for name, text in (
-        ("add", "Use an account only as a last resort"),
+        ("add", add_help),
         ("remove", "Return an account to normal ranking"),
     ):
         p = sub.add_parser(name, help=text)
         p.add_argument("account", metavar="NUM|EMAIL|ALIAS")
-    sub.add_parser("list", help="Show last-resort accounts (the default)")
+    sub.add_parser("list", help=list_help)
     args = parser.parse_args(argv)
     action = args.action or "list"
+
+    def store(key: str, kept: list[str]) -> None:
+        if kept:
+            set_setting(root, key, ",".join(kept))
+        else:
+            unset_setting(root, key)
 
     try:
         switcher = ClaudeAccountSwitcher(debug=args.debug)
@@ -1131,16 +1180,17 @@ Examples:
         root = switcher.backup_dir
         # parse_model_names is a generic comma-list splitter: trimmed,
         # case-insensitively deduped, first spelling kept.
-        entries = list(parse_model_names(load_maximize_settings(root).last_resort))
+        mx = load_maximize_settings(root)
+        entries = list(parse_model_names(getattr(mx, tl.field)))
 
         if action == "list":
             data = switcher._get_sequence_data() or {}
             accounts = data.get("accounts", {})
             names = switcher.account_names(data)
             if not entries:
-                print(dimmed("No last-resort accounts"))
+                print(dimmed(f"No {label} accounts"))
                 return
-            print(bolded("Last-resort accounts:"))
+            print(bolded(heading))
             for entry in entries:
                 nums = _last_resort_matches(accounts, entry)
                 where = (
@@ -1160,52 +1210,56 @@ Examples:
         if action == "remove" and dangling:
             # An entry naming no account (left by an older `remove`): drop it
             # by its text, since it resolves to no account to name.
-            kept = [e for e in entries if e not in dangling]
-            if kept:
-                set_setting(root, "maximize.lastResort", ",".join(kept))
-            else:
-                unset_setting(root, "maximize.lastResort")
-            print(f"{accent('Removed')} {dangling[0]} from last-resort (it named no account)")
+            store(tl.key, [e for e in entries if e not in dangling])
+            print(f"{accent('Removed')} {dangling[0]} from {label} (it named no account)")
             return
         num, email, _ = switcher.resolve_account(args.account)
         who = name_of(names, num, email)
 
+        def also_returned(dropped: list[str]) -> None:
+            also = sorted(
+                {n for e in dropped for n in _last_resort_matches(accounts, e)} - {num},
+                key=int,
+            )
+            if also:
+                warning(
+                    f"  Also returned {', '.join(name_of(names, n) for n in also)} "
+                    "(the removed entry named them too); re-add by alias if needed."
+                )
+
         if action == "add":
             if num in {n for e in entries for n in _last_resort_matches(accounts, e)}:
-                print(dimmed(f"{who} is already last-resort."))
-                return
-            entries.append(_last_resort_entry(accounts, num, email))
-            set_setting(root, "maximize.lastResort", ",".join(entries))
-            print(f"{accent('Marked')} {who} last-resort")
-            strategy = load_settings(root).strategy
-            if strategy != "maximize":
-                print(dimmed(
-                    f"  Takes effect with the maximize strategy (now {strategy}): "
-                    "cc-swap config set autoswitch.strategy maximize"
-                ))
+                print(dimmed(f"{who} is already {label}."))
+            else:
+                entries.append(_mx_tiers.account_entry(accounts, num, email, tl))
+                store(tl.key, entries)
+                print(f"{accent('Marked')} {who} {label}")
+                strategy = load_settings(root).strategy
+                if strategy != "maximize":
+                    print(dimmed(
+                        f"  Takes effect with the maximize strategy (now {strategy}): "
+                        "cc-swap config set autoswitch.strategy maximize"
+                    ))
+            # An account is in one tier list at most: drop it from the other.
+            other = _mx_tiers.OTHER[tl.key]
+            value, dropped = _mx_tiers.without_account(
+                accounts, getattr(mx, other.field), num
+            )
+            if dropped:
+                store(other.key, [value] if value else [])
+                print(f"{accent('Removed')} {who} from {other.label} (it is {label} now)")
+                also_returned(dropped)
             return
 
         # remove: drop every entry that marks this account, so it is
         # guaranteed normal afterwards.
         dropped = [e for e in entries if num in _last_resort_matches(accounts, e)]
         if not dropped:
-            print(dimmed(f"{who} is not last-resort."))
+            print(dimmed(f"{who} is not {label}."))
             return
-        kept = [e for e in entries if e not in dropped]
-        if kept:
-            set_setting(root, "maximize.lastResort", ",".join(kept))
-        else:
-            unset_setting(root, "maximize.lastResort")
-        print(f"{accent('Removed')} {who} from last-resort")
-        also = sorted(
-            {n for e in dropped for n in _last_resort_matches(accounts, e)} - {num},
-            key=int,
-        )
-        if also:
-            warning(
-                f"  Also returned {', '.join(name_of(names, n) for n in also)} "
-                "(the removed entry named them too); re-add by alias if needed."
-            )
+        store(tl.key, [e for e in entries if e not in dropped])
+        print(f"{accent('Removed')} {who} from {label}")
+        also_returned(dropped)
     except ClaudeSwitchError as e:
         error(f"Error: {e}")
         sys.exit(1)
@@ -1783,6 +1837,8 @@ cc-swap:
   %(prog)s auto --strategy maximize   per-window soft/hard auto-switching
   %(prog)s last-resort add|remove <a> use an account only as a last resort
   %(prog)s last-resort list           list last-resort accounts
+  %(prog)s prefer add|remove <a>      use an account before every normal one
+  %(prog)s prefer list                list preferred-tier accounts
   %(prog)s prime [N ...] [--dry-run]  open idle accounts' 5h windows now
   %(prog)s prime verify [--live]      re-check priming isolation after Claude Code changed
   %(prog)s login                      sign in: renews an account cc-swap has, adds a new one

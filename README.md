@@ -106,7 +106,7 @@ Fleet shows, from top to bottom:
 - **One sentence** saying what automatic switching is doing and who runs the engine (`viewer · service pid 4121 is switching`).
 - **Attention lines**, only when something needs you, each with what to do about it: a login that needs renewing, priming paused (Claude Code killed by macOS at launch, an update settling, a new version not verified yet), a login that ends within a week, a locked keychain. One line, up to three when the table leaves rows over.
 - **A capacity summary**: how many accounts still have 5h room, how long until the next account comes back and the next weekly reset, and roughly how many accounts' worth of weekly quota is left.
-- **One row per account**: the order automatic switching would land on them in, exactly as the engine would (`●` is the active one, `·` only when forced, `–` not now, e.g. a reading too old to trust), its name (`main`: the alias, else the part of the address before the `@`), plan, 5h and 7d bars with their reset times, and a status such as `next`, `last resort`, `excluded`, `login 3d left`, `re-login (r)`, `keychain locked (f)`, `reading 2h old`, `drain 18h` or `prime 19:30`. Each bar has an amber tick at the soft threshold and a red tick at the hard one.
+- **One row per account**: the order automatic switching would land on them in, exactly as the engine would (`●` is the active one, `·` only when forced, `–` not now, e.g. a reading too old to trust), its name (`main`: the alias, else the part of the address before the `@`), plan, 5h and 7d bars with their reset times, and a status such as `next`, `preferred`, `last resort`, `excluded`, `login 3d left`, `re-login (r)`, `keychain locked (f)`, `reading 2h old`, `drain 18h` or `prime 19:30`. Each bar has an amber tick at the soft threshold and a red tick at the hard one.
 - **The selected account in full**: organization, plan, login deadline, priming, and every usage window it has.
 
 Fleet keys:
@@ -116,6 +116,7 @@ Fleet keys:
 | `enter` | Switch to the selected account |
 | `r` | Re-login the selected account |
 | `l` | Mark or unmark the selected account as last resort |
+| `u` | Mark or unmark the selected account as preferred (used before every normal account) |
 | `h` | Hold: stay on the active account for a while |
 | `n` | Name the selected account (set its alias) |
 | `↑`/`↓` or `j`/`k` | Move the selection |
@@ -226,16 +227,18 @@ A goes first, even though B has far more left: B still has six days to use its q
 
 Even below the soft thresholds, cc-swap moves you to a better-scored account at an idle moment (at most once every 30 minutes). Once it has learned your usual quiet hours, it can also move you early when the active account's week is on pace to cross its soft threshold before your next quiet time, and it saves small rebalancing moves for a quiet time.
 
-### Last-resort and excluded accounts
+### Preferred, last-resort and excluded accounts
 
 ```bash
+cc-swap prefer add alice@example.com        # use before every normal account
+cc-swap prefer remove alice@example.com
 cc-swap last-resort add carol@example.com   # use only when nothing else can take you
 cc-swap last-resort remove carol@example.com
 cc-swap disable 3                           # never switch to it automatically
 cc-swap enable 3
 ```
 
-A last-resort account is used only when no normal account can take you. An excluded (disabled) account is never a target and never primed, though you can still `cc-swap switch` to it yourself. In Fleet, `l` toggles last resort and `m` → `x` excludes or includes the selected account.
+A preferred account is used before any normal one: whenever one can take you, cc-swap goes there (or moves you back there at the next idle moment), and only the usual soft and hard thresholds move you off it. It is not entered again until it is back under its soft threshold minus the landing margin (after its 5h window resets, say), so it never bounces. A last-resort account is used only when no normal account can take you. An account is in at most one of the two lists: adding it to one removes it from the other. An excluded (disabled) account is never a target and never primed, though you can still `cc-swap switch` to it yourself. In Fleet, `u` toggles preferred, `l` toggles last resort and `m` → `x` excludes or includes the selected account.
 
 ### Waiting for a reset
 

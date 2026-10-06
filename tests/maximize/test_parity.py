@@ -15,7 +15,7 @@ the ``auto`` parser; ``prime verify`` is a ``prime`` subcommand; ``upgrade
 are listed in ``EXTRA_FORK_ACTIONS`` so they are held to the same rule.
 
 A route is the key path from the Fleet home screen. Since 0.4.0 the home
-screen's keys are its footer (seven since 0.5.0 added ``h`` hold) and
+screen's keys are its footer (eight since ``u`` preferred joined ``l``) and
 everything else lives in the ``m`` menu: ``"l"`` is a home key; ``"m p"`` is
 ``m`` (the menu) then ``p``;
 ``"m a i"`` is the menu, ``a`` (Account settings), then ``i`` on that
@@ -46,6 +46,7 @@ EXTRA_FORK_ACTIONS: tuple[str, ...] = (
 #: CLI action -> the Fleet key path that performs the same thing.
 FLEET_ROUTES: dict[str, str] = {
     "last-resort": "l",  # home key: toggle last resort on the selected account
+    "prefer": "u",  # home key: toggle the preferred tier on the selected account
     "prime": "m p",  # menu → Prime now…
     "history": "m v",  # menu → View switch history (the ledger, newest first)
     "doctor": "m a i",  # menu → Account settings → Inspect all logins (doctor)
@@ -232,6 +233,10 @@ STRATEGY_ASYMMETRY: dict[str, str] = {
     "maximize.lastResort": (
         "a comma-separated list of emails or aliases; Fleet's l toggles last resort on "
         "the selected account and edits this same list"
+    ),
+    "maximize.preferred": (
+        "a comma-separated list of emails or aliases; Fleet's u toggles the preferred "
+        "tier on the selected account and edits this same list"
     ),
     "maximize.planOverride": (
         "a per-email text map that only breaks ties; the plan normally comes from each "

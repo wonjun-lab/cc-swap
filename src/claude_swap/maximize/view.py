@@ -61,7 +61,10 @@ KNOB_LABELS = {
     "soft_5h": "5h soft", "hard_5h": "5h hard", "soft_7d": "7d soft", "hard_7d": "7d hard",
 }
 _PAIRS = (("soft_5h", "hard_5h"), ("soft_7d", "hard_7d"))
-TIER_LABELS = {"normal": "normal", "last_resort": "last resort", "excluded": "excluded"}
+TIER_LABELS = {
+    "preferred": "preferred", "normal": "normal", "last_resort": "last resort",
+    "excluded": "excluded",
+}
 
 
 #: ``engine_hook.DECISION_KEY`` (pinned by a test, like STATE_FILENAME).

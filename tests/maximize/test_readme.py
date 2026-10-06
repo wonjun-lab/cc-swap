@@ -31,7 +31,7 @@ def _table_rows() -> dict[str, list[str]]:
 
 
 def test_every_fork_key_is_registered():
-    assert len(FORK_KEYS) == 29  # 23 maximize.* + 6 prime.*
+    assert len(FORK_KEYS) == 30  # 24 maximize.* + 6 prime.*
 
 
 @pytest.mark.parametrize("key", FORK_KEYS)
