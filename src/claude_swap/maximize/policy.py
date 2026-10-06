@@ -22,7 +22,9 @@ tier. Rebalance (a) is the tier rule: it moves off the active account
 whenever a landable account of a higher tier exists, whatever the active's
 score or pace, and also off a draining active account (the tier wins over
 the drain's "never move off a draining account" below). Preempt never
-moves to a lower tier. Leaving a preferred-tier account by a soft or hard
+moves to a lower tier, and does not fire while a higher tier than the
+active can land: rebalance (a) makes that move directly, not after a
+detour through a same-tier account. Leaving a preferred-tier account by a soft or hard
 move cannot flap back: rebalance (a) only re-enters it once it is landable
 by the usual rule (under soft minus ``landingMargin``), as for any account.
 With ``maximize.preferred`` unset nothing is in that tier and every
@@ -1096,7 +1098,9 @@ def _preempt(
 
     The active's 7d must reach soft7d within the horizon at its burn rate,
     and a landable account of no worse a tier must not
-    (:func:`crosses_soft7_within`). The rebalance cooldown applies.
+    (:func:`crosses_soft7_within`). The rebalance cooldown applies. None
+    when the best landing candidate is in a higher tier than the active:
+    rebalance (a) moves there.
     """
     s = snap.settings
     rate = snap.rates7.get(a.number)
