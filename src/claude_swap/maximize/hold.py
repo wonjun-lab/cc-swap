@@ -333,7 +333,10 @@ def parse_until(text: str, now: float) -> float:
         wanted = (day.year, day.month, day.day, hour, minute)
         found = []
         for isdst in (-1, 0, 1):  # both readings of an hour that happens twice
-            at = time.mktime((*wanted, 0, 0, 0, isdst))
+            try:
+                at = time.mktime((*wanted, 0, 0, 0, isdst))
+            except (OverflowError, ValueError, OSError):
+                continue  # no such reading: glibc refuses isdst=1 in a zone without DST
             if time.localtime(at)[:5] == wanted and at > now:  # it exists that day
                 found.append(at)
         if found:
