@@ -201,6 +201,39 @@ def test_parse_until_is_the_next_such_local_time():
             h.parse_until(bad, morning)
 
 
+def _glibc_mktime(monkeypatch):
+    """What glibc does in a zone without daylight saving: mktime with
+    isdst=1 returns -1, which Python raises as OverflowError."""
+    real = time.mktime
+
+    def mktime(t):
+        if t[8] == 1:
+            raise OverflowError("mktime argument out of range")
+        return real(t)
+
+    monkeypatch.setattr(time, "mktime", mktime)
+
+
+def test_parse_until_skips_a_daylight_reading_mktime_refuses(monkeypatch):
+    morning = time.mktime((2026, 10, 3, 9, 15, 0, 0, 0, -1))  # 09:15 local (UTC)
+    _glibc_mktime(monkeypatch)
+    assert h.parse_until("23:00", morning) == morning + 13 * H + 45 * 60
+    assert h.parse_until("9:00", morning) == morning + 24 * H - 15 * 60
+
+
+@pytest.mark.parametrize("glibc", [False, True])
+def test_parse_until_in_a_zone_without_daylight_saving(monkeypatch, glibc):
+    os.environ["TZ"] = "Asia/Seoul"  # the ``utc`` fixture restores the zone
+    time.tzset()
+    if glibc:
+        _glibc_mktime(monkeypatch)
+    morning = time.mktime((2026, 10, 3, 9, 15, 0, 0, 0, 0))  # 09:15 KST
+    at = h.parse_until("23:00", morning)
+    assert at == morning + 13 * H + 45 * 60
+    assert time.strftime("%Y-%m-%d %H:%M %Z", time.localtime(at)) == "2026-10-03 23:00 KST"
+    assert h.parse_until("09:15", morning) == morning + 24 * H
+
+
 @pytest.fixture
 def new_york():
     """Local time with daylight saving: America/New_York (the ``utc``
