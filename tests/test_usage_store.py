@@ -1863,3 +1863,153 @@ class TestLoginExpiredStrikes:
         store.record({"1": FetchRecord(error="login_expired")}, IDENT)
         store.record({"1": FetchRecord(usage=USAGE)}, IDENT)
         assert store.entries(IDENT)["1"].auth_dead_strikes == 0
+
+
+RECOVERY_IDS = {
+    num: (f"{name}@example.com", f"org-{name}")
+    for num, name in zip("123456", ("a", "b", "c", "d", "e", "f"))
+}
+
+
+class TestConnectivityRecovery:
+    """A successful read ends every other row's network/timeout backoff."""
+
+    IDS = RECOVERY_IDS
+    A, B, C, D, E, F = "123456"
+
+    def _outage(self, store, clock):
+        """All six read fine, then each fails its own way, B twice."""
+        store.record({n: FetchRecord(usage=USAGE) for n in self.IDS}, self.IDS)
+        clock.advance(STALE_OK_S + 60)
+        store.record({self.B: FetchRecord(error="network")}, self.IDS)
+        clock.advance(BACKOFF_BASE_S + 1)
+        failures = {
+            self.B: FetchRecord(error="network"),
+            self.C: FetchRecord(error="timeout"),
+            self.D: FetchRecord(error="http-429", retry_after_s=600.0),
+            self.E: FetchRecord(error="invalid_grant"),
+            self.F: FetchRecord(error="bad-response"),
+        }
+        for num, rec in failures.items():
+            store.record({num: rec}, self.IDS)
+        clock.advance(5)
+
+    def _backed_off(self, store, clock) -> set[str]:
+        entries = store.entries(self.IDS)
+        return {n for n, e in entries.items() if e.in_backoff(clock.now)}
+
+    def test_success_releases_network_and_timeout_rows_only(self, store, clock):
+        self._outage(store, clock)
+        assert self._backed_off(store, clock) == {
+            self.B, self.C, self.D, self.E, self.F
+        }
+        before = store.entries(self.IDS)
+
+        store.record({self.A: FetchRecord(usage=USAGE)}, self.IDS)
+
+        after = store.entries(self.IDS)
+        for num in (self.B, self.C):
+            entry = after[num]
+            assert not entry.in_backoff(clock.now)
+            assert entry.backoff_until is None
+            assert entry.consecutive_failures == 0
+            # The re-read overwrites it; until then it stays the cause.
+            assert entry.last_error == before[num].last_error
+        for num in (self.D, self.E, self.F):
+            assert after[num] == before[num]
+        assert self._backed_off(store, clock) == {self.D, self.E, self.F}
+        assert set(
+            store.reserve(list(self.IDS), self.IDS, respect_plans=False)
+        ) == {self.B, self.C}
+
+    def test_released_row_keeps_its_failure_state_trust(self, store, clock):
+        # Past STALE_OK_S a failing row is trusted as deliberate staleness;
+        # releasing it must not flip it to unknown before its re-read lands.
+        self._outage(store, clock)
+        assert store.entries(self.IDS)[self.B].decision_value() == USAGE
+        store.record({self.A: FetchRecord(usage=USAGE)}, self.IDS)
+        entry = store.entries(self.IDS)[self.B]
+        assert entry.age_s > STALE_OK_S
+        assert entry.decision_value() == USAGE
+        # ... and still never past the general ceiling.
+        clock.advance(TRUST_MAX_AGE_S)
+        assert store.entries(self.IDS)[self.B].decision_value() is None
+
+    def test_a_failed_outcome_releases_nothing(self, store, clock):
+        self._outage(store, clock)
+        before = store.entries(self.IDS)
+        store.record({self.A: FetchRecord(error="network")}, self.IDS)
+        after = store.entries(self.IDS)
+        for num in (self.B, self.C, self.D, self.E, self.F):
+            assert after[num].backoff_until == before[num].backoff_until
+            assert after[num].consecutive_failures == before[num].consecutive_failures
+
+    def test_two_failures_in_one_call_release_nothing(self, store, clock):
+        self._outage(store, clock)
+        before = store.entries(self.IDS)
+        store.record(
+            {
+                self.A: FetchRecord(error="network"),
+                self.C: FetchRecord(error="timeout"),
+            },
+            self.IDS,
+        )
+        after = store.entries(self.IDS)
+        assert after[self.B].backoff_until == before[self.B].backoff_until
+        assert after[self.B].consecutive_failures == 2
+        assert after[self.C].in_backoff(clock.now)
+
+    def test_a_sentinel_releases_nothing(self, store, clock):
+        self._outage(store, clock)
+        store.record({self.A: FetchRecord(sentinel="api key")}, self.IDS)
+        assert self.B in self._backed_off(store, clock)
+
+    def test_claims_are_left_alone(self, store, clock):
+        self._outage(store, clock)
+        before = json.loads(store.path.read_text(encoding="utf-8"))["accounts"]
+        store.record({self.A: FetchRecord(usage=USAGE)}, self.IDS)
+        after = json.loads(store.path.read_text(encoding="utf-8"))["accounts"]
+        for num in (self.B, self.C):
+            assert after[num]["claimId"] == before[num]["claimId"]
+            assert after[num]["claimUntil"] == before[num]["claimUntil"]
+
+    def test_future_poll_plan_is_pulled_to_now(self, store, clock):
+        # An escalation fetch may fail on a row whose plan is not yet due;
+        # with only the backoff cleared, that plan would still keep it out.
+        self._outage(store, clock)
+        store.set_poll_plan({self.B: (clock.now + 1800.0, 1800.0)}, self.IDS)
+        store.record({self.A: FetchRecord(usage=USAGE)}, self.IDS)
+        entry = store.entries(self.IDS)[self.B]
+        assert entry.next_poll_at == clock.now
+        assert entry.poll_interval_s == 1800.0
+        assert set(
+            store.reserve([self.B], self.IDS, respect_plans=False, repair_overslept=True)
+        ) == {self.B}
+
+    def test_next_pass_chooses_the_released_row(self, store, clock):
+        self._outage(store, clock)
+        candidates = [self.B, self.D, self.E, self.F]
+        assert due_candidate(candidates, store.entries(self.IDS), clock.now) is None
+        store.record({self.A: FetchRecord(usage=USAGE)}, self.IDS)
+        assert (
+            due_candidate(candidates, store.entries(self.IDS), clock.now) == self.B
+        )
+        # The scheduler's reserve still decides the fetch: one pick, one claim.
+        assert set(
+            store.reserve([self.B], self.IDS, respect_plans=False, repair_overslept=True)
+        ) == {self.B}
+
+    def test_release_logs_a_count_without_identities(self, store, clock, caplog):
+        self._outage(store, clock)
+        with caplog.at_level("INFO", logger="claude-swap"):
+            store.record({self.A: FetchRecord(usage=USAGE)}, self.IDS)
+        lines = [r.getMessage() for r in caplog.records if "released" in r.getMessage()]
+        assert lines == [
+            "Usage read succeeded; released 2 account(s) from network/timeout backoff"
+        ]
+        assert "example.com" not in caplog.text
+
+    def test_nothing_to_release_logs_nothing(self, store, clock, caplog):
+        with caplog.at_level("INFO", logger="claude-swap"):
+            store.record({self.A: FetchRecord(usage=USAGE)}, self.IDS)
+        assert "released" not in caplog.text
