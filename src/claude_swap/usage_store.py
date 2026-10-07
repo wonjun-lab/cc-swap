@@ -29,6 +29,7 @@ batch, not one request.
 from __future__ import annotations
 
 import json
+import logging
 import time
 import uuid
 from collections.abc import Callable, Iterable
@@ -47,6 +48,8 @@ from claude_swap.poll_policy import (
     parse_reset_ts,
 )
 from claude_swap.settings import atomic_write_json
+
+_logger = logging.getLogger("claude-swap")
 
 SCHEMA_VERSION = 2
 
@@ -235,6 +238,13 @@ AUTH_DEAD_STRIKES = 1
 # recorded deadline had passed when the server rejected the grant (see
 # ``oauth.permanent_refresh_kind``) — and strikes exactly the same way.
 PERMANENT_AUTH_ERRORS = frozenset({"invalid_grant", "no_refresh_token", "login_expired"})
+
+# Fetch errors that say only "the request did not get through" (oauth.
+# _classify_usage_error). Any successful read disproves them for every
+# account at once, so record() releases their backoff (see
+# _release_connectivity_backoff). A 429 or other HTTP answer is the server's
+# own verdict on that account and is never released this way.
+CONNECTIVITY_ERRORS = frozenset({"network", "timeout"})
 
 # (email, organizationUuid) — the identity a slot number currently maps to.
 Identity = tuple[str, str]
@@ -943,10 +953,15 @@ class UsageStore:
             # polls this account and hands its readings over, so between two
             # hand-overs the last one is what decisions should run on.
             held = held_until is not None and now < held_until
+            # A lastError with no failure count is a row record() released
+            # from connectivity backoff (_release_connectivity_backoff): still
+            # in failure state until its re-read lands, so it keeps the trust
+            # it had. Every other writer clears the two together.
             trust_extended = (
                 within_ceiling
                 and (
                     consecutive_failures > 0
+                    or row.get("lastError") is not None
                     or (next_poll_at is not None and now < next_poll_at)
                     or live_claim
                     or held
@@ -1167,6 +1182,16 @@ class UsageStore:
                     rows[num] = row = self._fresh_row(identity)
                 assert isinstance(row, dict)
                 apply(num, row)
+            if any(
+                outcomes[num].error is None and outcomes[num].sentinel is None
+                for num in accepted
+            ):
+                released = _release_connectivity_backoff(rows, outcomes, now)
+                if released:
+                    _logger.info(
+                        f"Usage read succeeded; released {released} account(s) "
+                        "from network/timeout backoff"
+                    )
             if accepted:
                 self._write_rows(rows)
         return accepted
@@ -1298,6 +1323,47 @@ class UsageStore:
 
 def _num_or_none(value: object) -> float | None:
     return float(value) if isinstance(value, (int, float)) else None
+
+
+def _release_connectivity_backoff(
+    rows: dict[str, dict], outcomes: dict[str, FetchRecord], now: float
+) -> int:
+    """Make every other row that failed on connectivity due again.
+
+    Called inside :meth:`UsageStore.record`'s locked transaction when it
+    accepted a success: a usage read just went through, so the network works
+    and a ``network``/``timeout`` backoff on another row only delays its
+    re-read (after an outage each row would otherwise wait out its own
+    curve, reading unknown once trust expires). Clears ``backoffUntil`` and
+    ``consecutiveFailures`` and pulls a future ``nextPollAt`` to now, so the
+    next pass's :meth:`UsageStore.reserve` / :func:`due_candidate` — which
+    still pace how many rows are fetched — sees the row due. ``lastError``
+    stays until the re-read overwrites it (``entries()`` keeps the row's
+    failure-state trust on it). Server-chosen waits (429 and other HTTP
+    errors), auth failures and bad responses are left alone, as are claims
+    and rows recorded in this same call. Returns the number of rows released.
+    """
+    released = 0
+    for num, row in rows.items():
+        if num in outcomes or not isinstance(row, dict):
+            continue
+        if row.get("lastError") not in CONNECTIVITY_ERRORS:
+            continue
+        if int(row.get("authDeadStrikes") or 0) >= AUTH_DEAD_STRIKES:
+            continue
+        next_poll_at = _num_or_none(row.get("nextPollAt"))
+        if (
+            row.get("backoffUntil") is None
+            and not row.get("consecutiveFailures")
+            and (next_poll_at is None or next_poll_at <= now)
+        ):
+            continue
+        row["backoffUntil"] = None
+        row["consecutiveFailures"] = 0
+        if next_poll_at is not None and next_poll_at > now:
+            row["nextPollAt"] = now
+        released += 1
+    return released
 
 
 def _row_eligible(
