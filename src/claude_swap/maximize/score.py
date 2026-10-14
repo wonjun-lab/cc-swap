@@ -35,16 +35,23 @@ def landable(view: AccountView, s: MaximizeSettings, *, drain_k: float | None = 
     """Spec §5.2: a healthy, known, eligible place to land. ``drain_k``: a
     draining account's k (``drain.land_k``); its 7d soft mark is set aside
     and its 7d gate is the room to the hard cap, in 5h points at that k
-    (``drain.lands_7d``), instead of ``soft7d − landingMargin``."""
+    (``drain.lands_7d``), instead of ``soft7d − landingMargin``; landing
+    there while it passes the gate means it is at risk, so its 5h gate is
+    ``hard5h − landingMargin``, not ``soft5h − landingMargin``."""
     if view.tier == "excluded" or view.quarantined or view.api_key:
         return False
     if view.pct5 is None or view.pct7 is None:
         return False
     if drain_k is None:
-        lands7 = view.pct7 < s.soft_7d - s.landing_margin
-    else:
-        lands7 = lands_7d(view.pct7, s.hard_7d, drain_k)
-    return view.pct5 < s.soft_5h - s.landing_margin and lands7
+        return (
+            view.pct5 < s.soft_5h - s.landing_margin
+            and view.pct7 < s.soft_7d - s.landing_margin
+        )
+    # At risk (its 7d room would expire unused): the 5h soft mark is set
+    # aside too, so the 5h gate is the hard mark less the margin.
+    return view.pct5 < s.hard_5h - s.landing_margin and lands_7d(
+        view.pct7, s.hard_7d, drain_k
+    )
 
 
 def below_hard(view: AccountView, s: MaximizeSettings) -> bool:

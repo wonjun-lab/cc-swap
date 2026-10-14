@@ -134,19 +134,19 @@ def test_snapshot_reads_maximize_preferred():
 
 class TestLandingOrder:
     def test_a_preferred_account_lands_before_a_better_scored_normal_one(self):
-        s = snap("1", acct("1", 30, 50), acct("2", 0, 0, reset7_d=0.5),
+        s = snap("1", acct("1", 30, 50), acct("2", 0, 0, reset7_d=6),
                  pref("3", 30, 80, reset7_d=6))
         assert [v.number for v in landing_candidates(s)] == ["3", "2"]
 
-    def test_the_drain_orders_only_within_a_tier(self):
+    def test_a_draining_account_goes_first_whatever_the_tier(self):
         draining = replace(acct("2", 0, 50), reset7=NOW + 18 * H)
         s = snap("1", acct("1", 30, 50), draining, pref("3", 0, 80, reset7_d=6),
                  pref("4", 0, 20, reset7_d=6))
-        assert policy.drain.preferred(draining, s)
-        assert [v.number for v in landing_candidates(s)] == ["4", "3", "2"]
+        assert policy.drain.at_risk(draining, s)
+        assert [v.number for v in landing_candidates(s)] == ["2", "4", "3"]
         pdrain = replace(pref("5", 0, 50), reset7=NOW + 18 * H)
         s = replace(s, accounts=(*s.accounts, pdrain))
-        assert [v.number for v in landing_candidates(s)] == ["5", "4", "3", "2"]
+        assert [v.number for v in landing_candidates(s)] == ["5", "2", "4", "3"]
 
     def test_soft_lands_on_the_preferred_account(self):
         got = decide(snap("1", acct("1", 55, 40), acct("2", 0, 0), pref("3", 30, 70),
@@ -188,7 +188,7 @@ class TestRebalanceUp:
         assert isinstance(got, Switch) and got.trigger == "rebalance" and got.target == "3"
 
     def test_a_preferred_active_never_rebalances_down_for_score(self):
-        got = decide(snap("1", pref("1", 30, 80, reset7_d=6), acct("2", 0, 0, reset7_d=0.5),
+        got = decide(snap("1", pref("1", 30, 80, reset7_d=6), acct("2", 0, 0, reset7_d=6),
                           samples="idle"))
         assert isinstance(got, Hold) and "no better account" in got.reason
 
@@ -198,12 +198,14 @@ class TestRebalanceUp:
         assert isinstance(got, Switch) and got.trigger == "rebalance" and got.target == "2"
         assert "beats" in got.reason
 
-    def test_the_tier_wins_over_a_draining_active_account(self):
+    def test_the_drain_wins_over_the_tier_for_a_draining_active_account(self):
         draining = replace(acct("1", 10, 88), reset7=NOW + 18 * H)
-        normal = decide(snap("1", draining, acct("2", 0, 0), samples="idle"))
-        assert isinstance(normal, Hold) and "drain" in normal.reason  # the drain's rule
-        got = decide(snap("1", draining, pref("2", 30, 80), samples="idle"))
         assert policy.draining(draining, snap("1", draining))
+        got = decide(snap("1", draining, pref("2", 30, 80), samples="idle"))
+        assert isinstance(got, Hold) and "would expire unused, using it first" in got.reason
+        # Not landable on 7d any more (< 10 5h points to hard7d): the tier rules.
+        spent = replace(acct("1", 10, 97.5), reset7=NOW + 18 * H)
+        got = decide(snap("1", spent, pref("2", 30, 80), samples="idle"))
         assert isinstance(got, Switch) and got.trigger == "rebalance" and got.target == "2"
 
     def test_a_hold_sets_the_tier_move_aside(self):

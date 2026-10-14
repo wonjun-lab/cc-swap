@@ -535,7 +535,7 @@ def pending(snap: Snapshot) -> PendingView | None:
     s = snap.settings
     if active.pct5 >= s.hard_5h or active.pct7 >= s.hard_7d:
         return None  # at-limit / hard switch at once: nothing to wait for
-    if active.pct5 >= s.soft_5h:
+    if active.pct5 >= s.soft_5h and not drain.at_risk(active, snap):
         window, pct = "5h", active.pct5
     elif active.pct7 >= s.soft_7d and not drain.draining(active, snap):
         window, pct = "7d", active.pct7
