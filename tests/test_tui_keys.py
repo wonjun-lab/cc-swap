@@ -139,9 +139,16 @@ async def _menu_mode(pilot):
 
 
 async def _menu_auto_confirm(pilot):
-    if pilot.app.screen._state.auto_off:  # a key confirmed "off" earlier: back on first
+    # Turning auto off asks; turning it on does not. The home screen's
+    # auto_off can lag a just-confirmed toggle, so do not trust one read:
+    # toggle until the confirm shows (at most twice: on, then off).
+    for _ in range(2):
         await _keys(pilot, "m", "o")
-    await _keys(pilot, "m", "o")
+        try:
+            await wait_until(pilot, lambda: _cls(pilot.app) == "ConfirmModal", "confirm", timeout=1.5)
+            return
+        except AssertionError:
+            await _go_home(pilot)
 
 
 async def _hold(pilot):
