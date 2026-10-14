@@ -25,6 +25,7 @@ from rich.text import Text
 from textual.app import ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical
+from claude_swap.tui.screen_guard import TopOnly
 from textual.screen import Screen
 from textual.widgets import Footer, RichLog, Static
 
@@ -84,7 +85,7 @@ def _run_engine_holding(engine: AutoSwitchEngine, keeper: "LeaseKeeper") -> int:
         keeper.engine_exited()
 
 
-class AutoScreen(Screen):
+class AutoScreen(TopOnly, Screen):
     BINDINGS = [
         Binding("l", "toggle_live", "Go live / dry-run"),
         Binding("t", "adjust_threshold", "Threshold"),
@@ -205,7 +206,7 @@ class AutoScreen(Screen):
             else:
                 self._end_adjust()
             return
-        self.app.pop_screen()
+        self.pop_self()
 
     # -- threshold adjust mode ------------------------------------------------
 

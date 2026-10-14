@@ -14,6 +14,7 @@ from rich.text import Text
 from textual.app import ComposeResult
 from textual.binding import Binding
 from textual.containers import Vertical
+from claude_swap.tui.screen_guard import TopOnly
 from textual.screen import ModalScreen
 from textual.widgets import Label, RichLog, Static
 
@@ -48,7 +49,7 @@ def finding_lines(findings: list[dr.Finding]) -> list[Text]:
     return out
 
 
-class DoctorModal(ModalScreen[None]):
+class DoctorModal(TopOnly, ModalScreen[None]):
     DEFAULT_CSS = """
     DoctorModal { align: center middle; background: $background 60%; }
     DoctorModal .fx-modal { width: 110; max-width: 95%; }

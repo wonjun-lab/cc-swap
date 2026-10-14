@@ -15,6 +15,7 @@ from typing import TYPE_CHECKING
 from rich.text import Text
 from textual.app import ComposeResult
 from textual.binding import Binding
+from claude_swap.tui.screen_guard import TopOnly
 from textual.screen import Screen
 from textual.widgets import DataTable, ListItem, ListView, Static
 
@@ -37,7 +38,7 @@ class AccountItem(ListItem):
         self.key, self.title, self.action_id = key, title, action
 
 
-class AccountsScreen(Screen):
+class AccountsScreen(TopOnly, Screen):
     CSS_PATH = "fleet.tcss"
     BINDINGS = [
         Binding("a", "item('add')", show=False),
@@ -228,7 +229,7 @@ class AccountsScreen(Screen):
             self._picking = None
             self._render_prompt()
             return
-        self.app.pop_screen()
+        self.pop_self()
 
     def action_quit(self) -> None:
         from claude_swap.tui.fleet import request_quit

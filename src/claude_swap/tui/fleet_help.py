@@ -12,6 +12,7 @@ from rich.text import Text
 from textual.app import ComposeResult
 from textual.binding import Binding
 from textual.containers import VerticalScroll
+from claude_swap.tui.screen_guard import TopOnly
 from textual.screen import ModalScreen
 from textual.widgets import Static
 
@@ -43,7 +44,7 @@ def help_text(
     return text
 
 
-class HelpScreen(ModalScreen[None]):
+class HelpScreen(TopOnly, ModalScreen[None]):
     DEFAULT_CSS = """
     HelpScreen { align: center middle; background: $background 60%; }
     HelpScreen #fx-help-scroll {
@@ -89,6 +90,8 @@ class HelpScreen(ModalScreen[None]):
     def action_quit(self) -> None:
         from claude_swap.tui.fleet import request_quit
 
+        if not self.is_top:
+            return
         self.dismiss(None)
         request_quit(self.app)
 

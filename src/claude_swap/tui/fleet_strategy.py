@@ -19,6 +19,7 @@ from typing import TYPE_CHECKING
 from rich.text import Text
 from textual.app import ComposeResult
 from textual.binding import Binding
+from claude_swap.tui.screen_guard import TopOnly
 from textual.screen import Screen
 from textual.widgets import Static
 
@@ -55,7 +56,7 @@ def _value_text(field: menus.StrategyField, value: object) -> str:
     return f"{text} {field.unit}".rstrip()
 
 
-class StrategyScreen(Screen):
+class StrategyScreen(TopOnly, Screen):
     CSS_PATH = "fleet.tcss"
     BINDINGS = [
         Binding("up,k", "move(-1)", show=False),
@@ -260,7 +261,7 @@ class StrategyScreen(Screen):
                 "Unsaved changes — b again discards them, s saves", severity="warning"
             )
             return
-        self.app.pop_screen()
+        self.pop_self()
 
     def action_quit(self) -> None:
         from claude_swap.tui.fleet import request_quit
