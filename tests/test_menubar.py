@@ -155,7 +155,7 @@ def test_usage_summary_includes_scoped_model_limits():
 
 def test_usage_summary_scoped_over_limit_marker():
     usage = {"scoped": [{"name": "Fable", "pct": 100.0}]}
-    assert menubar.usage_summary(usage) == "Fable 100% (!)"
+    assert menubar.usage_summary(usage) == "Fable full"
 
 
 def test_usage_summary_scoped_multiple_and_countdown():
@@ -196,10 +196,10 @@ def test_usage_summary_scoped_ahead_of_pace_marker():
 
 
 def test_usage_summary_maxed_scoped_marker_wins_over_pace():
-    # At/over the limit shows "(!)" — the more urgent signal — not "(ahead)".
+    # At/over the limit shows "full" — the more urgent signal — not "(ahead)".
     usage = {"scoped": [{"name": "Fable", "pct": 100.0, "resets_at": _iso(6 * 86400)}]}
     out = menubar.usage_summary(usage, _NOW, fetched_at=_NOW)
-    assert "(!)" in out
+    assert out == "Fable full (6d 0h)"
     assert "ahead" not in out
 
 
@@ -568,7 +568,7 @@ def test_usage_summary_reflects_passed_weekly_reset():
 
 def test_usage_summary_scoped_reflects_passed_weekly_reset():
     usage = {"scoped": [{"name": "Fable", "pct": 100.0, "resets_at": _iso(-86400)}]}
-    # rolled to 0% → the over-limit "(!)" marker is gone too
+    # rolled to 0% → the over-limit "full" marker is gone too
     assert menubar.usage_summary(usage, _NOW) == "Fable 0% (6d 0h)"
 
 

@@ -6855,7 +6855,7 @@ class TestFormatUsageLines:
         fable = lines[2]
         assert fable.startswith("Fable:")
         assert "100%" in fable
-        assert fable.rstrip().endswith("(!)")  # at/over limit marker
+        assert fable.rstrip().endswith("(limit reached)")  # at/over limit marker
 
     def test_scoped_under_limit_has_no_marker(self):
         usage = {"scoped": [{"name": "Fable", "pct": 40.0, "clock": "21:59", "countdown": "3h"}]}
@@ -6865,12 +6865,12 @@ class TestFormatUsageLines:
         assert "40%" in lines[0]
         assert "resets 21:59" in lines[0]
         assert "in 3h" in lines[0]
-        assert not lines[0].rstrip().endswith("(!)")
+        assert not lines[0].rstrip().endswith("(limit reached)")
 
     def test_scoped_without_clock_renders_pct_only(self):
         usage = {"scoped": [{"name": "Fable", "pct": 100.0}]}
         lines = _format_usage_lines(usage)
-        assert lines == ["Fable: 100%  (!)"]
+        assert lines == ["Fable: 100%  (limit reached)"]
 
     def test_countdown_recomputed_from_resets_at_not_cached_strings(self):
         # A measurement served from the store hours after its fetch still
@@ -6987,7 +6987,7 @@ class TestFormatUsageLines:
         usage = {"scoped": [{"name": "Fable", "pct": 50.0, "resets_at": resets_at.isoformat()}]}
         line = _format_usage_lines(usage, now)[0]
         assert "(ahead of pace)" in line
-        assert "(!)" not in line
+        assert "(limit reached)" not in line
 
     def test_no_pace_marker_without_fetched_at(self):
         # No fetched_at passed -> pace isn't computable, no marker (backward

@@ -155,7 +155,7 @@ def usage_rows(
     ``suffix``. Only windows the account actually has produce a row — an
     annual plan without a 7-day window simply has no 7d line. Order matches
     the CLI: spend, 5h, 7d, then per-model scoped windows (e.g. "Fable"),
-    the latter marked ``(!)`` at/over their limit. The weekly (7d) and scoped
+    the latter marked ``(limit reached)`` at/over their limit. The weekly (7d) and scoped
     rows also carry a "(ahead of pace)" marker when meaningfully ahead of the
     week's expected usage (issue #125) — never the 5h row.
     """
@@ -185,8 +185,8 @@ def usage_rows(
         suffix, suffix_full = _reset_parts(window, now)
         suffix, suffix_full = suffix or "", suffix_full or ""
         if pct >= 100:
-            suffix = f"{suffix}  (!)" if suffix else "(!)"
-            suffix_full = f"{suffix_full}  (!)" if suffix_full else "(!)"
+            suffix = f"{suffix}  (limit reached)" if suffix else "(limit reached)"
+            suffix_full = f"{suffix_full}  (limit reached)" if suffix_full else "(limit reached)"
         else:
             marker = _pace_suffix(window, fetched_at)
             if marker:
@@ -308,7 +308,7 @@ def mini_account_text(
     ``work@acme.dev [personal]   5h 92% · 7d 63%`` — pcts only, severity
     colored (by maximize's soft/hard marks when ``window_ticks`` names the
     window, as the bars are); a window at/over 100% brings its reset
-    countdown along, and a maxed per-model window shows as ``Fable (!)``.
+    countdown along, and a maxed per-model window shows as ``Fable (limit reached)``.
     Sentinel states show their label instead.
     """
     text = Text(no_wrap=True, overflow="ellipsis")
@@ -360,7 +360,7 @@ def mini_account_text(
     for name in maxed:
         if parts:
             text.append(" · ", style=palette.track)
-        text.append(f"{name} (!)", style=palette.sev_crit)
+        text.append(f"{name} (limit reached)", style=palette.sev_crit)
         parts += 1
     if not parts:
         text.append("usage unknown", style=palette.muted)

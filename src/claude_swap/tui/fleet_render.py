@@ -262,7 +262,7 @@ def _reset_ts(window: Mapping | None) -> float | None:
         return None
 
 
-_MARKERS = ("(!)", "(ahead of pace)")
+_MARKERS = ("(limit reached)", "(ahead of pace)")
 
 
 def detail_windows(

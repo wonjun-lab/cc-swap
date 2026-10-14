@@ -521,9 +521,9 @@ class TestUsageRows:
         labels = [label for label, *_ in rows]
         assert labels == ["5h", "7d", "Fable", "Opus"]
         fable = next(row for row in rows if row[0] == "Fable")
-        assert "(!)" in fable[2]
+        assert "(limit reached)" in fable[2]
         # the marker stays terminal in the clock-extended variant too
-        assert fable[3].endswith("(!)") and " · " in fable[3]
+        assert fable[3].endswith("(limit reached)") and " · " in fable[3]
 
     def test_spend_row_first_with_amounts(self):
         from claude_swap.tui.widgets import usage_rows
@@ -596,7 +596,7 @@ class TestUsageRows:
         now = time.time()
         last_good = {"scoped": [{"name": "Fable", "pct": 100.0, "resets_at": _iso_in(86400 * 6)}]}
         row = usage_rows(last_good, now, now)[0]
-        assert "(!)" in row[2]
+        assert "(limit reached)" in row[2]
         assert "ahead of pace" not in row[2]
 
     def test_no_pace_marker_without_fetched_at(self):

@@ -263,7 +263,9 @@ def usage_summary(
         if isinstance(window, dict) and isinstance(window.get("pct"), (int, float)) and window.get("name"):
             seg = f"{window['name']} {window['pct']:.0f}%"
             if window["pct"] >= 100:
-                seg += " (!)"  # maxed model — the usual reason to switch
+                seg = f"{window['name']} full"  # maxed model — the usual reason to switch.
+                # Short form on purpose: the macOS menu bar title is narrow, so
+                # "Fable full" replaces "Fable 100%" rather than adding to it.
             elif pace_result and pace_result.ahead:
                 seg += " (ahead)"
             countdown = _live_countdown(window, now)
