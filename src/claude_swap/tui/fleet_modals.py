@@ -19,6 +19,7 @@ from rich.text import Text
 from textual.app import ComposeResult
 from textual.binding import Binding
 from textual.containers import Vertical
+from claude_swap.tui.screen_guard import TopOnly
 from textual.screen import ModalScreen
 from textual.widgets import Input, Label, ListItem, ListView, RichLog, SelectionList, Static
 from textual.widgets.selection_list import Selection
@@ -51,7 +52,7 @@ class PrimeChoice:
     name: str = ""  # the display name (maximize/names.py) the log says
 
 
-class PrimeModal(ModalScreen[None]):
+class PrimeModal(TopOnly, ModalScreen[None]):
     """Pick accounts and prime them now. Accounts the primer would skip are
     listed with the reason and cannot be picked."""
 
@@ -108,7 +109,7 @@ class PrimeModal(ModalScreen[None]):
         self.query_one("#fx-prime-list", SelectionList).focus()
 
     def action_run(self) -> None:
-        if self._priming:
+        if self._priming or not self.is_top:
             return
         numbers = set(self.query_one("#fx-prime-list", SelectionList).selected)
         log = self.query_one("#fx-prime-log", RichLog)
@@ -146,7 +147,7 @@ class PrimeModal(ModalScreen[None]):
         self.dismiss(None)
 
 
-class ReloginModal(ModalScreen["ActionResult | None"]):
+class ReloginModal(TopOnly, ModalScreen["ActionResult | None"]):
     """Guided re-login. cc-swap launches nothing: the steps say what to run;
     enter then stores the live login (identity-checked) and switches back.
     The engine is paused (``maximize/pause.py``) while this is open."""
@@ -302,7 +303,7 @@ class ReloginModal(ModalScreen["ActionResult | None"]):
             self.query_one("#fx-relogin-status", Static).update(Text(note, style=palette.muted))
 
     def action_store(self) -> None:
-        if self._busy or self._preparing or self._refused is not None:
+        if not self.is_top or self._busy or self._preparing or self._refused is not None:
             return
         if self.app.busy:
             self.notify("Another action is still running", severity="warning")
@@ -372,7 +373,7 @@ def _resume(root: Path, owner: str | None = None) -> None:
         pass  # the marker expires on its own within 10 minutes
 
 
-class ModeModal(ModalScreen["str | None"]):
+class ModeModal(TopOnly, ModalScreen["str | None"]):
     """Who switches accounts on this machine, and the choices this TUI has:
     run an engine here (dry-run or live), go live / back, stop it. A viewer
     gets the facts only. Dismisses with a ``ModeAction.action`` or None."""
@@ -407,6 +408,8 @@ class ModeModal(ModalScreen["str | None"]):
         self.query_one("#fx-mode-actions", Static).update(text)
 
     def on_key(self, event) -> None:
+        if not self.is_top:
+            return
         for action in self._actions:
             if event.key == action.key:
                 event.stop()
@@ -423,7 +426,7 @@ class MenuItem(ListItem):
         self.row = row
 
 
-class MenuModal(ModalScreen["str | None"]):
+class MenuModal(TopOnly, ModalScreen["str | None"]):
     """The home screen's ``m`` menu: every item with its key, its state and
     a short note. A letter picks its item at once; ↑↓ then enter work too
     (it opens with nothing highlighted, so enter alone does nothing).
@@ -487,6 +490,8 @@ class MenuModal(ModalScreen["str | None"]):
         self.query_one("#fx-menu-list", ListView).focus()
 
     def on_key(self, event) -> None:
+        if not self.is_top:
+            return
         char = event.character or ""
         action = self._by_key.get(char)
         if action is None and self._digits is not None and len(char) == 1 and char.isdigit():
@@ -517,7 +522,7 @@ def menu_row_text(row: MenuRow, title_w: int, palette: Palette) -> Text:
     return text
 
 
-class TextInputModal(ModalScreen["str | None"]):
+class TextInputModal(TopOnly, ModalScreen["str | None"]):
     """One line of text (alias, a typed setting value). Enter submits, Esc
     cancels."""
 

@@ -8,11 +8,13 @@ loop never touches file locks, keychain subprocesses, or the network.
 
 from __future__ import annotations
 
+import logging
 import time
 from dataclasses import replace
 from functools import partial
 
-from textual.app import App
+from textual.app import App, ScreenStackError
+from textual.await_complete import AwaitComplete
 from textual.binding import Binding
 from textual.reactive import reactive
 from textual.worker import WorkerState
@@ -36,6 +38,8 @@ from claude_swap.tui.data import ActionResult, SnapshotSource, format_duration, 
 from claude_swap.tui.fleet import EngineHost, FleetScreen, fork_home, open_fleet
 from claude_swap.tui.modals import AddTokenModal, ConfirmModal, OutputModal, TokenForm
 from claude_swap.tui.theme import CSWAP_DARK, CSWAP_LIGHT
+
+log = logging.getLogger(__name__)
 
 
 class CswapApp(App):
@@ -130,6 +134,16 @@ class CswapApp(App):
         self.set_interval(self.POLL_INTERVAL_S, self._tick)
         self.set_interval(1.0, self._update_refresh_status)
         self._tick()
+
+    def pop_screen(self) -> AwaitComplete:
+        """Defence in depth: a dismiss/pop of a screen that is already gone
+        (one key too many) must not take the app down. Only that exact case
+        is swallowed — ``TopOnly`` already stops it at the screen."""
+        try:
+            return super().pop_screen()
+        except ScreenStackError:
+            log.warning("ignored pop_screen: no screen above the base screen to pop")
+            return AwaitComplete.nothing()
 
     # -- snapshot poll loop ---------------------------------------------------
 

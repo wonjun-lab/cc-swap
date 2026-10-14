@@ -8,11 +8,12 @@ from rich.text import Text
 from textual.app import ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical, VerticalScroll
+from claude_swap.tui.screen_guard import TopOnly
 from textual.screen import ModalScreen
 from textual.widgets import Button, Input, Label, Static
 
 
-class ConfirmModal(ModalScreen[bool]):
+class ConfirmModal(TopOnly, ModalScreen[bool]):
     """Yes/No confirmation. Dismisses with True only on explicit confirm.
 
     Keyboard-first: ←/→ move between the buttons (Enter presses the focused
@@ -65,7 +66,7 @@ class TokenForm:
     slot: int | None
 
 
-class AddTokenModal(ModalScreen["TokenForm | None"]):
+class AddTokenModal(TopOnly, ModalScreen["TokenForm | None"]):
     """Collects a setup-token/API key, optional email label, optional slot.
 
     ←/→ only reach the screen when a Button is focused (a focused Input
@@ -133,7 +134,7 @@ class AddTokenModal(ModalScreen["TokenForm | None"]):
         self.dismiss(None)
 
 
-class OutputModal(ModalScreen[None]):
+class OutputModal(TopOnly, ModalScreen[None]):
     """Scrollable display of captured (ANSI-colored) action output."""
 
     BINDINGS = [Binding("escape,q,enter", "dismiss_modal", "Close", show=False)]

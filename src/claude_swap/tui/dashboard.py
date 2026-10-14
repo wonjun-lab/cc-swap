@@ -22,6 +22,7 @@ from typing import TYPE_CHECKING, Callable
 
 from textual.app import ComposeResult
 from textual.binding import Binding
+from claude_swap.tui.screen_guard import TopOnly
 from textual.screen import Screen
 from textual.widgets import Footer, ListView, Static
 
@@ -38,7 +39,7 @@ MenuEntries = list[tuple[str, str]]  # (label, action_id)
 _BACK = ("← back", "back")
 
 
-class DashboardScreen(Screen):
+class DashboardScreen(TopOnly, Screen):
     BINDINGS = [
         Binding("s", "open_switch", "Switch accounts"),
         Binding("w", "app.open_watch", "Watch"),
@@ -211,7 +212,7 @@ class DashboardScreen(Screen):
         self.query_one("#menu", ListView).action_cursor_up()
 
 
-class AccountListScreen(Screen):
+class AccountListScreen(TopOnly, Screen):
     """Shared machinery: a live ListView of full account cards.
 
     Subclasses decide what the cursor does — :class:`SwitchScreen` is
@@ -318,7 +319,7 @@ class SwitchScreen(AccountListScreen):
         item = event.item
         if isinstance(item, AccountItem):
             self.app.do_switch(item.number)
-            self.app.pop_screen()
+            self.pop_self()
 
     def action_select_highlighted(self) -> None:
         listview = self.query_one("#accounts", ListView)
@@ -326,7 +327,7 @@ class SwitchScreen(AccountListScreen):
             listview.action_select_cursor()
 
     def action_back(self) -> None:
-        self.app.pop_screen()
+        self.pop_self()
 
 
 class WatchScreen(AccountListScreen):
@@ -415,7 +416,7 @@ class WatchScreen(AccountListScreen):
         if self._selecting:
             self._set_selecting(False)
         else:
-            self.app.pop_screen()
+            self.pop_self()
 
     def action_nav_down(self) -> None:
         listview = self.query_one("#accounts", ListView)

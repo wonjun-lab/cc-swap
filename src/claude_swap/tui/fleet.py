@@ -44,6 +44,7 @@ from __future__ import annotations
 
 import os
 import socket
+import sys
 import time
 from functools import partial
 from pathlib import Path
@@ -54,6 +55,7 @@ from textual.app import ComposeResult
 from textual.binding import Binding
 from textual.containers import VerticalScroll
 from textual.geometry import Region
+from claude_swap.tui.screen_guard import TopOnly
 from textual.screen import ModalScreen, Screen
 from textual.widgets import Static
 
@@ -282,6 +284,7 @@ def _launch_relogin(app: "CswapApp", number: str, claude: str, supported: bool) 
         with rl.terminate_as_interrupt(), app.suspend():
             print(attempt.banner(), flush=True)
             early = attempt.launch(_run_login)
+            _flush_stdin()  # keys typed meanwhile are not for the TUI
     except SuspendNotSupported:
         attempt.cleanup()
         open_guided_relogin(app, number)
@@ -312,6 +315,17 @@ def _launch_relogin(app: "CswapApp", number: str, claude: str, supported: bool) 
         finish, thread=True, group="fleet-relogin", exit_on_error=False,
         name="fleet-relogin",
     )
+
+
+def _flush_stdin() -> None:
+    """Drop keystrokes buffered while ``claude`` owned the terminal: they
+    would otherwise reach whatever screen is on top when the TUI resumes."""
+    try:
+        import termios
+
+        termios.tcflush(sys.stdin.fileno(), termios.TCIFLUSH)
+    except Exception:  # not a tty / no termios (Windows): nothing to flush
+        pass
 
 
 def _run_login(argv, env, cwd):
@@ -407,6 +421,7 @@ def _launch_sign_in(app: "CswapApp", claude: str, supported: bool) -> None:
         with rl.terminate_as_interrupt(), app.suspend():
             print(attempt.banner(), flush=True)
             early = attempt.launch(_run_login)
+            _flush_stdin()  # keys typed meanwhile are not for the TUI
     except SuspendNotSupported:
         attempt.cleanup()
         _sign_in_unavailable(app, claude)
@@ -557,7 +572,7 @@ class FleetBody(Static):
             screen.select(number)
 
 
-class FleetScreen(Screen):
+class FleetScreen(TopOnly, Screen):
     CSS_PATH = "fleet.tcss"
     BINDINGS = [
         # The footer: menus.HOME_KEYS.
@@ -1472,7 +1487,7 @@ class FleetScreen(Screen):
         # fetch-enabled lane so its ``f`` performs a real fetch. Fleet's
         # ``on_screen_resume`` re-applies store-only when it comes back.
         self.app.set_store_only(False)
-        self.app.pop_screen()
+        self.pop_self()
 
     def idle_pattern(self) -> str:
         """``idle pattern: 9 days learned · next quiet window 23:00–07:30``:
