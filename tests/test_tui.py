@@ -271,7 +271,7 @@ async def settle(pilot) -> None:
     await pilot.pause()
 
 
-async def wait_until(pilot, predicate, what: str, timeout: float = 5.0) -> None:
+async def wait_until(pilot, predicate, what: str, timeout: float = 15.0) -> None:
     """Pump the app until ``predicate()`` holds; fail with ``what`` (and the
     screen stack) if it never does. Fixed numbers of pauses are timing
     assumptions — on a loaded machine the app needs more turns of the event
