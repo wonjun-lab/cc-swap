@@ -153,11 +153,14 @@ def land_note(
         return "quarant."
     if view.pct5 is None or view.pct7 is None:
         return "usage ?"
-    if view.pct5 >= s.soft_5h - s.landing_margin:
-        return f"5h≥{s.soft_5h - s.landing_margin:g}"
     if drain_k is not None:
+        # At risk (or draining without room): the 5h soft mark is set aside.
         if not drain.lands_7d(view.pct7, s.hard_7d, drain_k):
             return f"7d room<{drain.MIN_LAND_5H:g}"
+        if view.pct5 >= s.hard_5h - s.landing_margin:
+            return f"5h≥{s.hard_5h - s.landing_margin:g}"
+    elif view.pct5 >= s.soft_5h - s.landing_margin:
+        return f"5h≥{s.soft_5h - s.landing_margin:g}"
     elif view.pct7 >= s.soft_7d - s.landing_margin:
         return f"7d≥{s.soft_7d - s.landing_margin:g}"
     if now is not None and policy.login_guarded(view, now, s):
@@ -269,10 +272,13 @@ class FleetRow:
     trusted: bool = True
     # The near-reset drain (maximize/drain.py): the engine sets this
     # account's 7d soft mark aside until its 7d reset (``drain``), and
-    # lands on it up to hard7d - margin when it has useful room
+    # lands on it up to hard7d when at risk
     # (``drain_k``: its k, ``drain.land_k``; None when not draining).
     drain: bool = False
     drain_k: float | None = None
+    # Its week would expire unused (``drain.at_risk``): used first, whatever
+    # its tier, with its 5h and 7d soft marks set aside.
+    at_risk: bool = False
 
 
 def _seen_resets(acc: AccountSnapshot, now: float) -> tuple[float | None, float | None]:
@@ -370,6 +376,7 @@ def fleet_rows(
         seen5, seen7 = _seen_resets(acc, now)
         draining = policy.draining(tv, msnap)
         drain_k = drain.land_k(tv, msnap)
+        risk = drain.at_risk(tv, msnap)
         out.append(
             FleetRow(
                 number=acc.number,
@@ -410,6 +417,7 @@ def fleet_rows(
                 trusted=acc.usage.decision_value() is not None,
                 drain=draining,
                 drain_k=drain_k,
+                at_risk=risk,
             )
         )
     return out

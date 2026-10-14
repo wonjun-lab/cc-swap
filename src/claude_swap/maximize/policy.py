@@ -1,5 +1,22 @@
 """The maximize policy: ``decide(Snapshot) -> Decision`` (spec §5.5). Pure.
 
+Priority rule (the iron rule; it comes before everything below):
+
+0. Never used: excluded accounts, quarantined or dead logins, an account
+   inside the login-expiry guard, and an account at or over ``hard5h`` or
+   ``hard7d`` (or 100%).
+1. First: an account AT RISK, whose 7d room to ``hard7d`` would expire
+   unused before its reset (``drain.at_risk``: its reset is within
+   ``maximize.drainHours`` or the headroom rule says so, and the room is
+   worth at least ``drain.MIN_LAND_5H`` 5h points at its k), whatever its
+   tier; the soonest 7d reset first. Its 5h soft mark and its 7d soft mark
+   are set aside (landable under ``hard5h − landingMargin``); while active
+   on an at-risk account only a rule-0 limit (a hard mark, 100%) or an
+   at-risk account that resets sooner moves you off it: no soft, preempt,
+   rebalance or tier move.
+2. Then the tiers: preferred > normal > last resort.
+3. Within a tier: the score and rank (below).
+
 Triggers, first match wins:
 
 1. at-limit   active 5h or 7d at 100%                  busy or not
@@ -15,14 +32,14 @@ Triggers, first match wins:
               tier's best beats the active by > eps     idle + cooldown
 
 Tiers (``model.TIER_ORDER``; ``maximize.preferred``, ``maximize.lastResort``,
-maximize/tiers.py) come first, except for the near-reset drain below: a
+maximize/tiers.py) come first, except for an at-risk account (above): a
 landable preferred-tier account is the destination before any normal one,
 and the score ranks only within a tier. Rebalance (a) is the tier rule: it
 moves off the active account whenever a landable account of a higher tier
-exists, whatever the active's score or pace, except off a draining active
-account that is still landable on 7d (the drain beats the tiers). Preempt
-never moves to a lower tier (a draining account with useful room is no
-lower tier: it goes first), and does not fire while a higher tier than the
+exists, whatever the active's score or pace, except off an at-risk active
+account (its week would expire unused). Preempt
+never moves to a lower tier (an at-risk account is no lower tier: it
+goes first), and does not fire while a higher tier than the
 active can land: rebalance (a) makes that move directly, not after a
 detour through a same-tier account. Leaving a preferred-tier account by a soft or hard
 move cannot flap back: rebalance (a) only re-enters it once it is landable
@@ -113,22 +130,22 @@ none of it aside: the ride is the hard path, only later.
 
 Near-reset drain (``drainHours``, maximize/drain.py): an account whose 7d
 reset is close (within ``drainHours``, or so close that what is left under
-``hard7d`` needs most of the 5h windows to the reset) is *draining*. Its 7d
-soft mark is set aside: no ``soft`` or ``preempt`` move off it on 7d, and it
-is landable on 7d while what is left to ``hard7d`` is worth at least
-``drain.MIN_LAND_5H`` 5h points at its k (``drain.lands_7d``). The drain
-beats the tiers: ``landing_candidates`` puts a draining account with useful
-room (``drain.preferred``: at least a quarter 5h window before a mark)
-first whatever its tier (preferred, normal or last resort), the earliest 7d
-reset first (:func:`drain_first`); one with less competes on its score in
-its own tier. Excluded and quarantined accounts stay out entirely. Preempt takes a draining target only when its 7d would not
-reach ``hard7d`` within the horizon either. Rebalance (b) tries the first
-such draining candidate before the best other one, and never moves off a
-draining active account except to such a one whose 7d resets sooner (so it
-cannot bounce back); rebalance (a) never moves off a draining account that
-is still landable on 7d for a tier reason. Hard caps, at-limit, the
-login-expiry guard, quarantine and holds are unchanged. With no draining account every decision
-is what it was without the drain.
+``hard7d`` needs most of the 5h windows to the reset) is *draining*: its 7d
+soft mark is set aside (no ``soft`` or ``preempt`` move off it on 7d). One
+whose room to ``hard7d`` is worth at least ``drain.MIN_LAND_5H`` 5h points
+at its k (``drain.lands_7d``) is *at risk* (the priority rule above):
+``landing_candidates`` puts it first whatever its tier, the earliest 7d
+reset first (:func:`drain_first`), with no minimum 5h room; it is landable
+under ``hard5h − landingMargin`` and its 5h soft mark is set aside too (the
+5h hard mark still moves you, and the learned ride on 5h arms at that hard
+mark, so it rides to ``hard5h``). Preempt takes an at-risk target only when
+its 7d would not reach ``hard7d`` within the horizon either. Rebalance (b)
+tries the first at-risk candidate before the best other one, with no score
+gain needed, and never moves off an at-risk active account except to an
+at-risk one whose 7d resets sooner (so it cannot bounce back); rebalance (a)
+never moves off it for a tier reason. Hard caps, at-limit, the login-expiry
+guard, quarantine and holds are unchanged. With no at-risk account every
+decision is what it was without the drain.
 
 Unknown active usage is ``Indeterminate`` (the engine's upstream failover
 path counts it).
@@ -255,22 +272,29 @@ def draining(v: AccountView, snap: Snapshot) -> bool:
     return drain.draining(v, snap)
 
 
+def at_risk(v: AccountView, snap: Snapshot) -> bool:
+    """``v``'s week would expire unused (``drain.at_risk``): the priority
+    rule's first class, whatever its tier."""
+    return drain.at_risk(v, snap)
+
+
 def can_land(v: AccountView, snap: Snapshot) -> bool:
-    """``score.landable`` with the drain's 7d gate for a draining ``v``: at
-    least ``drain.MIN_LAND_5H`` 5h points of room to ``hard7d`` at its k."""
+    """``score.landable`` with the drain's gates for a draining ``v``: at
+    least ``drain.MIN_LAND_5H`` 5h points of room to ``hard7d`` at its k,
+    and its 5h under ``hard5h − landingMargin`` (the 5h soft mark is set
+    aside for an at-risk account)."""
     return landable(v, snap.settings, drain_k=drain.land_k(v, snap))
 
 
 def drain_first(ranked: list[AccountView], snap: Snapshot) -> list[AccountView]:
-    """``ranked`` (``rank`` order) with the draining accounts that have
-    useful room (``drain.preferred``) first whatever their tier (the drain
-    beats the tiers: a week about to reset is never left unused), the
-    earliest 7d reset first. The rest (a draining account with little room
-    included) keep their tier-first order. Stable: with no such account it
-    is ``ranked`` unchanged. Excluded accounts are never landable, so none
-    reaches here."""
+    """``ranked`` (``rank`` order) with the at-risk accounts first whatever
+    their tier (a week about to expire unused is never left unused), the
+    earliest 7d reset first. The rest keep their tier-first order. Stable:
+    with no at-risk account it is ``ranked`` unchanged. An account that
+    cannot land (:func:`can_land`: excluded, quarantined, at its 5h hard
+    mark …) is never first."""
     def key(v: AccountView) -> tuple:
-        if v.tier != "excluded" and drain.preferred(v, snap):
+        if v.tier != "excluded" and can_land(v, snap) and at_risk(v, snap):
             return (0, 0, v.reset7 if v.reset7 is not None else math.inf)
         return (1, TIER_ORDER[v.tier], 0.0)
 
@@ -279,8 +303,8 @@ def drain_first(ranked: list[AccountView], snap: Snapshot) -> list[AccountView]:
 
 def landing_candidates(snap: Snapshot) -> list[AccountView]:
     """Every non-active landable account, best first (spec §5.2 + §5.4),
-    draining accounts with useful room first whatever their tier
-    (:func:`drain_first`), then tier order.
+    at-risk accounts first whatever their tier (:func:`drain_first`), then
+    tier order.
 
     An account inside its login-expiry guard is no landing target (soft,
     rebalance, and the first choice of hard/at-limit); the hard/at-limit
@@ -422,7 +446,7 @@ def idle_note(snap: Snapshot) -> str:
 
 def _target(v: AccountView, snap: Snapshot) -> str:
     out = f"{view_name(v)} ({v.tier}, score {score(v, snap.now):.2f})"
-    if draining(v, snap):
+    if at_risk(v, snap):
         out += f": {drain.text(v, snap)}"
     return out
 
@@ -834,7 +858,7 @@ def _soft_reason(
     a: AccountView, snap: Snapshot, skip: tuple[Window, ...] = ()
 ) -> str | None:
     s = snap.settings
-    if "5h" not in skip and a.pct5 >= s.soft_5h:
+    if "5h" not in skip and a.pct5 >= s.soft_5h and not at_risk(a, snap):
         return f"{view_name(a)} 5h {_pct(a.pct5)} >= soft {_pct(s.soft_5h)}"
     if "7d" not in skip and a.pct7 >= s.soft_7d and not draining(a, snap):
         return f"{view_name(a)} 7d {_pct(a.pct7)} >= soft {_pct(s.soft_7d)}"
@@ -905,7 +929,9 @@ def _reset_wait(
     soft = tuple(
         w
         for w, pct, mark in (("5h", a.pct5, s.soft_5h), ("7d", a.pct7, s.soft_7d))
-        if pct >= mark and not (w == "7d" and draining(a, snap))
+        if pct >= mark
+        and not (w == "7d" and draining(a, snap))
+        and not (w == "5h" and at_risk(a, snap))
     )
     rates, age = pace(snap)
     waits: dict[Window, float] = {}
@@ -1123,8 +1149,8 @@ def _preempt(
         return None
     target = None
     for v in landing:
-        if TIER_ORDER[v.tier] > TIER_ORDER[a.tier] and not drain.preferred(v, snap):
-            continue  # a lower tier, unless it is draining (the drain wins)
+        if TIER_ORDER[v.tier] > TIER_ORDER[a.tier] and not at_risk(v, snap):
+            continue  # a lower tier, unless it is at risk (it goes first)
         check = reaches_hard7_within if draining(v, snap) else crosses_soft7_within
         if check(snap, a, v, horizon) is None:
             target = v
@@ -1192,13 +1218,12 @@ def _deferred_to(snap: Snapshot, gain: float) -> QuietWindow | None:
 
 
 def _rebalance_tries(pool: list[AccountView], snap: Snapshot) -> list[AccountView]:
-    """The candidates rebalance (b) weighs, in turn: the first draining one
-    with useful room (``drain.preferred``), then the first other one
-    (``pool`` is in landing order). With none of the first kind that is
-    ``pool[0]`` alone, as without the drain."""
-    first_draining = next((v for v in pool if drain.preferred(v, snap)), None)
-    first_other = next((v for v in pool if not drain.preferred(v, snap)), None)
-    return [v for v in (first_draining, first_other) if v is not None]
+    """The candidates rebalance (b) weighs, in turn: the first at-risk one,
+    then the first other one (``pool`` is in landing order). With no
+    at-risk account that is ``pool[0]`` alone."""
+    first_risk = next((v for v in pool if at_risk(v, snap)), None)
+    first_other = next((v for v in pool if not at_risk(v, snap)), None)
+    return [v for v in (first_risk, first_other) if v is not None]
 
 
 def _rebalance(
@@ -1213,14 +1238,12 @@ def _rebalance(
     top = landing[0]
     a_score = score(a, snap.now)
     gain: float | None = None
-    a_holds = draining(a, snap) and drain.lands_7d(
-        a.pct7, s.hard_7d, drain.k_for(a, snap.k7)[0]
-    )
-    if TIER_ORDER[top.tier] < TIER_ORDER[a.tier] and not a_holds:
+    a_risk = at_risk(a, snap)
+    if TIER_ORDER[top.tier] < TIER_ORDER[a.tier] and not a_risk:
         # A higher tier (preferred over normal, normal over last resort,
         # anything over excluded) is the user's rule: never skipped for a
-        # 7d pace. Not off a draining active account that is still landable
-        # on 7d: the drain beats the tiers.
+        # 7d pace. Not off an at-risk active account: its week would expire
+        # unused, which comes before the tiers.
         why = (
             f"{view_name(a)} is {TIER_LABELS[a.tier]} and {view_name(top)} "
             f"({TIER_LABELS[top.tier]}) can land"
@@ -1228,37 +1251,39 @@ def _rebalance(
     else:
         skipped = _preempt_would_leave(snap, a, landing)
         pool = [v for v in landing if v.number not in skipped]
-        a_draining = draining(a, snap)
-        if a_draining:
-            # Off a draining account only onto one that resets sooner (with
-            # useful room): never back to a non-draining one, and never back
-            # and forth.
+        if a_risk:
+            # Off an at-risk account only onto an at-risk one that resets
+            # sooner: never back to a non-at-risk one, and never back and
+            # forth.
             pool = [
                 v for v in pool
-                if drain.preferred(v, snap)
+                if at_risk(v, snap)
                 and (v.reset7 or math.inf) < (a.reset7 or math.inf)
             ]
+        # An at-risk target needs no score gain: its week would expire.
         top = next(
             (
                 v for v in _rebalance_tries(pool, snap)
-                if (v.tier == a.tier or drain.preferred(v, snap))
-                and score(v, snap.now) - a_score > s.tie_epsilon
+                if at_risk(v, snap)
+                or (v.tier == a.tier and score(v, snap.now) - a_score > s.tie_epsilon)
             ),
             None,
         )
-        if top is not None:
+        if top is not None and at_risk(top, snap):
+            why = drain.text(top, snap)
+            if a_risk:
+                why += f" (resets before {view_name(a)})"
+        elif top is not None:
             t_score = score(top, snap.now)
             gain = t_score - a_score
             why = (
                 f"{view_name(top)} score {t_score:.2f} beats {view_name(a)} "
                 f"{a_score:.2f} by more than {s.tie_epsilon:g}"
             )
-            if draining(top, snap):
-                why += f"; {drain.text(top, snap)}"
-        elif a_draining:
+        elif a_risk:
             return Hold(
-                f"{drain.text(a, snap)} (7d soft {_pct(s.soft_7d)} set aside "
-                f"until the reset; hard {_pct(s.hard_7d)} still switches)",
+                f"{drain.text(a, snap)} (soft marks set aside until the "
+                f"reset; hard {_pct(s.hard_5h)}/{_pct(s.hard_7d)} still switches)",
                 pending=False,
             )
         else:

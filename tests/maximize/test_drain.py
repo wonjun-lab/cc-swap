@@ -112,7 +112,7 @@ class TestPredicate:
 
     def test_words(self):
         v = hours("1", 0, 86, 18)
-        assert drain.text(v, one(v)) == "1 7d 86% resets in 18h — draining it first"
+        assert drain.text(v, one(v)) == "1 7d 86% resets in 18h — would expire unused, using it first"
         assert drain.tag(18.2) == "drain 18h"
         assert drain.left_text(0.4) == "24m" and drain.left_text(72) == "3d"
 
@@ -216,7 +216,7 @@ class TestLanding:
         got = decide(s)
         assert isinstance(got, Switch) and got.trigger == "hard" and got.target == "2"
         assert got.reason.endswith("-> 2 (normal, score 1.12): 2 7d 88% resets in 18h "
-                                   "— draining it first")
+                                   "— would expire unused, using it first")
         off = decide(replace(s, settings=MaximizeSettings(drain_hours=0)))
         assert isinstance(off, Switch) and off.target == "3"
 
@@ -226,8 +226,10 @@ class TestLanding:
         s = snap("1", acct("1", 96, 40), with_plan(hours("2", 0, 97, 18), "5x"),
                  with_plan(hours("3", 0, 96, 18), "5x"))
         assert [v.number for v in landing_candidates(s)] == ["3"]
-        # The 5h rule is unchanged: 45 = soft5h 50 - margin 5.
-        s = snap("1", acct("1", 96, 40), hours("2", 45, 88, 18))
+        # At risk, the 5h gate is hard5h 95 - margin 5, not the soft mark.
+        s = snap("1", acct("1", 96, 40), hours("2", 89, 88, 18))
+        assert [v.number for v in landing_candidates(s)] == ["2"]
+        s = snap("1", acct("1", 96, 40), hours("2", 90, 88, 18))
         assert landing_candidates(s) == []
 
     def test_lands_by_room_in_5h_points_at_its_k(self):
@@ -286,8 +288,8 @@ class TestLanding:
 
     def test_past_the_normal_7d_limit_a_draining_account_lands_by_room(self):
         # 7d 90% is past soft7d - margin (85): a draining account lands on
-        # its 7d room (8 / 0.105 = 76 5h points on 5x) whatever its 5h room
-        # (the 5h rule alone keeps it off at 45).
+        # its 7d room (8 / 0.105 = 76 5h points on 5x); the 5h gate is the
+        # hard mark less the margin (90), not the soft mark.
         def landable(p5):
             v = with_plan(hours("2", p5, 90, 18), "5x")
             s = snap("1", acct("1", 96, 40), v)
@@ -295,26 +297,26 @@ class TestLanding:
             return [x.number for x in landing_candidates(s)] == ["2"]
 
         assert landable(0)
-        assert landable(30)
-        assert not landable(45)
+        assert landable(45)
+        assert landable(89)
+        assert not landable(90)
 
-    def test_a_draining_account_with_little_5h_room_competes_on_its_score(self):
-        # #2 drains (7d 88%, 20 h) but its 5h is at 40: 5 pts to soft5h -
-        # margin, a few minutes before the 5h soft mark moves you on. It is
-        # landable (7d room is ample) but not first; with #2's 5h fresh it
-        # goes first.
+    def test_an_at_risk_account_goes_first_at_any_5h_under_hard_less_margin(self):
+        # No minimum 5h room: #2 is at risk (7d 88%, 20 h) and first at 5h
+        # 40 or 60 (past soft5h 50); at 5h 90 (hard5h 95 - margin 5) it is
+        # not landable at all.
         def landing(p5):
             s = snap("1", acct("1", 96, 40), hours("2", p5, 88, 20), acct("3", 0, 40, reset7_d=2))
             return [v.number for v in landing_candidates(s)]
 
-        assert drain.MIN_ROOM_5H == 25
-        assert landing(40) == ["3", "2"]
-        assert landing(20) == ["2", "3"]   # 25 pts of 5h room: the floor
-        assert landing(21) == ["3", "2"]
+        assert landing(20) == ["2", "3"]
+        assert landing(40) == ["2", "3"]
+        assert landing(60) == ["2", "3"]
+        assert landing(90) == ["3"]
 
-    def test_a_draining_account_with_little_7d_room_competes_on_its_score(self):
-        # hard7d 98, k 0.165: 7d 92% leaves 6 pts = 36 5h points (first);
-        # 94.5 leaves 21 (landable, but under the 25 floor: by score).
+    def test_an_account_needs_only_the_landing_room_in_7d_to_go_first(self):
+        # hard7d 98, k 0.165: 7d 92% leaves 6 pts = 36 5h points; 94.5
+        # leaves 21 (>= MIN_LAND_5H): both first.
         def landing(p7, k7=None):
             s = snap("1", acct("1", 96, 40), hours("2", 0, p7, 20), acct("3", 0, 40, reset7_d=2))
             if k7 is not None:
@@ -322,7 +324,7 @@ class TestLanding:
             return [v.number for v in landing_candidates(s)]
 
         assert landing(92) == ["2", "3"]
-        assert landing(94.5) == ["3", "2"]
+        assert landing(94.5) == ["2", "3"]
         assert landing(94.5, {"2": 0.1}) == ["2", "3"]   # 35 at its learned k
         assert landing(97) == ["3"]           # 1 / 0.165 = 6 < MIN_LAND_5H
 
@@ -340,8 +342,8 @@ class TestActiveDraining:
         got = decide(s)
         assert isinstance(got, Hold) and not got.pending and got.code is None
         assert got.reason == (
-            "1 7d 92% resets in 18h — draining it first (7d soft 90% set aside until "
-            "the reset; hard 98% still switches)"
+            "1 7d 92% resets in 18h — would expire unused, using it first (soft marks set aside "
+            "until the reset; hard 95%/98% still switches)"
         )
         off = decide(replace(s, settings=MaximizeSettings(drain_hours=0)))
         assert isinstance(off, Switch) and off.trigger == "soft" and off.target == "2"
@@ -367,10 +369,13 @@ class TestActiveDraining:
         got = decide(s)
         assert isinstance(got, Switch) and got.trigger == "hard"
 
-    def test_the_5h_soft_mark_still_moves_you(self):
+    def test_the_5h_soft_mark_is_set_aside_but_the_hard_mark_moves_you(self):
         s = snap("1", hours("1", 60, 92, 18), acct("2", 0, 10, reset7_d=6), samples="idle")
         got = decide(s)
-        assert isinstance(got, Switch) and got.trigger == "soft" and got.target == "2"
+        assert isinstance(got, Hold) and got.code is None and not got.pending
+        hard = decide(snap("1", hours("1", 95, 92, 18), acct("2", 0, 10, reset7_d=6),
+                           samples="idle"))
+        assert isinstance(hard, Switch) and hard.trigger == "hard" and hard.target == "2"
 
     def test_no_preempt_off_a_draining_account(self):
         # 84% climbing 2 pts/h passes 90 in 3 h, before the quiet window.
@@ -382,7 +387,7 @@ class TestActiveDraining:
         off = decide(make(drain_hours=0))
         assert isinstance(off, Switch) and off.trigger == "preempt"
         got = decide(make())
-        assert isinstance(got, Hold) and "draining it first" in got.reason
+        assert isinstance(got, Hold) and "would expire unused, using it first" in got.reason
 
     def test_preempt_onto_a_draining_target_checks_its_hard_mark(self):
         # Drain-on counterpart of test_policy's crossing-candidate case: #2
@@ -407,7 +412,7 @@ class TestActiveDraining:
                          samples="idle"), hold_until=NOW + H)
         got = decide(s)
         assert isinstance(got, Hold) and got.code == "hold"
-        assert "otherwise: 1 7d 92% resets in 18h — draining it first" in got.reason
+        assert "otherwise: 1 7d 92% resets in 18h — would expire unused, using it first" in got.reason
 
 
 class TestRebalance:
@@ -419,7 +424,7 @@ class TestRebalance:
         s = self.cooled(hours("1", 10, 92, 18), acct("2", 0, 0, reset7_d=1.5))
         assert policy.score(s.accounts[1], NOW) > policy.score(s.accounts[0], NOW) + 1
         got = decide(s)
-        assert isinstance(got, Hold) and "draining it first" in got.reason
+        assert isinstance(got, Hold) and "would expire unused, using it first" in got.reason
         off = decide(replace(s, settings=MaximizeSettings(drain_hours=0)))
         assert isinstance(off, Switch)   # without the drain: soft 7d (92 >= 90)
 
@@ -427,7 +432,7 @@ class TestRebalance:
         s = self.cooled(hours("1", 10, 80, 20), hours("2", 0, 85, 4))
         got = decide(s)
         assert isinstance(got, Switch) and got.trigger == "rebalance" and got.target == "2"
-        assert got.reason.endswith("2 7d 85% resets in 4h — draining it first; idle")
+        assert got.reason.endswith("2 7d 85% resets in 4h — would expire unused, using it first (resets before 1); idle")
         # The other way round: #2 resets later, whatever its score.
         back = self.cooled(hours("2", 0, 85, 4), hours("1", 10, 20, 20))
         assert isinstance(decide(back), Hold)
@@ -437,26 +442,23 @@ class TestRebalance:
                         acct("3", 0, 0, reset7_d=2))
         got = decide(s)
         assert isinstance(got, Switch) and got.target == "2"
-        # No gain on the draining one: the best other one, as without it.
-        s = self.cooled(acct("1", 10, 30, reset7_d=3), hours("2", 0, 92, 20),
+        # Not at risk (no room to hard7d): the best other one, as without it.
+        s = self.cooled(acct("1", 10, 30, reset7_d=3), hours("2", 0, 97.5, 20),
                         acct("3", 0, 0, reset7_d=2))
         got = decide(s)
         assert isinstance(got, Switch) and got.target == "3"
 
-    def test_rebalance_onto_a_draining_account_only_with_room(self):
-        # #2 (5h 30: 15 pts of room) drains and scores best; #3 drains with
-        # room. Rebalance prefers #3; #2 is weighed on its score only.
+    def test_rebalance_onto_an_at_risk_account_whatever_its_5h(self):
+        # Both drain with room: the sooner reset goes first, at any 5h
+        # under the hard mark.
         s = self.cooled(acct("1", 10, 60, reset7_d=3), hours("2", 30, 80, 20),
                         hours("3", 0, 85, 22))
         got = decide(s)
-        assert isinstance(got, Switch) and got.target == "3"
-        s = self.cooled(acct("1", 10, 60, reset7_d=3), hours("2", 30, 80, 20),
-                        hours("3", 30, 85, 22))
+        assert isinstance(got, Switch) and got.target == "2"
+        # Off an at-risk account onto a sooner one at 5h 60 (past soft).
+        s = self.cooled(hours("1", 10, 80, 20), hours("2", 60, 85, 4))
         got = decide(s)
-        assert isinstance(got, Switch) and got.target == "2"   # plain score order
-        # Off a draining account: never onto one without room.
-        s = self.cooled(hours("1", 10, 80, 20), hours("2", 30, 85, 4))
-        assert isinstance(decide(s), Hold)
+        assert isinstance(got, Switch) and got.target == "2"
 
     def test_cooldown_and_idle_still_hold_it(self):
         s = snap("1", acct("1", 10, 60, reset7_d=3), hours("2", 0, 80, 20), samples="idle",
@@ -556,7 +558,7 @@ class TestSurfaces:
         assert dv.kind == "hold"
         said = [_plain(v) for v in home.status_variants(SERVICE, dv, rows, MX, "live", now=FNOW)]
         assert said[0].endswith(
-            "7d 92% resets in 18h — draining it first (forced at 98%)"
+            "7d 92% resets in 18h — would expire unused, using it first (forced at 98%)"
         ), said
         assert "past soft" not in " ".join(said)
 
@@ -616,7 +618,7 @@ class TestEngine:
         assert of(h, SwitchEvent) == [] and h.active_number() == 1
         record = h.state()[DECISION_KEY]
         assert record["decision"] == "hold"
-        assert record["reason"].startswith("a 7d 92% resets in 18h — draining it first")
+        assert record["reason"].startswith("a 7d 92% resets in 18h — would expire unused, using it first")
         assert record["draining"] == {"1": pytest.approx(r7, abs=1)}
         status = doctor_cli.drain_status(
             h.switcher.backup_dir, now=h.clock.now, draining=record["draining"]
@@ -675,7 +677,7 @@ class TestDrainBeatsTiers:
         assert drain.draining(s.view("1"), s)
         got = decide(s)
         assert isinstance(got, Hold) and got.code is None
-        assert "draining it first" in got.reason
+        assert "would expire unused, using it first" in got.reason
         assert "last resort and" not in got.reason
         assert "cooldown" not in got.reason
         # Drain off: the tier rule moves off it as before.
@@ -700,11 +702,12 @@ class TestDrainBeatsTiers:
                  hours("3", 0, 87, 20))
         assert [v.number for v in landing_candidates(s)] == ["3", "2"]
 
-    def test_little_room_keeps_its_tier(self):
-        v = hours("2", 30, 85, 20, tier="last_resort")   # 5h room 15 < 25
+    def test_little_7d_room_is_still_first_from_the_landing_gate(self):
+        # 15 5h points of 7d room (>= MIN_LAND_5H 10, under the old 25).
+        v = hours("2", 60, 95.5, 5, tier="last_resort")
         s = snap("1", acct("1", 96, 40), v, acct("3", 0, 0, reset7_d=6))
-        assert drain.draining(v, s) and not drain.preferred(v, s)
-        assert [x.number for x in landing_candidates(s)] == ["3", "2"]
+        assert drain.at_risk(v, s)
+        assert [x.number for x in landing_candidates(s)] == ["2", "3"]
 
     def test_excluded_draining_is_never_used(self):
         s = self.cooled(acct("1", 10, 60, reset7_d=3), hours("2", 0, 80, 20, tier="excluded"))

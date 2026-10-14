@@ -216,10 +216,10 @@ def test_fleets_next_is_the_engines_target(name, snap, mx, state):
 def test_the_drain_fixtures_put_draining_accounts_first():
     by_name = {f[0]: f for f in FIXTURES}
     # (order, draining slots). A draining account lands while its room to
-    # hard7d is worth drain.MIN_LAND_5H 5h points; one with under a quarter
-    # window (#5 in "draining": 4 / 0.165 = 24) lands but competes on score.
+    # hard7d is worth drain.MIN_LAND_5H 5h points it is at risk and goes
+    # first by its 7d reset (#5 in "draining": 4 / 0.165 = 24 points).
     expected = {
-        "draining": (["3", "2", "4", "6", "5"], {"2", "3", "5"}),
+        "draining": (["3", "5", "2", "4", "6"], {"2", "3", "5"}),
         "draining by room": (["2", "3"], {"2"}),
         "draining active": (["3", "2"], {"1", "3"}),
     }
@@ -231,7 +231,7 @@ def test_the_drain_fixtures_put_draining_accounts_first():
         assert {n for n, r in rows.items() if r.drain} == draining, name
     _, snap, mx, state = by_name["draining active"]
     decision = policy.decide(_engine_snapshot(snap, mx, state))
-    assert isinstance(decision, Hold) and "draining it first" in decision.reason
+    assert isinstance(decision, Hold) and "would expire unused, using it first" in decision.reason
 
 
 def test_an_untrusted_account_is_never_tagged_next_even_when_published():

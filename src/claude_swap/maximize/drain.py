@@ -32,17 +32,13 @@ What draining changes (maximize/policy.py): its 7d soft trigger does not
 fire (no ``soft`` or ``preempt`` move off it on 7d); it is landable while
 what is left to ``hard7d`` is worth at least :data:`MIN_LAND_5H` 5h points
 at its k (:func:`lands_7d`: ``(hard7d − 7d) ÷ k``; no landing margin, since
-it rides to the hard cap; the 5h rules are unchanged);
-a draining account with useful room (:func:`preferred`: at least
-:data:`MIN_ROOM_5H` 5h points it could take before a mark, :func:`room_5h`)
-is tried first whatever its tier (the drain beats the tiers: a week about
-to reset is never left unused, last resort included), the earliest 7d reset
-first, and one with less competes on its score in its tier as usual;
-``rebalance`` moves onto a draining account only when it has that room, and
-never moves off a draining account that is still landable on 7d
-(:func:`lands_7d`) except to another such one that resets sooner, not for a
-tier reason. Hard caps, at-limit, the login-expiry guard, quarantine,
-excluded accounts and holds are unchanged.
+it rides to the hard cap). Such an account is *at risk* (:func:`at_risk`):
+its week would expire unused. It is tried first whatever its tier, the
+earliest 7d reset first, its 5h soft mark is set aside too (landable under
+``hard5h − landingMargin``, no soft move off it; the 5h hard mark still
+moves you), and ``rebalance`` never moves off it except to another at-risk
+account that resets sooner. Hard caps, at-limit, the login-expiry guard,
+quarantine, excluded accounts and holds are unchanged.
 
 ``k`` is learned from the usage history the engine already keeps
 (``usage_history.jsonl``, maximize/history.py): each account's first
@@ -75,10 +71,6 @@ HEADROOM_SHARE = 0.8
 #: ... and only this close to the reset: a k misread low cannot make an
 #: account draining most of its week.
 HEADROOM_MAX_H = 72.0
-#: A draining account goes first only with at least this much room, in 5h
-#: points (a quarter of a 5h window): :func:`room_5h`.
-MIN_ROOM_5H = 25.0
-
 #: A draining account is landable on 7d only while what is left to
 #: ``hard7d`` is worth at least this many 5h points at its k: a switch costs
 #: a prompt-cache rebuild on the new account, so a sliver is not worth it.
@@ -254,27 +246,14 @@ def land_k(v: AccountView, snap: Snapshot) -> float | None:
     return k_for(v, snap.k7)[0]
 
 
-def room_5h(v: AccountView, snap: Snapshot) -> float:
-    """What landing on ``v`` buys before a mark moves you off again, in 5h
-    points: the 5h room under ``soft5h − landingMargin``, or the 7d room
-    turned into 5h points at its k (``7d room ÷ k``), whichever is less. The
-    7d room is to ``hard7d`` for a draining ``v`` (it rides there) and to
-    ``hard7d − landingMargin`` otherwise. ``-inf`` with usage unknown."""
-    s = snap.settings
-    if v.pct5 is None or v.pct7 is None:
-        return -math.inf
-    k, _ = k_for(v, snap.k7)
-    room5 = s.soft_5h - s.landing_margin - v.pct5
-    margin7 = 0.0 if draining(v, snap) else s.landing_margin
-    room7 = room7_5h(v.pct7, s.hard_7d - margin7, k)
-    return min(room5, room7)
-
-
-def preferred(v: AccountView, snap: Snapshot) -> bool:
-    """A draining ``v`` worth trying first: at least :data:`MIN_ROOM_5H` of
-    room (:func:`room_5h`). With less, landing there buys a few minutes
-    before a forced move; it competes on its score instead."""
-    return draining(v, snap) and room_5h(v, snap) >= MIN_ROOM_5H
+def at_risk(v: AccountView, snap: Snapshot) -> bool:
+    """``v``'s week would expire unused: it is draining and its 7d room to
+    ``hard7d`` is worth at least :data:`MIN_LAND_5H` 5h points at its k
+    (:func:`lands_7d`). The priority rule: such an account goes first,
+    whatever its tier (maximize/policy.py)."""
+    if v.pct7 is None or not draining(v, snap):
+        return False
+    return lands_7d(v.pct7, snap.settings.hard_7d, k_for(v, snap.k7)[0])
 
 
 # -- words ------------------------------------------------------------------------------
@@ -290,11 +269,12 @@ def left_text(hours: float) -> str:
 
 
 def text(v: AccountView, snap: Snapshot) -> str:
-    """``dev 7d 86% resets in 18h — draining it first`` (a draining ``v``)."""
+    """``dev 7d 86% resets in 5h — would expire unused, using it first``
+    (an at-risk ``v``)."""
     left = hours_left(v, snap.now)
     when = f"resets in {left_text(left)}" if left is not None else "resets soon"
     pct = f"{v.pct7:g}%" if v.pct7 is not None else "?"
-    return f"{view_name(v)} 7d {pct} {when} — draining it first"
+    return f"{view_name(v)} 7d {pct} {when} — would expire unused, using it first"
 
 
 def tag(hours: float) -> str:

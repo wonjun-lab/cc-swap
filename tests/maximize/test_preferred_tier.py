@@ -142,7 +142,7 @@ class TestLandingOrder:
         draining = replace(acct("2", 0, 50), reset7=NOW + 18 * H)
         s = snap("1", acct("1", 30, 50), draining, pref("3", 0, 80, reset7_d=6),
                  pref("4", 0, 20, reset7_d=6))
-        assert policy.drain.preferred(draining, s)
+        assert policy.drain.at_risk(draining, s)
         assert [v.number for v in landing_candidates(s)] == ["2", "4", "3"]
         pdrain = replace(pref("5", 0, 50), reset7=NOW + 18 * H)
         s = replace(s, accounts=(*s.accounts, pdrain))
@@ -202,7 +202,7 @@ class TestRebalanceUp:
         draining = replace(acct("1", 10, 88), reset7=NOW + 18 * H)
         assert policy.draining(draining, snap("1", draining))
         got = decide(snap("1", draining, pref("2", 30, 80), samples="idle"))
-        assert isinstance(got, Hold) and "draining it first" in got.reason
+        assert isinstance(got, Hold) and "would expire unused, using it first" in got.reason
         # Not landable on 7d any more (< 10 5h points to hard7d): the tier rules.
         spent = replace(acct("1", 10, 97.5), reset7=NOW + 18 * H)
         got = decide(snap("1", spent, pref("2", 30, 80), samples="idle"))

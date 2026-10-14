@@ -226,8 +226,9 @@ def tag_for(
     if row.login == "ok" and row.stale and age is not None and age >= STALE_TAG_S:
         return old, "dim"
     if row.drain:
-        # Near its 7d reset: used first, its 7d soft mark set aside
-        # (maximize/drain.py). ``drain 18h``: the time to that reset.
+        # Near its 7d reset: used first when its week would expire unused,
+        # its soft marks set aside (maximize/drain.py). ``drain 18h``: the
+        # time to that reset.
         left = (row.reset7 - now) / 3600.0 if row.reset7 is not None else None
         return (drain.tag(left) if left is not None and left > 0 else "drain"), "ok"
     if row.tier == "preferred":
@@ -676,10 +677,13 @@ def capacity(
         return r.login_deadline is not None and r.login_deadline - at < guard
 
     def free_now(r: fx.FleetRow) -> bool:
+        # An at-risk account's 5h soft mark is set aside: the hard mark is
+        # its limit (``score.landable``).
+        mark5 = mx.hard_5h if r.at_risk else mx.soft_5h
         if r.active:
             soft7 = mx.hard_7d if r.drain else mx.soft_7d
-            return (r.pct5 or 0.0) < mx.soft_5h and (r.pct7 or 0.0) < soft7
-        return week_lands(r) and (r.pct5 or 0.0) < mx.soft_5h - margin and not guarded(r, now)
+            return (r.pct5 or 0.0) < mark5 and (r.pct7 or 0.0) < soft7
+        return week_lands(r) and (r.pct5 or 0.0) < mark5 - margin and not guarded(r, now)
 
     free = [r for r in usable if free_now(r)]
     waiting = [
@@ -841,8 +845,9 @@ def ago_text(seconds: float) -> str:
 
 def _past_soft(row: fx.FleetRow, mx: MaximizeSettings) -> tuple[str, float, float] | None:
     """The window (label, pct, soft) the account is past its soft mark in
-    (never 7d on a draining account: that mark is set aside)."""
-    if row.pct5 is not None and row.pct5 >= mx.soft_5h:
+    (never 7d on a draining account, nor 5h on an at-risk one: those marks
+    are set aside)."""
+    if row.pct5 is not None and row.pct5 >= mx.soft_5h and not row.at_risk:
         return "5h", row.pct5, mx.soft_5h
     if row.pct7 is not None and row.pct7 >= mx.soft_7d and not row.drain:
         return "7d", row.pct7, mx.soft_7d
@@ -1306,14 +1311,14 @@ def status_variants(
                         "plain")],
                 [head],
             ]
-        if act.drain and act.pct7 is not None:
+        if act.at_risk and act.pct7 is not None:
             left = (act.reset7 - now) / 3600.0 if act.reset7 is not None else None
             when = f" resets in {drain.left_text(left)}" if left is not None and left > 0 else ""
             return [
                 [head, (f" · using {name(act.number)} · 7d {act.pct7:.0f}%{when}"
-                        " — draining it first ", "plain"),
+                        " — would expire unused, using it first ", "plain"),
                  (f"(forced at {mx.hard_7d:g}%)", "dim")],
-                [head, (f" · {act.name} 7d {act.pct7:.0f}%{when} — draining it first",
+                [head, (f" · {act.name} 7d {act.pct7:.0f}%{when} — would expire unused, using it first",
                         "plain")],
                 [head],
             ]
