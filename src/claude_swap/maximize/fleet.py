@@ -136,12 +136,11 @@ def land_note(
     active: bool,
     login: LoginState,
     now: float | None = None,
-    drain_room: bool = False,
+    drain_k: float | None = None,
 ) -> str:
     """Whether maximize could land on this account, and if not, why. A
-    draining account with useful room (``drain_room``, ``drain.preferred``)
-    has its 7d soft mark set aside: its 7d limit is the hard cap less the
-    margin."""
+    draining account (``drain_k``, ``drain.land_k``) has its 7d soft mark set
+    aside: it needs ``drain.MIN_LAND_5H`` 5h points of room to the hard cap."""
     if login == "relogin":
         return "re-login"
     if active:
@@ -156,9 +155,11 @@ def land_note(
         return "usage ?"
     if view.pct5 >= s.soft_5h - s.landing_margin:
         return f"5h≥{s.soft_5h - s.landing_margin:g}"
-    limit7 = (s.hard_7d if drain_room else s.soft_7d) - s.landing_margin
-    if view.pct7 >= limit7:
-        return f"7d≥{limit7:g}"
+    if drain_k is not None:
+        if not drain.lands_7d(view.pct7, s.hard_7d, drain_k):
+            return f"7d room<{drain.MIN_LAND_5H:g}"
+    elif view.pct7 >= s.soft_7d - s.landing_margin:
+        return f"7d≥{s.soft_7d - s.landing_margin:g}"
     if now is not None and policy.login_guarded(view, now, s):
         return f"login<{minutes_text(s.login_expiry_guard_min).replace('h00m', 'h')}"
     return "yes"
@@ -269,9 +270,9 @@ class FleetRow:
     # The near-reset drain (maximize/drain.py): the engine sets this
     # account's 7d soft mark aside until its 7d reset (``drain``), and
     # lands on it up to hard7d - margin when it has useful room
-    # (``drain_room``, ``drain.preferred``).
+    # (``drain_k``: its k, ``drain.land_k``; None when not draining).
     drain: bool = False
-    drain_room: bool = False
+    drain_k: float | None = None
 
 
 def _seen_resets(acc: AccountSnapshot, now: float) -> tuple[float | None, float | None]:
@@ -368,7 +369,7 @@ def fleet_rows(
         active = acc.number == msnap.active
         seen5, seen7 = _seen_resets(acc, now)
         draining = policy.draining(tv, msnap)
-        drain_room = drain.preferred(tv, msnap)
+        drain_k = drain.land_k(tv, msnap)
         out.append(
             FleetRow(
                 number=acc.number,
@@ -385,12 +386,12 @@ def fleet_rows(
                 score=by_row[acc.number].score,
                 landable=(
                     not active
-                    and landable(tv, mx, drain_room=drain_room)
+                    and landable(tv, mx, drain_k=drain_k)
                     and not policy.login_guarded(tv, now, mx)
                     and not policy.stale_reading(tv)
                 ),
                 land=land_note(
-                    tv, mx, active=active, login=login, now=now, drain_room=drain_room
+                    tv, mx, active=active, login=login, now=now, drain_k=drain_k
                 ),
                 state5=r.state5,
                 reset5=(v.reset5 if r.state5 != "cold" else None) or seen5,
@@ -408,7 +409,7 @@ def fleet_rows(
                 shared=acc.usage.last_error == SHARED_LOGIN,
                 trusted=acc.usage.decision_value() is not None,
                 drain=draining,
-                drain_room=drain_room,
+                drain_k=drain_k,
             )
         )
     return out
