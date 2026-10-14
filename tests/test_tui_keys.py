@@ -24,7 +24,7 @@ from tests.maximize.test_tui_fleet_actions import (
     _launchable,
 )
 from tests.maximize.test_tui_fleet import _settings
-from tests.test_tui import make_app, settle
+from tests.test_tui import make_app, settle, wait_until
 
 SPECIAL = [
     "enter", "escape", "tab", "shift+tab", "up", "down", "left", "right",
@@ -67,9 +67,28 @@ def _world(root) -> StoringSwitcher:
     return _World(_accounts(), root)
 
 
+def _snapshot(app) -> tuple:
+    return tuple(id(sc) for sc in app.screen_stack), len(app.workers)
+
+
+async def _stable(pilot, polls: int = 5) -> None:
+    """Pump the app until its screens and workers stop changing for ``polls``
+    pauses in a row (a callback queued behind a key lands within a few loop
+    turns, and a loaded machine needs more of them than an idle one)."""
+    seen = [None, 0]
+
+    def unchanged() -> bool:
+        now = _snapshot(pilot.app)
+        seen[1] = seen[1] + 1 if now == seen[0] else 0
+        seen[0] = now
+        return seen[1] >= polls
+
+    await wait_until(pilot, unchanged, "the screens to stop changing")
+
+
 async def _open(pilot) -> None:
     await settle(pilot)
-    await settle(pilot)
+    await _stable(pilot)
 
 
 def _cls(app) -> str:
@@ -100,8 +119,11 @@ async def _select_row(pilot, number: str) -> None:
 
 
 async def _keys(pilot, *keys: str) -> None:
-    await pilot.press(*keys)
-    await _open(pilot)
+    """Navigation: one key at a time, each one fully handled (its screen
+    pushed or popped, its callback run) before the next goes in."""
+    for key in keys:
+        await pilot.press(key)
+        await _open(pilot)
 
 
 async def _home(pilot):
@@ -231,7 +253,10 @@ async def _reach(pilot, name: str) -> None:
     how, expect = SCREENS[name]
     await _go_home(pilot)
     await how(pilot)
-    assert _cls(pilot.app) == expect, f"{name}: on {_cls(pilot.app)}, wanted {expect}"
+    await wait_until(
+        pilot, lambda: _cls(pilot.app) == expect,
+        f"{name}: {expect} on top (on {_cls(pilot.app)})",
+    )
 
 
 # -- regression: two action keys in one burst -------------------------------------------------------
@@ -274,6 +299,7 @@ async def test_menu_two_keys_one_action(tmp_path, monkeypatch, entry, mode):
             _post_twice(app, entry.key, entry.key)
         else:
             await pilot.press(entry.key, entry.key)
+        await wait_until(pilot, lambda: seen, "the menu's action")
         await _open(pilot)
         _alive(app)
         assert seen == [entry.action]  # one key's action, once
@@ -321,6 +347,7 @@ async def test_hold_picker_two_keys_one_choice(tmp_path, monkeypatch, mode):
             _post_twice(app, key, key)
         else:
             await pilot.press(key, key)
+        await wait_until(pilot, lambda: chosen, "the hold choice")
         await _open(pilot)
         _alive(app)
         assert len(chosen) == 1
@@ -339,11 +366,12 @@ async def test_mode_modal_two_keys_one_choice(tmp_path, monkeypatch, mode):
         await _open(pilot)
         base = _depth(app)
         await _keys(pilot, "m", "m")
+        await wait_until(pilot, lambda: _cls(app) == "ModeModal", "the Mode modal")
         modal = app.screen
-        assert _cls(app) == "ModeModal"
         actions = modal._actions
         if not actions:  # a viewer lane: facts only, nothing to press
             await pilot.press("escape", "escape")
+            await wait_until(pilot, lambda: chosen, "the Mode close")
             await _open(pilot)
             _alive(app)
             assert _depth(app) == base and chosen == [None]
@@ -353,6 +381,7 @@ async def test_mode_modal_two_keys_one_choice(tmp_path, monkeypatch, mode):
             _post_twice(app, key, key)
         else:
             await pilot.press(key, key)
+        await wait_until(pilot, lambda: chosen, "the Mode choice")
         await _open(pilot)
         _alive(app)
         assert chosen == [actions[0].action] and _depth(app) == base
@@ -387,6 +416,7 @@ async def test_modal_two_dismissals_one_result(tmp_path, kind, mode):
             "prime": lambda: PrimeModal([PrimeChoice("2", "two", True)], set(), lambda n: []),
         }[kind]()
         app.push_screen(modal, results.append)
+        await wait_until(pilot, lambda: _depth(app) == base + 1, f"the {kind} modal to open")
         await _open(pilot)
         assert _depth(app) == base + 1
         char = key if len(key) == 1 else None
@@ -394,6 +424,7 @@ async def test_modal_two_dismissals_one_result(tmp_path, kind, mode):
             _post_twice(app, key, char)
         else:
             await pilot.press(key, key)
+        await wait_until(pilot, lambda: _depth(app) == base, f"the {kind} modal to close")
         await _open(pilot)
         _alive(app)
         assert _depth(app) == base and _cls(app) == "FleetScreen"
@@ -410,11 +441,13 @@ async def test_screen_back_twice_pops_once(tmp_path, name, mode):
         await _open(pilot)
         base = _depth(app)
         await _reach(pilot, name)
+        await wait_until(pilot, lambda: _depth(app) == base + 1, f"{name} to open")
         assert _depth(app) == base + 1
         if mode == "posted":
             _post_twice(app, "b", "b")
         else:
             await pilot.press("b", "b")
+        await wait_until(pilot, lambda: _depth(app) == base, f"{name} to go back")
         await _open(pilot)
         _alive(app)
         assert _cls(app) == "FleetScreen" and _depth(app) == base
@@ -438,6 +471,7 @@ async def test_dismiss_and_pop_of_a_gone_screen_are_noops(tmp_path):
             modal.dismiss("history")
             modal.dismiss(None)
         await _open(pilot)
+        await wait_until(pilot, lambda: seen, "the menu's result")
         assert seen == ["history"] and _depth(app) == base and _cls(app) == "FleetScreen"
         app.push_screen(modal := MenuModal([]))
         await _open(pilot)
@@ -445,6 +479,63 @@ async def test_dismiss_and_pop_of_a_gone_screen_are_noops(tmp_path):
         modal.pop_self()  # ...but only once
         await _open(pilot)
         assert _depth(app) == base
+        _alive(app)
+
+
+@pytest.mark.asyncio
+async def test_first_dismiss_is_never_dropped_when_the_stack_is_unreadable(tmp_path, monkeypatch):
+    """The guard refuses a *second* dismiss, not one that arrives while the
+    stack cannot be inspected (Textual mid-transition, app tearing down): a
+    real key must not turn into a no-op. Fails on a guard that treats "can't
+    tell if I'm the active screen" as "not active"."""
+    from textual.app import App
+
+    from claude_swap.tui.fleet_modals import ModeModal
+
+    app = make_app(_world(tmp_path))
+    seen: list = []
+    async with app.run_test(size=(120, 40)) as pilot:
+        await _open(pilot)
+        base = _depth(app)
+        modal = ModeModal(app.screen._engine_status())
+        app.push_screen(modal, seen.append)
+        await wait_until(pilot, lambda: _depth(app) == base + 1, "the Mode modal")
+        await _open(pilot)
+        real = App.screen_stack
+
+        def unreadable(self):
+            raise RuntimeError("mid-transition")
+
+        monkeypatch.setattr(App, "screen_stack", property(unreadable))
+        modal.dismiss("stop")  # the first one goes through
+        modal.dismiss("stop")  # a second one is refused, stack unreadable or not
+        modal.dismiss(None)
+        monkeypatch.setattr(App, "screen_stack", real)
+        await wait_until(pilot, lambda: seen, "the Mode result")
+        await _open(pilot)
+        assert seen == ["stop"] and _depth(app) == base
+        _alive(app)
+
+
+@pytest.mark.asyncio
+async def test_a_reused_screen_can_be_dismissed_again_after_it_is_pushed_again(tmp_path):
+    """Fleet is an installed screen pushed again and again: the "already
+    dismissed" mark must not outlive the pop."""
+    from claude_swap.tui.fleet_help import HelpScreen
+
+    app = make_app(_world(tmp_path))
+    async with app.run_test(size=(120, 40)) as pilot:
+        await _open(pilot)
+        base = _depth(app)
+        help_screen = HelpScreen()
+        app.install_screen(help_screen, "help-reused")
+        for _ in range(3):
+            app.push_screen("help-reused")
+            await wait_until(pilot, lambda: _depth(app) == base + 1, "help to open")
+            help_screen.dismiss(None)
+            help_screen.dismiss(None)
+            await wait_until(pilot, lambda: _depth(app) == base, "help to close")
+        await _open(pilot)
         _alive(app)
 
 
@@ -522,7 +613,7 @@ async def test_key_pairs_on_dialogs(tmp_path, name):
                 await _reach(pilot, name)
             char = key if len(key) == 1 else None
             _post_twice(app, key, char)
-            await pilot.pause()
+            await _open(pilot)
             try:
                 _alive(app)
             except AssertionError as e:

@@ -14,7 +14,7 @@ from textual.widgets import RichLog, Static
 from claude_swap.maximize import fleet as fx
 from claude_swap.maximize.lease import EngineLease
 from tests.maximize.test_tui_fleet import _fleet, _settings
-from tests.test_tui import fake_engine, make_app, settle  # noqa: F401 (fixture)
+from tests.test_tui import fake_engine, make_app, settle, wait_until  # noqa: F401 (fixture)
 
 
 async def _eventually(predicate, timeout: float = 5.0) -> bool:
@@ -27,8 +27,19 @@ async def _eventually(predicate, timeout: float = 5.0) -> bool:
 
 
 async def _open(pilot) -> None:
+    from claude_swap.tui.fleet import FleetScreen
+
     await settle(pilot)
+    await wait_until(pilot, lambda: isinstance(pilot.app.screen, FleetScreen), "Fleet home")
     await settle(pilot)
+
+
+async def _on(pilot, screen_cls, what: str | None = None) -> None:
+    """Wait for ``screen_cls`` to be the active screen."""
+    await wait_until(
+        pilot, lambda: isinstance(pilot.app.screen, screen_cls),
+        f"{what or screen_cls.__name__} on top",
+    )
 
 
 def _engine_line(app) -> str:
@@ -36,16 +47,23 @@ def _engine_line(app) -> str:
     return app.screen.query_one("#fx-status", Static).render().plain
 
 
-async def _mode(pilot, *keys: str) -> None:
-    """Menu (m) → Mode (m), then ``keys`` in the Mode modal."""
-    from claude_swap.tui.fleet_modals import ModeModal
+async def _mode(pilot, *keys: str, closes: bool = True) -> None:
+    """Menu (m) → Mode (m), then ``keys`` in the Mode modal; each key is
+    waited for (the modal closes, or another dialog replaces it) before the
+    next. ``closes=False``: the keys are not options and the modal stays."""
+    from claude_swap.tui.fleet_modals import MenuModal, ModeModal
 
-    await pilot.press("m", "m")
-    await pilot.pause()
-    assert isinstance(pilot.app.screen, ModeModal)
+    await pilot.press("m")
+    await _on(pilot, MenuModal)
+    await pilot.press("m")
+    await _on(pilot, ModeModal)
     for key in keys:
         await pilot.press(key)
-        await pilot.pause()
+        if closes:
+            await wait_until(
+                pilot, lambda: not isinstance(pilot.app.screen, ModeModal),
+                f"the Mode modal to close on {key!r}",
+            )
     await settle(pilot)
 
 
@@ -93,23 +111,25 @@ class TestEngineHost:
         async with app.run_test(size=(140, 40)) as pilot:
             await _open(pilot)
             await _mode(pilot, "d")
-            assert isinstance(app.screen, FleetScreen)
+            await _on(pilot, FleetScreen)
             assert len(fake_engine.instances) == 1
             assert fake_engine.instances[0].dry_run is True
             assert _engine_line(app).startswith("Dry run · ")
             assert _engine_line(app).endswith("engine here · dry run")
             assert app._store_only is True  # the engine here fetches
             await _mode(pilot, "l")
-            assert isinstance(app.screen, ConfirmModal)  # going live asks
+            await _on(pilot, ConfirmModal, "the go-live question")  # going live asks
             assert len(fake_engine.instances) == 1
             await pilot.press("y")
             await settle(pilot)
+            await wait_until(pilot, lambda: len(fake_engine.instances) == 2, "the live engine")
             assert len(fake_engine.instances) == 2
             assert fake_engine.instances[0].stopped is True
             assert fake_engine.instances[1].dry_run is False
             assert _engine_line(app).startswith("Auto ON · ")
             assert _engine_line(app).endswith("engine runs here · quitting stops it")
             await _mode(pilot, "d")
+            await wait_until(pilot, lambda: len(fake_engine.instances) == 3, "the dry-run engine")
             assert len(fake_engine.instances) == 3 and fake_engine.instances[2].dry_run
 
     async def test_auto_screen_attaches_to_running_host_engine_no_second_engine(
@@ -124,16 +144,16 @@ class TestEngineHost:
             await _open(pilot)
             await _mode(pilot, "d")
             await pilot.press("e")
+            await _on(pilot, AutoScreen)
             await settle(pilot)
-            assert isinstance(app.screen, AutoScreen)
             assert len(fake_engine.instances) == 1
             log = app.screen.query_one("#event-log", RichLog)
             texts = [line.text for line in log.lines]
             assert any("cooldown" in t for t in texts)  # replayed from the ring buffer
             assert any("attached to the engine this TUI runs" in t for t in texts)
             await pilot.press("escape")
+            await _on(pilot, FleetScreen)
             await settle(pilot)
-            assert isinstance(app.screen, FleetScreen)
             assert fake_engine.instances[0].stopped is False  # still Fleet's engine
             assert app.engine_host.running and app.engine_keeper.lease.held
 
@@ -144,11 +164,12 @@ class TestEngineHost:
         async with app.run_test(size=(140, 40)) as pilot:
             await _open(pilot)
             await pilot.press("e")
+            await wait_until(pilot, lambda: len(fake_engine.instances) == 1, "the auto screen's engine")
             await settle(pilot)
             assert len(fake_engine.instances) == 1 and fake_engine.instances[0].dry_run
             assert not app.engine_host.running
             await pilot.press("escape")
-            await settle(pilot)
+            await wait_until(pilot, lambda: fake_engine.instances[0].stopped, "the engine to stop")
             assert fake_engine.instances[0].stopped is True
             assert await _eventually(lambda: not probe.held_elsewhere())
 
@@ -161,29 +182,36 @@ class TestEngineHost:
         async with app.run_test(size=(140, 40)) as pilot:
             await _open(pilot)
             await _mode(pilot, "l")
+            await _on(pilot, ConfirmModal, "the go-live question")
             await pilot.press("y")
-            await settle(pilot)
-            assert app.engine_host.running and not app.engine_host.dry_run
+            await wait_until(
+                pilot, lambda: app.engine_host.running and not app.engine_host.dry_run,
+                "the live engine to run",
+            )
+            await _on(pilot, FleetScreen)
             await pilot.press("q")
-            await pilot.pause()
-            assert isinstance(app.screen, ConfirmModal)
+            await _on(pilot, ConfirmModal, "the quit question")
             await pilot.press("n")
-            await pilot.pause()
-            assert isinstance(app.screen, FleetScreen) and app.engine_host.running
+            await _on(pilot, FleetScreen)
+            assert app.engine_host.running
             await pilot.press("q")
-            await pilot.pause()
+            await _on(pilot, ConfirmModal, "the quit question")
             await pilot.press("y")
-            await pilot.pause()
+            await wait_until(pilot, lambda: not app.is_running, "the app to quit")
         assert fake_engine.instances[-1].stopped is True
 
     async def test_quit_with_dry_run_engine_does_not_ask(self, tmp_path, fake_engine):
+        from claude_swap.tui.fleet import FleetScreen
+
         _settings(tmp_path)
         app = make_app(_fleet(tmp_path))
         async with app.run_test(size=(140, 40)) as pilot:
             await _open(pilot)
             await _mode(pilot, "d")
+            await wait_until(pilot, lambda: app.engine_host.running, "the dry-run engine to run")
+            await _on(pilot, FleetScreen)
             await pilot.press("q")
-            await pilot.pause()
+            await wait_until(pilot, lambda: not app.is_running, "the app to quit")
         assert fake_engine.instances[-1].stopped is True
 
     async def test_lease_released_after_host_engine_thread_exits(self, tmp_path, fake_engine):
@@ -193,9 +221,10 @@ class TestEngineHost:
         async with app.run_test(size=(140, 40)) as pilot:
             await _open(pilot)
             await _mode(pilot, "d")
+            await wait_until(pilot, lambda: app.engine_host.running, "the dry-run engine to run")
             assert probe.held_elsewhere() is True
             await _mode(pilot, "s")
-            assert not app.engine_host.running
+            await wait_until(pilot, lambda: not app.engine_host.running, "the engine to stop")
             assert await _eventually(lambda: not probe.held_elsewhere())
             assert _engine_line(app).startswith("Not switching — no engine is running")
 
@@ -208,13 +237,15 @@ class TestEngineHost:
         async with app.run_test(size=(140, 40)) as pilot:
             await _open(pilot)
             await _mode(pilot, "d")
+            await wait_until(pilot, lambda: app.engine_host.running, "the dry-run engine to run")
+            await _on(pilot, FleetScreen)
             await pilot.press("c")
+            await _on(pilot, DashboardScreen)
             await settle(pilot)
-            assert isinstance(app.screen, DashboardScreen)
             assert app.engine_host.running and not fake_engine.instances[0].stopped
             await pilot.press("ctrl+f")
+            await _on(pilot, FleetScreen)
             await settle(pilot)
-            assert isinstance(app.screen, FleetScreen)
             assert _engine_line(app).endswith("engine here · dry run")
 
     async def test_viewer_mode_offers_facts_only(self, tmp_path, fake_engine):
@@ -227,12 +258,11 @@ class TestEngineHost:
             app = make_app(_fleet(tmp_path))
             async with app.run_test(size=(140, 40)) as pilot:
                 await _open(pilot)
-                await _mode(pilot, "d")  # not an option for a viewer: nothing happens
+                await _mode(pilot, "d", closes=False)  # not an option for a viewer: nothing happens
                 facts = app.screen.query_one("#fx-mode-facts", Static).render().plain
                 assert "holds the engine lease" in facts
                 await pilot.press("escape")
-                await pilot.pause()
-                assert isinstance(app.screen, FleetScreen)
+                await _on(pilot, FleetScreen)
                 assert fake_engine.instances == []
         finally:
             other.release()

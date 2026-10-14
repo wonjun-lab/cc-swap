@@ -271,6 +271,22 @@ async def settle(pilot) -> None:
     await pilot.pause()
 
 
+async def wait_until(pilot, predicate, what: str, timeout: float = 5.0) -> None:
+    """Pump the app until ``predicate()`` holds; fail with ``what`` (and the
+    screen stack) if it never does. Fixed numbers of pauses are timing
+    assumptions — on a loaded machine the app needs more turns of the event
+    loop than on an idle one — so tests wait for the condition instead."""
+    deadline = time.monotonic() + timeout
+    while True:
+        await pilot.pause()
+        if predicate():
+            return
+        if time.monotonic() >= deadline:
+            stack = [type(sc).__name__ for sc in pilot.app.screen_stack]
+            raise AssertionError(f"timed out after {timeout:g}s waiting for {what}; screens: {stack}")
+        await asyncio.sleep(0.01)
+
+
 async def wait_event(event: threading.Event, timeout: float = 1.0) -> None:
     assert await asyncio.to_thread(event.wait, timeout)
 
