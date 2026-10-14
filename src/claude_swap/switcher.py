@@ -161,7 +161,7 @@ def _format_usage_lines(usage: dict, fetched_at: float | None = None) -> list[st
     for w in usage.get("scoped") or []:
         # Per-model weekly limits (e.g. Fable). Flag ones at/over the limit so a
         # maxed model — the usual reason to switch — stands out.
-        marker = "  (!)" if w["pct"] >= 100 else _pace_marker(w, fetched_at)
+        marker = "  (limit reached)" if w["pct"] >= 100 else _pace_marker(w, fetched_at)
         cell = oauth.fresh_reset_strings(w)
         if cell:
             countdown, clock = cell
