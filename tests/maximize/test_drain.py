@@ -220,14 +220,57 @@ class TestLanding:
         off = decide(replace(s, settings=MaximizeSettings(drain_hours=0)))
         assert isinstance(off, Switch) and off.target == "3"
 
-    def test_landable_under_hard_minus_margin_only(self):
-        # With room (5x plans: k 0.105), under hard7d - margin (93) only.
-        s = snap("1", acct("1", 96, 40), with_plan(hours("2", 0, 93, 18), "5x"),
-                 with_plan(hours("3", 0, 90, 18), "5x"))
+    def test_landable_by_room_to_hard7d_without_the_margin(self):
+        # 5x plans (k 0.105), hard7d 98: 97 leaves 1/0.105 = 9.5 < 10 5h
+        # points, 96 leaves 19.
+        s = snap("1", acct("1", 96, 40), with_plan(hours("2", 0, 97, 18), "5x"),
+                 with_plan(hours("3", 0, 96, 18), "5x"))
         assert [v.number for v in landing_candidates(s)] == ["3"]
         # The 5h rule is unchanged: 45 = soft5h 50 - margin 5.
         s = snap("1", acct("1", 96, 40), hours("2", 45, 88, 18))
         assert landing_candidates(s) == []
+
+    def test_lands_by_room_in_5h_points_at_its_k(self):
+        assert drain.MIN_LAND_5H == 10.0
+
+        def landing(p7, k=0.16, **kw):
+            v = hours("2", 0, p7, 6, **kw)
+            s = replace(snap("1", acct("1", 96, 40), v, hard_7d=99), k7={"2": k})
+            assert drain.draining(v, s)
+            return [x.number for x in landing_candidates(s)]
+
+        assert landing(96) == ["2"]                 # 3 / 0.16 = 18.75
+        assert landing(98.5) == []                  # 0.5 / 0.16 = 3.1
+        assert landing(97.3) == ["2"]               # 1.7 / 0.16 = 10.6
+        assert landing(97.5) == []
+        assert landing(98, 0.105) == []             # 1 / 0.105 = 9.52
+        assert landing(97.9, 0.105) == ["2"]        # 1.1 / 0.105 = 10.5
+
+    def test_a_draining_account_at_96_is_chosen_as_the_best_draining_one(self):
+        # Alone, 96% (18.75 5h points) is landable and chosen.
+        v = hours("2", 0, 96, 6)
+        s = replace(snap("1", acct("1", 96, 40), v, hard_7d=99), k7={"2": 0.16})
+        got = decide(s)
+        assert isinstance(got, Switch) and got.target == "2"
+        # At 95% (25 points: useful room) it goes before a better-scored account.
+        v = hours("2", 0, 95, 6)
+        s = replace(snap("1", acct("1", 96, 40), v, acct("3", 0, 10, reset7_d=2), hard_7d=99),
+                    k7={"2": 0.16})
+        got = decide(s)
+        assert isinstance(got, Switch) and got.target == "2"
+
+    def test_a_non_draining_account_at_96_is_not_landable(self):
+        # Reset in 6 days: not draining; the normal 7d rule (soft7d - margin) applies.
+        v = acct("2", 0, 96, reset7_d=6)
+        s = replace(snap("1", acct("1", 96, 40), v, hard_7d=99), k7={"2": 0.16})
+        assert not drain.draining(v, s)
+        assert landing_candidates(s) == []
+
+    def test_the_ride_stays_to_hard7d(self):
+        v = hours("1", 20, 98, 6)
+        s = snap("1", v, acct("2", 0, 10, reset7_d=6), hard_7d=99)
+        got = decide(s)
+        assert isinstance(got, Hold) and got.code is None   # no soft/preempt move off
 
     def test_draining_first_earliest_reset_first_then_score(self):
         s = snap(
@@ -241,11 +284,10 @@ class TestLanding:
         )
         assert [v.number for v in landing_candidates(s)] == ["4", "3", "2", "7", "6", "5"]
 
-    def test_past_the_normal_7d_limit_only_with_room(self):
-        # 7d 90% is past soft7d - margin (85). A 5x plan (k 0.105) has
-        # 3 / 0.105 = 28.6 5h points of 7d room under hard7d - margin: with
-        # a fresh 5h it has room and lands; at 5h 30 (15 pts) it has not,
-        # and the normal 7d rule keeps it off like any other account.
+    def test_past_the_normal_7d_limit_a_draining_account_lands_by_room(self):
+        # 7d 90% is past soft7d - margin (85): a draining account lands on
+        # its 7d room (8 / 0.105 = 76 5h points on 5x) whatever its 5h room
+        # (the 5h rule alone keeps it off at 45).
         def landable(p5):
             v = with_plan(hours("2", p5, 90, 18), "5x")
             s = snap("1", acct("1", 96, 40), v)
@@ -253,41 +295,36 @@ class TestLanding:
             return [x.number for x in landing_candidates(s)] == ["2"]
 
         assert landable(0)
-        assert not landable(30)
-        # Under the normal limit a draining account without room still lands.
-        s = snap("1", acct("1", 96, 40), hours("2", 30, 80, 18))
-        assert not drain.preferred(s.accounts[1], s)
-        assert [v.number for v in landing_candidates(s)] == ["2"]
+        assert landable(30)
+        assert not landable(45)
 
     def test_a_draining_account_with_little_5h_room_competes_on_its_score(self):
         # #2 drains (7d 88%, 20 h) but its 5h is at 40: 5 pts to soft5h -
-        # margin, a few minutes before the 5h soft mark moves you on. Without
-        # room the normal 7d rule (85) keeps it off; with #2's 5h fresh it
+        # margin, a few minutes before the 5h soft mark moves you on. It is
+        # landable (7d room is ample) but not first; with #2's 5h fresh it
         # goes first.
         def landing(p5):
             s = snap("1", acct("1", 96, 40), hours("2", p5, 88, 20), acct("3", 0, 40, reset7_d=2))
             return [v.number for v in landing_candidates(s)]
 
         assert drain.MIN_ROOM_5H == 25
-        assert landing(40) == ["3"]
+        assert landing(40) == ["3", "2"]
         assert landing(20) == ["2", "3"]   # 25 pts of 5h room: the floor
-        assert landing(21) == ["3"]
-        # Under soft7d - margin it lands as any account, on its score.
-        s = snap("1", acct("1", 96, 40), hours("2", 40, 80, 20), acct("3", 0, 40, reset7_d=2))
-        assert [v.number for v in landing_candidates(s)] == ["3", "2"]
+        assert landing(21) == ["3", "2"]
 
     def test_a_draining_account_with_little_7d_room_competes_on_its_score(self):
-        # 7d 92% leaves 1 pt to hard7d - margin: ~6 5h points at k 0.165.
+        # hard7d 98, k 0.165: 7d 92% leaves 6 pts = 36 5h points (first);
+        # 94.5 leaves 21 (landable, but under the 25 floor: by score).
         def landing(p7, k7=None):
             s = snap("1", acct("1", 96, 40), hours("2", 0, p7, 20), acct("3", 0, 40, reset7_d=2))
             if k7 is not None:
                 s = replace(s, k7=k7)
             return [v.number for v in landing_candidates(s)]
 
-        assert landing(92) == ["3"]           # no room: the normal 7d rule
-        assert landing(87) == ["2", "3"]      # 6 pts / 0.165 = 36 5h points
-        assert landing(88.9) == ["3"]         # 4.1 / 0.165 = 24.8: under the floor
-        assert landing(88.9, {"2": 0.1}) == ["2", "3"]   # 41 at its learned k
+        assert landing(92) == ["2", "3"]
+        assert landing(94.5) == ["3", "2"]
+        assert landing(94.5, {"2": 0.1}) == ["2", "3"]   # 35 at its learned k
+        assert landing(97) == ["3"]           # 1 / 0.165 = 6 < MIN_LAND_5H
 
     def test_the_guards_still_apply(self):
         guarded = replace(hours("2", 0, 88, 18), login_deadline=NOW + 60)

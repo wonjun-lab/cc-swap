@@ -30,7 +30,9 @@ headroom rule fire later, never move you off anything.
 
 What draining changes (maximize/policy.py): its 7d soft trigger does not
 fire (no ``soft`` or ``preempt`` move off it on 7d); it is landable while
-its 7d is under ``hard7d − landingMargin`` (the 5h rules are unchanged);
+what is left to ``hard7d`` is worth at least :data:`MIN_LAND_5H` 5h points
+at its k (:func:`lands_7d`: ``(hard7d − 7d) ÷ k``; no landing margin, since
+it rides to the hard cap; the 5h rules are unchanged);
 within a tier a draining account with useful room (:func:`preferred`: at
 least :data:`MIN_ROOM_5H` 5h points it could take before a mark,
 :func:`room_5h`) is tried first, the earliest 7d reset first, and one with
@@ -73,6 +75,11 @@ HEADROOM_MAX_H = 72.0
 #: A draining account goes first only with at least this much room, in 5h
 #: points (a quarter of a 5h window): :func:`room_5h`.
 MIN_ROOM_5H = 25.0
+
+#: A draining account is landable on 7d only while what is left to
+#: ``hard7d`` is worth at least this many 5h points at its k: a switch costs
+#: a prompt-cache rebuild on the new account, so a sliver is not worth it.
+MIN_LAND_5H = 10.0
 
 #: 7d points per 5h point when nothing is learned, by plan (measured on
 #: real 20x and 5x accounts: a full 5h window is ~16.5% / ~10.5% of 7d).
@@ -225,17 +232,38 @@ def draining(v: AccountView, snap: Snapshot) -> bool:
     return rule(v, snap) is not None
 
 
+def room7_5h(pct7: float, hard_7d: float, k: float) -> float:
+    """The 7d room left to ``hard_7d`` in 5h points at ``k``."""
+    return (hard_7d - pct7) / k
+
+
+def lands_7d(pct7: float, hard_7d: float, k: float) -> bool:
+    """A draining account's 7d landing gate: at least :data:`MIN_LAND_5H`
+    5h points of room to ``hard_7d`` at ``k``."""
+    return room7_5h(pct7, hard_7d, k) >= MIN_LAND_5H
+
+
+def land_k(v: AccountView, snap: Snapshot) -> float | None:
+    """The k a draining ``v`` is gated by (``score.landable``'s
+    ``drain_k``), or None when ``v`` is not draining (its normal 7d rule)."""
+    if not draining(v, snap):
+        return None
+    return k_for(v, snap.k7)[0]
+
+
 def room_5h(v: AccountView, snap: Snapshot) -> float:
     """What landing on ``v`` buys before a mark moves you off again, in 5h
     points: the 5h room under ``soft5h − landingMargin``, or the 7d room
-    under ``hard7d − landingMargin`` turned into 5h points at its k
-    (``7d room ÷ k``), whichever is less. ``-inf`` with usage unknown."""
+    turned into 5h points at its k (``7d room ÷ k``), whichever is less. The
+    7d room is to ``hard7d`` for a draining ``v`` (it rides there) and to
+    ``hard7d − landingMargin`` otherwise. ``-inf`` with usage unknown."""
     s = snap.settings
     if v.pct5 is None or v.pct7 is None:
         return -math.inf
     k, _ = k_for(v, snap.k7)
     room5 = s.soft_5h - s.landing_margin - v.pct5
-    room7 = (s.hard_7d - s.landing_margin - v.pct7) / k
+    margin7 = 0.0 if draining(v, snap) else s.landing_margin
+    room7 = room7_5h(v.pct7, s.hard_7d - margin7, k)
     return min(room5, room7)
 
 

@@ -114,9 +114,9 @@ none of it aside: the ride is the hard path, only later.
 Near-reset drain (``drainHours``, maximize/drain.py): an account whose 7d
 reset is close (within ``drainHours``, or so close that what is left under
 ``hard7d`` needs most of the 5h windows to the reset) is *draining*. Its 7d
-soft mark is set aside: no ``soft`` or ``preempt`` move off it on 7d, and,
-with useful room (``drain.preferred``), it is landable while its 7d is under
-``hard7d − landingMargin`` (with less, by the normal rule). Within a tier
+soft mark is set aside: no ``soft`` or ``preempt`` move off it on 7d, and it
+is landable on 7d while what is left to ``hard7d`` is worth at least
+``drain.MIN_LAND_5H`` 5h points at its k (``drain.lands_7d``). Within a tier
 ``landing_candidates`` puts a draining account with useful room
 (``drain.preferred``: at least a quarter 5h window before a mark) first,
 the earliest 7d reset first (:func:`drain_first`); one with less competes
@@ -255,10 +255,9 @@ def draining(v: AccountView, snap: Snapshot) -> bool:
 
 
 def can_land(v: AccountView, snap: Snapshot) -> bool:
-    """``score.landable`` with the drain's 7d limit (``hard7d − margin``)
-    for a draining ``v`` with useful room (``drain.preferred``); a draining
-    account with less lands by the normal rule (``soft7d − margin``)."""
-    return landable(v, snap.settings, drain_room=drain.preferred(v, snap))
+    """``score.landable`` with the drain's 7d gate for a draining ``v``: at
+    least ``drain.MIN_LAND_5H`` 5h points of room to ``hard7d`` at its k."""
+    return landable(v, snap.settings, drain_k=drain.land_k(v, snap))
 
 
 def drain_first(ranked: list[AccountView], snap: Snapshot) -> list[AccountView]:

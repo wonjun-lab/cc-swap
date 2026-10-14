@@ -5,6 +5,7 @@ from __future__ import annotations
 import math
 from collections.abc import Sequence
 
+from claude_swap.maximize.drain import lands_7d
 from claude_swap.maximize.model import TIER_ORDER, AccountView
 from claude_swap.settings import MaximizeSettings
 
@@ -30,20 +31,20 @@ def score(view: AccountView, now: float) -> float:
     return (100.0 - view.pct7) / (days_left(view, now) * 100.0 / 7.0)
 
 
-def landable(view: AccountView, s: MaximizeSettings, *, drain_room: bool = False) -> bool:
-    """Spec §5.2: a healthy, known, eligible place to land. ``drain_room``:
-    a draining account with useful room (``drain.preferred``, near its 7d
-    reset) has its 7d soft mark set aside: its 7d need only be under the
-    hard cap less the margin."""
+def landable(view: AccountView, s: MaximizeSettings, *, drain_k: float | None = None) -> bool:
+    """Spec §5.2: a healthy, known, eligible place to land. ``drain_k``: a
+    draining account's k (``drain.land_k``); its 7d soft mark is set aside
+    and its 7d gate is the room to the hard cap, in 5h points at that k
+    (``drain.lands_7d``), instead of ``soft7d − landingMargin``."""
     if view.tier == "excluded" or view.quarantined or view.api_key:
         return False
     if view.pct5 is None or view.pct7 is None:
         return False
-    soft7 = s.hard_7d if drain_room else s.soft_7d
-    return (
-        view.pct5 < s.soft_5h - s.landing_margin
-        and view.pct7 < soft7 - s.landing_margin
-    )
+    if drain_k is None:
+        lands7 = view.pct7 < s.soft_7d - s.landing_margin
+    else:
+        lands7 = lands_7d(view.pct7, s.hard_7d, drain_k)
+    return view.pct5 < s.soft_5h - s.landing_margin and lands7
 
 
 def below_hard(view: AccountView, s: MaximizeSettings) -> bool:

@@ -133,8 +133,8 @@ def _fixtures():
         acc(3, _old(0, 0, age_s=3 * H)),
     ), MX, plain
     # The near-reset drain (maximize/drain.py): #2 and #3 reset within a
-    # day, so their 7d soft mark is set aside (landable under 93) and they
-    # go first, the sooner reset first; #5 is past 93: forced only.
+    # day, so their 7d soft mark is set aside and they go first, the sooner
+    # reset first; #5 has under a quarter 5h window of room: by score.
     yield "draining", accounts(
         acc(1, usage(62, 40), active=True),
         acc(2, usage(0, 88, days7=0.75)),
@@ -215,13 +215,13 @@ def test_fleets_next_is_the_engines_target(name, snap, mx, state):
 
 def test_the_drain_fixtures_put_draining_accounts_first():
     by_name = {f[0]: f for f in FIXTURES}
-    # (order, draining slots). #3 in "draining" and in "draining active"
-    # drains with under a quarter 5h window of 7d room: past soft7d - margin
-    # it lands by the normal rule, so not at all.
+    # (order, draining slots). A draining account lands while its room to
+    # hard7d is worth drain.MIN_LAND_5H 5h points; one with under a quarter
+    # window (#5 in "draining": 4 / 0.165 = 24) lands but competes on score.
     expected = {
-        "draining": (["2", "4", "6"], {"2", "3", "5"}),
+        "draining": (["3", "2", "4", "6", "5"], {"2", "3", "5"}),
         "draining by room": (["2", "3"], {"2"}),
-        "draining active": (["2"], {"1", "3"}),
+        "draining active": (["3", "2"], {"1", "3"}),
     }
     for name, (order, draining) in expected.items():
         _, snap, mx, state = by_name[name]
