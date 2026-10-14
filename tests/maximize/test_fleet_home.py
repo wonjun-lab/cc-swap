@@ -725,10 +725,10 @@ def test_a_pending_tier_move_names_where_it_goes():
     assert said[0].endswith(
         "will move up to side (preferred) when you pause after the cooldown (20m left)"
     )
-    # A draining active account: not "draining it first" either.
+    # A draining active account stays: the drain beats the tier.
     dv, rows, said = _tier_decided(busy, replace(mx, drain_hours=24 * 4), p7=88)
-    assert rows[0].drain and dv.target == "2"
-    assert said[0].startswith("Auto ON · using main (normal) — will move up to side")
+    assert rows[0].drain and dv.target is None
+    assert "draining it first" in said[0] and "move up" not in said[0]
     # Off a last-resort account to a normal one: the same words.
     dv, rows, said = _tier_decided(busy, replace(MX, last_resort="main"))
     assert said[0] == (

@@ -33,13 +33,16 @@ fire (no ``soft`` or ``preempt`` move off it on 7d); it is landable while
 what is left to ``hard7d`` is worth at least :data:`MIN_LAND_5H` 5h points
 at its k (:func:`lands_7d`: ``(hard7d − 7d) ÷ k``; no landing margin, since
 it rides to the hard cap; the 5h rules are unchanged);
-within a tier a draining account with useful room (:func:`preferred`: at
-least :data:`MIN_ROOM_5H` 5h points it could take before a mark,
-:func:`room_5h`) is tried first, the earliest 7d reset first, and one with
-less competes on its score as usual; ``rebalance`` moves onto a draining
-account only when it has that room, and never moves off a draining
-account except to another such one that resets sooner. Hard caps, at-limit, the
-login-expiry guard, last resort, quarantine and holds are unchanged.
+a draining account with useful room (:func:`preferred`: at least
+:data:`MIN_ROOM_5H` 5h points it could take before a mark, :func:`room_5h`)
+is tried first whatever its tier (the drain beats the tiers: a week about
+to reset is never left unused, last resort included), the earliest 7d reset
+first, and one with less competes on its score in its tier as usual;
+``rebalance`` moves onto a draining account only when it has that room, and
+never moves off a draining account that is still landable on 7d
+(:func:`lands_7d`) except to another such one that resets sooner, not for a
+tier reason. Hard caps, at-limit, the login-expiry guard, quarantine,
+excluded accounts and holds are unchanged.
 
 ``k`` is learned from the usage history the engine already keeps
 (``usage_history.jsonl``, maximize/history.py): each account's first

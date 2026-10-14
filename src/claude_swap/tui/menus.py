@@ -370,7 +370,7 @@ def help_entries(idle_pattern: str | None = None) -> list[tuple[str, str]]:
                       "unused (m → s: 7d drain)"),
         ("preferred", "used before every normal account; left only at a mark, and "
                       "taken back once it can land again (u toggles)"),
-        ("last resort", "used only when every other account is at its limit (l toggles)"),
+        ("last resort", "used only when every other account is at its limit, unless its week is about to reset (l toggles)"),
         ("prime 19:30", "its 5h window has not started; priming starts it then (now: at "
                         "the next tick; 5h off: priming does not run)"),
         ("primed", "priming opened the 5h window it is in (shown when nothing above "

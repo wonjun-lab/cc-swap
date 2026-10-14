@@ -256,7 +256,7 @@ CASES = [
          Switch, target="2", trigger="soft"),
     # -- tiers ------------------------------------------------------------
     Case("last-resort-only-when-normals-fail",
-         snap("1", acct("1", 62, 40), acct("2", 0, 0, reset7_d=0.5, tier="last_resort"),
+         snap("1", acct("1", 62, 40), acct("2", 0, 0, reset7_d=6, tier="last_resort"),
               acct("3", 0, 60), samples="idle"),
          Switch, target="3", trigger="soft"),
     Case("last-resort-when-no-normal-lands",
@@ -290,7 +290,7 @@ CASES = [
          snap("1", acct("1", 10, 30, reset7_d=7), acct("2", 0, 25, reset7_d=7), samples="idle"),
          Hold, pending=False, reason_has="no better account"),
     Case("rebalance-never-normal-to-last-resort",
-         snap("1", acct("1", 10, 50), acct("2", 0, 0, reset7_d=0.5, tier="last_resort"),
+         snap("1", acct("1", 10, 50), acct("2", 0, 0, reset7_d=6, tier="last_resort"),
               samples="idle"),
          Hold, pending=False),
     Case("rebalance-in-cooldown-holds",

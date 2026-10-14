@@ -272,7 +272,7 @@ class TestLanding:
         got = decide(s)
         assert isinstance(got, Hold) and got.code is None   # no soft/preempt move off
 
-    def test_draining_first_earliest_reset_first_then_score(self):
+    def test_draining_first_whatever_the_tier_then_tier_and_score(self):
         s = snap(
             "1", acct("1", 96, 40),
             acct("2", 0, 0, reset7_d=6),          # best score, not draining
@@ -282,7 +282,7 @@ class TestLanding:
             hours("6", 0, 80, 12, tier="last_resort"),
             acct("7", 0, 50, reset7_d=6),
         )
-        assert [v.number for v in landing_candidates(s)] == ["4", "3", "2", "7", "6", "5"]
+        assert [v.number for v in landing_candidates(s)] == ["4", "6", "3", "2", "7", "5"]
 
     def test_past_the_normal_7d_limit_a_draining_account_lands_by_room(self):
         # 7d 90% is past soft7d - margin (85): a draining account lands on
@@ -656,3 +656,73 @@ class TestEngine:
         h.tick_with_usage({"1": win(20, 40), "2": win(0, 10), "3": win(0, 20)})
         snap_ = runtime_for(h.engine).last_snapshot
         assert snap_.k7 == {"2": pytest.approx(0.17, abs=1e-3)}
+
+
+class TestDrainBeatsTiers:
+    """A draining account with useful room goes first whatever its tier."""
+
+    def cooled(self, *accounts, **settings):
+        return snap(accounts[0].number, *accounts, samples="idle", last_switch_min=60,
+                    **settings)
+
+    def test_real_case_active_last_resort_draining_is_kept(self):
+        # Last resort, 7d 89% resetting in 5h (k 0.157: ~64 5h points to
+        # hard7d 99), active; a normal account at 0% can land.
+        s = snap("1", hours("1", 30, 89, 5, tier="last_resort"),
+                 acct("2", 0, 0, reset7_d=6), samples="idle", last_switch_min=10,
+                 hard_7d=99)
+        s = replace(s, k7={"1": 0.157})
+        assert drain.draining(s.view("1"), s)
+        got = decide(s)
+        assert isinstance(got, Hold) and got.code is None
+        assert "draining it first" in got.reason
+        assert "last resort and" not in got.reason
+        assert "cooldown" not in got.reason
+        # Drain off: the tier rule moves off it as before.
+        off = decide(replace(s, settings=replace(s.settings, drain_hours=0)))
+        assert "last resort and 2 (normal) can land" in off.reason
+
+    def test_draining_last_resort_is_the_first_candidate_and_rebalance_lands(self):
+        s = self.cooled(acct("1", 10, 60, reset7_d=3), hours("2", 0, 80, 20, tier="last_resort"),
+                        acct("3", 0, 0, reset7_d=6))
+        assert [v.number for v in landing_candidates(s)] == ["2", "3"]
+        got = decide(s)
+        assert isinstance(got, Switch) and got.trigger == "rebalance" and got.target == "2"
+
+    def test_rebalance_cooldown_holds_the_move_onto_it(self):
+        s = snap("1", acct("1", 10, 60, reset7_d=3), hours("2", 0, 80, 20, tier="last_resort"),
+                 samples="idle", last_switch_min=10)
+        got = decide(s)
+        assert isinstance(got, Hold) and "cooldown" in got.reason
+
+    def test_draining_normal_beats_non_draining_preferred(self):
+        s = snap("1", acct("1", 96, 40), acct("2", 0, 0, reset7_d=6, tier="preferred"),
+                 hours("3", 0, 87, 20))
+        assert [v.number for v in landing_candidates(s)] == ["3", "2"]
+
+    def test_little_room_keeps_its_tier(self):
+        v = hours("2", 30, 85, 20, tier="last_resort")   # 5h room 15 < 25
+        s = snap("1", acct("1", 96, 40), v, acct("3", 0, 0, reset7_d=6))
+        assert drain.draining(v, s) and not drain.preferred(v, s)
+        assert [x.number for x in landing_candidates(s)] == ["3", "2"]
+
+    def test_excluded_draining_is_never_used(self):
+        s = self.cooled(acct("1", 10, 60, reset7_d=3), hours("2", 0, 80, 20, tier="excluded"))
+        assert landing_candidates(s) == []
+
+    def test_last_resort_at_hard7d_is_not_landable(self):
+        v = hours("2", 0, 98, 5, tier="last_resort")
+        s = snap("1", acct("1", 96, 40), v, acct("3", 0, 0, reset7_d=6))
+        assert [x.number for x in landing_candidates(s)] == ["3"]
+
+    def test_active_draining_moves_to_a_sooner_draining_account_of_any_tier(self):
+        s = self.cooled(hours("1", 10, 80, 20), hours("2", 0, 85, 4, tier="last_resort"))
+        got = decide(s)
+        assert isinstance(got, Switch) and got.target == "2"
+
+    def test_active_draining_not_landable_on_7d_still_leaves_for_a_higher_tier(self):
+        # 7d 97.5 at k 0.165: < 10 5h points to hard7d, so the drain no
+        # longer holds it and the tier rule applies.
+        s = self.cooled(hours("1", 10, 97.5, 5, tier="last_resort"), acct("2", 0, 0, reset7_d=6))
+        got = decide(s)
+        assert isinstance(got, Switch) and got.target == "2"
