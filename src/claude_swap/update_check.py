@@ -760,12 +760,15 @@ def run_self_upgrade(force: bool = False) -> int:
         print(f"To upgrade cc-swap on Windows, run:\n  {accent(shlex.join(cmd))}")
         return 1
 
+    # Everything about the service is decided before the install replaces the
+    # package files this process imports from.
+    plan = _plan_service_refresh()
     if tag is not None:
         print(f"Installing cc-swap release {tag} ...")
     try:
         result = subprocess.run(cmd, check=False)
         if result.returncode == 0:
-            _refresh_service()
+            _refresh_service(plan)
         return result.returncode
     except FileNotFoundError:
         error(
@@ -775,37 +778,65 @@ def run_self_upgrade(force: bool = False) -> int:
         return 1
 
 
-def _refresh_service() -> None:
+def _plan_service_refresh() -> tuple[str, list[str] | None]:
+    """Decide, BEFORE the install replaces site-packages, what the refresh
+    needs: ``("none", None)`` no service to refresh, ``("run", cmd)`` the
+    command to run afterwards, ``("unknown", None)`` a service may be
+    installed but the command could not be determined (warn, never skip).
+
+    Importing :mod:`claude_swap.maximize.service` after the install would load
+    the new files into this old process (mixed versions), so it happens here.
+    """
+    try:
+        from claude_swap.maximize import service
+    except Exception:
+        # Cannot even tell: the service module is unusable on this platform.
+        return "none", None
+    try:
+        if not service.status().get("installed"):
+            return "none", None
+    except Exception:
+        # No service manager here (no launchctl/systemctl): nothing to refresh.
+        return "none", None
+    try:
+        cmd = service.reinstall_command()
+    except Exception:
+        return "unknown", None
+    return ("run", list(cmd)) if cmd else ("unknown", None)
+
+
+def _refresh_service(plan: tuple[str, list[str] | None] | None = None) -> None:
     """Re-run ``cc-swap service install`` when the service is installed.
 
     The service keeps running the build it was started with, so without this
-    an upgrade leaves a stale engine behind. It shells out to the console
-    script rather than calling :func:`service.install` because this process
-    still holds the old code. Never fails the upgrade: the reinstall already
-    happened, so a problem here is a warning with the command to run.
+    an upgrade leaves a stale engine behind. ``plan`` is
+    :func:`_plan_service_refresh`, computed before the install; after it only
+    a subprocess runs (the new console script), nothing is imported from the
+    replaced package. Never fails the upgrade and never skips silently: when
+    the service is installed but the refresh cannot be done, it is a warning
+    with the command to run.
     """
     from claude_swap.printer import warning
 
-    try:
-        from claude_swap.maximize import service
-
-        if not service.status().get("installed"):
-            return
-        cmd = service.reinstall_command()
-    except Exception:
-        # No service for this platform, or launchctl/systemctl is absent.
+    if plan is None:
+        plan = _plan_service_refresh()
+    state, cmd = plan
+    if state == "none":
+        return
+    manual = (
+        "Could not restart the cc-swap service on the new build; run "
+        "`cc-swap service install` yourself."
+    )
+    if state != "run" or not cmd:
+        warning(manual, file=sys.stderr)
         return
     print("Refreshing the cc-swap service so it runs the new build ...")
     try:
         rc = subprocess.run(cmd, check=False).returncode
-    except OSError:
+    except Exception:
         rc = 1
     if rc != 0:
-        warning(
-            "Could not restart the cc-swap service on the new build; run "
-            "`cc-swap service install` yourself.",
-            file=sys.stderr,
-        )
+        warning(manual, file=sys.stderr)
 
 
 def _release_notes_between(installed: str, latest: str) -> list[tuple[str, str]]:

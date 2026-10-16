@@ -882,3 +882,37 @@ def test_a_new_file_at_the_path_drops_the_old_evidence(home, root):
     _install(home, "2.1.290")
     cx.observe(root, cx.stat_binary(str(link)))
     assert "external" not in cx.load_state(root)
+
+
+def _doctor_ctx(home, root, now):
+    return SimpleNamespace(probes=SimpleNamespace(
+        backup_root=root, home=home, platform="darwin", now=now,
+    ))
+
+
+def test_doctor_codesign_is_info_once_the_same_version_launched_fine_after(home, root):
+    now = time.time()
+    versions = home / ".local" / "share" / "claude" / "versions"
+    last = now - 600
+    _ips(home, "claude-1.ips", str(versions / "2.1.289"), last)
+    # a failed run, a run of another version, and a good run before the kill don't count
+    real = str(versions / "2.1.289")
+    cx.append_record(root, {"kind": "exec", "at": last - 5, "real": real, "exit": 0})
+    cx.append_record(root, {"kind": "exec", "at": last + 5, "real": real, "exit": None, "signal": 9})
+    cx.append_record(root, {"kind": "exec", "at": last + 6, "real": str(versions / "2.1.290"), "exit": 0})
+    [f] = dr.check_codesign_kills(_doctor_ctx(home, root, now))
+    assert f.severity == "warn" and f.fix
+    cx.append_record(root, {"kind": "exec", "at": last + 60, "real": real, "exit": 0, "signal": None})
+    [f] = dr.check_codesign_kills(_doctor_ctx(home, root, now))
+    assert f.severity == "info" and f.fix == ""
+    assert "macOS killed claude 2.1.289 1 time at launch" in f.detail
+    assert "launched fine since" in f.detail
+
+
+def test_doctor_codesign_is_info_when_the_last_kill_is_over_a_day_old(home, root):
+    now = time.time()
+    versions = home / ".local" / "share" / "claude" / "versions"
+    _ips(home, "claude-1.ips", str(versions / "2.1.289"), now - 30 * 3600)
+    [f] = dr.check_codesign_kills(_doctor_ctx(home, root, now))
+    assert f.severity == "info" and f.fix == ""
+    assert "last kill over 24 h ago" in f.detail

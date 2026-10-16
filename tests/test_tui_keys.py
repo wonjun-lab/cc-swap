@@ -24,7 +24,7 @@ from tests.maximize.test_tui_fleet_actions import (
     _launchable,
 )
 from tests.maximize.test_tui_fleet import _settings
-from tests.test_tui import make_app, settle, wait_until
+from tests.test_tui import make_app, screen_ready, settle, wait_until
 
 SPECIAL = [
     "enter", "escape", "tab", "shift+tab", "up", "down", "left", "right",
@@ -261,8 +261,8 @@ async def _reach(pilot, name: str) -> None:
     await _go_home(pilot)
     await how(pilot)
     await wait_until(
-        pilot, lambda: _cls(pilot.app) == expect,
-        f"{name}: {expect} on top (on {_cls(pilot.app)})",
+        pilot, lambda: _cls(pilot.app) == expect and screen_ready(pilot.app),
+        f"{name}: {expect} on top and ready (on {_cls(pilot.app)})",
     )
 
 
@@ -373,7 +373,7 @@ async def test_mode_modal_two_keys_one_choice(tmp_path, monkeypatch, mode):
         await _open(pilot)
         base = _depth(app)
         await _keys(pilot, "m", "m")
-        await wait_until(pilot, lambda: _cls(app) == "ModeModal", "the Mode modal")
+        await wait_until(pilot, lambda: _cls(app) == "ModeModal" and screen_ready(app), "the Mode modal")
         modal = app.screen
         actions = modal._actions
         if not actions:  # a viewer lane: facts only, nothing to press
@@ -423,7 +423,7 @@ async def test_modal_two_dismissals_one_result(tmp_path, kind, mode):
             "prime": lambda: PrimeModal([PrimeChoice("2", "two", True)], set(), lambda n: []),
         }[kind]()
         app.push_screen(modal, results.append)
-        await wait_until(pilot, lambda: _depth(app) == base + 1, f"the {kind} modal to open")
+        await wait_until(pilot, lambda: _depth(app) == base + 1 and screen_ready(app), f"the {kind} modal to open")
         await _open(pilot)
         assert _depth(app) == base + 1
         char = key if len(key) == 1 else None

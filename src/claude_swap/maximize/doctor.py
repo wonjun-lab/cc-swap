@@ -834,6 +834,9 @@ def _when(epoch: float) -> str:
     return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(epoch))
 
 
+_CODESIGN_RECENT_S = 24 * 3600
+
+
 def check_codesign_kills(ctx: Context) -> list[Finding]:
     """macOS: crash reports of the last week in which the OS killed a native
     ``claude`` for an invalid code signature, per version — count, first and
@@ -856,11 +859,28 @@ def check_codesign_kills(ctx: Context) -> list[Finding]:
             before = "no cc-swap claude launch recorded before it"
         n = e["count"]
         launched = f"; launched by {', '.join(e['parents'])}" if e.get("parents") else ""
-        out.append(Finding(
-            "codesign-kills", "warn",
+        detail = (
             f"macOS killed claude {e['version']} {n} time{'s' if n != 1 else ''} at launch "
             f"(SIGKILL, Code Signature Invalid; ~/Library/Logs/DiagnosticReports): first "
-            f"{_when(e['first'])}, last {_when(e['last'])}{launched}; {before}",
+            f"{_when(e['first'])}, last {_when(e['last'])}{launched}; {before}"
+        )
+        # Only a recent episode is a problem: an old one, or one that cc-swap's
+        # own audit shows launching fine afterwards, is history.
+        ok = claude_exec.launched_ok_after(p.backup_root, e["version"], e["last"])
+        if ok is not None:
+            out.append(Finding(
+                "codesign-kills", "info",
+                f"{detail}; launched fine since ({_when(float(ok['at']))})",
+            ))
+            continue
+        if p.now - e["last"] > _CODESIGN_RECENT_S:
+            out.append(Finding(
+                "codesign-kills", "info",
+                f"{detail}; last kill over 24 h ago",
+            ))
+            continue
+        out.append(Finding(
+            "codesign-kills", "warn", detail,
             f"if claude {e['version']} still dies at launch: "
             f"{claude_exec.fix_command(_tilde(e['path'], p.home))}",
         ))
