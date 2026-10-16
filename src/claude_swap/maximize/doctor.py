@@ -1431,6 +1431,7 @@ def check_settings(ctx: Context) -> list[Finding]:
         ("maximize", st.MaximizeSettings),
         ("notify", st.NotifySettings),
         ("claude", st.ClaudeSettings),
+        ("tui", st.TuiSettings),
     )
     loaded = {}
     for name, cls in sections:

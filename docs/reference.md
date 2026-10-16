@@ -197,6 +197,7 @@ cc-swap config path                         # where settings.json lives
 | `notify.primePaused` | bool | true | Notify priming paused after a Claude Code update, and the engine's automatic verify passing or failing |
 | `notify.keychain` | bool | true | Notify a live login unreadable for over 15 minutes |
 | `claude.settleS` | int 0–86400 | 600 | The engine never runs a `claude` binary changed less than this many seconds ago (see *Every `claude` cc-swap runs*); 0 turns the wait off |
+| `tui.pollSeconds` | int 1–60 | 3 | Seconds between the TUI's polls; the TUI repaints only when something visible changed, so raise this in hosts that persist terminal scrollback |
 
 The plan (5x/20x) comes from each account's stored credentials; an entry in `maximize.planOverride` wins over it. It matters for breaking ties, and for the near-reset drain's default 7d cost of a 5h window until one is learned.
 

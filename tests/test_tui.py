@@ -314,7 +314,7 @@ async def menu_select(pilot, action_id: str) -> None:
 
 class TestFormatting:
     def test_format_duration(self):
-        assert tui_data.format_duration(42) == "42s"
+        assert tui_data.format_duration(42) == "<1m"
         assert tui_data.format_duration(180) == "3m"
         assert tui_data.format_duration(7980) == "2h 13m"
         assert tui_data.format_duration(3600 * 26) == "1d 2h"

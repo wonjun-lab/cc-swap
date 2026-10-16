@@ -166,6 +166,14 @@ class ClaudeSettings:
     settle_s: int = 600
 
 
+@dataclass(frozen=True)
+class TuiSettings:
+    """The TUI's own knobs (``tui`` section)."""
+
+    # Seconds between the TUI's snapshot polls.
+    poll_seconds: int = 3
+
+
 _SECTION_DEFAULT_SOURCES = {
     "autoswitch": AutoSwitchSettings,
     "ui": UiSettings,
@@ -173,6 +181,7 @@ _SECTION_DEFAULT_SOURCES = {
     "prime": PrimeSettings,
     "notify": NotifySettings,
     "claude": ClaudeSettings,
+    "tui": TuiSettings,
 }
 
 
@@ -407,6 +416,10 @@ SETTING_SPECS: dict[str, SettingSpec] = {
         SettingSpec(
             "claude", "settleS", "settle_s", "int", 0, 86400,
             help="claude: the engine waits this long after Claude Code changed before running it",
+        ),
+        SettingSpec(
+            "tui", "pollSeconds", "poll_seconds", "int", 1, 60,
+            help="tui: seconds between the TUI's polls (raise it where the host persists scrollback)",
         ),
     )
 }
@@ -795,6 +808,7 @@ def effective_settings(backup_root: Path) -> list[tuple[SettingSpec, object, boo
         "prime": load_prime_settings(backup_root),
         "notify": load_notify_settings(backup_root),
         "claude": load_claude_settings(backup_root),
+        "tui": load_tui_settings(backup_root),
     }
     rows = []
     for spec in SETTING_SPECS.values():
@@ -1002,6 +1016,15 @@ def load_claude_settings(
     sections (out of range is clamped, a bad type is the default)."""
     raw = _read_raw(settings_path(backup_root))
     return _section_for_load(raw, "claude", ClaudeSettings, problems)
+
+
+def load_tui_settings(
+    backup_root: Path, *, problems: list[str] | None = None
+) -> TuiSettings:
+    """Load the ``tui`` section; never raises (out of range is clamped, a bad
+    type is the default)."""
+    raw = _read_raw(settings_path(backup_root))
+    return _section_for_load(raw, "tui", TuiSettings, problems)
 
 
 def prime_from_raw(section, repairs: list[str]) -> PrimeSettings:

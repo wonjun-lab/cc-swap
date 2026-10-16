@@ -19,7 +19,7 @@ from claude_swap.json_output import USAGE_API_KEY
 from claude_swap.models import AccountSnapshot
 from claude_swap.switcher import ERROR_NOTES, login_expiry_warning_from_ms
 from claude_swap.usage_store import STALE_OK_S
-from claude_swap.tui import data
+from claude_swap.tui import data, quiet
 from claude_swap.tui.theme import Palette
 
 if TYPE_CHECKING:
@@ -375,12 +375,23 @@ class AccountsPanel(Static):
     def __init__(self, *, show_minis: bool = True, id: str | None = None) -> None:
         super().__init__(id=id)
         self._show_minis = show_minis
+        self._shown: dict = {}
 
     def on_mount(self) -> None:
-        self.watch(self.app, "snapshot", lambda _snap: self.refresh(layout=True))
-        self.watch(self.app, "theme", lambda _t: self.refresh(layout=True))
+        self.watch(self.app, "snapshot", lambda _snap: self.repaint())
+        self.watch(self.app, "theme", lambda _t: self.repaint())
+
+    def repaint(self) -> None:
+        """Redraw only when the rendered text differs from what is shown."""
+        if quiet.changed(self._shown, "text", self._build()):
+            self.refresh(layout=True)
 
     def render(self) -> Text:
+        text = self._build()
+        self._shown["text"] = text
+        return text
+
+    def _build(self) -> Text:
         app: "CswapApp" = self.app  # type: ignore[assignment]
         palette = Palette.from_theme(app.current_theme)
         snap = app.snapshot
@@ -433,12 +444,19 @@ class AccountCard(Static):
         super().__init__()
         self._acc = acc
         self._threshold = threshold
+        self._shown: dict = {}
 
     def set_account(self, acc: AccountSnapshot) -> None:
         self._acc = acc
-        self.refresh(layout=True)
+        if quiet.changed(self._shown, "text", self._build()):
+            self.refresh(layout=True)
 
     def render(self) -> Text:
+        text = self._build()
+        self._shown["text"] = text
+        return text
+
+    def _build(self) -> Text:
         return account_card_text(
             self._acc, self.size.width or 80, threshold=self._threshold,
             palette=Palette.from_theme(self.app.current_theme),

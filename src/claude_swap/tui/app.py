@@ -28,6 +28,7 @@ from claude_swap.snapshot_source import account_identity
 from claude_swap.settings import (
     load_maximize_settings,
     load_settings,
+    load_tui_settings,
     load_ui_settings,
     set_setting,
 )
@@ -37,7 +38,10 @@ from claude_swap.tui.dashboard import DashboardScreen, WatchScreen
 from claude_swap.tui.data import ActionResult, SnapshotSource, format_duration, run_action
 from claude_swap.tui.fleet import EngineHost, FleetScreen, fork_home, open_fleet
 from claude_swap.tui.modals import AddTokenModal, ConfirmModal, OutputModal, TokenForm
+from claude_swap.tui import quiet
 from claude_swap.tui.theme import CSWAP_DARK, CSWAP_LIGHT
+
+quiet.install()
 
 log = logging.getLogger(__name__)
 
@@ -62,8 +66,8 @@ class CswapApp(App):
     # second.
     SNAPSHOT_AGE_NOTE_S = 60.0
 
-    snapshot: reactive[AccountsSnapshot | None] = reactive(None)
-    refresh_status: reactive[str] = reactive("")
+    snapshot: reactive[AccountsSnapshot | None] = reactive(None, repaint=False)
+    refresh_status: reactive[str] = reactive("", repaint=False)
     busy: reactive[bool] = reactive(False)
 
     def __init__(
@@ -110,6 +114,11 @@ class CswapApp(App):
                 )
         except Exception:
             self.window_ticks = None
+        # tui.pollSeconds (a host that persists scrollback wants it longer).
+        try:
+            self.POLL_INTERVAL_S = float(load_tui_settings(switcher.backup_dir).poll_seconds)
+        except Exception:
+            pass
         try:
             self._theme_name = load_ui_settings(switcher.backup_dir).theme
         except Exception:
