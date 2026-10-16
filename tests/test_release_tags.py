@@ -494,3 +494,74 @@ class TestMain:
 
         kinds = [c[:2] for c in git.calls if c[:2] in (*_WRITES, ("uv", "run"))]
         assert kinds == [("uv", "run"), *_WRITES]
+
+
+class TestServiceRefreshAfterInstall:
+    """The service is decided before the install replaces site-packages; after
+    it only a subprocess runs, and a refresh that cannot happen is a warning."""
+
+    def _setup(self, monkeypatch, *, installed=True):
+        from claude_swap.maximize import service
+
+        monkeypatch.setattr(service, "status", lambda **kw: {"installed": installed})
+        monkeypatch.setattr(service, "reinstall_command", lambda: ["cc-swap", "service", "install"])
+        uc.write_cache(uc.CACHE_PATH, "cc-v9.9.9")
+        monkeypatch.setattr("claude_swap.update_check.__version__", "0.3.0", raising=False)
+        calls: list = []
+
+        def run(cmd, **kw):
+            calls.append(list(cmd))
+            if cmd[:3] == ["uv", "tool", "install"]:
+                # site-packages is replaced: importing the service now breaks
+                monkeypatch.setitem(sys.modules, "claude_swap.maximize.service", None)
+            return MagicMock(returncode=0)
+
+        monkeypatch.setattr("claude_swap.update_check.subprocess.run", run)
+        return calls
+
+    def test_refresh_runs_from_the_precomputed_command(self, monkeypatch, capsys):
+        calls = self._setup(monkeypatch)
+
+        assert uc.run_self_upgrade() == 0
+
+        assert calls[-1] == ["cc-swap", "service", "install"]
+        assert "Refreshing the cc-swap service" in capsys.readouterr().out
+
+    def test_no_service_means_no_refresh_and_no_warning(self, monkeypatch, capsys):
+        calls = self._setup(monkeypatch, installed=False)
+
+        assert uc.run_self_upgrade() == 0
+
+        assert len(calls) == 1
+        captured = capsys.readouterr()
+        assert "Refreshing" not in captured.out and "service install" not in captured.err
+
+    def test_undeterminable_command_warns_instead_of_skipping(self, monkeypatch, capsys):
+        from claude_swap.maximize import service
+
+        calls = self._setup(monkeypatch)
+
+        def boom():
+            raise RuntimeError("no program")
+
+        monkeypatch.setattr(service, "reinstall_command", boom)
+
+        assert uc.run_self_upgrade() == 0
+
+        assert len(calls) == 1
+        assert "cc-swap service install" in capsys.readouterr().err
+
+    def test_a_failing_refresh_warns(self, monkeypatch, capsys):
+        calls = self._setup(monkeypatch)
+        run = uc.subprocess.run
+
+        def run2(cmd, **kw):
+            r = run(cmd, **kw)
+            return MagicMock(returncode=1) if cmd[0] == "cc-swap" else r
+
+        monkeypatch.setattr("claude_swap.update_check.subprocess.run", run2)
+
+        assert uc.run_self_upgrade() == 0
+
+        assert calls[-1] == ["cc-swap", "service", "install"]
+        assert "cc-swap service install" in capsys.readouterr().err

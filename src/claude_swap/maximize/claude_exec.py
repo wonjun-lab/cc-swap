@@ -370,6 +370,25 @@ def last_launch_before(root: Path | None, at: float) -> dict | None:
     return best
 
 
+def launched_ok_after(root: Path | None, version: str, at: float) -> dict | None:
+    """The first ``claude`` run of ``version`` (the file's name under
+    ``.../versions/``) that cc-swap started after ``at`` and that ended
+    normally (exit 0, no signal, no error), or None."""
+    best = None
+    for rec in read_jsonl(root):
+        t = rec.get("at")
+        if rec.get("kind") != "exec" or not isinstance(t, (int, float)) or t <= at:
+            continue
+        real = rec.get("real")
+        if not isinstance(real, str) or Path(real).name != version:
+            continue
+        if rec.get("exit") != 0 or rec.get("signal") or rec.get("error") or rec.get("timedOut"):
+            continue
+        if best is None or t < best["at"]:
+            best = rec
+    return best
+
+
 def load_state(root: Path | None) -> dict[str, Any]:
     if root is None:
         return {}

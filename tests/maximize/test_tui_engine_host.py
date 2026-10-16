@@ -14,7 +14,7 @@ from textual.widgets import RichLog, Static
 from claude_swap.maximize import fleet as fx
 from claude_swap.maximize.lease import EngineLease
 from tests.maximize.test_tui_fleet import _fleet, _settings
-from tests.test_tui import fake_engine, make_app, settle, wait_until  # noqa: F401 (fixture)
+from tests.test_tui import fake_engine, make_app, settle, wait_screen, wait_until  # noqa: F401 (fixture)
 
 
 async def _eventually(predicate, timeout: float = 5.0) -> bool:
@@ -35,11 +35,9 @@ async def _open(pilot) -> None:
 
 
 async def _on(pilot, screen_cls, what: str | None = None) -> None:
-    """Wait for ``screen_cls`` to be the active screen."""
-    await wait_until(
-        pilot, lambda: isinstance(pilot.app.screen, screen_cls),
-        f"{what or screen_cls.__name__} on top",
-    )
+    """Wait for ``screen_cls`` to be the active screen, mounted and ready for
+    keys (a key pressed while it is only on the stack is lost under load)."""
+    await wait_screen(pilot, screen_cls, what)
 
 
 def _engine_line(app) -> str:
@@ -64,6 +62,9 @@ async def _mode(pilot, *keys: str, closes: bool = True) -> None:
                 pilot, lambda: not isinstance(pilot.app.screen, ModeModal),
                 f"the Mode modal to close on {key!r}",
             )
+            # the screen below (or a dialog that replaced it) must be ready
+            # before the next key goes in
+            await wait_screen(pilot, type(pilot.app.screen))
     await settle(pilot)
 
 
