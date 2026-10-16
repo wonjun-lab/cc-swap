@@ -287,6 +287,31 @@ async def wait_until(pilot, predicate, what: str, timeout: float = 15.0) -> None
         await asyncio.sleep(0.01)
 
 
+def screen_ready(app, screen_cls=None) -> bool:
+    """The active screen (an instance of ``screen_cls`` when given) is mounted
+    and running, its focus has landed (when it has anything to focus) and its
+    message queue is drained. A modal can be the top of the stack a few loop
+    turns before it takes keys; on a loaded machine a key pressed in that gap
+    is lost, so a test presses only once this holds."""
+    screen = app.screen
+    if screen_cls is not None and not isinstance(screen, screen_cls):
+        return False
+    if not (screen.is_mounted and screen.is_running):
+        return False
+    if screen.focused is None and screen.focus_chain:
+        return False
+    return screen._message_queue.empty()
+
+
+async def wait_screen(pilot, screen_cls, what: str | None = None, timeout: float = 15.0) -> None:
+    """Wait until ``screen_cls`` is the active screen AND ready for keys
+    (:func:`screen_ready`)."""
+    await wait_until(
+        pilot, lambda: screen_ready(pilot.app, screen_cls),
+        f"{what or screen_cls.__name__} on top and ready", timeout,
+    )
+
+
 async def wait_event(event: threading.Event, timeout: float = 1.0) -> None:
     assert await asyncio.to_thread(event.wait, timeout)
 
@@ -314,7 +339,7 @@ async def menu_select(pilot, action_id: str) -> None:
 
 class TestFormatting:
     def test_format_duration(self):
-        assert tui_data.format_duration(42) == "42s"
+        assert tui_data.format_duration(42) == "<1m"
         assert tui_data.format_duration(180) == "3m"
         assert tui_data.format_duration(7980) == "2h 13m"
         assert tui_data.format_duration(3600 * 26) == "1d 2h"

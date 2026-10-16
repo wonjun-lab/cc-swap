@@ -94,6 +94,7 @@ def build_snapshot(
     ages: Mapping[str, float | None] | None = None,
     estimate: UsageEstimate | None = None,
     local_idle: bool | None = None,
+    elsewhere: Mapping[str, float] | None = None,
 ) -> Snapshot:
     """One view per ``records`` entry, in ``records`` order (sequence order).
 
@@ -151,4 +152,5 @@ def build_snapshot(
         ride_k7=dict(ride_k7 or {}),
         estimate=estimate,
         local_idle=local_idle,
+        elsewhere=dict(elsewhere or {}),
     )

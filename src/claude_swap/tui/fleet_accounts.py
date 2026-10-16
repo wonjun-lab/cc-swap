@@ -21,7 +21,7 @@ from textual.widgets import DataTable, ListItem, ListView, Static
 
 from claude_swap.maximize import fleet as fx
 from claude_swap.models import AccountsSnapshot
-from claude_swap.tui import menus
+from claude_swap.tui import menus, quiet
 from claude_swap.tui.fleet_modals import TextInputModal
 from claude_swap.tui.theme import Palette
 
@@ -58,6 +58,7 @@ class AccountsScreen(TopOnly, Screen):
         super().__init__()
         self._numbers: list[str] = []
         self._picking: str | None = None
+        self._shown_rows: list | None = None
 
     def compose(self) -> ComposeResult:
         yield Static("", id="fx-ac-head", markup=False)
@@ -115,10 +116,11 @@ class AccountsScreen(TopOnly, Screen):
         rows = fleet_rows_now(self.app, snap)
         table = self.query_one("#fx-ac-table", DataTable)
         keep = self.current_number()
-        table.clear()
+        cells = []
         for row in rows:
             login, tone = fx.login_text(row)
-            table.add_row(
+            cells.append((
+                row.number,
                 Text(f"{row.name}  [{row.org}]" + ("  ● active" if row.active else ""),
                      style=tone_style(
                          "crit" if row.login == "relogin"
@@ -127,8 +129,17 @@ class AccountsScreen(TopOnly, Screen):
                 Text(fx.TIER_CELLS.get(row.tier, row.tier),
                      style=tone_style(
                          "plain" if row.tier in ("preferred", "normal") else "dim", palette)),
-                key=row.number,
-            )
+            ))
+        # Quiet repaints: an unchanged table is not rebuilt (see tui/quiet.py).
+        if self._shown_rows is not None and len(cells) == len(self._shown_rows) and all(
+            a[0] == b[0] and all(quiet.same_content(x, y) for x, y in zip(a[1:], b[1:]))
+            for a, b in zip(cells, self._shown_rows)
+        ):
+            return
+        self._shown_rows = cells
+        table.clear()
+        for number, *row_cells in cells:
+            table.add_row(*row_cells, key=number)
         self._numbers = [r.number for r in rows]
         if keep in self._numbers:
             table.move_cursor(row=self._numbers.index(keep))

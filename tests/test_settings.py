@@ -231,7 +231,7 @@ class TestSettingSpecs:
         }
 
     def test_defaults_match_dataclass(self):
-        from claude_swap.settings import ClaudeSettings, NotifySettings
+        from claude_swap.settings import ClaudeSettings, NotifySettings, TuiSettings
 
         sources = {
             "autoswitch": AutoSwitchSettings(),
@@ -240,6 +240,7 @@ class TestSettingSpecs:
             "prime": PrimeSettings(),
             "notify": NotifySettings(),
             "claude": ClaudeSettings(),
+            "tui": TuiSettings(),
         }
         for spec in SETTING_SPECS.values():
             assert spec.default == getattr(sources[spec.section], spec.field)
@@ -430,3 +431,19 @@ class TestAtomicWriteThroughSymlink:
         assert (repo.stat().st_mode & 0o777) == 0o755, "foreign dir untouched"
         assert (live.stat().st_mode & 0o777) == 0o700, "our dir hardened"
         assert (tracked.stat().st_mode & 0o777) == 0o600, "file still 0600"
+
+
+class TestTuiPollSeconds:
+    def test_default_and_clamp(self, tmp_path: Path):
+        from claude_swap.settings import load_tui_settings
+
+        assert load_tui_settings(tmp_path).poll_seconds == 3
+        settings_path(tmp_path).write_text(json.dumps({"tui": {"pollSeconds": 600}}))
+        assert load_tui_settings(tmp_path).poll_seconds == 60
+        settings_path(tmp_path).write_text(json.dumps({"tui": {"pollSeconds": 0}}))
+        assert load_tui_settings(tmp_path).poll_seconds == 1
+
+    def test_set_validates_range(self, tmp_path: Path):
+        assert set_setting(tmp_path, "tui.pollSeconds", "10") == 10
+        with pytest.raises(Exception):
+            set_setting(tmp_path, "tui.pollSeconds", "61")

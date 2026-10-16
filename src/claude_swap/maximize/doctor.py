@@ -834,6 +834,9 @@ def _when(epoch: float) -> str:
     return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(epoch))
 
 
+_CODESIGN_RECENT_S = 24 * 3600
+
+
 def check_codesign_kills(ctx: Context) -> list[Finding]:
     """macOS: crash reports of the last week in which the OS killed a native
     ``claude`` for an invalid code signature, per version — count, first and
@@ -856,11 +859,28 @@ def check_codesign_kills(ctx: Context) -> list[Finding]:
             before = "no cc-swap claude launch recorded before it"
         n = e["count"]
         launched = f"; launched by {', '.join(e['parents'])}" if e.get("parents") else ""
-        out.append(Finding(
-            "codesign-kills", "warn",
+        detail = (
             f"macOS killed claude {e['version']} {n} time{'s' if n != 1 else ''} at launch "
             f"(SIGKILL, Code Signature Invalid; ~/Library/Logs/DiagnosticReports): first "
-            f"{_when(e['first'])}, last {_when(e['last'])}{launched}; {before}",
+            f"{_when(e['first'])}, last {_when(e['last'])}{launched}; {before}"
+        )
+        # Only a recent episode is a problem: an old one, or one that cc-swap's
+        # own audit shows launching fine afterwards, is history.
+        ok = claude_exec.launched_ok_after(p.backup_root, e["version"], e["last"])
+        if ok is not None:
+            out.append(Finding(
+                "codesign-kills", "info",
+                f"{detail}; launched fine since ({_when(float(ok['at']))})",
+            ))
+            continue
+        if p.now - e["last"] > _CODESIGN_RECENT_S:
+            out.append(Finding(
+                "codesign-kills", "info",
+                f"{detail}; last kill over 24 h ago",
+            ))
+            continue
+        out.append(Finding(
+            "codesign-kills", "warn", detail,
             f"if claude {e['version']} still dies at launch: "
             f"{claude_exec.fix_command(_tilde(e['path'], p.home))}",
         ))
@@ -1431,6 +1451,7 @@ def check_settings(ctx: Context) -> list[Finding]:
         ("maximize", st.MaximizeSettings),
         ("notify", st.NotifySettings),
         ("claude", st.ClaudeSettings),
+        ("tui", st.TuiSettings),
     )
     loaded = {}
     for name, cls in sections:
@@ -1512,6 +1533,38 @@ def check_idle_pattern(ctx: Context) -> list[Finding]:
     p = ctx.probes
     slots = history.read(p.backup_root, p.now).slots
     return [Finding("idle-pattern", "info", history.describe(slots, p.now, enabled=enabled))]
+
+
+def check_elsewhere(ctx: Context) -> list[Finding]:
+    """Accounts seen in use on another machine and since when (info only;
+    ``maximize`` strategy only; maximize/elsewhere.py). Reads the state
+    file's ``maximizeElsewhere``, writes nothing."""
+    from claude_swap import settings as st
+    from claude_swap.maximize import elsewhere
+
+    if ctx.strategy != "maximize":
+        return []
+    try:
+        mx = st._section_from_raw(
+            (ctx.raw_settings or {}).get("maximize"), "maximize", st.MaximizeSettings
+        )
+    except TypeError:
+        mx = st.MaximizeSettings()
+    if not mx.avoid_elsewhere:
+        return []
+    now = ctx.probes.now
+    seen = elsewhere.marks(ctx.state, now)
+    if not seen:
+        return []
+    listed = ", ".join(
+        f"{ctx.name(n)} since {time.strftime('%H:%M', time.localtime(since))}"
+        for n, since in sorted(seen.items(), key=lambda kv: _slot_key(kv[0]))
+    )
+    return [Finding(
+        "elsewhere", "info",
+        f"in use on another machine: {listed} — landed on last within its tier "
+        "(an at-risk account is never avoided; maximize.avoidElsewhere)",
+    )]
 
 
 def check_reset_coupons(ctx: Context) -> list[Finding]:
@@ -1820,6 +1873,7 @@ ENV_CHECKS: tuple[Callable[[Context], list[Finding]], ...] = (
     check_settings,
     check_priming,
     check_idle_pattern,
+    check_elsewhere,
     check_learned_ride,
     check_drain,
     check_reset_coupons,

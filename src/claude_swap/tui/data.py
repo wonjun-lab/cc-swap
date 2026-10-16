@@ -153,10 +153,12 @@ def window_reset_text(last_good: dict | None, key: str, now: float) -> str | Non
 
 
 def format_duration(seconds: float) -> str:
-    """Compact duration: "45s", "12m", "2h 13m", "3d 4h"."""
+    """Compact duration: "<1m", "12m", "2h 13m", "3d 4h". Never finer than a
+    minute, so a text showing one changes at most once a minute (a per-second
+    label would repaint the terminal on every poll)."""
     s = int(seconds)
     if s < 60:
-        return f"{s}s"
+        return "<1m"
     if s < 3600:
         return f"{s // 60}m"
     if s < 86400:
