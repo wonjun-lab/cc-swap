@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import math
-from collections.abc import Sequence
+from collections.abc import Collection, Sequence
 
 from claude_swap.maximize.drain import lands_7d
 from claude_swap.maximize.model import TIER_ORDER, AccountView
@@ -78,30 +78,54 @@ def _tie_key(view: AccountView, now: float) -> tuple:
     return (-view.plan_weight, reset5, slot_order(view))
 
 
-def rank(
+def _rank_group(
     views: Sequence[AccountView], now: float, eps: float
+) -> list[AccountView]:
+    """One tier's (or one avoid group's) accounts: score descending in
+    eps-wide tie groups, then the tie-break."""
+    out: list[AccountView] = []
+    members = sorted(
+        views,
+        key=lambda v: (-score(v, now), slot_order(v)),
+    )
+    i = 0
+    while i < len(members):
+        anchor = score(members[i], now)
+        j = i + 1
+        while j < len(members):
+            gap = anchor - score(members[j], now)
+            if not (gap <= eps):  # nan (-inf vs -inf) ends the group too
+                break
+            j += 1
+        out.extend(sorted(members[i:j], key=lambda v: _tie_key(v, now)))
+        i = j
+    return out
+
+
+def rank(
+    views: Sequence[AccountView],
+    now: float,
+    eps: float,
+    avoid: Collection[str] = (),
 ) -> list[AccountView]:
     """Spec §5.4: tier, then score descending in eps-wide tie groups, then
     plan weight (20x first), sooner running 5h reset (off windows last), slot.
 
     A tie group is anchored on its highest score: a member joins while it is
     within ``eps`` of that anchor, so ties never chain past ``eps`` in total.
+
+    ``avoid``: slots in use on another machine (``policy.avoided_slots``);
+    within a tier they come after the others, each group ranked as above.
     """
     out: list[AccountView] = []
     for tier in sorted(TIER_ORDER, key=TIER_ORDER.__getitem__):
-        members = sorted(
-            (v for v in views if v.tier == tier),
-            key=lambda v: (-score(v, now), slot_order(v)),
-        )
-        i = 0
-        while i < len(members):
-            anchor = score(members[i], now)
-            j = i + 1
-            while j < len(members):
-                gap = anchor - score(members[j], now)
-                if not (gap <= eps):  # nan (-inf vs -inf) ends the group too
-                    break
-                j += 1
-            out.extend(sorted(members[i:j], key=lambda v: _tie_key(v, now)))
-            i = j
+        for elsewhere in (False, True):
+            out.extend(_rank_group(
+                [
+                    v for v in views
+                    if v.tier == tier and (v.number in avoid) is elsewhere
+                ],
+                now,
+                eps,
+            ))
     return out

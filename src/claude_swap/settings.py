@@ -107,6 +107,9 @@ class MaximizeSettings:
     preempt: bool = True
     # Learn when you are usually busy/quiet from the usage history.
     learn_idle_pattern: bool = True
+    # Avoid landing on (and move off) an account another machine is using
+    # (maximize/elsewhere.py); an at-risk account is never avoided.
+    avoid_elsewhere: bool = True
     preempt_horizon_max_h: int = 12
     # In a usually-busy time, rebalance at once only for a score gain this
     # large; smaller ones wait for the next quiet window.
@@ -327,6 +330,10 @@ SETTING_SPECS: dict[str, SettingSpec] = {
         SettingSpec(
             "maximize", "learnIdlePattern", "learn_idle_pattern", "bool",
             help="maximize: learn your usual busy and quiet times from the usage history",
+        ),
+        SettingSpec(
+            "maximize", "avoidElsewhere", "avoid_elsewhere", "bool",
+            help="maximize: avoid accounts in use on another machine (never an at-risk one)",
         ),
         SettingSpec(
             "maximize", "preemptHorizonMaxH", "preempt_horizon_max_h", "int", 1, 48,

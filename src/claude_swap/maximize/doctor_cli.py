@@ -474,7 +474,7 @@ REASONS: dict[str, tuple[str, str]] = {
         "Nothing; a hard ceiling switches at once. Lower maximize.idleWindowMin to switch sooner.",
     ),
     "maximize-hold": (
-        "maximize sees no reason to move: below every soft mark and no better-scored account (or within rebalanceCooldownMin, or the better-scored one's 7d would pass soft7d before your next quiet time, so preempt would only move you off it again).",
+        "maximize sees no reason to move: below every soft mark and no better-scored account (or within rebalanceCooldownMin, or the better-scored one's 7d would pass soft7d before your next quiet time, so preempt would only move you off it again; or the active account is in use on another machine and no free account of the same or a higher tier can land, or Claude Code is busy here, so this machine keeps it).",
         "Nothing.",
     ),
     "reset-wait": (
@@ -509,7 +509,7 @@ TRIGGERS: dict[str, str] = {
     "hard": "a hard ceiling is reached (or the pace reaches one within forceEtaMin)",
     "soft": "a soft mark is crossed and the account went idle",
     "preempt": "the active 7d is on pace to pass soft7d before your next quiet time; moved while idle",
-    "rebalance": "a better-scored account exists, or one in a higher tier can land (preferred over normal over last resort)",
+    "rebalance": "a better-scored account exists, one in a higher tier can land (preferred over normal over last resort), or another machine is using the active account and a same-or-higher-tier one is free (maximize.avoidElsewhere; never off an at-risk account)",
     "failover": "the active account's usage could not be read several times in a row",
     "proactive": "the active account reached autoswitch.threshold",
     "consume-first": "another account's weekly window resets sooner",

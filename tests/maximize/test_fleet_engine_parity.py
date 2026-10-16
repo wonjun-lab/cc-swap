@@ -22,7 +22,7 @@ from claude_swap.json_output import (
     USAGE_KEYCHAIN_UNAVAILABLE,
     USAGE_RELOGIN_REQUIRED,
 )
-from claude_swap.maximize import engine_hook, home, policy
+from claude_swap.maximize import elsewhere, engine_hook, home, policy
 from claude_swap.maximize import fleet as fx
 from claude_swap.maximize.model import Hold, Switch
 from claude_swap.maximize.view import MaximizeState
@@ -67,6 +67,10 @@ def _engine_snapshot(snap, mx, state):
             for a in snap.accounts if a.login_expires_at is not None
         },
         ages=engine_hook.reading_ages(entries),
+        elsewhere=(
+            elsewhere.marks({elsewhere.STATE_KEY: state.elsewhere}, NOW)
+            if mx.avoid_elsewhere else {}
+        ),
     )
     return esnap
 
@@ -156,6 +160,24 @@ def _fixtures():
         acc(2, usage(0, 10)),
         acc(3, usage(0, 89, days7=0.5)),
     ), MX, plain
+    # #2 would be the best pick, but another machine is using it (and #5,
+    # an at-risk account in use elsewhere, is still first).
+    marked = MaximizeState(elsewhere={"slots": {
+        n: {"since": NOW - 600, "last": NOW - 300, "until5": NOW + 3600}
+        for n in ("2", "5")
+    }})
+    yield "elsewhere", accounts(
+        acc(1, usage(62, 40), active=True),
+        acc(2, usage(0, 5)),
+        acc(3, usage(20, 30)),
+        acc(4, usage(10, 60)),
+        acc(5, usage(0, 88, days7=0.5)),
+    ), MX, marked
+    yield "elsewhere off", accounts(
+        acc(1, usage(62, 40), active=True),
+        acc(2, usage(0, 5)),
+        acc(3, usage(20, 30)),
+    ), replace(MX, avoid_elsewhere=False), marked
 
 
 FIXTURES = list(_fixtures())
@@ -279,3 +301,14 @@ def test_a_shared_login_is_never_numbered_next_or_counted():
     row = {r.number: r for r in rows}["2"]
     assert row.shared and home.tag_for(row, is_next=True, now=NOW) != ("next", "accent")
     assert home.capacity(rows, MX, NOW).usable == 2  # #1 and #3
+
+
+def test_fleet_tags_an_account_in_use_elsewhere_but_not_an_at_risk_one():
+    name, snap, mx, state = next(f for f in FIXTURES if f[0] == "elsewhere")
+    rows = {r.number: r for r in fx.fleet_rows(snap, mx, PRIME, state, now=NOW)}
+    assert rows["2"].elsewhere and not rows["5"].elsewhere
+    assert home.tag_for(rows["2"], is_next=False, now=NOW) == ("elsewhere", "warn")
+    assert home.tag_for(rows["5"], is_next=False, now=NOW) != ("elsewhere", "warn")
+    off = next(f for f in FIXTURES if f[0] == "elsewhere off")
+    rows = fx.fleet_rows(off[1], off[2], PRIME, off[3], now=NOW)
+    assert not any(r.elsewhere for r in rows)

@@ -22,6 +22,7 @@ from pathlib import Path
 from typing import Literal, get_args
 
 from claude_swap.maximize import drain
+from claude_swap.maximize import elsewhere as elsewhere_marks
 from claude_swap.maximize import history as usage_history
 from claude_swap.maximize import hold as account_hold
 from claude_swap.maximize import policy
@@ -126,6 +127,9 @@ class MaximizeState:
     ride_point_s: Mapping[str, Mapping[str, float]] = field(default_factory=dict)
     ride_t: Mapping[str, float] = field(default_factory=dict)
     ride_5h: Mapping[str, Mapping[str, RideFiveH]] = field(default_factory=dict)
+    # The in-use-elsewhere record as written (``maximizeElsewhere``,
+    # maximize/elsewhere.py); ``elsewhere.marks`` reads who it marks at a time.
+    elsewhere: Mapping = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -276,6 +280,11 @@ def read_state(backup_root: Path) -> MaximizeState:
     off_by = off_map.get("by")
     ride_armed_at, ride_point_s, ride_5h = _ride_armed(raw.get("maximizeRide"))
     return MaximizeState(
+        elsewhere=(
+            raw[elsewhere_marks.STATE_KEY]
+            if isinstance(raw.get(elsewhere_marks.STATE_KEY), dict)
+            else {}
+        ),
         ride_learning=raw.get(learned_ride.LEARN_KEY),
         ride_q=learned_ride.q_values(raw.get(learned_ride.LEARN_KEY)),
         ride_t=learned_ride.t_values(raw.get(learned_ride.LEARN_KEY)),
@@ -468,6 +477,11 @@ def snapshot_from_accounts(
         ride_t={**state.ride_t, **_own(state, snap.active_number, "t")},
         k7=drain_k7(history, settings, now),
         ride_k7=ride_k7(history, settings, now),
+        elsewhere=(
+            elsewhere_marks.marks({elsewhere_marks.STATE_KEY: state.elsewhere}, now)
+            if settings.avoid_elsewhere
+            else {}
+        ),
         # How old each reading is: the policy's stale landing rule, as the
         # engine applies it (engine_hook.reading_ages).
         ages={
@@ -502,7 +516,9 @@ def rows(snap: Snapshot, primes: Mapping[str, Mapping]) -> list[RowView]:
     the non-excluded accounts, then whatever it left out (excluded included)
     by slot."""
     eligible = [a for a in snap.accounts if a.tier != "excluded"]
-    ordered = list(rank(eligible, snap.now, snap.settings.tie_epsilon))
+    ordered = list(rank(
+        eligible, snap.now, snap.settings.tie_epsilon, policy.avoided_slots(snap)
+    ))
     seen = {a.number for a in ordered}
     ordered += sorted((a for a in snap.accounts if a.number not in seen), key=_slot)
     out: list[RowView] = []

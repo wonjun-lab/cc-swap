@@ -1535,6 +1535,38 @@ def check_idle_pattern(ctx: Context) -> list[Finding]:
     return [Finding("idle-pattern", "info", history.describe(slots, p.now, enabled=enabled))]
 
 
+def check_elsewhere(ctx: Context) -> list[Finding]:
+    """Accounts seen in use on another machine and since when (info only;
+    ``maximize`` strategy only; maximize/elsewhere.py). Reads the state
+    file's ``maximizeElsewhere``, writes nothing."""
+    from claude_swap import settings as st
+    from claude_swap.maximize import elsewhere
+
+    if ctx.strategy != "maximize":
+        return []
+    try:
+        mx = st._section_from_raw(
+            (ctx.raw_settings or {}).get("maximize"), "maximize", st.MaximizeSettings
+        )
+    except TypeError:
+        mx = st.MaximizeSettings()
+    if not mx.avoid_elsewhere:
+        return []
+    now = ctx.probes.now
+    seen = elsewhere.marks(ctx.state, now)
+    if not seen:
+        return []
+    listed = ", ".join(
+        f"{ctx.name(n)} since {time.strftime('%H:%M', time.localtime(since))}"
+        for n, since in sorted(seen.items(), key=lambda kv: _slot_key(kv[0]))
+    )
+    return [Finding(
+        "elsewhere", "info",
+        f"in use on another machine: {listed} — landed on last within its tier "
+        "(an at-risk account is never avoided; maximize.avoidElsewhere)",
+    )]
+
+
 def check_reset_coupons(ctx: Context) -> list[Finding]:
     """Usage-reset coupons as the last usage readings report them (info
     only): why none are offered (``ineligible_reason``, e.g. ``surface``),
@@ -1841,6 +1873,7 @@ ENV_CHECKS: tuple[Callable[[Context], list[Finding]], ...] = (
     check_settings,
     check_priming,
     check_idle_pattern,
+    check_elsewhere,
     check_learned_ride,
     check_drain,
     check_reset_coupons,
