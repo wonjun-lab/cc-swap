@@ -308,6 +308,26 @@ def local_idle(engine: Any, now: float, idle_window_min: float) -> bool | None:
     return now - last >= idle_window_min * 60.0
 
 
+def local_activity(engine: Any, now: float) -> tuple[bool, float | None]:
+    """``(known, busy_at)``: the latest moment Claude Code was busy on this
+    machine, from the evidence :func:`local_idle` uses — ``now`` while a
+    running session is in a turn, else its newest transcript write (None: no
+    transcript was ever seen). ``known`` is False when that cannot be told
+    (no watcher, or the transcript walk was cut short): never "idle"."""
+    watch = getattr(engine, WATCH_ATTR, None)
+    if not isinstance(watch, ActiveWatch):
+        return False, None
+    try:
+        busy = limit_watch.busy_sessions(limit_watch.default_root().parent)
+    except Exception:
+        busy = None
+    if busy:
+        return True, now
+    if not watch.watcher.available or not watch.watcher.complete:
+        return False, None
+    return True, watch.watcher.last_write
+
+
 def quiet_for_s(engine: Any, now: float) -> float | None:
     watch = getattr(engine, WATCH_ATTR, None)
     if not isinstance(watch, ActiveWatch) or watch.watcher.last_write is None:

@@ -168,6 +168,9 @@ class Snapshot:
     # this machine was written within ``idleWindowMin`` (None: unknown, the
     # samples decide).
     local_idle: bool | None = None
+    # Accounts in use on another machine (maximize/elsewhere.py): slot ->
+    # since when (epoch s). Empty = none seen, or ``avoidElsewhere`` is off.
+    elsewhere: Mapping[str, float] = field(default_factory=dict)
 
     def view(self, number: str | None) -> AccountView | None:
         """The account with this slot number, or None."""

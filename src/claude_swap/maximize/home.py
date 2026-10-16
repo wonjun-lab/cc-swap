@@ -180,7 +180,7 @@ def short_left(seconds: float) -> str:
 #: The tags in priority order: an account shows only the first that applies.
 TAG_PRIORITY: tuple[str, ...] = (
     "active", "re-login", "keychain", "excluded", "untrusted", "next", "login",
-    "reading old", "drain", "preferred", "last resort", "prime",
+    "reading old", "elsewhere", "drain", "preferred", "last resort", "prime",
 )
 
 #: The tiers the detail panel names among the selected account's facts
@@ -225,6 +225,9 @@ def tag_for(
         return (f"login {short_left(left)} left" if left > 0 else "login expired"), tone
     if row.login == "ok" and row.stale and age is not None and age >= STALE_TAG_S:
         return old, "dim"
+    if row.elsewhere:
+        # Another machine is using it: landed on last within its tier.
+        return "elsewhere", "warn"
     if row.drain:
         # Near its 7d reset: used first when its week would expire unused,
         # its soft marks set aside (maximize/drain.py). ``drain 18h``: the

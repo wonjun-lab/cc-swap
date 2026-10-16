@@ -279,6 +279,9 @@ class FleetRow:
     # Its week would expire unused (``drain.at_risk``): used first, whatever
     # its tier, with its 5h and 7d soft marks set aside.
     at_risk: bool = False
+    # Another machine is using this account (maximize/elsewhere.py) and
+    # maximize lands on it last within its tier; False for an at-risk one.
+    elsewhere: bool = False
 
 
 def _seen_resets(acc: AccountSnapshot, now: float) -> tuple[float | None, float | None]:
@@ -360,6 +363,7 @@ def fleet_rows(
     by_row = {r.number: r for r in ranked}
     shown_rows = {r.number: r for r in mxview.rows(shown_snap, state.primes)}
     trusted_views = {v.number: v for v in msnap.accounts}
+    avoided = policy.avoided_slots(msnap)
     views = {v.number: v for v in shown_snap.accounts}
     shown = display_names(
         (a.number, a.email, a.alias, a.org_name if a.org_uuid else "") for a in snap.accounts
@@ -418,6 +422,7 @@ def fleet_rows(
                 drain=draining,
                 drain_k=drain_k,
                 at_risk=risk,
+                elsewhere=acc.number in avoided,
             )
         )
     return out
@@ -466,6 +471,13 @@ class DecisionView:
 TIER_MOVE_RE = re.compile(
     r"^rebalance (?:waits for idle \(.*\)|cooldown \((?P<cool>\d+) min left\)): "
     r".+ is (?P<from>[a-z ]+) and .+ \((?P<to>[a-z ]+)\) can land"
+)
+#: ``rebalance waits for idle (…): main is in use on another machine —
+#: moving to side`` (``policy._rebalance``): a move off an account another
+#: machine is using, waiting for a locally idle moment or the cooldown.
+ELSEWHERE_MOVE_RE = re.compile(
+    r"^rebalance (?:waits for idle \(.*\)|cooldown \(\d+ min left\)): "
+    r".+ is in use on another machine — moving to "
 )
 
 _SLOT_RE = re.compile(r"#(\w+)")  # a reason from before names (``#3``)
@@ -562,7 +574,9 @@ def _hold_target(
     goes nowhere."""
     if code in ("preempt", "rebalance-deferred"):
         return _target_in(reason, active, msnap)
-    if code is None and TIER_MOVE_RE.search(reason or ""):
+    if code is None and (
+        TIER_MOVE_RE.search(reason or "") or ELSEWHERE_MOVE_RE.search(reason or "")
+    ):
         return _target_in(reason, active, msnap)
     return None
 

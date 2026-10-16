@@ -57,6 +57,7 @@ from claude_swap.exceptions import ConfigError
 from claude_swap.maximize import (
     active_watch,
     drain,
+    elsewhere,
     history,
     idle,
     ledger,
@@ -177,6 +178,8 @@ class MaximizeRuntime:
     history: history.Recorder | None = None
     # Dry runs keep the learned ride's records here (never learning).
     dry_ride: dict = field(default_factory=dict)
+    # Dry runs keep the in-use-elsewhere record here (maximize/elsewhere.py).
+    dry_elsewhere: dict = field(default_factory=dict)
 
 
 # -- settings ------------------------------------------------------------------
@@ -678,6 +681,42 @@ def _notify_tick(
         records=records, usage=usage, state=state, deadlines=deadlines,
         prime_note=prime_note, now=now,
     )
+
+
+def _track_elsewhere(
+    engine: aw.AutoSwitchEngine,
+    rt: MaximizeRuntime,
+    state: Mapping,
+    entries: Mapping,
+    usage: Mapping[str, dict | str | None],
+    records: Mapping,
+    current: str,
+    now: float,
+) -> dict[str, float]:
+    """Update ``maximizeElsewhere`` from this tick's readings and return the
+    accounts in use on another machine (slot -> since). Nothing is read or
+    kept while ``maximize.avoidElsewhere`` is off."""
+    if not rt.settings.avoid_elsewhere:
+        return {}
+    readings: dict[str, elsewhere.Reading] = {}
+    for number, entry in entries.items():
+        fetched = getattr(entry, "fetched_at", None)
+        if isinstance(fetched, bool) or not isinstance(fetched, (int, float)):
+            continue
+        pct5, reset5, _, _ = usage_windows(usage.get(number), float(fetched))
+        if pct5 is not None:
+            readings[str(number)] = elsewhere.Reading(float(fetched), pct5, reset5)
+    known, busy_at = active_watch.local_activity(engine, now)
+    source = rt.dry_elsewhere if engine.dry_run else state
+    record = elsewhere.update(
+        source, readings, active=current, local_busy_at=busy_at,
+        local_known=known, now=now, roster=set(map(str, records)),
+    )
+    if engine.dry_run:
+        rt.dry_elsewhere = {elsewhere.STATE_KEY: record}
+    elif state.get(elsewhere.STATE_KEY) != record:
+        engine._mutate_state(lambda s: s.__setitem__(elsewhere.STATE_KEY, record))
+    return elsewhere.marks({elsewhere.STATE_KEY: record}, now)
 
 
 def _stored_samples(source: Mapping, current: str) -> list[Sample]:
@@ -1851,6 +1890,7 @@ def run_maximize_tick(
     # keep running on the readings themselves; a reported limit is a ride's
     # hit all the same.
     estimate = active_estimate(engine, current)
+    marked = _track_elsewhere(engine, rt, state, entries, usage, records, current, now)
     tiers = _rate_limit_tiers(engine, rt, records, now)
     _reconcile_ride_slots(engine, rt, state, records, tiers)
     ride_tick = _ride_track(
@@ -1896,9 +1936,11 @@ def run_maximize_tick(
         estimate=estimate.for_snapshot() if estimate is not None else None,
         local_idle=(
             active_watch.local_idle(engine, now, rt.settings.idle_window_min)
-            if estimate is not None and estimate.kind == "projected"
+            if (estimate is not None and estimate.kind == "projected")
+            or current in marked
             else None
         ),
+        elsewhere=marked,
     )
     decision = policy.decide(snap)
     rt.last_snapshot, rt.last_decision = snap, decision

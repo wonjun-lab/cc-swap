@@ -763,3 +763,26 @@ def test_keychain_account_follows_user(world):
         ("Claude Code-credentials", USER)
     )
     assert not problems(run(world))
+
+
+def test_elsewhere_lists_accounts_seen_in_use_on_another_machine(world):
+    from claude_swap.maximize import elsewhere as ew
+
+    world.healthy()
+    assert find(run(world), "elsewhere") == []
+    world.state(**{ew.STATE_KEY: {"slots": {"2": {
+        "since": NOW - 600, "last": NOW - 300, "until5": NOW + 3600,
+    }}}})
+    [f] = find(run(world), "elsewhere", "info")
+    assert f.detail.startswith("in use on another machine: ")
+    assert " since " in f.detail and "never avoided" in f.detail
+    # An expired mark is not listed; neither is anything while the setting is off.
+    world.state(**{ew.STATE_KEY: {"slots": {"2": {
+        "since": NOW - 7200, "last": NOW - 6000, "until5": NOW + 3600,
+    }}}})
+    assert find(run(world), "elsewhere") == []
+    world.state(**{ew.STATE_KEY: {"slots": {"2": {
+        "since": NOW - 600, "last": NOW - 300,
+    }}}})
+    world.settings(maximize={"avoidElsewhere": False})
+    assert find(run(world), "elsewhere") == []

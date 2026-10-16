@@ -267,6 +267,9 @@ STRATEGY_FIELDS: tuple[StrategyField, ...] = (
                   "when to leave the active account"),
     StrategyField("maximize.tieEpsilon", "tie epsilon", "", "scores this close count as a tie",
                   0.05, "when to leave the active account"),
+    StrategyField("maximize.avoidElsewhere", "avoid elsewhere", "",
+                  "avoid accounts another machine is using (never an at-risk one)", 1,
+                  "when to leave the active account"),
     StrategyField("maximize.learnIdlePattern", "learn idle pattern", "",
                   "learn your usual busy and quiet times from the usage history", 1,
                   QUIET_GROUP),
@@ -365,6 +368,10 @@ def help_entries(idle_pattern: str | None = None) -> list[tuple[str, str]]:
         ("reading 2h old", "its usage was last read that long ago. Amber: the engine no "
                            "longer trusts it and counts the account as unknown (never "
                            "next, not in the summary); dim: still trusted"),
+        ("elsewhere", "another machine is using this account (its 5h rose while nothing "
+                      "here used it): cc-swap lands on it last within its tier and "
+                      "moves off it when you are idle, never an at-risk account "
+                      "(maximize.avoidElsewhere)"),
         ("drain 18h", "its 7d resets in 18h: cc-swap uses it first and up to its hard mark "
                       "(its 7d soft mark is set aside) so that quota does not expire "
                       "unused (m → s: 7d drain)"),

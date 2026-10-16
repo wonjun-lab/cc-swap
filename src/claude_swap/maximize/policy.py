@@ -161,6 +161,15 @@ this machine within ``idleWindowMin``" (``Snapshot.local_idle``) when that
 is known; no learned ride starts (it needs 60 s readings). Every reason
 then says so: ``(5h ~74% projected — usage reads rate-limited for 52m)``.
 
+In use elsewhere (``Snapshot.elsewhere``, maximize/elsewhere.py,
+``maximize.avoidElsewhere``): another machine logged in to the same account
+is using it. Within a tier, accounts not in use elsewhere land before ones
+that are (they stay landable: with nothing else, one is used). Rebalance
+moves off an active account in use elsewhere, at a locally idle moment and
+after the cooldown, to a landable account of the same or a higher tier that
+is not; never onto one for this reason. An at-risk account is never
+avoided and never left for it: the priority rule above comes first.
+
 Stale landing (``STALE_LANDING_S``): a non-active account whose reading is
 older than that is no landing target (soft, preempt, rebalance, and the
 first choice of hard/at-limit); the hard/at-limit fallbacks still take
@@ -243,6 +252,17 @@ def is_idle(snap: Snapshot) -> bool:
     return idle.is_idle(snap.samples, snap.now, snap.settings)
 
 
+def locally_idle(snap: Snapshot) -> bool:
+    """Whether Claude Code on this machine is idle (``Snapshot.local_idle``:
+    no busy session, no transcript written within ``idleWindowMin``); the
+    samples' verdict (:func:`is_idle`) when that cannot be told. The usage
+    samples cannot decide for an account another machine is burning: its 5h
+    rises while this machine does nothing."""
+    if snap.local_idle is not None:
+        return snap.local_idle
+    return is_idle(snap)
+
+
 def _pct(value: float) -> str:
     return f"{value:g}%"
 
@@ -276,6 +296,20 @@ def at_risk(v: AccountView, snap: Snapshot) -> bool:
     """``v``'s week would expire unused (``drain.at_risk``): the priority
     rule's first class, whatever its tier."""
     return drain.at_risk(v, snap)
+
+
+def avoided_slots(snap: Snapshot) -> frozenset[str]:
+    """Slots to land on last within their tier: in use on another machine
+    (``Snapshot.elsewhere``, maximize/elsewhere.py) while
+    ``maximize.avoidElsewhere`` is on. Never an at-risk account — its week
+    would expire unused, which comes before anything else (the priority
+    rule) — and never the cause of leaving one."""
+    if not snap.settings.avoid_elsewhere or not snap.elsewhere:
+        return frozenset()
+    return frozenset(
+        v.number for v in snap.accounts
+        if v.number in snap.elsewhere and not at_risk(v, snap)
+    )
 
 
 def can_land(v: AccountView, snap: Snapshot) -> bool:
@@ -322,6 +356,7 @@ def landing_candidates(snap: Snapshot) -> list[AccountView]:
             ],
             snap.now,
             s.tie_epsilon,
+            avoided_slots(snap),
         ),
         snap,
     )
@@ -1239,7 +1274,27 @@ def _rebalance(
     a_score = score(a, snap.now)
     gain: float | None = None
     a_risk = at_risk(a, snap)
-    if TIER_ORDER[top.tier] < TIER_ORDER[a.tier] and not a_risk:
+    avoided = avoided_slots(snap)
+    away = None
+    if a.number in avoided:
+        # In use on another machine: move to a landable account of the same
+        # or a higher tier that is not (the busy machine keeps it: the move
+        # waits for this one to be idle). Never off an at-risk account.
+        away = next(
+            (
+                v for v in landing
+                if TIER_ORDER[v.tier] <= TIER_ORDER[a.tier]
+                and v.number not in avoided
+            ),
+            None,
+        )
+    if away is not None:
+        top = away
+        why = (
+            f"{view_name(a)} is in use on another machine — "
+            f"moving to {view_name(top)}"
+        )
+    elif TIER_ORDER[top.tier] < TIER_ORDER[a.tier] and not a_risk:
         # A higher tier (preferred over normal, normal over last resort,
         # anything over excluded) is the user's rule: never skipped for a
         # 7d pace. Not off an at-risk active account: its week would expire
@@ -1250,7 +1305,10 @@ def _rebalance(
         )
     else:
         skipped = _preempt_would_leave(snap, a, landing)
-        pool = [v for v in landing if v.number not in skipped]
+        pool = [
+            v for v in landing
+            if v.number not in skipped and v.number not in avoided
+        ]
         if a_risk:
             # Off an at-risk account only onto an at-risk one that resets
             # sooner: never back to a non-at-risk one, and never back and
@@ -1319,6 +1377,17 @@ def _rebalance(
             pending=False,
             code="rebalance-deferred",
         )
+    if away is not None:
+        # The tiebreak between machines: only the one that is locally idle
+        # moves; the busy one stays on the account.
+        if not locally_idle(snap):
+            window = s.idle_window_min
+            return Hold(
+                f"rebalance waits for idle (Claude Code active here within "
+                f"{window} min): {why}",
+                pending=False,
+            )
+        return Switch(top.number, "rebalance", f"{why}; idle")
     if not is_idle(snap):
         return Hold(
             f"rebalance waits for idle ({idle_note(snap)}): {why}",
